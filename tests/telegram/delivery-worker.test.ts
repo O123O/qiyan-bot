@@ -24,6 +24,14 @@ test("prepared delivery becomes dispatched then atomically confirmed", async () 
   assert.equal(states.length, 1);
 });
 
+test("metadata observer failure cannot roll a confirmed delivery back to uncertain", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({ id: "d_observer", kind: "text", destination: "7", body: "done", mandatory: true });
+  const worker = new DeliveryWorker(store, { sendMessage: async () => ({ message_id: 44 }) }, undefined, undefined, () => { throw new Error("metadata store failed"); });
+  await worker.processOne(delivery.id);
+  assert.equal(store.get(delivery.id)?.state, "confirmed");
+});
+
 test("crash recovery retries mandatory uncertainty with a stable recovery label", async () => {
   const store = new DeliveryStore(createTestDatabase());
   const delivery = store.prepare({ id: "d_ab12", kind: "text", destination: "7", body: "[payments] done", mandatory: true });

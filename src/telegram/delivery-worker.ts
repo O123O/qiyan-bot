@@ -28,7 +28,7 @@ export class DeliveryWorker {
         ? await this.sendAttachment(delivery, body)
         : await this.api.sendMessage(delivery.destination, body, delivery.replyTo);
       this.store.confirm(id, String(result.message_id));
-      await this.onStateChange(this.store.get(id)!);
+      await this.notify(this.store.get(id)!);
     } catch (error) {
       if (isRateLimitError(error)) this.store.markPrepared(id);
       else if (isDeterministicDeliveryError(error)) this.store.fail(id);
@@ -42,7 +42,7 @@ export class DeliveryWorker {
           mandatory: true,
         });
       }
-      if (!isRateLimitError(error)) await this.onStateChange(this.store.get(id)!, error);
+      if (!isRateLimitError(error)) await this.notify(this.store.get(id)!, error);
       throw error;
     }
   }
@@ -71,6 +71,11 @@ export class DeliveryWorker {
   private recoveryEnvelope(body: string, id: string): string {
     const match = /^\[([^\]]+)\]\s?(.*)$/su.exec(body);
     return match ? `[${match[1]} · recovery retry ${id}] ${match[2]}` : `[recovery retry ${id}] ${body}`;
+  }
+
+  private async notify(delivery: DeliveryRecord, error?: unknown): Promise<void> {
+    try { await this.onStateChange(delivery, error); }
+    catch { /* delivery state is authoritative; maintenance can rebuild metadata */ }
   }
 
   private async sendAttachment(delivery: NonNullable<ReturnType<DeliveryStore["get"]>>, body: string): Promise<{ message_id: number }> {

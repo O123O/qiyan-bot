@@ -158,6 +158,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         await resumeManagedSessions();
         await relay.reconcileEndpoint(endpoint.id);
         for (const recovered of deliveries.recoverAfterCrash()) persistDeliveryState(recovered);
+        reconcileDeliveryEvents();
         acceptingReadyEvents = true;
       }, stop: async () => { acceptingReadyEvents = false; },
     },
@@ -781,11 +782,20 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     if (schedulerAccepting) void enqueuePendingEvents();
   }
 
+  function reconcileDeliveryEvents(): void {
+    const rows = db.prepare("SELECT id FROM deliveries WHERE state IN ('confirmed', 'failed', 'uncertain') ORDER BY created_at, id").all() as Array<{ id: string }>;
+    for (const row of rows) {
+      const delivery = deliveries.get(row.id);
+      if (delivery) persistDeliveryState(delivery);
+    }
+  }
+
   return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });
 
   async function runMaintenance(): Promise<void> {
     await attachments.cleanupExpired();
     discovery.cleanupExpired();
+    reconcileDeliveryEvents();
     await reconcileOperations();
     if (coordinatorEndpoint.state === "ready") {
       await reconcileCoordinatorAttempts();
