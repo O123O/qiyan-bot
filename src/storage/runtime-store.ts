@@ -21,6 +21,35 @@ export class RuntimeStore {
     };
   }
 
+  setActiveTurn(endpointId: string, threadId: string, turnId: string | undefined): void {
+    this.db.prepare("UPDATE session_runtime SET active_turn_id = ?, native_status = ? WHERE endpoint_id = ? AND thread_id = ?")
+      .run(turnId ?? null, turnId ? "active" : "idle", endpointId, threadId);
+  }
+
+  activeTurn(endpointId: string, threadId: string): string | undefined {
+    const row = this.db.prepare("SELECT active_turn_id FROM session_runtime WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as { active_turn_id: string | null } | undefined;
+    return row?.active_turn_id ?? undefined;
+  }
+
+  setModel(endpointId: string, threadId: string, model: string): void {
+    this.db.prepare("UPDATE session_runtime SET model = ? WHERE endpoint_id = ? AND thread_id = ?").run(model, endpointId, threadId);
+  }
+
+  setEffort(endpointId: string, threadId: string, effort: string): void {
+    this.db.prepare("UPDATE session_runtime SET effort = ? WHERE endpoint_id = ? AND thread_id = ?").run(effort, endpointId, threadId);
+  }
+
+  settings(endpointId: string, threadId: string): { model?: string; effort?: string } {
+    const row = this.db.prepare("SELECT model, effort FROM session_runtime WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as { model: string | null; effort: string | null } | undefined;
+    return row ? { ...(row.model ? { model: row.model } : {}), ...(row.effort ? { effort: row.effort } : {}) } : {};
+  }
+
+  consumeSettings(endpointId: string, threadId: string): { model?: string; effort?: string } {
+    const value = this.settings(endpointId, threadId);
+    this.db.prepare("UPDATE session_runtime SET model = NULL, effort = NULL WHERE endpoint_id = ? AND thread_id = ?").run(endpointId, threadId);
+    return value;
+  }
+
   listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; nativeStatus: string }> {
     return (this.db.prepare("SELECT endpoint_id, thread_id, management_state, native_status FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
       endpointId: String(row.endpoint_id), threadId: String(row.thread_id), managementState: String(row.management_state) as ManagementState, nativeStatus: String(row.native_status),

@@ -86,6 +86,13 @@ export const migrations = [
     terminal_status TEXT NOT NULL,
     UNIQUE(endpoint_id, thread_id, turn_id, item_id)
   );
+  CREATE TABLE IF NOT EXISTS terminal_turn_observations (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY(endpoint_id, thread_id, turn_id)
+  );
 
   CREATE TABLE IF NOT EXISTS session_runtime (
     endpoint_id TEXT NOT NULL,
@@ -96,6 +103,7 @@ export const migrations = [
     delivery_cursor TEXT,
     model TEXT,
     effort TEXT,
+    active_turn_id TEXT,
     last_error TEXT,
     PRIMARY KEY(endpoint_id, thread_id)
   );
