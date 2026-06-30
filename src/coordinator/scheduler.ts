@@ -51,7 +51,7 @@ export class CoordinatorScheduler {
   private kick(): void {
     if (this.running) return;
     this.running = true;
-    void this.pump();
+    void this.pump().catch(() => undefined);
   }
 
   private async pump(): Promise<void> {

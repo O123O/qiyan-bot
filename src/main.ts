@@ -14,4 +14,4 @@ export async function main(env = process.env): Promise<void> {
   process.once("SIGTERM", stop);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) void main();
+if (import.meta.url === `file://${process.argv[1]}`) void main().catch(() => { process.exitCode = 1; });

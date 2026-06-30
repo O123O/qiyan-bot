@@ -96,6 +96,7 @@ test("a proven no-effect error does not consume a pass directive", async () => {
   await assert.rejects(tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" }, args), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
   const failed = db.prepare("SELECT state FROM operations WHERE call_id = 'first'").get() as { state: string };
   assert.equal(failed.state, "failed");
+  await assert.rejects(tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" }, args), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
   const receipt = await tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "second" }, args);
   assert.equal((receipt as any).turnId, "turn");
   assert.equal(calls, 2);

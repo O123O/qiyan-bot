@@ -73,10 +73,10 @@ export function createCoordinatorTools(
       let operation: OperationRecord | undefined;
       if (directive) operation = operations.replayDirective(context.sourceContextId, directive.kind, directive.binding);
       operation ??= operations.prepare({ contextId: context.sourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args });
-      if (directive) operations.bindDirective(context.sourceContextId, directive.kind, directive.binding, operation.id);
       if (operation.state === "succeeded") return operation.receipt;
       if (operation.state === "dispatched" || operation.state === "uncertain") throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
       if (operation.state === "failed") throw new AppError("OPERATION_UNCERTAIN", `${name} previously failed and requires reconciliation`);
+      if (directive) operations.bindDirective(context.sourceContextId, directive.kind, directive.binding, operation.id);
 
       const action = actions[name];
       if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);

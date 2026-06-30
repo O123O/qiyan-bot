@@ -56,7 +56,7 @@ export class LoopbackMcpServer {
           if (closed) return;
           closed = true;
           this.activeServers.delete(mcp);
-          void mcp.close();
+          void mcp.close().catch(() => undefined);
         };
         response.once("close", close);
         await transport.handleRequest(request, response, body);

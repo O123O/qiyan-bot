@@ -10,6 +10,7 @@ import { SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
+import { runBackground } from "./core/background.ts";
 import { CoordinatorNotebook } from "./coordinator/notebook.ts";
 import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
@@ -71,6 +72,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let stopping = false;
   let registryInvalid = false;
   let endpointsCommitted = false;
+  let backgroundIncident = 0;
   let operationReconciliationTail: Promise<void> = Promise.resolve();
 
   const phases: AppPhase[] = [
@@ -126,13 +128,13 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, { destination: String(config.telegramDestinationChatId), clock: { now: () => Date.now() } }, attachments);
         scheduler = new CoordinatorScheduler(runCoordinatorJob);
-        unsubscribers.push(endpoint.onNotification((method, params) => void onNotification(endpoint.id, method, params)));
-        unsubscribers.push(coordinatorEndpoint.onNotification((method, params) => void onNotification(coordinatorEndpoint.id, method, params)));
-        unsubscribers.push(endpoint.onPermissionBlocked((event) => void (async () => { await relay.handlePermissionBlocked(endpoint.id, event); await enqueuePendingEvents(); })()));
-        unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) void relay.reconcileEndpoint(endpoint.id); }));
-        unsubscribers.push(coordinatorEndpoint.onReady(() => { if (acceptingReadyEvents) void reconcileCoordinatorAttempts(); }));
-        unsubscribers.push(endpoint.onUnavailable(() => void handleEndpointUnavailable(endpoint)));
-        unsubscribers.push(coordinatorEndpoint.onUnavailable(() => void handleEndpointUnavailable(coordinatorEndpoint)));
+        unsubscribers.push(endpoint.onNotification((method, params) => runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"))));
+        unsubscribers.push(coordinatorEndpoint.onNotification((method, params) => runBackground(() => onNotification(coordinatorEndpoint.id, method, params), () => recordBackgroundFailure("coordinator notification"))));
+        unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => { await relay.handlePermissionBlocked(endpoint.id, event); enqueuePendingEvents(); }, () => recordBackgroundFailure("permission notification"))));
+        unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
+        unsubscribers.push(coordinatorEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => reconcileCoordinatorAttempts(), () => recordBackgroundFailure("coordinator ready reconciliation")); }));
+        unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
+        unsubscribers.push(coordinatorEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(coordinatorEndpoint), () => recordBackgroundFailure("coordinator unavailable handling"))));
       }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); },
     },
     {
@@ -431,7 +433,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     await enqueuePendingSources();
   }
 
-  async function enqueuePendingEvents(): Promise<void> {
+  function enqueuePendingEvents(): void {
     if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
     const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
@@ -454,7 +456,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
   }
 
-  async function enqueuePendingSources(): Promise<void> {
+  function enqueuePendingSources(): void {
     if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
     for (const source of operations.listPendingSourceContexts(["telegram", "recovery"])) enqueueSource(source.id);
   }
@@ -475,8 +477,8 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
     const retry = setTimeout(() => {
       if (stopping) return;
-      if (eventIds.length > 0) void enqueuePendingEvents();
-      else void enqueuePendingSources();
+      if (eventIds.length > 0) enqueuePendingEvents();
+      else enqueuePendingSources();
     }, 1_000);
     retry.unref?.();
   }
@@ -822,16 +824,29 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   function persistDeliveryState(delivery: DeliveryRecord, schedule = true): boolean {
     const inserted = persistDeliveryStateEvent(db, delivery);
-    if (inserted && schedule && schedulerAccepting) void enqueuePendingEvents();
+    if (inserted && schedule && schedulerAccepting) enqueuePendingEvents();
     return inserted;
   }
 
   function reconcileDeliveryEvents(): void {
-    if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) void enqueuePendingEvents();
+    if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) enqueuePendingEvents();
   }
 
   function failRecoveredNoEffect(operationId: string, message: string): void {
     operations.failAndUnbind(operationId, { message });
+  }
+
+  function recordBackgroundFailure(label: string): void {
+    try {
+      backgroundIncident += 1;
+      const id = `background-failure:${backgroundIncident}`;
+      deliveries.prepare({ id, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
+      const identity = registry.snapshot().coordinator;
+      db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+        VALUES (?, ?, ?, 'background_failure', ?, 'pending', ?)`)
+        .run(id, identity.endpoint, identity.thread_id, JSON.stringify({ label, incident: backgroundIncident }), Date.now());
+      if (schedulerAccepting) enqueuePendingEvents();
+    } catch { /* containment path cannot safely escalate */ }
   }
 
   return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });
@@ -841,6 +856,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     discovery.cleanupExpired();
     reconcileDeliveryEvents();
     await reconcileOperations();
+    if (endpoint.state === "ready") {
+      try { await relay.reconcileEndpoint(endpoint.id); }
+      catch { recordBackgroundFailure("periodic project reconciliation"); }
+    }
     if (coordinatorEndpoint.state === "ready") {
       await reconcileCoordinatorAttempts();
       if (!hasOrphanCoordinatorAttempt()) {
