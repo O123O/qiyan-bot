@@ -88,3 +88,12 @@ test("reconciliation stops at an in-progress turn without advancing past it", as
   await relay.reconcileEndpoint("local");
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] later"]);
 });
+
+test("replaying an older terminal does not clear a newer active worker turn", async () => {
+  const { endpoint, runtime, relay } = await fixture();
+  runtime.setActiveTurn("local", "worker", "current");
+  endpoint.turns = [terminal("baseline"), terminal("old"), { id: "current", status: "inProgress", completedAt: null, items: [] }];
+  await relay.reconcileEndpoint("local");
+  assert.equal(runtime.activeTurn("local", "worker"), "current");
+  assert.equal(runtime.getSession("local", "worker")?.nativeStatus, "active");
+});

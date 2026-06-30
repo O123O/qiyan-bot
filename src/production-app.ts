@@ -127,7 +127,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.sandboxMode });
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, { destination: String(config.telegramDestinationChatId), clock: { now: () => Date.now() } }, attachments);
-        scheduler = new CoordinatorScheduler(runCoordinatorJob);
+        scheduler = new CoordinatorScheduler(runCoordinatorJob, { onError: handleSchedulerFailure });
         unsubscribers.push(endpoint.onNotification((method, params) => runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"))));
         unsubscribers.push(coordinatorEndpoint.onNotification((method, params) => runBackground(() => onNotification(coordinatorEndpoint.id, method, params), () => recordBackgroundFailure("coordinator notification"))));
         unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => { await relay.handlePermissionBlocked(endpoint.id, event); enqueuePendingEvents(); }, () => recordBackgroundFailure("permission notification"))));
@@ -388,6 +388,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       const recovery = active?.attemptId === attemptId ? coordinator.failAttempt(active.turnId, error) : undefined;
       await requeueFailedContext(contextId, eventIds, recovery);
     }
+  }
+
+  async function handleSchedulerFailure(job: CoordinatorJob, _error: unknown): Promise<void> {
+    const eventIds = "events" in job ? job.events.map((event) => event.id) : [];
+    const contextId = "events" in job ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
+    enqueuedSources.delete(contextId);
+    for (const id of eventIds) enqueuedEvents.delete(id);
+    recordBackgroundFailure("coordinator job before dispatch");
+    await requeueFailedContext(contextId, eventIds, undefined);
   }
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {

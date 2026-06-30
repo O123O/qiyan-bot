@@ -34,6 +34,12 @@ export class RuntimeStore {
       .run(turnId ?? null, turnId ? "active" : "idle", endpointId, threadId);
   }
 
+  clearActiveTurn(endpointId: string, threadId: string, turnId: string): boolean {
+    return this.db.prepare(`UPDATE session_runtime SET active_turn_id = NULL, native_status = 'idle'
+      WHERE endpoint_id = ? AND thread_id = ? AND active_turn_id = ?`)
+      .run(endpointId, threadId, turnId).changes === 1;
+  }
+
   reconcileNativeState(endpointId: string, threadId: string, nativeStatus: string, activeTurnId?: string): void {
     this.db.prepare("UPDATE session_runtime SET native_status = ?, active_turn_id = ? WHERE endpoint_id = ? AND thread_id = ?")
       .run(nativeStatus, activeTurnId ?? null, endpointId, threadId);

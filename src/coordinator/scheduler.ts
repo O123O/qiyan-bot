@@ -22,6 +22,7 @@ export class CoordinatorScheduler {
       now?: () => number;
       setTimeout?: typeof setTimeout;
       clearTimeout?: typeof clearTimeout;
+      onError?: (job: CoordinatorJob, error: unknown) => Promise<void> | void;
     } = {},
   ) {}
 
@@ -60,13 +61,13 @@ export class CoordinatorScheduler {
         if (this.shouldServiceEvents()) {
           const events = this.takeEventBatch();
           this.consecutiveUsers = 0;
-          await this.execute({ id: `batch:${events.map((item) => item.id).join(",")}`, events, payload: events.map((item) => item.payload) });
+          await this.executeSafely({ id: `batch:${events.map((item) => item.id).join(",")}`, events, payload: events.map((item) => item.payload) });
           continue;
         }
         if (this.users.length > 0) {
           const job = this.users.shift()!;
           this.consecutiveUsers += 1;
-          await this.execute(job);
+          await this.executeSafely(job);
           continue;
         }
         this.scheduleEventWindow();
@@ -80,6 +81,14 @@ export class CoordinatorScheduler {
       } else if (this.users.length > 0 || this.shouldServiceEvents()) {
         this.kick();
       }
+    }
+  }
+
+  private async executeSafely(job: CoordinatorJob): Promise<void> {
+    try { await this.execute(job); }
+    catch (error) {
+      try { await this.options.onError?.(job, error); }
+      catch { /* scheduler failure reporting must not stop later durable jobs */ }
     }
   }
 

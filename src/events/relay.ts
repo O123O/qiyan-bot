@@ -66,7 +66,7 @@ export class EventRelay {
       const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
       turn = history.thread.turns.find((candidate) => candidate.id === turn.id) ?? turn;
     }
-    this.runtime.setActiveTurn(endpointId, threadId, undefined);
+    this.runtime.clearActiveTurn(endpointId, threadId, turn.id);
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(endpointId, threadId, turn, this.options.clock.now());
     const eventId = `terminal:${endpointId}:${threadId}:${turn.id}`;

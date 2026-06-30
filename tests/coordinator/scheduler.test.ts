@@ -45,3 +45,17 @@ test("events wait for the batch window but a 30-second-old event cannot starve",
   await scheduler.idle();
   assert.deepEqual(seen, ["batch:e"]);
 });
+
+test("a failed job is reported and does not stop later durable jobs", async () => {
+  const executed: string[] = [];
+  const failed: string[] = [];
+  const scheduler = new CoordinatorScheduler(async (job) => {
+    executed.push(job.id);
+    if (job.id === "bad") throw new Error("pre-dispatch failure");
+  }, { onError: (job) => { failed.push(job.id); } });
+  scheduler.enqueueUser({ id: "bad", payload: {} });
+  scheduler.enqueueUser({ id: "next", payload: {} });
+  await scheduler.idle();
+  assert.deepEqual(executed, ["bad", "next"]);
+  assert.deepEqual(failed, ["bad"]);
+});
