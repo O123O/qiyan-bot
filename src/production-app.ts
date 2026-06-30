@@ -577,7 +577,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
           const result = Array.isArray(checkpoint?.messageIds)
             ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { destination: String(config.telegramDestinationChatId), deliveryKey: operation.contextId })
-            : await sessions.collect(args.nickname, args.count, { direct: true, destination: String(config.telegramDestinationChatId), deliveryKey: operation.contextId });
+            : await sessions.collect(args.nickname, args.count, {
+              direct: true,
+              destination: String(config.telegramDestinationChatId),
+              deliveryKey: operation.contextId,
+              onSelected: (messageIds) => operations.checkpoint(operation.id, { messageIds }),
+            });
           operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
         } else if (operation.kind === "send_to_session") {
           const session = registry.get(args.nickname);
