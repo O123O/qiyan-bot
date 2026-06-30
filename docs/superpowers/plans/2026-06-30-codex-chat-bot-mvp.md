@@ -18,6 +18,7 @@ The plan implements only the local Telegram MVP. SSH endpoints, Slack, WeChat, m
 package.json                         scripts and pinned dependencies
 tsconfig.json                       strict TypeScript configuration
 .gitignore                          runtime state and secrets
+scripts/run-tests.mjs               recursive and targeted test runner
 src/main.ts                         process entry point and shutdown
 src/app.ts                          dependency composition
 src/config.ts                       environment parsing and defaults
@@ -63,6 +64,7 @@ tests/**                            unit, contract, integration, recovery tests
 - Create: `package.json`
 - Create: `tsconfig.json`
 - Create: `.gitignore`
+- Create: `scripts/run-tests.mjs`
 - Create: `src/config.ts`
 - Create: `src/core/errors.ts`
 - Create: `src/core/types.ts`
@@ -103,7 +105,7 @@ test("loadConfig applies bounded defaults", () => {
   "engines": { "node": ">=24" },
   "scripts": {
     "start": "tsx src/main.ts",
-    "test": "node --import tsx --test tests/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
     "generate:codex-schema": "node scripts/generate-app-server-schema.mjs"
@@ -120,7 +122,9 @@ test("loadConfig applies bounded defaults", () => {
 }
 ```
 
-Use `module: "NodeNext"`, `moduleResolution: "NodeNext"`, `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, and include `src`, `tests`, and `scripts`.
+Use `module: "NodeNext"`, `moduleResolution: "NodeNext"`, `allowImportingTsExtensions: true`, `noEmit: true`, `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, and include `src`, `tests`, and `scripts`.
+
+`scripts/run-tests.mjs` recursively discovers every `*.test.ts` file when called without arguments and otherwise passes only its explicit CLI paths to `node --import tsx --test`. Sort discovered paths for deterministic output and propagate the child exit status.
 
 - [ ] **Step 3: Implement strict configuration and shared contracts**
 
@@ -143,6 +147,8 @@ export interface SourceContext {
 
 Implement `AppError` with the exact stable codes from the design, a `SystemClock`, and `loadConfig(env)` using `zod`. Do not read `process.env` outside `main.ts`.
 
+Add `OPERATION_CONFLICT` as the stable code for replaying one operation identity with a different canonical argument hash.
+
 - [ ] **Step 4: Install and verify**
 
 Run: `npm install`
@@ -158,7 +164,7 @@ Expected: exit 0.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add package.json package-lock.json tsconfig.json .gitignore src/core src/config.ts tests/config.test.ts
+git add package.json package-lock.json tsconfig.json .gitignore scripts/run-tests.mjs src/core src/config.ts tests/config.test.ts
 git commit -m "chore: scaffold TypeScript bot"
 ```
 
@@ -205,7 +211,7 @@ test("dispatched deliveries become uncertain during startup recovery", () => {
 
 - [ ] **Step 3: Implement schema and transactional stores**
 
-Create migrations for `source_contexts`, `coordinator_attempts`, `operations`, `deliveries`, `events`, `event_batches`, `session_runtime`, `managed_epochs`, `discovery_snapshots`, and `attachments`. Use `PRAGMA journal_mode=WAL`, `foreign_keys=ON`, and explicit `BEGIN IMMEDIATE` transactions.
+Create migrations for `telegram_state`, `source_contexts`, `coordinator_attempts`, `operations`, `deliveries`, `events`, `event_batches`, `logical_final_messages`, `session_runtime`, `managed_epochs`, `discovery_snapshots`, and `attachments`. Use `PRAGMA journal_mode=WAL`, `foreign_keys=ON`, and explicit `BEGIN IMMEDIATE` transactions.
 
 Canonicalize operation arguments by recursively sorting object keys before SHA-256 hashing. Implement the terminal `superseded_by` transition atomically with recovery-event insertion.
 
@@ -253,7 +259,7 @@ Also test Unicode preservation, attachment-only empty pass payload, count 21 rej
 
 - [ ] **Step 2: Write owner/update-form tests**
 
-Construct Telegram fixtures proving only ordinary `message` updates from `from.id === ownerId` yield canonical messages. Prove edited messages, callbacks, channel posts, service messages, unsupported media, and other senders return `null` before attachment download.
+Construct Telegram fixtures proving only ordinary `message` updates from `from.id === ownerId` yield canonical messages. Edited messages, callbacks, channel posts, service messages, unsupported media, and other senders must return `{ kind: "ignored", updateId, reason }` containing no sender content. This lets the poller advance its offset without persisting message bodies or downloading attachments.
 
 - [ ] **Step 3: Implement parser and adapter**
 
@@ -266,6 +272,8 @@ export type ParsedDirective =
 ```
 
 Scan raw Unicode text by code-unit indices only for ASCII marker/boundary characters; slice the payload directly from the original string. Keep raw text separate from display metadata.
+
+Expand the parser matrix to cover start/ASCII-space/tab/newline boundaries, non-ASCII whitespace not acting as a boundary, malformed-first/no-later-rescue, `/pass` with tab versus exactly one ASCII space, empty pass with and without attachments, every `/collect` trailing-whitespace form, and count limits. At the tool boundary, malformed directive contexts must reject both send and collect, using the wrong tool must fail, and successful receipts must assert the exact payload, ordered attachment IDs, SHA-256, target thread, and mode.
 
 - [ ] **Step 4: Run tests and commit**
 
@@ -282,15 +290,17 @@ git commit -m "feat: parse lossless chat directives"
 
 **Files:**
 - Create: `src/registry/session-registry.ts`
+- Create: `src/coordinator/notebook.ts`
 - Create: `AGENTS.md`
 - Create: `coordinator/AGENTS.override.md`
 - Create: `coordinator/session-status.example.json`
 - Create: `coordinator/.gitignore`
 - Test: `tests/registry/session-registry.test.ts`
+- Test: `tests/coordinator/notebook.test.ts`
 
 - [ ] **Step 1: Write failing registry tests**
 
-Test atomic create/rename, nickname collision, duplicate endpoint/thread mappings, invalid JSON preserving the last known-good value, and canonical `realpath` handling. Simulate a failed rename and verify the old file remains valid.
+Test atomic create/rename, nickname collision, duplicate endpoint/thread mappings, invalid JSON preserving the last known-good value, and canonical `realpath` handling. Simulate a failed rename and verify the old file remains valid. Add concurrent registration/rename tests under a registry-wide mutex, external valid replacement activation, startup quarantine warnings, mapping-without-runtime initialization as unavailable, and operational orphan retention without control access.
 
 - [ ] **Step 2: Implement registry validation and atomic replacement**
 
@@ -309,18 +319,20 @@ export interface RegistryDocument {
 }
 ```
 
-Write to a same-directory temporary file with mode `0o600`, `fsync` the file, rename it, then `fsync` the directory. Expose immutable snapshots to readers.
+Write to a same-directory temporary file with mode `0o600`, `fsync` the file, rename it, then `fsync` the directory. Expose immutable snapshots to readers. Serialize every compare-and-write with one registry-wide mutex because nickname uniqueness spans all sessions. `reload()` validates an externally replaced complete document before activation; startup reconciliation applies the exact JSON/SQLite authority rules from the design.
 
 - [ ] **Step 3: Add coordinator instructions and notebook example**
 
 The instructions must encode the routing, automatic delivery, no-repeat, `/pass`, `/collect`, goal, and notebook rules from the design. Ignore `session-status.json` in `coordinator/.gitignore`; commit only the example.
 
+Implement `CoordinatorNotebook.bootstrap()` to atomically copy the example when the live file is missing and validate version/thread-ID keyed entries when it exists. Tests must verify initialization, invalid-JSON quarantine/recovery, rename reconciliation by stable thread ID, and that notebook status never overrides live tool status. Static instruction tests must require read-on-start and updates after adopt, rename, send, worker event, and completed follow-up removal.
+
 - [ ] **Step 4: Verify and commit**
 
-Run: `npm test -- tests/registry/*.test.ts`
+Run: `npm test -- tests/registry/*.test.ts tests/coordinator/notebook.test.ts`
 
 ```bash
-git add AGENTS.md src/registry coordinator tests/registry
+git add AGENTS.md src/registry src/coordinator/notebook.ts coordinator tests/registry tests/coordinator/notebook.test.ts
 git commit -m "feat: add session registry and coordinator policy"
 ```
 
@@ -328,6 +340,8 @@ git commit -m "feat: add session registry and coordinator policy"
 
 **Files:**
 - Create: `scripts/generate-app-server-schema.mjs`
+- Create: `src/app-server/generated/` (output of `codex app-server generate-ts`)
+- Create: `src/app-server/protocol-manifest.json`
 - Create: `src/app-server/protocol.ts`
 - Create: `src/app-server/json-rpc-client.ts`
 - Create: `src/app-server/local-endpoint.ts`
@@ -336,11 +350,11 @@ git commit -m "feat: add session registry and coordinator policy"
 
 - [ ] **Step 1: Generate and pin protocol evidence**
 
-The script runs `codex app-server generate-json-schema --out .tmp/codex-app-server-schema`, records `codex --version`, and verifies the methods and fields used by the pinned 0.142.4 client. `protocol.ts` narrows request/response shapes used by this app and retains an `unknown` payload escape only inside the transport boundary.
+The script verifies `codex --version` is the pinned 0.142.4 release, runs `codex app-server generate-ts --out src/app-server/generated` and `generate-json-schema --out .tmp/codex-app-server-schema`, then writes `protocol-manifest.json` with CLI version and a SHA-256 over generated artifacts. `protocol.ts` imports generated request/response/notification types and narrows them into service methods; `unknown` is allowed only while decoding the transport envelope. Add a negative test that a changed version/hash or missing required method rejects endpoint startup.
 
 - [ ] **Step 2: Write failing transport tests with a fake child process**
 
-Test initialize-before-use, monotonically increasing request IDs, out-of-order responses, notifications, server requests such as `item/tool/call`, malformed JSON isolation, request timeout, process exit rejection, and clean shutdown.
+Test initialize-before-use, monotonically increasing request IDs, out-of-order responses, notifications, malformed JSON isolation, request timeout, process exit rejection, and clean shutdown. Test deterministic responses for `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval`: deny/block the request, mark the thread permission-blocked, and emit one deduplicatable metadata/warning event. Do not implement `item/tool/call` here because coordinator tools use MCP, not dynamic client tools.
 
 - [ ] **Step 3: Implement JSON-RPC transport**
 
@@ -357,7 +371,7 @@ Use newline-delimited JSON over child stdin/stdout; never parse stderr as protoc
 
 - [ ] **Step 4: Implement `LocalEndpoint`**
 
-Own `codex app-server --listen stdio://`, initialize once, verify version/capabilities, restart with bounded backoff, and expose typed thread/model/goal/turn methods. Route all thread/turn notifications through one subscription.
+Own `codex app-server --listen stdio://`, initialize once, verify the pinned manifest/capabilities, restart with fake-clock-testable bounded backoff, and expose generated-type-backed thread/model/goal/turn methods. Route all thread/turn notifications and permission-blocked events through one subscription.
 
 - [ ] **Step 5: Run and commit**
 
@@ -379,7 +393,7 @@ git commit -m "feat: connect to local codex app-server"
 
 - [ ] **Step 1: Write discovery tests**
 
-Fake separate archived/non-archived pages with mixed source kinds and subagent/ephemeral rows. Verify exhaustive pagination, filtering, deterministic `updatedAt`/thread-ID sorting, combined limit, opaque snapshot cursor, and stable second-page results after the fake server changes.
+Fake separate archived/non-archived pages with mixed source kinds and subagent/ephemeral rows. Verify exhaustive pagination, filtering, deterministic `updatedAt`/thread-ID sorting, combined limit, opaque snapshot cursor, and stable second-page results after the fake server changes. Assert exact `sourceKinds`, both archived queries, `useStateDbOnly: false`, omission of absent `cwd`, query-fingerprint mismatch rejection, cursor tamper/expiry rejection, and TTL cleanup.
 
 - [ ] **Step 2: Write lifecycle transition tests**
 
@@ -395,7 +409,7 @@ export interface AppServerEndpoint {
 }
 ```
 
-`AppServerPool.startTurn` uses a semaphore and throws `CAPACITY_EXCEEDED` immediately rather than queueing.
+`AppServerPool.startTurn` uses a semaphore and throws `CAPACITY_EXCEEDED` immediately rather than queueing. Fake-clock tests verify permits release on success, failure, interrupt, endpoint exit, and startup rejection; restart backoff resets only after a stable ready interval.
 
 - [ ] **Step 4: Implement lifecycle service**
 
@@ -420,7 +434,7 @@ git commit -m "feat: manage codex session lifecycle"
 
 - [ ] **Step 1: Write the terminal-turn extraction matrix**
 
-Test explicit final phase, several final items, phase-unknown fallback to the last agent message, commentary exclusion, successful no-message, failed/interrupted with and without an eligible message, and stable ordering by completion time/turn ID/item index.
+Test explicit final phase, several final items, phase-unknown fallback to the last agent message, commentary exclusion, successful no-message, failed/interrupted with and without an eligible message, nullable protocol `completedAt`, and stable ordering by effective completion time/turn ID/item index. When protocol completion time is null, persist the first terminal-observed timestamp once and reuse it during every replay/reconciliation.
 
 - [ ] **Step 2: Write collection and control tests**
 
@@ -434,7 +448,7 @@ export interface LogicalFinalMessage {
   threadId: string;
   turnId: string;
   itemId: string;
-  completedAt: number;
+  completedAt: number; // protocol completedAt or persisted first terminal-observed time
   itemOrder: number;
   body: string;
   terminalStatus: string;
@@ -460,7 +474,7 @@ git commit -m "feat: add session messaging and controls"
 
 - [ ] **Step 1: Write failing safety tests**
 
-Test streamed byte limits despite false metadata, per-message/store quota, randomized mode-0600 files, SHA-256, sanitized display names, attachment-only pass, reference-counted retention, expiry, traversal rejection, symlink/no-follow rejection, and opaque handle scope.
+Test streamed byte limits despite false metadata, per-message/store quota, randomized mode-0600 files, SHA-256, sanitized display names, attachment-only pass, reference-counted retention, expiry, traversal rejection, intermediate/final symlink swapping, growing-file upload limits, sandbox readability, and opaque handle scope. Add full Telegram-download -> store -> app-server `localImage`/`mention` fixtures and project-relative file -> safe handle -> Telegram-upload fixtures.
 
 - [ ] **Step 2: Implement the store**
 
@@ -476,7 +490,7 @@ export interface StoredAttachment {
 }
 ```
 
-Materialize images as `{ type: "localImage", path }` and generic files as `{ type: "mention", name, path }`. Resolve outbound relative paths beneath a canonical owner root and retain an opened file descriptor through upload.
+Materialize images as `{ type: "localImage", path }` and generic files as `{ type: "mention", name, path }`. On Linux, resolve an outbound relative path beneath the canonical owner root, open the final component with `O_NOFOLLOW`, `fstat` it as a regular file, resolve `/proc/self/fd/<fd>` after opening, and reject unless that actual opened target remains under the root. Retain the descriptor through a byte-limited upload, so later symlink/path swaps cannot change the source. Fail closed on platforms without an equivalent race-safe primitive.
 
 - [ ] **Step 3: Run and commit**
 
@@ -499,7 +513,7 @@ git commit -m "feat: add safe attachment handling"
 
 - [ ] **Step 1: Write HTTP and polling tests**
 
-Use an injected `fetch` fake. Verify `getUpdates` offsets advance only after durable acceptance, unauthorized/unsupported updates never download files, 429 retry-after handling, abortable long polling, file download streaming, text splitting, and upload paths.
+Use an injected `fetch` fake. For accepted input, verify one transaction persists the source context and next update offset. For unauthorized/unsupported input, persist only the next offset—never sender content—so ignored updates cannot stall polling; verify no attachment download, queue, content log, model work, or reply. Also test 429 retry-after handling, abortable long polling, file download streaming, text splitting, and upload paths.
 
 - [ ] **Step 2: Write ambiguity tests**
 
@@ -530,7 +544,7 @@ git commit -m "feat: add Telegram transport and outbox"
 
 - [ ] **Step 1: Write event-relay tests**
 
-Feed app-server terminal notifications and thread reads into the relay. Verify managed-epoch filtering, terminal extraction, logical-message persistence, automatic Telegram deliveries with nickname envelope, metadata-only coordinator events, failed/interrupted warnings, no-final behavior, and event/delivery deduplication after replay.
+Feed app-server terminal notifications and thread reads into the relay. Verify managed-epoch filtering, terminal extraction, logical-message persistence, automatic Telegram deliveries with nickname envelope, metadata-only coordinator events, failed/interrupted warnings, no-final behavior, and event/delivery deduplication after replay. Feed permission-blocked server events and verify deterministic nickname-labeled Telegram warnings, metadata-only coordinator notification, runtime status, and deduplication.
 
 - [ ] **Step 2: Write scheduler tests with a fake clock**
 
@@ -540,11 +554,17 @@ Verify one active coordinator turn, FIFO user messages, one-second event batchin
 
 Verify a failure before dispatch permits a new attempt; a failure after any dispatched effect atomically supersedes the original context and creates exactly one recovery context; original event IDs cannot remain pending; the recovery prompt includes stored receipts; internal final text is suppressed.
 
-- [ ] **Step 4: Implement relay, scheduler, and runtime**
+- [ ] **Step 4: Write coordinator-answer and reconnect reconciliation tests**
 
-Use source-context records from Task 2. Coordinator user turns receive raw message metadata and directive context. Internal event turns receive metadata only. Start/resume the coordinator thread in `coordinator/` and never pass project transcripts automatically.
+For a user-triggered coordinator terminal turn, extract its eligible final text, create a mandatory durable Telegram delivery correlated to the source message, suppress nothing, and verify notification replay does not duplicate the logical delivery. Fault-inject Telegram ambiguity and verify mandatory recovery retry. For internal turns, continue suppressing final text.
 
-- [ ] **Step 5: Run and commit**
+Simulate endpoint ready after a disconnect: for every managed thread, read history after its epoch baseline and delivery cursor, feed unseen terminal turns through the same relay, and advance the cursor transactionally. Verify a turn completed before notification processing is recovered while adopted history and detached-period turns remain excluded.
+
+- [ ] **Step 5: Implement relay, scheduler, and runtime**
+
+Use source-context records from Task 2. Coordinator user turns receive raw message metadata and directive context. Internal event turns receive metadata only. Start/resume the coordinator thread in `coordinator/` and never pass project transcripts automatically. Subscribe the relay to endpoint notifications and endpoint-ready events; the latter always runs the managed-history reconciliation pass before new work is accepted.
+
+- [ ] **Step 6: Run and commit**
 
 Run: `npm test -- tests/events/*.test.ts tests/coordinator/*.test.ts`
 
@@ -566,6 +586,18 @@ Cover list/discover/status/create/register/adopt/rename/detach/attach/archive, s
 - [ ] **Step 2: Write directive enforcement tests at the tool boundary**
 
 For `/pass`, verify exact raw payload and attachment order, coordinator-selected target/mode, single consumption, identical receipt replay, and changed target/mode rejection. For `/collect`, verify source count, stored selection, direct deliveries, and receipt-only tool output.
+
+Add a per-operation recovery matrix:
+
+- `turn/start` and `turn/steer`: reconcile by verified `clientUserMessageId` plus thread/turn history; otherwise become uncertain.
+- create/register/adopt/detach/attach/archive/rename: reconcile app-server thread state, canonical `cwd`, registry prepared record, and runtime transition.
+- model/effort: remain local pending state until included in a successful turn start, so no standalone remote retry exists.
+- goal set/pause/resume/cancel: compare native `thread/goal/get` with the requested objective/status before deciding success or uncertainty.
+- interrupt: inspect terminal/active turn status before retry; never interrupt a different turn ID.
+- chat message/attachment and direct collection: reconcile through delivery records and Telegram confirmed/uncertain policy.
+- file-handle preparation: return the existing valid opaque handle for identical replay.
+
+Test stored receipt replay, changed-argument `OPERATION_CONFLICT`, proven success after a lost response, proven failure, and irreconcilable `OPERATION_UNCERTAIN` without retransmission for every row.
 
 - [ ] **Step 3: Implement tools through the operation ledger**
 
@@ -601,11 +633,11 @@ git commit -m "feat: expose coordinator control tools"
 
 - [ ] **Step 1: Write MCP protocol tests**
 
-Start the server on an ephemeral loopback port. Verify bearer authorization, initialize instructions, complete tool listing, successful dispatch with source context, malformed input errors, unknown tools, and rejection from non-loopback binding configuration.
+Start the server on an ephemeral loopback port. Verify bearer authorization, initialize instructions, complete tool listing, successful dispatch with source context, MCP JSON-RPC request ID propagation into `callId`, malformed input errors, unknown tools, inactive/mismatched coordinator context rejection, and rejection from non-loopback binding configuration.
 
 - [ ] **Step 2: Implement Streamable HTTP MCP**
 
-Use `@modelcontextprotocol/sdk` and its Streamable HTTP server transport. Bind only `127.0.0.1`, require a random startup bearer token, advertise the manager workflow in server instructions, and register tools from Task 11. Pass the MCP URL through the coordinator thread start/resume `config.mcp_servers` override and pass only the bearer-token environment variable to the owned app-server child. Do not put this MCP server in global Codex configuration or project-session thread configuration.
+Use `@modelcontextprotocol/sdk` and its Streamable HTTP server transport. Bind only `127.0.0.1`, require a random startup bearer token, advertise the manager workflow in server instructions, and register tools from Task 11. Pass the MCP URL through the coordinator thread start/resume `config.mcp_servers` override. Build the owned app-server child environment by inheriting the Codex-required host environment (`PATH`, `HOME`, `CODEX_HOME`, proxy settings, and supported Codex authentication variables), explicitly removing Telegram and unrelated bot secrets, then adding `CODEX_BOT_MCP_TOKEN`. Add `shell_environment_policy.exclude = ["CODEX_BOT_MCP_TOKEN"]` plus the default secret exclusions to every turn configuration so model-launched commands cannot inherit it. Do not put this MCP server in global Codex configuration or project-session thread configuration. Test both a file-backed Codex profile and a fixture environment-auth profile at the environment-construction boundary.
 
 - [ ] **Step 3: Run and commit**
 
@@ -625,7 +657,7 @@ git commit -m "feat: serve coordinator tools over MCP"
 
 - [ ] **Step 1: Write composition tests**
 
-Use fakes to verify startup order: database/migrations, registry validation, attachment cleanup, MCP listener, app-server initialize, lifecycle reconciliation, outbox recovery, coordinator resume/create, then Telegram polling. Verify reverse-order graceful shutdown and signal idempotence.
+Use fakes to verify startup order: database/migrations, registry validation and operational reconciliation, coordinator-notebook bootstrap, attachment cleanup, MCP listener, construct the endpoint/pool, install event-relay notification and endpoint-ready subscriptions, start/initialize app-server, lifecycle and missed-history reconciliation while live notifications are concurrently deduplicated, outbox recovery, coordinator resume/create, coordinator scheduler, delivery worker, maintenance scheduler, then Telegram polling. No work is accepted before reconciliation completes. Verify a terminal notification arriving during startup reconciliation is delivered exactly once, every long-lived worker starts exactly once, reverse-order graceful shutdown, startup-failure cleanup, and signal idempotence.
 
 - [ ] **Step 2: Implement `createApp` and `main`**
 
@@ -644,7 +676,7 @@ export async function main(env = process.env): Promise<void> {
 }
 ```
 
-Ensure startup failures close already-started resources. Emit structured metadata logs without message bodies, tokens, or attachment content.
+Ensure startup failures close already-started resources. The maintenance scheduler expires attachment materializations and discovery snapshots with an injected clock and is covered by deterministic tests. Emit structured metadata logs without message bodies, sender content from ignored updates, tokens, or attachment content.
 
 - [ ] **Step 3: Run and commit**
 
@@ -660,13 +692,19 @@ git commit -m "feat: compose bot application"
 **Files:**
 - Create: `tests/integration/app-server.test.ts`
 - Create: `tests/integration/recovery.test.ts`
+- Create: `tests/integration/mcp-coordinator.test.ts`
+- Create: `tests/integration/telegram-live.test.ts`
 - Create: `tests/integration/fixtures/fake-telegram-server.ts`
 - Create: `.env.example`
 - Create: `README.md`
 
 - [ ] **Step 1: Add opt-in real app-server tests**
 
-Under `RUN_CODEX_INTEGRATION=1`, start one real app-server and temporary projects. Verify multiple top-level threads, exhaustive discovery, create/adopt/resume, `cwd`, status, start/steer/interrupt, model/effort, available goal methods, localImage/mention inputs, final extraction, and restart/resume. Skip with a clear message when the flag is absent.
+Under `RUN_CODEX_INTEGRATION=1`, start one real app-server and temporary projects. Verify multiple top-level threads, exhaustive discovery, create/register/adopt, detach/unsubscribe, two-read attach, archive, `cwd`, status, concurrent turns, immediate capacity failure and permit release, fake-clock restart backoff, start/steer/interrupt, model/effort, available goal methods, localImage/mention inputs, final extraction, and restart/resume. Measure and record the pinned version's actual `clientUserMessageId` behavior for start and steer; make recovery policy assertions match the observed contract. Skip with a clear message when the flag is absent.
+
+Start the loopback MCP server and real coordinator thread with `config.mcp_servers`. Prompt the coordinator to call one harmless curated status tool and assert the SDK request ID binds to the active source context and receipt. Start a project thread through the same app-server and prove it does not list the bot MCP tool and that a shell command cannot observe `CODEX_BOT_MCP_TOKEN`.
+
+Exercise both attachment directions end to end: Telegram fixture -> streamed store -> localImage/mention turn input, and project-relative file -> race-safe handle -> Telegram fixture upload.
 
 - [ ] **Step 2: Add fault-injection recovery tests**
 
@@ -686,9 +724,19 @@ Run: `RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/app-server.test.ts`
 
 Expected: app-server contract tests pass against pinned Codex 0.142.4.
 
+Run: `RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-coordinator.test.ts`
+
+Expected: real coordinator MCP invocation and project-thread/token isolation pass.
+
 Run: `npm test -- tests/integration/recovery.test.ts`
 
 Expected: all fault-injection cases pass.
+
+Run only when `RUN_TELEGRAM_LIVE=1`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, and `TELEGRAM_DESTINATION_CHAT_ID` are present:
+
+`RUN_TELEGRAM_LIVE=1 npm test -- tests/integration/telegram-live.test.ts`
+
+Expected: one owner-only private-chat round trip succeeds; otherwise the test skips without failure.
 
 - [ ] **Step 5: Commit**
 

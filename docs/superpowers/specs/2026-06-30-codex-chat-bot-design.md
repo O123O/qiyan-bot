@@ -497,6 +497,7 @@ Backend tools return typed errors with stable categories, including:
 - `ATTACHMENT_INVALID`
 - `DELIVERY_FAILED`
 - `DELIVERY_UNCERTAIN`
+- `OPERATION_CONFLICT`
 - `OPERATION_UNCERTAIN`
 - `CAPACITY_EXCEEDED`
 - `PERMISSION_BLOCKED`
