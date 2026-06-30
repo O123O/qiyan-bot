@@ -14,7 +14,7 @@ export class SessionService {
     private readonly deliveries: DeliveryStore,
   ) {}
 
-  async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[] } = {}): Promise<{ mode: "start" | "steer"; turnId: string }> {
+  async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[] } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean }> {
     const session = this.required(nickname);
     const state = this.runtime.getSession(session.endpoint, session.thread_id);
     if (!state || state.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
@@ -42,10 +42,11 @@ export class SessionService {
       threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
     });
     this.runtime.consumeSettings(session.endpoint, session.thread_id);
-    if (!new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "")) {
+    const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
+    if (!terminal) {
       this.runtime.setActiveTurn(session.endpoint, session.thread_id, response.turn.id);
     }
-    return { mode: "start", turnId: response.turn.id };
+    return { mode: "start", turnId: response.turn.id, terminal };
   }
 
   async interrupt(nickname: string, turnId?: string): Promise<void> {
@@ -87,6 +88,11 @@ export class SessionService {
       nativeStatus: native.thread.status,
       activeTurnId: this.runtime.activeTurn(session.endpoint, session.thread_id) ?? null,
       pendingSettings: this.runtime.settings(session.endpoint, session.thread_id),
+      configuredSettings: {
+        ...this.runtime.settings(session.endpoint, session.thread_id),
+        ...(native.thread.model ? { model: native.thread.model } : {}),
+        ...(native.thread.reasoningEffort ?? native.thread.effort ? { effort: native.thread.reasoningEffort ?? native.thread.effort } : {}),
+      },
       deliveryCursor: runtime?.deliveryCursor ?? null,
       goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
     };
@@ -95,17 +101,19 @@ export class SessionService {
   async models(endpointId: string): Promise<unknown> { return { data: await this.listModels(endpointId), nextCursor: null }; }
 
   async setModel(nickname: string, model: string): Promise<void> {
-    const session = this.required(nickname);
+    const session = this.managed(nickname);
     const available = await this.listModels(session.endpoint);
     if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${session.endpoint}: ${model}`);
     this.runtime.setModel(session.endpoint, session.thread_id, model);
   }
 
   async setEffort(nickname: string, effort: string): Promise<void> {
-    const session = this.required(nickname);
+    const session = this.managed(nickname);
     const available = await this.listModels(session.endpoint);
     const pendingModel = this.runtime.settings(session.endpoint, session.thread_id).model;
-    const model = available.find((candidate) => candidate.id === pendingModel || candidate.model === pendingModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
+    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
+    const configuredModel = pendingModel ?? native.thread.model;
+    const model = available.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
     if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
@@ -117,7 +125,7 @@ export class SessionService {
   }
 
   async setGoal(nickname: string, objective: string, tokenBudget?: number): Promise<unknown> {
-    const session = this.required(nickname);
+    const session = this.managed(nickname);
     try {
       return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) });
     } catch (error) {
@@ -132,7 +140,7 @@ export class SessionService {
   resumeGoal(nickname: string): Promise<unknown> { return this.setGoalStatus(nickname, "active"); }
 
   async cancelGoal(nickname: string): Promise<unknown> {
-    const session = this.required(nickname);
+    const session = this.managed(nickname);
     try { return await this.pool.request(session.endpoint, "thread/goal/clear", { threadId: session.thread_id }); }
     catch (error) {
       const current = await this.getGoal(nickname).catch(() => undefined) as any;
@@ -142,7 +150,7 @@ export class SessionService {
   }
 
   private async setGoalStatus(nickname: string, status: "paused" | "active"): Promise<unknown> {
-    const session = this.required(nickname);
+    const session = this.managed(nickname);
     try { return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, status }); }
     catch (error) {
       const current = await this.getGoal(nickname).catch(() => undefined) as any;
@@ -165,6 +173,12 @@ export class SessionService {
   private required(nickname: string) {
     const session = this.registry.get(nickname);
     if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${nickname}`);
+    return session;
+  }
+
+  private managed(nickname: string) {
+    const session = this.required(nickname);
+    if (this.runtime.getSession(session.endpoint, session.thread_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
 }

@@ -5,6 +5,7 @@ import { AppError } from "../core/errors.ts";
 import type { ManagementState } from "../core/types.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
+import { secureShellConfig } from "../mcp/server.ts";
 
 interface ThreadView { id: string; cwd: string; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string }
@@ -25,7 +26,7 @@ export class SessionLifecycle {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", {
-        cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, ephemeral: false,
+        cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(), ephemeral: false,
       });
       await this.verifyCwd(response.thread.cwd, canonical);
       this.requireIdle(response.thread);
@@ -75,7 +76,7 @@ export class SessionLifecycle {
       let resumed = false;
       try {
         const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", {
-          threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: this.execution.sandboxMode,
+          threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(),
         });
         resumed = true;
         await this.verifyCwd(response.thread.cwd, session.project_dir);
@@ -111,6 +112,7 @@ export class SessionLifecycle {
         this.runtime.setSession(entry.endpointId, entry.threadId, "detached", "notLoaded");
       } else if (entry.managementState === "attaching") {
         const nickname = this.nicknameFor(entry.endpointId, entry.threadId);
+        this.runtime.endEpoch(entry.endpointId, entry.threadId, this.clock.now());
         this.runtime.setSession(entry.endpointId, entry.threadId, "detached", entry.nativeStatus);
         if (nickname) await this.attach(nickname);
       }

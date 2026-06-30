@@ -41,9 +41,10 @@ export class TelegramPoller {
       }
       const saved = await this.attachments.ingestMany(contextId, parts, this.options.maxMessageBytes ?? Number.MAX_SAFE_INTEGER);
       inTransaction(this.db, () => {
-        this.operations.createSourceContext({
+        const created = this.operations.createSourceContext({
           id: contextId, kind: "telegram", sourceId: String(update.update_id), rawText: classified.message.rawText, attachmentIds: saved.map((item) => item.id),
         });
+        if (created) for (const attachment of saved) this.attachments.retain(contextId, attachment.id);
         this.advance(update.update_id + 1);
       });
       offset = update.update_id + 1;

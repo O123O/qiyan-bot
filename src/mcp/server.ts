@@ -1,5 +1,6 @@
 import { createServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { readFile, readdir, readlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -18,7 +19,7 @@ export class LoopbackMcpServer {
   constructor(
     private readonly tools: Record<CoordinatorToolName, ToolHandler>,
     private readonly contexts: CoordinatorContextProvider,
-    private readonly options: { host: "127.0.0.1"; port: number; token: string },
+    private readonly options: { host: "127.0.0.1"; port: number; token: string; allowedClientPid?: () => number | undefined },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
     if (!options.token) throw new Error("MCP bearer token is required");
@@ -36,6 +37,10 @@ export class LoopbackMcpServer {
         }
         if (request.headers.authorization !== `Bearer ${this.options.token}`) {
           response.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" }).end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
+        if (this.options.allowedClientPid && !await requestBelongsToPid(request.socket.remotePort, request.socket.localPort, this.options.allowedClientPid())) {
+          response.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ error: "client process is not authorized" }));
           return;
         }
         const body = await readJson(request);
@@ -93,6 +98,48 @@ export class LoopbackMcpServer {
   }
 }
 
+async function requestBelongsToPid(remotePort: number | undefined, localPort: number | undefined, pid: number | undefined): Promise<boolean> {
+  if (!remotePort || !localPort || !pid || process.platform !== "linux") return false;
+  try {
+    const source = remotePort.toString(16).toUpperCase().padStart(4, "0");
+    const destination = localPort.toString(16).toUpperCase().padStart(4, "0");
+    const tables = await Promise.all(["/proc/net/tcp", "/proc/net/tcp6"].map((path) => readFile(path, "utf8").catch(() => "")));
+    const inodes = new Set<string>();
+    for (const table of tables) {
+      for (const line of table.split("\n").slice(1)) {
+        const fields = line.trim().split(/\s+/u);
+        if (fields[1]?.endsWith(`:${source}`) && fields[2]?.endsWith(`:${destination}`) && fields[9]) inodes.add(fields[9]);
+      }
+    }
+    if (inodes.size === 0) return false;
+    const procEntries = await readdir("/proc");
+    for (const entry of procEntries) {
+      const ownerPid = Number(entry);
+      if (!Number.isSafeInteger(ownerPid) || !await isDescendantOrSelf(ownerPid, pid)) continue;
+      for (const fd of await readdir(`/proc/${ownerPid}/fd`).catch(() => [])) {
+        const target = await readlink(`/proc/${ownerPid}/fd/${fd}`).catch(() => "");
+        if (target.startsWith("socket:[") && inodes.has(target.slice(8, -1))) return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function isDescendantOrSelf(candidate: number, root: number): Promise<boolean> {
+  let current = candidate;
+  const visited = new Set<number>();
+  while (current > 1 && !visited.has(current)) {
+    if (current === root) return true;
+    visited.add(current);
+    const stat = await readFile(`/proc/${current}/stat`, "utf8").catch(() => "");
+    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/u);
+    current = Number(fields[1] ?? 0);
+  }
+  return current === root;
+}
+
 async function readJson(request: AsyncIterable<Uint8Array>): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -110,18 +157,24 @@ const inheritedEnvironmentKeys = new Set([
   "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 ]);
 
-export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken: string): NodeJS.ProcessEnv {
+export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken?: string): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(host)) {
     if (value !== undefined && (inheritedEnvironmentKeys.has(key) || key.startsWith("LC_"))) result[key] = value;
   }
-  result.CODEX_BOT_MCP_TOKEN = mcpToken;
+  if (mcpToken) result.CODEX_BOT_MCP_TOKEN = mcpToken;
   return result;
 }
 
 export function coordinatorTurnConfig(mcpUrl: string, _mcpToken: string): Record<string, unknown> {
   return {
     mcp_servers: { codex_bot_manager: { url: mcpUrl, bearer_token_env_var: "CODEX_BOT_MCP_TOKEN" } },
+    ...secureShellConfig(),
+  };
+}
+
+export function secureShellConfig(): Record<string, unknown> {
+  return {
     allow_login_shell: false,
     "shell_environment_policy.inherit": "core",
     "shell_environment_policy.exclude": ["CODEX_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"],

@@ -8,7 +8,7 @@ export async function main(env = process.env): Promise<void> {
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    void app.stop();
+    void app.stop().catch(() => { process.exitCode = 1; });
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);

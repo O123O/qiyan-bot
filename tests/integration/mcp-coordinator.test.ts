@@ -19,11 +19,14 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
   let calls = 0;
   const tools = createCoordinatorTools(operations, { list_managed_sessions: async () => { calls += 1; return { sessions: [] }; } }, { maxCollectCount: 20 });
   const token = "integration-secret-token";
+  const endpoint = new LocalEndpoint({ id: "coordinator-local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env, token), requestTimeoutMs: 30_000 });
+  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env), requestTimeoutMs: 30_000 });
   let active = { contextId: "ctx", attemptId: "attempt", turnId: "pending" };
-  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token });
+  const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientPid: () => endpoint.pid });
   await mcp.start(); t.after(() => mcp.stop());
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", env: buildCodexChildEnvironment(process.env, token), requestTimeoutMs: 30_000 });
   await endpoint.start(); t.after(() => endpoint.stop());
+  await worker.start(); t.after(() => worker.stop());
+  assert.equal((await fetch(mcp.url, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" })).status, 403, "a valid token is insufficient outside the coordinator app-server process");
   const cwd = await mkdtemp(join(tmpdir(), "codex-bot-real-mcp-"));
   const thread = await endpoint.request<any>("thread/start", {
     cwd, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false,
@@ -35,7 +38,7 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
       if (method === "turn/completed" && params.threadId === thread.thread.id) { clearTimeout(timeout); unsubscribe(); resolve(params.turn); }
     });
   });
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint, worker], { maxConcurrentTurns: 1 });
   const started = await pool.startTurn<any>(endpoint.id, {
     threadId: thread.thread.id,
     clientUserMessageId: "mcp-integration",
@@ -50,4 +53,5 @@ test("real coordinator can call manager MCP while its shell cannot read the bear
   const completedFromHistory = history.thread.turns.find((turn: any) => turn.id === started.turn.id);
   assert.ok(completedFromHistory.items.some((item: any) => item.type === "agentMessage" && item.text.includes("MCP_OK")));
   assert.equal(JSON.stringify(completedFromHistory).includes(token), false);
+
 });

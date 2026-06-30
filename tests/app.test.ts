@@ -48,3 +48,14 @@ test("terminal inbox preserves a completion that precedes attempt registration",
   assert.deepEqual(inbox.take("turn"), { status: "completed" });
   assert.equal(inbox.take("turn"), undefined);
 });
+
+test("shutdown attempts every phase and propagates the first cleanup failure", async () => {
+  const stopped: string[] = [];
+  const app = composeApp([
+    { name: "one", start: async () => undefined, stop: async () => { stopped.push("one"); } },
+    { name: "two", start: async () => undefined, stop: async () => { stopped.push("two"); throw new Error("cleanup failed"); } },
+  ]);
+  await app.start();
+  await assert.rejects(app.stop(), /cleanup failed/);
+  assert.deepEqual(stopped, ["two", "one"]);
+});

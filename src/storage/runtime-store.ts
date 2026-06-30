@@ -34,6 +34,11 @@ export class RuntimeStore {
       .run(turnId ?? null, turnId ? "active" : "idle", endpointId, threadId);
   }
 
+  reconcileNativeState(endpointId: string, threadId: string, nativeStatus: string, activeTurnId?: string): void {
+    this.db.prepare("UPDATE session_runtime SET native_status = ?, active_turn_id = ? WHERE endpoint_id = ? AND thread_id = ?")
+      .run(nativeStatus, activeTurnId ?? null, endpointId, threadId);
+  }
+
   activeTurn(endpointId: string, threadId: string): string | undefined {
     const row = this.db.prepare("SELECT active_turn_id FROM session_runtime WHERE endpoint_id = ? AND thread_id = ?").get(endpointId, threadId) as { active_turn_id: string | null } | undefined;
     return row?.active_turn_id ?? undefined;
@@ -57,9 +62,7 @@ export class RuntimeStore {
   }
 
   consumeSettings(endpointId: string, threadId: string): { model?: string; effort?: string } {
-    const value = this.settings(endpointId, threadId);
-    this.db.prepare("UPDATE session_runtime SET model = NULL, effort = NULL WHERE endpoint_id = ? AND thread_id = ?").run(endpointId, threadId);
-    return value;
+    return this.settings(endpointId, threadId);
   }
 
   listSessions(): Array<{ endpointId: string; threadId: string; managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string }> {

@@ -79,7 +79,7 @@ export function createCoordinatorTools(
 
       const action = actions[name];
       if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);
-      const sideEffecting = !READ_ONLY_TOOLS.has(name);
+      const sideEffecting = name === "collect_messages" ? directive?.kind === "collect" : !READ_ONLY_TOOLS.has(name);
       if (sideEffecting) operations.markDispatched(operation.id);
       try {
         const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, context);

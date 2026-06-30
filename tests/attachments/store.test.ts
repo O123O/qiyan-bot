@@ -11,14 +11,15 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 async function fixture(overrides: { maxFileBytes?: number; maxStoreBytes?: number } = {}) {
   const root = await mkdtemp(join(tmpdir(), "codex-bot-files-"));
   let now = 1_000;
-  const store = new AttachmentStore(createTestDatabase(), root, {
+  const db = createTestDatabase();
+  const store = new AttachmentStore(db, root, {
     maxFileBytes: overrides.maxFileBytes ?? 8,
     maxStoreBytes: overrides.maxStoreBytes ?? 20,
     ttlMs: 100,
     clock: { now: () => now },
   });
   await store.initialize();
-  return { root, store, advance: (ms: number) => { now += ms; } };
+  return { root, db, store, advance: (ms: number) => { now += ms; } };
 }
 
 test("streams bytes into randomized mode-0600 files and ignores false size metadata", async () => {
@@ -92,4 +93,15 @@ test("openForUpload holds a descriptor to the private regular file and enforces 
   await upload.close();
   assert.equal(Buffer.concat(chunks).toString(), "abc");
   await assert.rejects(store.openForUpload("other", saved.id));
+});
+
+test("turn references retain attachments exactly once until terminal release", async () => {
+  const { db, store } = await fixture();
+  const saved = await store.ingest("ctx", Readable.from(["abc"]), { displayName: "a.txt", mediaType: "text/plain" });
+  store.retainForTurn("local", "thread", "turn", "ctx", [saved.id]);
+  store.retainForTurn("local", "thread", "turn", "ctx", [saved.id]);
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 1);
+  store.releaseTurn("local", "thread", "turn");
+  store.releaseTurn("local", "thread", "turn");
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 0);
 });

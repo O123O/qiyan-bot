@@ -48,3 +48,12 @@ test("pending Telegram and recovery contexts survive process-local queue loss", 
 
   assert.deepEqual(store.listPendingSourceContexts(["telegram", "recovery"]).map((context) => context.id), ["recovery-1"]);
 });
+
+test("recoverable operations retain their canonical arguments and stable call identity", () => {
+  const store = new OperationStore(createTestDatabase());
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" } });
+  store.markDispatched(operation.id);
+  assert.deepEqual(store.listRecoverable().map(({ contextId, attemptId, callId, kind, args, state }) => ({ contextId, attemptId, callId, kind, args, state })), [{
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" }, state: "dispatched",
+  }]);
+});

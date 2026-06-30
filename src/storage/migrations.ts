@@ -56,9 +56,6 @@ export const migrations = [
     kind TEXT NOT NULL,
     destination TEXT NOT NULL,
     body TEXT NOT NULL,
-    attachment_id TEXT,
-    attachment_scope_id TEXT,
-    reply_to INTEGER,
     mandatory INTEGER NOT NULL,
     state TEXT NOT NULL,
     telegram_message_id TEXT,
@@ -143,6 +140,25 @@ export const migrations = [
     ref_count INTEGER NOT NULL DEFAULT 0,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
+  );
+  `,
+  `
+  ALTER TABLE deliveries ADD COLUMN attachment_id TEXT;
+  ALTER TABLE deliveries ADD COLUMN attachment_scope_id TEXT;
+  ALTER TABLE deliveries ADD COLUMN reply_to INTEGER;
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS source_attachment_releases (
+    context_id TEXT PRIMARY KEY REFERENCES source_contexts(id),
+    released_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS turn_attachment_refs (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    PRIMARY KEY(endpoint_id, thread_id, turn_id, attachment_id)
   );
   `,
 ] as const;

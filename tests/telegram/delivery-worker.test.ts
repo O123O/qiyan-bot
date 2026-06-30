@@ -84,3 +84,28 @@ test("attachment deliveries use the durable outbox and scoped private snapshot",
   assert.equal(store.get(delivery.id)?.telegramMessageId, "22");
   assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(file.id) as any).ref_count, 0);
 });
+
+test("document rate limits reopen the stream and retry without becoming uncertain", async () => {
+  const db = createTestDatabase();
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "delivery-rate-file-")), { maxFileBytes: 100, maxStoreBytes: 100 });
+  await attachments.initialize();
+  const file = await attachments.ingest("ctx", Readable.from(["payload"]), { displayName: "report.txt", mediaType: "text/plain" });
+  const store = new DeliveryStore(db);
+  const delivery = store.prepareAttachment({ id: "d_rate_file", kind: "attachment", destination: "7", body: "", mandatory: false, attachmentId: file.id, attachmentScopeId: "ctx" });
+  let attempts = 0;
+  const sleeps: number[] = [];
+  const worker = new DeliveryWorker(store, {
+    sendMessage: async () => ({ message_id: 1 }),
+    sendDocument: async (_chat, upload) => {
+      let bytes = ""; for await (const chunk of upload.stream) bytes += Buffer.from(chunk).toString();
+      assert.equal(bytes, "payload");
+      attempts += 1;
+      if (attempts === 1) throw { status: 429, response: { parameters: { retry_after: 2 } } };
+      return { message_id: 23 };
+    },
+  }, attachments, async (ms) => { sleeps.push(ms); });
+  await worker.processOne(delivery.id);
+  assert.equal(attempts, 2);
+  assert.deepEqual(sleeps, [2_000]);
+  assert.equal(store.get(delivery.id)?.state, "confirmed");
+});

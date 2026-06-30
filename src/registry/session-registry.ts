@@ -18,7 +18,7 @@ const registrySchema = z.object({
 export type RegistrySession = z.infer<typeof sessionSchema>;
 export type RegistryDocument = z.infer<typeof registrySchema>;
 
-async function atomicWrite(path: string, value: unknown): Promise<void> {
+async function atomicWriteOne(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = join(dirname(path), `.${crypto.randomUUID()}.tmp`);
   const file = await open(temporary, "wx", 0o600);
@@ -31,6 +31,11 @@ async function atomicWrite(path: string, value: unknown): Promise<void> {
   await rename(temporary, path);
   const directory = await open(dirname(path), "r");
   try { await directory.sync(); } finally { await directory.close(); }
+}
+
+async function atomicWrite(path: string, value: unknown): Promise<void> {
+  await atomicWriteOne(`${path}.last-good`, value);
+  await atomicWriteOne(path, value);
 }
 
 async function canonicalSession(session: RegistrySession): Promise<RegistrySession> {
@@ -54,19 +59,28 @@ async function normalize(document: RegistryDocument): Promise<RegistryDocument> 
 export class SessionRegistry {
   private tail: Promise<void> = Promise.resolve();
 
-  private constructor(private readonly path: string, private document: RegistryDocument) {}
+  private constructor(private readonly path: string, private document: RegistryDocument, private readonly startupWarnings: string[] = []) {}
 
   static async open(path: string, initial: RegistryDocument): Promise<SessionRegistry> {
     try {
       const document = await normalize(JSON.parse(await readFile(path, "utf8")) as RegistryDocument);
       return new SessionRegistry(path, document);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        let document: RegistryDocument;
+        try { document = await normalize(JSON.parse(await readFile(`${path}.last-good`, "utf8")) as RegistryDocument); }
+        catch { throw new Error("registry is invalid and no valid last-known-good snapshot is available", { cause: error }); }
+        await rename(path, `${path}.invalid-${Date.now()}`).catch(() => undefined);
+        await atomicWrite(path, document);
+        return new SessionRegistry(path, document, ["invalid registry was quarantined and the last-known-good registry was restored"]);
+      }
       const document = await normalize(initial);
       await atomicWrite(path, document);
       return new SessionRegistry(path, document);
     }
   }
+
+  warnings(): readonly string[] { return [...this.startupWarnings]; }
 
   snapshot(): RegistryDocument {
     return structuredClone(this.document);
@@ -112,6 +126,7 @@ export class SessionRegistry {
         const document = await normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
         await validate?.(structuredClone(document));
         this.document = document;
+        await atomicWriteOne(`${this.path}.last-good`, document);
         return true;
       } catch {
         return false;

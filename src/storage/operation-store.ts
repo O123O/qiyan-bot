@@ -22,17 +22,25 @@ export interface OperationRecord {
   receipt?: unknown;
 }
 
+export interface RecoverableOperation extends OperationRecord {
+  contextId: string;
+  attemptId: string;
+  callId: string;
+  kind: string;
+  args: any;
+}
+
 export class OperationStore {
   constructor(private readonly db: Database) {}
 
-  createSourceContext(context: SourceContext): void {
-    this.db.prepare(`INSERT OR IGNORE INTO source_contexts
+  createSourceContext(context: SourceContext): boolean {
+    return this.db.prepare(`INSERT OR IGNORE INTO source_contexts
       (id, kind, source_id, raw_text, attachment_ids_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds), Date.now());
+      .run(context.id, context.kind, context.sourceId, context.rawText, JSON.stringify(context.attachmentIds), Date.now()).changes === 1;
   }
 
-  getSourceContext(id: string): (SourceContext & { supersededBy?: string }) | undefined {
+  getSourceContext(id: string): (SourceContext & { state: "pending" | "active" | "completed" | "superseded"; supersededBy?: string }) | undefined {
     const row = this.db.prepare("SELECT * FROM source_contexts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return {
@@ -41,6 +49,7 @@ export class OperationStore {
       sourceId: String(row.source_id),
       rawText: String(row.raw_text),
       attachmentIds: JSON.parse(String(row.attachment_ids_json)) as string[],
+      state: String(row.state) as "pending" | "active" | "completed" | "superseded",
       ...(row.superseded_by ? { supersededBy: String(row.superseded_by) } : {}),
     };
   }
@@ -52,7 +61,7 @@ export class OperationStore {
     return rows.map((row) => this.getSourceContext(row.id)!).filter(Boolean);
   }
 
-  setSourceState(id: string, state: "pending" | "completed" | "superseded"): void {
+  setSourceState(id: string, state: "pending" | "active" | "completed" | "superseded"): void {
     this.db.prepare("UPDATE source_contexts SET state = ? WHERE id = ?").run(state, id);
   }
 
@@ -86,6 +95,20 @@ export class OperationStore {
     return row ? { id: String(row.id), state: String(row.state) as OperationState, ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}) } : undefined;
   }
 
+  listRecoverable(): RecoverableOperation[] {
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, state, receipt_json
+      FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({
+      id: String(row.id),
+      contextId: String(row.context_id),
+      attemptId: String(row.attempt_id),
+      callId: String(row.call_id),
+      kind: String(row.kind),
+      args: JSON.parse(String(row.args_json)),
+      state: String(row.state) as OperationState,
+      ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}),
+    }));
+  }
+
   replayDirective(contextId: string, kind: string, binding: unknown): OperationRecord | undefined {
     const row = this.db.prepare("SELECT kind, binding_hash, operation_id FROM directive_consumptions WHERE context_id = ?").get(contextId) as Record<string, unknown> | undefined;
     if (!row) return undefined;
@@ -117,21 +140,23 @@ export class OperationStore {
   }
 
   supersedeWithRecovery(contextId: string, receipts: readonly unknown[]): SourceContext {
-    return inTransaction(this.db, () => {
-      const source = this.getSourceContext(contextId);
-      if (!source) throw new Error(`unknown source context ${contextId}`);
-      if (source.supersededBy) return this.getSourceContext(source.supersededBy) ?? (() => { throw new Error("missing recovery context"); })();
-      const recovery: SourceContext = {
-        id: `recovery_${randomUUID()}`,
-        kind: "recovery",
-        sourceId: contextId,
-        rawText: JSON.stringify(receipts),
-        attachmentIds: [],
-      };
-      this.createSourceContext(recovery);
-      this.db.prepare("UPDATE source_contexts SET state = 'superseded', superseded_by = ? WHERE id = ?").run(recovery.id, contextId);
-      return recovery;
-    });
+    return inTransaction(this.db, () => this.supersedeWithRecoveryInTransaction(contextId, receipts));
+  }
+
+  supersedeWithRecoveryInTransaction(contextId: string, receipts: readonly unknown[]): SourceContext {
+    const source = this.getSourceContext(contextId);
+    if (!source) throw new Error(`unknown source context ${contextId}`);
+    if (source.supersededBy) return this.getSourceContext(source.supersededBy) ?? (() => { throw new Error("missing recovery context"); })();
+    const recovery: SourceContext = {
+      id: `recovery_${randomUUID()}`,
+      kind: "recovery",
+      sourceId: contextId,
+      rawText: JSON.stringify(receipts),
+      attachmentIds: [],
+    };
+    this.createSourceContext(recovery);
+    this.db.prepare("UPDATE source_contexts SET state = 'superseded', superseded_by = ? WHERE id = ?").run(recovery.id, contextId);
+    return recovery;
   }
 
   private setState(id: string, state: OperationState): void {

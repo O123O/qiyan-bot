@@ -2,7 +2,7 @@
 
 A single-user, self-hosted Telegram bridge for Codex. One persistent Codex thread acts as the coordinator; ordinary Codex threads remain ordinary project sessions that can also be resumed manually from their project directories.
 
-The MVP runs on one machine. Its endpoint pool and registry include endpoint IDs so a later release can add SSH-hosted app-servers without changing chat routing or session identity.
+The MVP runs on one machine. One token-free app-server hosts all project sessions; a second local app-server hosts only the coordinator. The split, plus Linux peer-PID authorization on the loopback manager endpoint, prevents a project session from using manager credentials even if it can inspect same-user process environments. The endpoint pool and registry include endpoint IDs so a later release can add SSH-hosted app-servers without changing chat routing or session identity.
 
 ## Requirements
 
@@ -12,7 +12,7 @@ The MVP runs on one machine. Its endpoint pool and registry include endpoint IDs
 - A Telegram bot token from BotFather
 - The numeric Telegram user ID of the only authorized owner
 
-The bot intentionally runs project sessions with approval policy `never` and the configured non-interactive sandbox. Review this trust model before running it: project sessions can modify files and execute commands without chat approval buttons. The Telegram adapter discards every non-owner update before storing content or invoking a model.
+The bot intentionally runs project sessions with approval policy `never` and the configured non-interactive sandbox. Review this trust model before running it: project sessions can modify files and execute commands without chat approval buttons. `workspace-write` is the default; use `danger-full-access` only for projects you trust. The Telegram adapter discards every non-owner update before storing content or invoking a model, and output is restricted to that owner's private chat ID.
 
 ## Setup
 
@@ -23,7 +23,7 @@ cp .env.example .env
 
 Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, and `TELEGRAM_DESTINATION_CHAT_ID`. The destination is normally the owner's private chat ID. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
 
-Codex authentication may come from the normal `CODEX_HOME` profile or supported environment credentials such as `OPENAI_API_KEY`. The owned app-server inherits only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token is available to the app-server but explicitly excluded from model-launched shell commands.
+Codex authentication may come from the normal `CODEX_HOME` profile or supported environment credentials such as `OPENAI_API_KEY`. The owned app-servers inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
 
 Run:
 

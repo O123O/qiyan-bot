@@ -4,7 +4,7 @@
 
 Build a single-user, self-hosted assistant that lets its owner operate Codex from chat applications. The assistant is itself a persistent Codex thread called the coordinator. It answers general questions, manages projects, chooses project sessions, and uses structured backend tools to control ordinary Codex threads.
 
-The MVP uses Telegram, TypeScript, and one local `codex app-server`. It is designed so Slack and WeChat adapters, remote app-servers reached through SSH, and multiple app-server processes per host can be added without changing coordinator behavior.
+The MVP uses Telegram, TypeScript, one token-free local project `codex app-server`, and one coordinator-only local app-server. The coordinator split is a security boundary for manager credentials; the project app-server still hosts all ordinary project threads. It is designed so Slack and WeChat adapters and remote app-servers reached through SSH can be added without changing coordinator behavior.
 
 ## Goals
 
@@ -28,7 +28,7 @@ The MVP uses Telegram, TypeScript, and one local `codex app-server`. It is desig
 - Interactive approval buttons or approval conversations in Telegram.
 - Voice or video handling.
 - A generic raw JSON-RPC tool exposed to the coordinator.
-- Multiple app-server processes on one local host unless verification reveals a practical concurrency limit.
+- Sharding project sessions across multiple local app-server processes for capacity alone.
 
 ## Terminology
 
@@ -36,7 +36,7 @@ The MVP uses Telegram, TypeScript, and one local `codex app-server`. It is desig
 - **Thread/session:** A persistent Codex conversation containing turns and items. This document uses "session" in user-facing language and "thread" when referring to the app-server protocol.
 - **Coordinator:** A persistent Codex thread rooted in the bot repository and instructed to act as the user's assistant and session manager.
 - **Project session:** An ordinary Codex thread whose working directory is a project directory. It has no bot-specific worker behavior and may use normal Codex tools and subagents.
-- **Endpoint:** A connection strategy for one app-server. The MVP has a local endpoint; a later release adds SSH endpoints.
+- **Endpoint:** A connection strategy for one app-server. The MVP has local project and coordinator endpoints; a later release adds SSH endpoints.
 - **Managed session:** A discovered or created Codex thread that has a coordinator-assigned nickname in the bot registry.
 
 App-server threads are distinct from subagent threads. Limits such as `agents.max_threads` govern subagents spawned inside a Codex session, not the number of persistent top-level sessions stored by one app-server. The backend will nevertheless cap concurrent active turns and retain the ability to shard a host across multiple app-server processes.
@@ -60,9 +60,12 @@ TypeScript Bot Backend
     `-- OperationalStore
              |
              v
+    AppServerEndpoint: coordinator-local
+      `-- coordinator-only Codex app-server
+            `-- coordinator thread
+
     AppServerEndpoint: local
-      `-- one local Codex app-server
-            |-- coordinator thread
+      `-- token-free project Codex app-server
             |-- payments thread
             `-- website thread
 

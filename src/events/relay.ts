@@ -5,6 +5,7 @@ import type { FinalMessageStore } from "../sessions/final-messages.ts";
 import type { Database } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { AttachmentStore } from "../attachments/store.ts";
 
 interface TerminalTurn { id: string; status: string; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
 
@@ -17,6 +18,7 @@ export class EventRelay {
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
     private readonly options: { destination: string; clock: Clock },
+    private readonly attachments?: Pick<AttachmentStore, "releaseTurn">,
   ) {}
 
   async handleNotification(endpointId: string, method: string, params: any): Promise<void> {
@@ -79,6 +81,7 @@ export class EventRelay {
       const status = turn.status === "completed" ? "" : ` · ${turn.status}`;
       this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", destination: this.options.destination, body: `[${nickname}${status}] ${message.body}`, mandatory: true });
     }
+    this.attachments?.releaseTurn(endpointId, threadId, turn.id);
   }
 
   private persistEvent(id: string, endpointId: string, threadId: string, turnId: string | undefined, kind: string, payload: unknown): void {

@@ -38,6 +38,30 @@ test("invalid external replacement preserves last known-good state", async () =>
   assert.equal(registry.snapshot().version, 1);
 });
 
+test("invalid startup registry is quarantined and replaced without activating corrupt mappings", async () => {
+  const { dir, path } = await fixture();
+  await writeFile(path, "{broken", "utf8");
+  const registry = await SessionRegistry.open(path, {
+    version: 1,
+    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    sessions: {},
+  });
+  assert.deepEqual(registry.snapshot().sessions, {});
+  assert.equal(registry.warnings().length, 1);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
+});
+
+test("invalid startup registry without a last-known-good snapshot refuses unsafe reset", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "codex-bot-registry-corrupt-"));
+  const path = join(dir, "sessions.json");
+  await writeFile(path, "{broken", "utf8");
+  await assert.rejects(SessionRegistry.open(path, {
+    version: 1,
+    coordinator: { endpoint: "local", thread_id: "coordinator", project_dir: dir },
+    sessions: {},
+  }), /no valid last-known-good/);
+});
+
 test("external replacement is activated only after asynchronous mapping validation", async () => {
   const { dir, path, registry } = await fixture();
   await writeFile(path, JSON.stringify({

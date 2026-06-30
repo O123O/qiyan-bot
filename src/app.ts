@@ -69,8 +69,12 @@ export function composeApp(
       state = "stopping";
       transition = (async () => {
         if (hasMaintenanceTimer) { timers.clearInterval(maintenanceTimer); maintenanceTimer = undefined; hasMaintenanceTimer = false; }
-        for (const phase of started.splice(0).reverse()) await phase.stop().catch(() => undefined);
+        let firstError: unknown;
+        for (const phase of started.splice(0).reverse()) {
+          try { await phase.stop(); } catch (error) { firstError ??= error; }
+        }
         state = "stopped";
+        if (firstError) throw firstError;
       })();
       return transition;
     },

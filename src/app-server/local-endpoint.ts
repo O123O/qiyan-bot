@@ -15,13 +15,15 @@ export interface PermissionBlockedEvent {
 type Spawn = (command: string, args: readonly string[], options: SpawnOptionsWithoutStdio) => ChildProcessWithoutNullStreams;
 
 export class LocalEndpoint {
-  readonly id = "local";
+  readonly id: string;
   state: "starting" | "ready" | "unavailable" | "stopped" = "stopped";
   private child?: ChildProcessWithoutNullStreams;
   private client?: JsonRpcClient;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string }) {}
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string }) {
+    this.id = options.id ?? "local";
+  }
 
   async start(): Promise<void> {
     if (this.state === "ready") return;
@@ -81,8 +83,17 @@ export class LocalEndpoint {
 
   async stop(): Promise<void> {
     this.state = "stopped";
+    const child = this.child;
     this.client?.close();
-    this.child?.kill();
+    if (!child) return;
+    const exited = new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      child.once("exit", () => resolve());
+      const timeout = setTimeout(resolve, 5_000);
+      timeout.unref?.();
+    });
+    child.kill();
+    await exited;
   }
 
   request<T>(method: string, params: unknown, signal?: AbortSignal): Promise<T> {
@@ -104,6 +115,8 @@ export class LocalEndpoint {
     this.events.on("unavailable", listener);
     return () => this.events.off("unavailable", listener);
   }
+
+  get pid(): number | undefined { return this.child?.pid; }
 
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void {
     this.events.on("permissionBlocked", listener);

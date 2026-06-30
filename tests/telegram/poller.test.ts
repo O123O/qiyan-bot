@@ -25,6 +25,7 @@ test("accepted input atomically stores source context and advances the offset af
   const context = operations.getSourceContext("telegram:10:2");
   assert.equal(context?.rawText, "/pass hi");
   assert.equal(context?.attachmentIds.length, 1);
+  assert.equal((db.prepare("SELECT ref_count FROM attachments").get() as any).ref_count, 1);
   assert.deepEqual(queued, ["telegram:10:2"]);
 });
 
@@ -46,4 +47,3 @@ test("unauthorized and unsupported updates advance offset without downloads or r
   assert.equal((db.prepare("SELECT COUNT(*) AS count FROM source_contexts").get() as any).count, 0);
   assert.equal(downloads, 0);
 });
-

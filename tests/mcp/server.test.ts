@@ -12,7 +12,7 @@ test("loopback MCP requires bearer auth, advertises instructions, lists tools, a
   operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "ordinary", attachmentIds: [] });
   let received: any;
   const tools = createCoordinatorTools(operations, { list_managed_sessions: async (_args, context) => { received = context; return []; } }, { maxCollectCount: 20 });
-  const server = new LoopbackMcpServer(tools, { current: () => ({ contextId: "ctx", attemptId: "a", turnId: "t" }) }, { host: "127.0.0.1", port: 0, token: "secret" });
+  const server = new LoopbackMcpServer(tools, { current: () => ({ contextId: "ctx", attemptId: "a", turnId: "t" }) }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => process.pid });
   await server.start();
   t.after(() => server.stop());
   assert.equal((await fetch(server.url, { method: "POST", body: "{}" })).status, 401);
@@ -48,12 +48,21 @@ test("inactive coordinator context is rejected and non-loopback binding is refus
   await client.close(); await server.stop();
 });
 
+test("a bearer token alone is rejected outside the authorized process tree", async (t) => {
+  const operations = new OperationStore(createTestDatabase());
+  const tools = createCoordinatorTools(operations, {}, { maxCollectCount: 20 });
+  const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => -1 });
+  await server.start(); t.after(() => server.stop());
+  assert.equal((await fetch(server.url, { method: "POST", headers: { authorization: "Bearer secret" }, body: "{}" })).status, 403);
+});
+
 test("child environment keeps Codex auth but strips Telegram secrets and hides the MCP token from shells", () => {
   const env = buildCodexChildEnvironment({ PATH: "/bin", HOME: "/home/u", CODEX_HOME: "/codex", OPENAI_API_KEY: "auth", TELEGRAM_BOT_TOKEN: "leak", OTHER_SECRET: "no" }, "mcp-secret");
   assert.equal(env.OPENAI_API_KEY, "auth");
   assert.equal(env.TELEGRAM_BOT_TOKEN, undefined);
   assert.equal(env.OTHER_SECRET, undefined);
   assert.equal(env.CODEX_BOT_MCP_TOKEN, "mcp-secret");
+  assert.equal(buildCodexChildEnvironment({ PATH: "/bin" }).CODEX_BOT_MCP_TOKEN, undefined);
   const config = coordinatorTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret");
   assert.deepEqual((config["shell_environment_policy.exclude"] as any).includes("CODEX_BOT_MCP_TOKEN"), true);
   assert.equal(config.allow_login_shell, false);

@@ -7,6 +7,7 @@ import type { Clock } from "../core/clock.ts";
 import { SystemClock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
 import type { Database } from "../storage/database.ts";
+import { inTransaction } from "../storage/database.ts";
 
 export type FileHandleId = `file_${string}`;
 
@@ -101,6 +102,27 @@ export class AttachmentStore {
   release(scopeId: string, id: FileHandleId): void {
     this.required(scopeId, id);
     this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);
+  }
+
+  retainForTurn(endpointId: string, threadId: string, turnId: string, scopeId: string, ids: readonly FileHandleId[]): void {
+    inTransaction(this.db, () => {
+      for (const id of ids) {
+        this.required(scopeId, id);
+        const inserted = this.db.prepare(`INSERT OR IGNORE INTO turn_attachment_refs
+          (endpoint_id, thread_id, turn_id, scope_id, attachment_id) VALUES (?, ?, ?, ?, ?)`)
+          .run(endpointId, threadId, turnId, scopeId, id).changes;
+        if (inserted) this.db.prepare("UPDATE attachments SET ref_count = ref_count + 1 WHERE id = ?").run(id);
+      }
+    });
+  }
+
+  releaseTurn(endpointId: string, threadId: string, turnId: string): void {
+    inTransaction(this.db, () => {
+      const rows = this.db.prepare("SELECT attachment_id FROM turn_attachment_refs WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?")
+        .all(endpointId, threadId, turnId) as Array<{ attachment_id: string }>;
+      for (const row of rows) this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(row.attachment_id);
+      this.db.prepare("DELETE FROM turn_attachment_refs WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?").run(endpointId, threadId, turnId);
+    });
   }
 
   async cleanupExpired(): Promise<number> {

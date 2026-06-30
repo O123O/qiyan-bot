@@ -95,6 +95,10 @@ export class DeliveryStore {
     });
   }
 
+  markPrepared(id: string): void {
+    this.db.prepare("UPDATE deliveries SET state = 'prepared', updated_at = ? WHERE id = ?").run(Date.now(), id);
+  }
+
   recoverAfterCrash(): void {
     inTransaction(this.db, () => {
       const optional = this.db.prepare("SELECT id, destination FROM deliveries WHERE state = 'dispatched' AND mandatory = 0").all() as Array<{ id: string; destination: string }>;

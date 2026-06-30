@@ -66,7 +66,7 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   assert.deepEqual(endpoint.calls.find((call) => call.method === "turn/start")?.params, {
     threadId: "thread", clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
   });
-  assert.deepEqual(runtime.settings("local", "thread"), {});
+  assert.deepEqual(runtime.settings("local", "thread"), { model: "gpt-5", effort: "high" });
 
   runtime.setActiveTurn("local", "thread", "active-1");
   assert.equal((await service.send("payments", "more")).mode, "steer");
@@ -78,6 +78,8 @@ test("send enforces managed state and start/steer preconditions", async () => {
   const { runtime, service } = await fixture();
   runtime.setSession("local", "thread", "detached", "idle");
   await assert.rejects(service.send("payments", "x"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
+  await assert.rejects(service.setModel("payments", "gpt-5"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
+  await assert.rejects(service.setGoal("payments", "do not mutate"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
   runtime.setSession("local", "thread", "managed", "idle");
   await assert.rejects(service.send("payments", "x", { mode: "steer" }), (error: unknown) => error instanceof AppError && error.code === "SESSION_IDLE");
 });
