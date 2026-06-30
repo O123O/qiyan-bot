@@ -57,3 +57,21 @@ test("recoverable operations retain their canonical arguments and stable call id
     contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" }, state: "dispatched",
   }]);
 });
+
+test("failing an operation and releasing its directive are one transaction", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "/pass exact", attachmentIds: [] });
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args: { content: "exact" } });
+  store.markDispatched(operation.id);
+  store.bindDirective("ctx", "pass", { content: "exact" }, operation.id);
+  db.exec(`CREATE TRIGGER fail_directive_release BEFORE DELETE ON directive_consumptions
+    BEGIN SELECT RAISE(ABORT, 'release failed'); END;`);
+  assert.throws(() => store.failAndUnbind(operation.id, { message: "no effect" }), /release failed/);
+  assert.equal(store.get(operation.id)?.state, "dispatched");
+  assert.ok(store.replayDirective("ctx", "pass", { content: "exact" }));
+  db.exec("DROP TRIGGER fail_directive_release");
+  store.failAndUnbind(operation.id, { message: "no effect" });
+  assert.equal(store.get(operation.id)?.state, "failed");
+  assert.equal(store.replayDirective("ctx", "pass", { content: "exact" }), undefined);
+});

@@ -113,3 +113,14 @@ test("a failed attach rollback remains uncertain instead of being classified as 
   await assert.rejects(lifecycle.attach("payments"), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "attaching");
 });
+
+test("endpoint loss preserves managed restore state for attach recovery", async () => {
+  const { dir, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  assert.deepEqual(runtime.getSession("local", "thread-1"), {
+    managementState: "unavailable",
+    restoreState: "managed",
+    nativeStatus: "notLoaded",
+  });
+});

@@ -600,15 +600,13 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
             operations.succeed(operation.id, { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status) });
           } else if (args.mode === "start" && history.thread.status?.type === "idle") {
             attachments.releaseOperation(holdId);
-            operations.fail(operation.id, { message: "thread history proves the requested start did not create a turn" });
-            operations.unbindDirective(operation.id);
+            operations.failAndUnbind(operation.id, { message: "thread history proves the requested start did not create a turn" });
           } else if (args.mode === "steer") {
             const targetTurnId = (operation.receipt as { turnId?: string } | undefined)?.turnId;
             const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
             if (target && isTerminalStatus(target.status)) {
               attachments.releaseOperation(holdId);
-              operations.fail(operation.id, { message: "terminal target history proves the requested steer was not appended" });
-              operations.unbindDirective(operation.id);
+              operations.failAndUnbind(operation.id, { message: "terminal target history proves the requested steer was not appended" });
             }
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {
@@ -649,7 +647,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
           if (state === expected) operations.succeed(operation.id, { nickname: args.nickname });
-          else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && (state === "detached" || state === "unavailable"))) {
+          else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && state === "detached")) {
             failRecoveredNoEffect(operation.id, `durable ${operation.kind === "detach_session" ? "detaching" : "attaching"} marker was not committed`);
           }
         } else if (operation.kind === "archive_session") {
@@ -833,8 +831,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   function failRecoveredNoEffect(operationId: string, message: string): void {
-    operations.fail(operationId, { message });
-    operations.unbindDirective(operationId);
+    operations.failAndUnbind(operationId, { message });
   }
 
   return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });

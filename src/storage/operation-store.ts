@@ -148,6 +148,13 @@ export class OperationStore {
     this.db.prepare("DELETE FROM directive_consumptions WHERE operation_id = ?").run(operationId);
   }
 
+  failAndUnbind(id: string, error: unknown): void {
+    inTransaction(this.db, () => {
+      this.fail(id, error);
+      this.unbindDirective(id);
+    });
+  }
+
   supersedeWithRecovery(contextId: string, receipts: readonly unknown[]): SourceContext {
     return inTransaction(this.db, () => this.supersedeWithRecoveryInTransaction(contextId, receipts));
   }

@@ -97,8 +97,9 @@ export function createCoordinatorTools(
         return receipt;
       } catch (error) {
         const uncertain = sideEffecting && !isProvenNoEffect(error);
-        operations.fail(operation.id, { message: error instanceof Error ? error.message : String(error) }, uncertain);
-        if (!uncertain && directive) operations.unbindDirective(operation.id);
+        const failure = { message: error instanceof Error ? error.message : String(error) };
+        if (uncertain) operations.fail(operation.id, failure, true);
+        else operations.failAndUnbind(operation.id, failure);
         throw error;
       }
     };
