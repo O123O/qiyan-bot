@@ -84,6 +84,19 @@ test("project-relative outbound preparation rejects traversal and symlinks, then
   await chmod(store.pathForTesting(handle.id), 0o600);
 });
 
+test("outbound preparation resumes the same durable handle after a lost receipt", async () => {
+  const { root, store } = await fixture();
+  const project = join(root, "project-resume");
+  await mkdir(project);
+  await writeFile(join(project, "report.txt"), "first");
+  const stable = "file_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
+  const first = await store.prepareOutbound("ctx", project, "report.txt", "report.txt", "text/plain", stable);
+  await writeFile(join(project, "report.txt"), "later");
+  const replay = await store.prepareOutbound("ctx", project, "report.txt", "report.txt", "text/plain", stable);
+  assert.deepEqual(replay, first);
+  assert.equal(await readFile(store.pathForTesting(stable), "utf8"), "first");
+});
+
 test("openForUpload holds a descriptor to the private regular file and enforces scope", async () => {
   const { store } = await fixture();
   const saved = await store.ingest("ctx", Readable.from(["abc"]), { displayName: "a.txt", mediaType: "text/plain" });
@@ -102,6 +115,18 @@ test("turn references retain attachments exactly once until terminal release", a
   store.retainForTurn("local", "thread", "turn", "ctx", [saved.id]);
   assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 1);
   store.releaseTurn("local", "thread", "turn");
+  store.releaseTurn("local", "thread", "turn");
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 0);
+});
+
+test("a durable dispatch hold transfers to the recovered worker turn without a refcount gap", async () => {
+  const { db, store } = await fixture();
+  const saved = await store.ingest("ctx", Readable.from(["abc"]), { displayName: "a.txt", mediaType: "text/plain" });
+  store.retainForOperation("send-1", "ctx", [saved.id]);
+  store.retainForOperation("send-1", "ctx", [saved.id]);
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 1);
+  store.transferOperationToTurn("send-1", "local", "thread", "turn");
+  assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 1);
   store.releaseTurn("local", "thread", "turn");
   assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count, 0);
 });

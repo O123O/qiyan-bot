@@ -79,3 +79,24 @@ test("changed arguments conflict and uncertain operations are never retransmitte
   await assert.rejects(tools.send_chat_message(context, { content: "two" }), (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");
   assert.equal(calls, 1);
 });
+
+test("a proven no-effect error does not consume a pass directive", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "4", rawText: "/pass exact", attachmentIds: [] });
+  let calls = 0;
+  const tools = createCoordinatorTools(operations, {
+    send_to_session: async () => {
+      calls += 1;
+      if (calls === 1) throw new AppError("SESSION_BUSY", "busy before dispatch");
+      return { turnId: "turn" };
+    },
+  }, { maxCollectCount: 20 });
+  const args = { nickname: "payments", content: "exact", attachment_ids: [], mode: "start" };
+  await assert.rejects(tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" }, args), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  const failed = db.prepare("SELECT state FROM operations WHERE call_id = 'first'").get() as { state: string };
+  assert.equal(failed.state, "failed");
+  const receipt = await tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "second" }, args);
+  assert.equal((receipt as any).turnId, "turn");
+  assert.equal(calls, 2);
+});

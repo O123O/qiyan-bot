@@ -21,15 +21,16 @@ export class SessionLifecycle {
     private readonly execution: { sandboxMode: "read-only" | "workspace-write" | "danger-full-access" } = { sandboxMode: "workspace-write" },
   ) {}
 
-  async create(nickname: string, endpointId: string, projectDir: string): Promise<void> {
+  async create(nickname: string, endpointId: string, projectDir: string, onThreadCreated?: (thread: ThreadView) => void): Promise<void> {
     await this.lock(`${endpointId}:new:${nickname}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", {
         cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(), ephemeral: false,
       });
+      onThreadCreated?.(response.thread);
       await this.verifyCwd(response.thread.cwd, canonical);
-      this.requireIdle(response.thread);
+      if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
       await this.registry.register(nickname, { endpoint: endpointId, thread_id: response.thread.id, project_dir: canonical });
       this.runtime.setSession(endpointId, response.thread.id, "managed", response.thread.status.type);
       this.runtime.beginEpoch(endpointId, response.thread.id, this.baseline(response.thread), this.clock.now());
@@ -85,7 +86,12 @@ export class SessionLifecycle {
         this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
         this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
       } catch (error) {
-        if (resumed) await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }).catch(() => undefined);
+        if (resumed) {
+          try { await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }); }
+          catch (rollbackError) {
+            throw new AppError("OPERATION_UNCERTAIN", `attach failed and unsubscribe rollback could not be confirmed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+          }
+        }
         this.runtime.setSession(session.endpoint, session.thread_id, "detached", before.thread.status.type);
         throw error;
       }

@@ -77,6 +77,21 @@ test("a lost turn/start response is proven from history instead of retransmitted
   assert.equal(starts, 1);
 });
 
+test("a failed history read after turn/start uncertainty remains operation uncertainty", async () => {
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") throw new Error("start response timed out");
+      throw new Error("history read timed out");
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  await assert.rejects(
+    pool.startTurn("local", { threadId: "t", clientUserMessageId: "stable-client-id", input: [] }),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+});
+
 test("a lost interrupt response succeeds only when the exact turn is proven terminal", async () => {
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",

@@ -58,6 +58,15 @@ export class SessionService {
     this.runtime.setActiveTurn(session.endpoint, session.thread_id, undefined);
   }
 
+  activeTurnId(nickname: string): string {
+    const session = this.managed(nickname);
+    const turnId = this.runtime.activeTurn(session.endpoint, session.thread_id);
+    if (!turnId) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
+    return turnId;
+  }
+
+  managedProjectRoot(nickname: string): string { return this.managed(nickname).project_dir; }
+
   collect(nickname: string, count: number): Promise<LogicalFinalMessage[]>;
   collect(nickname: string, count: number, options: { direct?: false; destination?: string }): Promise<LogicalFinalMessage[]>;
   collect(nickname: string, count: number, options: { direct: true; destination: string; deliveryKey?: string }): Promise<Array<{ deliveryId: string }>>;

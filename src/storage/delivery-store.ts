@@ -99,9 +99,10 @@ export class DeliveryStore {
     this.db.prepare("UPDATE deliveries SET state = 'prepared', updated_at = ? WHERE id = ?").run(Date.now(), id);
   }
 
-  recoverAfterCrash(): void {
-    inTransaction(this.db, () => {
+  recoverAfterCrash(): DeliveryRecord[] {
+    return inTransaction(this.db, () => {
       const optional = this.db.prepare("SELECT id, destination FROM deliveries WHERE state = 'dispatched' AND mandatory = 0").all() as Array<{ id: string; destination: string }>;
+      const recovered = this.db.prepare("SELECT id FROM deliveries WHERE state = 'dispatched' ORDER BY created_at, id").all() as Array<{ id: string }>;
       this.db.prepare("UPDATE deliveries SET state = 'uncertain', updated_at = ? WHERE state = 'dispatched'").run(Date.now());
       for (const delivery of optional) {
         this.releaseAttachment(delivery.id);
@@ -113,6 +114,7 @@ export class DeliveryStore {
           mandatory: true,
         });
       }
+      return recovered.map(({ id }) => this.get(id)!).filter(Boolean);
     });
   }
 

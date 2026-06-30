@@ -1,4 +1,8 @@
-export const migrations = [
+import type { DatabaseSync } from "node:sqlite";
+
+export type Migration = string | ((db: DatabaseSync) => void);
+
+export const migrations: readonly Migration[] = [
   `
   CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);
   CREATE TABLE IF NOT EXISTS telegram_state (
@@ -142,11 +146,12 @@ export const migrations = [
     created_at INTEGER NOT NULL
   );
   `,
-  `
-  ALTER TABLE deliveries ADD COLUMN attachment_id TEXT;
-  ALTER TABLE deliveries ADD COLUMN attachment_scope_id TEXT;
-  ALTER TABLE deliveries ADD COLUMN reply_to INTEGER;
-  `,
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("attachment_id")) db.exec("ALTER TABLE deliveries ADD COLUMN attachment_id TEXT");
+    if (!columns.has("attachment_scope_id")) db.exec("ALTER TABLE deliveries ADD COLUMN attachment_scope_id TEXT");
+    if (!columns.has("reply_to")) db.exec("ALTER TABLE deliveries ADD COLUMN reply_to INTEGER");
+  },
   `
   CREATE TABLE IF NOT EXISTS source_attachment_releases (
     context_id TEXT PRIMARY KEY REFERENCES source_contexts(id),
@@ -161,4 +166,13 @@ export const migrations = [
     PRIMARY KEY(endpoint_id, thread_id, turn_id, attachment_id)
   );
   `,
-] as const;
+  `
+  CREATE TABLE IF NOT EXISTS operation_attachment_refs (
+    hold_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(hold_id, attachment_id)
+  );
+  `,
+];

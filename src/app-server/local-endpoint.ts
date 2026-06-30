@@ -76,7 +76,8 @@ export class LocalEndpoint {
       this.events.emit("ready");
     } catch (error) {
       this.state = "unavailable";
-      child.kill();
+      await this.stop();
+      this.state = "unavailable";
       throw error;
     }
   }
@@ -88,8 +89,11 @@ export class LocalEndpoint {
     if (!child) return;
     const exited = new Promise<void>((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) return resolve();
-      child.once("exit", () => resolve());
-      const timeout = setTimeout(resolve, 5_000);
+      let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const done = () => { if (!settled) { settled = true; if (timeout) clearTimeout(timeout); resolve(); } };
+      child.once("exit", done);
+      timeout = setTimeout(() => { child.kill("SIGKILL"); done(); }, 5_000);
       timeout.unref?.();
     });
     child.kill();

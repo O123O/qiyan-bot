@@ -129,6 +129,11 @@ export class OperationStore {
     this.setState(id, "dispatched");
   }
 
+  checkpoint(id: string, receipt: unknown): void {
+    this.db.prepare("UPDATE operations SET receipt_json = ?, updated_at = ? WHERE id = ? AND state IN ('dispatched', 'uncertain')")
+      .run(JSON.stringify(receipt), Date.now(), id);
+  }
+
   succeed(id: string, receipt: unknown): void {
     this.db.prepare("UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ? WHERE id = ?")
       .run(JSON.stringify(receipt), Date.now(), id);
@@ -137,6 +142,10 @@ export class OperationStore {
   fail(id: string, error: unknown, uncertain = false): void {
     this.db.prepare("UPDATE operations SET state = ?, error_json = ?, updated_at = ? WHERE id = ?")
       .run(uncertain ? "uncertain" : "failed", JSON.stringify(error), Date.now(), id);
+  }
+
+  unbindDirective(operationId: string): void {
+    this.db.prepare("DELETE FROM directive_consumptions WHERE operation_id = ?").run(operationId);
   }
 
   supersedeWithRecovery(contextId: string, receipts: readonly unknown[]): SourceContext {

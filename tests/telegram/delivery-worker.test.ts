@@ -50,9 +50,11 @@ test("optional uncertain tool output is not automatically retried", async () => 
 test("a nondeterministic send failure is persisted as uncertain immediately", async () => {
   const store = new DeliveryStore(createTestDatabase());
   const delivery = store.prepare({ id: "d_network", kind: "text", destination: "7", body: "x", mandatory: true });
-  const worker = new DeliveryWorker(store, { sendMessage: async () => { throw new Error("socket reset"); } });
+  const observed: string[] = [];
+  const worker = new DeliveryWorker(store, { sendMessage: async () => { throw new Error("socket reset"); } }, undefined, undefined, (changed) => { observed.push(changed.state); });
   await assert.rejects(worker.processOne(delivery.id), /socket reset/);
   assert.equal(store.get(delivery.id)?.state, "uncertain");
+  assert.deepEqual(observed, ["uncertain"]);
 });
 
 test("an optional delivery failure creates one mandatory visible warning", async () => {

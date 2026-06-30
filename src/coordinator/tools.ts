@@ -6,6 +6,7 @@ import type { OperationRecord, OperationStore } from "../storage/operation-store
 
 export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
+export interface ToolActionContext extends ToolCallContext { operationId: string; checkpoint(receipt: unknown): void }
 
 const nickname = z.string().min(1);
 export const COORDINATOR_TOOL_SCHEMAS = {
@@ -35,7 +36,7 @@ export const COORDINATOR_TOOL_SCHEMAS = {
 
 export const TOOL_NAMES = Object.freeze(Object.keys(COORDINATOR_TOOL_SCHEMAS)) as readonly (keyof typeof COORDINATOR_TOOL_SCHEMAS)[];
 export type CoordinatorToolName = keyof typeof COORDINATOR_TOOL_SCHEMAS;
-type Action = (args: any, context: ToolCallContext) => Promise<any>;
+type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
 export const READ_ONLY_TOOLS = new Set<CoordinatorToolName>([
   "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal",
@@ -82,7 +83,11 @@ export function createCoordinatorTools(
       const sideEffecting = name === "collect_messages" ? directive?.kind === "collect" : !READ_ONLY_TOOLS.has(name);
       if (sideEffecting) operations.markDispatched(operation.id);
       try {
-        const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, context);
+        const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, {
+          ...context,
+          operationId: operation.id,
+          checkpoint: (receipt) => operations.checkpoint(operation!.id, receipt),
+        });
         const receipt = directive?.kind === "pass"
           ? { ...(isRecord(actionResult) ? actionResult : { result: actionResult }), nickname: args.nickname, actualText: args.content, attachmentIds: args.attachment_ids, payloadHash: createHash("sha256").update(args.content).digest("hex") }
           : directive?.kind === "collect"
@@ -91,7 +96,9 @@ export function createCoordinatorTools(
         operations.succeed(operation.id, receipt);
         return receipt;
       } catch (error) {
-        operations.fail(operation.id, { message: error instanceof Error ? error.message : String(error) }, sideEffecting);
+        const uncertain = sideEffecting && !isProvenNoEffect(error);
+        operations.fail(operation.id, { message: error instanceof Error ? error.message : String(error) }, uncertain);
+        if (!uncertain && directive) operations.unbindDirective(operation.id);
         throw error;
       }
     };
@@ -101,3 +108,9 @@ export function createCoordinatorTools(
 
 function equalStrings(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every((value, index) => value === right[index]); }
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+
+const provenNoEffectCodes = new Set([
+  "UNKNOWN_SESSION", "AMBIGUOUS_SESSION", "SESSION_DETACHED", "SESSION_BUSY", "SESSION_IDLE", "THREAD_NOT_FOUND",
+  "UNSUPPORTED_CAPABILITY", "ATTACHMENT_INVALID", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED",
+]);
+function isProvenNoEffect(error: unknown): boolean { return error instanceof AppError && provenNoEffectCodes.has(error.code); }

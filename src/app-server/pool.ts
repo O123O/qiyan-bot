@@ -87,9 +87,12 @@ export class AppServerPool {
   private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, candidateTurnId?: string): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
     const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 30_000);
     do {
-      const history = await this.request<{ thread: { turns: Array<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> } }>(
-        endpointId, "thread/read", { threadId, includeTurns: true },
-      );
+      let history: { thread: { turns: Array<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> } };
+      try {
+        history = await this.request(endpointId, "thread/read", { threadId, includeTurns: true });
+      } catch (error) {
+        throw new AppError("OPERATION_UNCERTAIN", `turn/start outcome could not be reconciled because thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const actual = [...history.thread.turns].reverse().find((turn) =>
         turn.items.some((item) => item.type === "userMessage" && item.clientId === clientUserMessageId)
         || (candidateTurnId !== undefined && turn.id === candidateTurnId));

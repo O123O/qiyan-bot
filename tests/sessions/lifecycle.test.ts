@@ -20,6 +20,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   threadId = "thread-1";
   turns = [{ id: "historical" }];
   afterResume: (() => void) | undefined;
+  failUnsubscribe = false;
 
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
@@ -29,6 +30,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
       return { thread: { ...thread, status: { type: this.status } }, cwd: this.cwd } as T;
     }
     if (method === "thread/read") return { thread } as T;
+    if (method === "thread/unsubscribe" && this.failUnsubscribe) throw new Error("unsubscribe response lost");
     return {} as T;
   }
 }
@@ -100,4 +102,14 @@ test("archive requires idle and startup reconciliation completes intermediate st
   await lifecycle.archive("payments");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "archived");
   assert.ok(endpoint.calls.some((call) => call.method === "thread/archive"));
+});
+
+test("a failed attach rollback remains uncertain instead of being classified as no effect", async () => {
+  const { dir, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  await lifecycle.detach("payments");
+  endpoint.afterResume = () => { endpoint.status = "active"; };
+  endpoint.failUnsubscribe = true;
+  await assert.rejects(lifecycle.attach("payments"), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
+  assert.equal(runtime.getSession("local", "thread-1")?.managementState, "attaching");
 });

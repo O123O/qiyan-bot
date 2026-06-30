@@ -1,8 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AttachmentStore } from "./attachments/store.ts";
+import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
@@ -11,6 +11,7 @@ import { composeApp, TerminalInbox, type AppPhase, type BotApp } from "./app.ts"
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { CoordinatorNotebook } from "./coordinator/notebook.ts";
+import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
 import { createCoordinatorTools, type CoordinatorToolName } from "./coordinator/tools.ts";
@@ -22,7 +23,7 @@ import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { SessionService } from "./sessions/service.ts";
 import { inTransaction, openDatabase, type Database } from "./storage/database.ts";
-import { DeliveryStore } from "./storage/delivery-store.ts";
+import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
@@ -57,6 +58,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let chat!: ChatAdapter;
   let deliveryWorker!: DeliveryWorker;
   let acceptingReadyEvents = false;
+  let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
   const terminalWaiters = new Map<string, { resolve(): void; reject(error: unknown): void; eventIds: string[] }>();
   const earlyCoordinatorTerminals = new TerminalInbox<any>();
@@ -132,7 +134,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     },
     {
       name: "endpoint",
-      start: async () => { stopping = false; await endpoint.start(); await coordinatorEndpoint.start(); },
+      start: async () => {
+        stopping = false;
+        await endpoint.start();
+        try {
+          await coordinatorEndpoint.start();
+        } catch (error) {
+          await endpoint.stop().catch(() => undefined);
+          throw error;
+        }
+      },
       stop: async () => {
         stopping = true;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
@@ -146,7 +157,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         await lifecycle.reconcileStartup();
         await resumeManagedSessions();
         await relay.reconcileEndpoint(endpoint.id);
-        deliveries.recoverAfterCrash();
+        for (const recovered of deliveries.recoverAfterCrash()) persistDeliveryState(recovered);
         acceptingReadyEvents = true;
       }, stop: async () => { acceptingReadyEvents = false; },
     },
@@ -161,14 +172,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     },
     {
       name: "scheduler",
-      start: async () => { await enqueuePendingEvents(); await enqueuePendingSources(); },
+      start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await enqueuePendingSources(); },
       stop: async () => {
         stopping = true;
+        schedulerAccepting = false;
         const active = coordinator.current();
-        if (active && !active.turnId.startsWith("pending:")) await pool.interrupt(endpoint.id, registry.snapshot().coordinator.thread_id, active.turnId).catch(() => undefined);
+        if (active && !active.turnId.startsWith("pending:")) await pool.interrupt(coordinatorEndpoint.id, registry.snapshot().coordinator.thread_id, active.turnId).catch(() => undefined);
         for (const [turnId, waiter] of terminalWaiters) {
           terminalWaiters.delete(turnId);
-          waiter.reject(new Error("bot is stopping"));
+          waiter.reject(new AppError("OPERATION_UNCERTAIN", "bot stopped before the coordinator turn reached a proven terminal state"));
         }
         await scheduler.idle();
       },
@@ -177,7 +189,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "delivery",
       start: async () => {
         chat = new TelegramChatAdapter(db, operations, attachments, { token: config.telegramBotToken, ownerId: config.telegramOwnerId, maxMessageBytes: config.attachmentMaxBytes, onAccepted: async (contextId) => { enqueueSource(contextId); } });
-        deliveryWorker = new DeliveryWorker(deliveries, chat.delivery, attachments);
+        deliveryWorker = new DeliveryWorker(deliveries, chat.delivery, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
       stop: async () => { await deliveryWorker.stop(); },
@@ -192,12 +204,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   function buildActions(): Partial<Record<CoordinatorToolName, (args: any, context: any) => Promise<any>>> {
     return {
       list_managed_sessions: async () => registry.snapshot(),
-      discover_sessions: async (args) => discovery.list({ endpointId: args.endpoint ?? "local", ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
+      discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
       get_session_status: async (args) => sessions.status(args.nickname),
-      create_session: async (args) => { await lifecycle.create(args.nickname, args.endpoint ?? "local", args.project_dir); return { nickname: args.nickname }; },
-      register_session: async (args) => { await lifecycle.register(args.nickname, args.endpoint ?? "local", args.thread_id, args.project_dir); return { nickname: args.nickname }; },
+      create_session: async (args, context) => {
+        const endpointId = projectEndpoint(args.endpoint);
+        await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread) => context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd }));
+        return { nickname: args.nickname };
+      },
+      register_session: async (args) => { await lifecycle.register(args.nickname, projectEndpoint(args.endpoint), args.thread_id, args.project_dir); return { nickname: args.nickname }; },
       adopt_session: async (args) => {
-        const endpointId = args.endpoint ?? "local";
+        const endpointId = projectEndpoint(args.endpoint);
         const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
         await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir); return { nickname: args.nickname };
       },
@@ -206,12 +222,24 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       attach_session: async (args) => { await lifecycle.attach(args.nickname); return { nickname: args.nickname }; },
       archive_session: async (args) => { await lifecycle.archive(args.nickname); return { nickname: args.nickname }; },
       send_to_session: async (args, context) => {
+        const worker = registry.get(args.nickname);
+        if (!worker) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.sourceContextId, id));
         const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
-        const result = await sessions.send(args.nickname, args.content, { mode: args.mode, clientUserMessageId: `${context.sourceContextId}:${context.callId}`, input });
-        const worker = registry.get(args.nickname)!;
+        const holdId = workerAttachmentHoldId(context.sourceContextId, context.attemptId, context.callId);
+        if (args.attachment_ids.length > 0) attachments.retainForOperation(holdId, context.sourceContextId, args.attachment_ids);
+        let result: Awaited<ReturnType<SessionService["send"]>>;
+        try {
+          result = await sessions.send(args.nickname, args.content, { mode: args.mode, clientUserMessageId: `${context.sourceContextId}:${context.callId}`, input });
+        } catch (error) {
+          if (isProvenSendNoEffect(error)) attachments.releaseOperation(holdId);
+          throw error;
+        }
+        if (args.attachment_ids.length > 0) {
+          if (result.terminal) attachments.releaseOperation(holdId);
+          else attachments.transferOperationToTurn(holdId, worker.endpoint, worker.thread_id, result.turnId);
+        }
         if (args.attachment_ids.length > 0 && !result.terminal) {
-          attachments.retainForTurn(worker.endpoint, worker.thread_id, result.turnId, context.sourceContextId, args.attachment_ids);
           const history = await pool.request<any>(worker.endpoint, "thread/read", { threadId: worker.thread_id, includeTurns: true });
           const turn = history.thread.turns.find((candidate: any) => candidate.id === result.turnId);
           if (turn && isTerminalStatus(turn.status)) attachments.releaseTurn(worker.endpoint, worker.thread_id, result.turnId);
@@ -228,19 +256,32 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       collect_messages: async (args, context) => args.direct
         ? sessions.collect(args.nickname, args.count, { direct: true, destination: String(config.telegramDestinationChatId), deliveryKey: context.sourceContextId })
         : sessions.collect(args.nickname, args.count),
-      interrupt_session: async (args) => { await sessions.interrupt(args.nickname, args.turn_id); return { interrupted: true }; },
+      interrupt_session: async (args, context) => {
+        const turnId = args.turn_id ?? sessions.activeTurnId(args.nickname);
+        context.checkpoint({ turnId });
+        await sessions.interrupt(args.nickname, turnId);
+        return { interrupted: true, turnId };
+      },
       list_models: async (args) => sessions.models(args.endpoint ?? "local"),
       set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); return { pending: true }; },
       set_reasoning_effort: async (args) => { await sessions.setEffort(args.nickname, args.effort); return { pending: true }; },
       get_goal: async (args) => sessions.getGoal(args.nickname),
       set_goal: async (args) => sessions.setGoal(args.nickname, args.objective, args.token_budget),
       pause_goal: async (args) => sessions.pauseGoal(args.nickname), resume_goal: async (args) => sessions.resumeGoal(args.nickname),
-      cancel_goal: async (args) => { if (args.interrupt_active_turn) await sessions.interrupt(args.nickname).catch(() => undefined); return sessions.cancelGoal(args.nickname); },
+      cancel_goal: async (args, context) => {
+        if (args.interrupt_active_turn) {
+          let turnId: string | null = null;
+          try { turnId = sessions.activeTurnId(args.nickname); }
+          catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+          context.checkpoint({ turnId });
+          if (turnId) await sessions.interrupt(args.nickname, turnId);
+        }
+        return sessions.cancelGoal(args.nickname);
+      },
       send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", destination: String(config.telegramDestinationChatId), body: args.content, mandatory: false, replyTo: args.reply_to }).id }),
       prepare_chat_attachment: async (args, context) => {
-        const ownerRoot = args.owner === "coordinator" ? coordinatorDir : registry.get(args.owner)?.project_dir;
-        if (!ownerRoot) throw new Error("unknown attachment owner");
-        const prepared = await attachments.prepareOutbound(context.sourceContextId, ownerRoot, args.relative_path);
+        const ownerRoot = args.owner === "coordinator" ? coordinatorDir : sessions.managedProjectRoot(args.owner);
+        const prepared = await attachments.prepareOutbound(context.sourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.sourceContextId, context.attemptId, context.callId));
         return { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 };
       },
       send_chat_attachment: async (args, context) => {
@@ -262,11 +303,17 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     await notebook.reconcileNicknames(map);
   }
 
+  function projectEndpoint(requested?: string): string {
+    const endpointId = requested ?? endpoint.id;
+    if (endpointId === coordinatorEndpoint.id) throw new AppError("UNSUPPORTED_CAPABILITY", "the coordinator-only endpoint cannot host project sessions");
+    return endpointId;
+  }
+
   async function runCoordinatorJob(job: CoordinatorJob): Promise<void> {
     const isEventBatch = "events" in job;
     const eventIds = isEventBatch ? job.events.map((event) => event.id) : [];
     const contextId = isEventBatch ? `batch:${eventIds.join(",")}` : String((job.payload as any).contextId);
-    if (stopping || hasOrphanCoordinatorAttempt()) {
+    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) {
       enqueuedSources.delete(contextId);
       for (const id of eventIds) enqueuedEvents.delete(id);
       return;
@@ -299,15 +346,20 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       const response = await pool.startTurn<any>(identity.endpoint, { threadId: identity.thread_id, clientUserMessageId: contextId, input });
       const turnId = String(response.turn.id);
       coordinator.bindTurn(attemptId, turnId);
+      if (stopping || !schedulerAccepting) {
+        await pool.interrupt(identity.endpoint, identity.thread_id, turnId).catch(() => undefined);
+        throw new AppError("OPERATION_UNCERTAIN", "bot stopped after the coordinator turn started and before its terminal state was observed");
+      }
       const terminal = new Promise<void>((resolvePromise, rejectPromise) => terminalWaiters.set(turnId, { resolve: resolvePromise, reject: rejectPromise, eventIds }));
       const early = earlyCoordinatorTerminals.take(turnId);
       if (early) await processCoordinatorTerminal(early);
       else if (isTerminalStatus(response.turn.status)) await processCoordinatorTerminal({ threadId: identity.thread_id, turn: response.turn });
       await terminal;
     } catch (error) {
+      await reconcileOperations();
       const active = coordinator.current();
       if (active?.attemptId === attemptId) terminalWaiters.delete(active.turnId);
-      const uncertainTransport = coordinatorEndpoint.state !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
+      const uncertainTransport = isUncertainCoordinatorTransportFailure(error, coordinatorEndpoint.state);
       if (uncertainTransport && active?.attemptId === attemptId) {
         coordinator.abandonActive(active.turnId);
         enqueuedSources.delete(contextId);
@@ -344,6 +396,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         enqueuedSources.delete(attempt.contextId);
       }
     } else {
+      await reconcileOperations({ includeActiveAttempt: true });
       recovery = coordinator.failAttempt(turn.id, turn.error);
     }
     const waiter = terminalWaiters.get(turn.id);
@@ -362,7 +415,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function enqueuePendingEvents(): Promise<void> {
-    if (stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
     const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
     for (const row of rows) {
@@ -385,12 +438,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function enqueuePendingSources(): Promise<void> {
-    if (stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
     for (const source of operations.listPendingSourceContexts(["telegram", "recovery"])) enqueueSource(source.id);
   }
 
   function enqueueSource(contextId: string): void {
-    if (stopping || hasOrphanCoordinatorAttempt()) return;
+    if (!schedulerAccepting || stopping || hasOrphanCoordinatorAttempt()) return;
     if (enqueuedSources.has(contextId)) return;
     enqueuedSources.add(contextId);
     scheduler.enqueueUser({ id: contextId, payload: { contextId } });
@@ -425,14 +478,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function startOrResumeCoordinator(): Promise<void> {
-    const identity = registry.snapshot().coordinator;
-    const configOverride = coordinatorTurnConfig(mcp.url, token);
-    const response = identity.thread_id === "pending"
-      ? await coordinatorEndpoint.request<any>("thread/start", { cwd: coordinatorDir, approvalPolicy: "never", sandbox: config.sandboxMode, config: configOverride, ephemeral: false })
-      : await coordinatorEndpoint.request<any>("thread/resume", { threadId: identity.thread_id, cwd: coordinatorDir, approvalPolicy: "never", sandbox: config.sandboxMode, config: configOverride });
-    const threadId = String(response.thread.id);
-    await registry.setCoordinator({ endpoint: coordinatorEndpoint.id, thread_id: threadId, project_dir: coordinatorDir });
-    runtime.setSession(coordinatorEndpoint.id, threadId, "managed", response.thread.status?.type ?? "idle");
+    const resumed = await resumeCoordinatorIdentity({
+      registry,
+      endpoint: coordinatorEndpoint,
+      legacyEndpointId: endpoint.id,
+      coordinatorDir,
+      sandboxMode: config.sandboxMode,
+      config: coordinatorTurnConfig(mcp.url, token),
+    });
+    runtime.setSession(coordinatorEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
   }
 
   async function reconcileCoordinatorAttempts(): Promise<void> {
@@ -471,8 +525,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
   }
 
-  async function reconcileOperations(): Promise<void> {
+  async function reconcileOperations(options: { includeActiveAttempt?: boolean } = {}): Promise<void> {
+    const liveAttemptId = coordinator.current()?.attemptId;
     for (const operation of operations.listRecoverable()) {
+      if (!options.includeActiveAttempt && operation.attemptId === liveAttemptId) continue;
       const args = operation.args as any;
       try {
         if (operation.kind === "send_chat_message") {
@@ -481,6 +537,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         } else if (operation.kind === "send_chat_attachment") {
           const id = `chat-attachment:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
+        } else if (operation.kind === "prepare_chat_attachment") {
+          const id = operationFileHandle(operation.contextId, operation.attemptId, operation.callId);
+          let prepared = attachments.get(operation.contextId, id);
+          if (!prepared) {
+            const ownerRoot = args.owner === "coordinator" ? coordinatorDir : sessions.managedProjectRoot(args.owner);
+            prepared = await attachments.prepareOutbound(operation.contextId, ownerRoot, args.relative_path, undefined, undefined, id);
+          }
+          operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "collect_messages") {
           const prefix = `collect:${operation.contextId}:`;
           const ids = (db.prepare("SELECT id FROM deliveries WHERE kind = 'collection' ORDER BY created_at, id").all() as Array<{ id: string }>).map((row) => row.id).filter((id) => id.startsWith(prefix));
@@ -491,38 +555,91 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
           const clientId = `${operation.contextId}:${operation.callId}`;
           const turn = history.thread.turns.find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === clientId));
-          if (turn) operations.succeed(operation.id, { nickname: args.nickname, mode: args.mode, turnId: turn.id });
+          const holdId = workerAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId);
+          if (turn) {
+            if (args.attachment_ids.length > 0) {
+              attachments.transferOperationToTurn(holdId, session.endpoint, session.thread_id, turn.id);
+              attachments.retainForTurn(session.endpoint, session.thread_id, turn.id, operation.contextId, args.attachment_ids);
+              if (isTerminalStatus(turn.status)) attachments.releaseTurn(session.endpoint, session.thread_id, turn.id);
+            }
+            operations.succeed(operation.id, { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status) });
+          } else if (args.mode === "start" && history.thread.status?.type === "idle") {
+            attachments.releaseOperation(holdId);
+            operations.fail(operation.id, { message: "thread history proves the requested start did not create a turn" });
+            operations.unbindDirective(operation.id);
+          }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {
           const session = registry.get(args.nickname);
           const settings = session ? runtime.settings(session.endpoint, session.thread_id) : {};
           if (operation.kind === "set_session_model" && settings.model === args.model) operations.succeed(operation.id, { pending: true });
           if (operation.kind === "set_reasoning_effort" && settings.effort === args.effort) operations.succeed(operation.id, { pending: true });
         } else if (["create_session", "register_session", "adopt_session"].includes(operation.kind)) {
-          const session = registry.get(args.nickname);
-          const expectedThread = args.thread_id as string | undefined;
+          let session = registry.get(args.nickname);
+          const checkpoint = operation.receipt as { endpoint?: string; threadId?: string; projectDir?: string } | undefined;
+          const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = args.project_dir ? await realpath(args.project_dir) : undefined;
-          if (session && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) operations.succeed(operation.id, { nickname: args.nickname });
+          if (!session && operation.kind === "create_session" && checkpoint?.threadId && expectedDir) {
+            await lifecycle.adopt(args.nickname, projectEndpoint(checkpoint.endpoint ?? args.endpoint), checkpoint.threadId, expectedDir);
+            session = registry.get(args.nickname);
+          }
+          if (session && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+            const native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+            await verifySessionCwd(native.thread.cwd, session.project_dir);
+            if (!runtime.getSession(session.endpoint, session.thread_id) && native.thread.status?.type === "idle") {
+              runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
+              runtime.beginEpoch(session.endpoint, session.thread_id, native.thread.turns?.at(-1)?.id, Date.now());
+            }
+            operations.succeed(operation.id, { nickname: args.nickname });
+          }
         } else if (operation.kind === "rename_session") {
           if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) operations.succeed(operation.id, { nickname: args.new_nickname });
-        } else if (["detach_session", "attach_session", "archive_session"].includes(operation.kind)) {
+        } else if (["detach_session", "attach_session"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
           const state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
-          const expected = operation.kind === "detach_session" ? "detached" : operation.kind === "attach_session" ? "managed" : "archived";
+          const expected = operation.kind === "detach_session" ? "detached" : "managed";
           if (state === expected) operations.succeed(operation.id, { nickname: args.nickname });
+        } else if (operation.kind === "archive_session") {
+          const session = registry.get(args.nickname);
+          if (!session) continue;
+          let state = runtime.getSession(session.endpoint, session.thread_id)?.managementState;
+          if (state !== "archived") {
+            const found = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, limit: 100 })).sessions.find((candidate) => candidate.id === session.thread_id);
+            if (found?.archived) {
+              runtime.endEpoch(session.endpoint, session.thread_id, Date.now());
+              runtime.setSession(session.endpoint, session.thread_id, "archived", "notLoaded");
+              state = "archived";
+            }
+          }
+          if (state === "archived") operations.succeed(operation.id, { nickname: args.nickname });
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
           const current = await sessions.getGoal(args.nickname) as any;
           const goal = current?.goal;
-          const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active"
+          const actualBudget = goal?.tokenBudget ?? goal?.token_budget ?? null;
+          let cancelInterruptProven = true;
+          if (operation.kind === "cancel_goal" && args.interrupt_active_turn) {
+            const checkpoint = operation.receipt as { turnId?: string | null } | undefined;
+            cancelInterruptProven = checkpoint !== undefined && checkpoint.turnId === null;
+            if (checkpoint?.turnId) {
+              const session = registry.get(args.nickname);
+              if (session) {
+                const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+                cancelInterruptProven = history.thread.turns.some((turn: any) => turn.id === checkpoint.turnId && isTerminalStatus(turn.status));
+              }
+            }
+          }
+          const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
-                : goal == null;
+                : goal == null && cancelInterruptProven;
           if (proven) operations.succeed(operation.id, current);
-        } else if (operation.kind === "interrupt_session" && args.turn_id) {
+        } else if (operation.kind === "interrupt_session") {
           const session = registry.get(args.nickname);
           if (!session) continue;
+          const turnId = args.turn_id ?? (operation.receipt as { turnId?: string } | undefined)?.turnId;
+          if (!turnId) continue;
           const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-          const turn = history.thread.turns.find((candidate: any) => candidate.id === args.turn_id);
-          if (turn && isTerminalStatus(turn.status)) operations.succeed(operation.id, { interrupted: true });
+          const turn = history.thread.turns.find((candidate: any) => candidate.id === turnId);
+          if (turn && isTerminalStatus(turn.status)) operations.succeed(operation.id, { interrupted: true, turnId });
         }
       } catch {
         // Leave the operation uncertain unless authoritative state proves its exact outcome.
@@ -583,6 +700,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       }
     }
     if (target.id === coordinatorEndpoint.id) {
+      schedulerAccepting = false;
       for (const [turnId, waiter] of terminalWaiters) {
         terminalWaiters.delete(turnId);
         waiter.reject(new AppError("ENDPOINT_UNAVAILABLE", "coordinator app-server became unavailable"));
@@ -626,6 +744,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       await startOrResumeCoordinator();
       await reconcileOperations();
       await reconcileCoordinatorAttempts();
+      schedulerAccepting = true;
     }
     acceptingReadyEvents = true;
     reconnectAttempts.set(target.id, 0);
@@ -647,11 +766,27 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     });
   }
 
+  function persistDeliveryState(delivery: DeliveryRecord): void {
+    if (!new Set(["confirmed", "failed", "uncertain"]).has(delivery.state)) return;
+    const id = `delivery-status:${delivery.id}:${delivery.state}`;
+    db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+      VALUES (?, 'chat', ?, 'delivery_status', ?, 'pending', ?)`)
+      .run(id, delivery.destination, JSON.stringify({
+        deliveryId: delivery.id,
+        kind: delivery.kind,
+        state: delivery.state,
+        mandatory: delivery.mandatory,
+        telegramMessageId: delivery.telegramMessageId ?? null,
+      }), Date.now());
+    if (schedulerAccepting) void enqueuePendingEvents();
+  }
+
   return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });
 
   async function runMaintenance(): Promise<void> {
     await attachments.cleanupExpired();
     discovery.cleanupExpired();
+    await reconcileOperations();
     if (coordinatorEndpoint.state === "ready") {
       await reconcileCoordinatorAttempts();
       if (!hasOrphanCoordinatorAttempt()) {
@@ -699,4 +834,20 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
     }
   }
+}
+
+export function isUncertainCoordinatorTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
+  return endpointState !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
+}
+
+function operationFileHandle(contextId: string, attemptId: string, callId: string): FileHandleId {
+  return `file_${createHash("sha256").update(`${contextId}\0${attemptId}\0${callId}`).digest("hex")}`;
+}
+
+function workerAttachmentHoldId(contextId: string, attemptId: string, callId: string): string {
+  return `worker-send:${createHash("sha256").update(`${contextId}\0${attemptId}\0${callId}`).digest("hex")}`;
+}
+
+function isProvenSendNoEffect(error: unknown): boolean {
+  return error instanceof AppError && new Set(["UNKNOWN_SESSION", "SESSION_DETACHED", "SESSION_BUSY", "SESSION_IDLE", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED"]).has(error.code);
 }

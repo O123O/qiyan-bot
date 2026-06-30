@@ -23,7 +23,9 @@ function migrate(db: Database): void {
   for (let index = current; index < migrations.length; index += 1) {
     db.exec("BEGIN IMMEDIATE");
     try {
-      db.exec(migrations[index] ?? "");
+      const migration = migrations[index];
+      if (typeof migration === "function") migration(db);
+      else db.exec(migration ?? "");
       db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(index + 1);
       db.exec("COMMIT");
     } catch (error) {

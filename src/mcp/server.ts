@@ -39,7 +39,13 @@ export class LoopbackMcpServer {
           response.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" }).end(JSON.stringify({ error: "unauthorized" }));
           return;
         }
-        if (this.options.allowedClientPid && !await requestBelongsToPid(request.socket.remotePort, request.socket.localPort, this.options.allowedClientPid())) {
+        if (this.options.allowedClientPid && !await requestBelongsToPid({
+          remoteAddress: request.socket.remoteAddress,
+          remotePort: request.socket.remotePort,
+          localAddress: request.socket.localAddress,
+          localPort: request.socket.localPort,
+          family: request.socket.remoteFamily,
+        }, this.options.allowedClientPid())) {
           response.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ error: "client process is not authorized" }));
           return;
         }
@@ -98,19 +104,34 @@ export class LoopbackMcpServer {
   }
 }
 
-async function requestBelongsToPid(remotePort: number | undefined, localPort: number | undefined, pid: number | undefined): Promise<boolean> {
-  if (!remotePort || !localPort || !pid || process.platform !== "linux") return false;
+export interface TcpConnectionTuple {
+  remoteAddress: string | undefined;
+  remotePort: number | undefined;
+  localAddress: string | undefined;
+  localPort: number | undefined;
+  family: string | undefined;
+}
+
+export function tcpConnectionInodes(table: string, connection: TcpConnectionTuple): string[] {
+  if (connection.family !== "IPv4" || !connection.remotePort || !connection.localPort) return [];
+  const sourceAddress = ipv4ProcHex(connection.remoteAddress);
+  const destinationAddress = ipv4ProcHex(connection.localAddress);
+  if (!sourceAddress || !destinationAddress) return [];
+  const source = `${sourceAddress}:${connection.remotePort.toString(16).toUpperCase().padStart(4, "0")}`;
+  const destination = `${destinationAddress}:${connection.localPort.toString(16).toUpperCase().padStart(4, "0")}`;
+  const inodes: string[] = [];
+  for (const line of table.split("\n").slice(1)) {
+    const fields = line.trim().split(/\s+/u);
+    if (fields[1] === source && fields[2] === destination && fields[3] === "01" && fields[9]) inodes.push(fields[9]);
+  }
+  return inodes;
+}
+
+async function requestBelongsToPid(connection: TcpConnectionTuple, pid: number | undefined): Promise<boolean> {
+  if (!pid || process.platform !== "linux" || connection.family !== "IPv4") return false;
   try {
-    const source = remotePort.toString(16).toUpperCase().padStart(4, "0");
-    const destination = localPort.toString(16).toUpperCase().padStart(4, "0");
-    const tables = await Promise.all(["/proc/net/tcp", "/proc/net/tcp6"].map((path) => readFile(path, "utf8").catch(() => "")));
-    const inodes = new Set<string>();
-    for (const table of tables) {
-      for (const line of table.split("\n").slice(1)) {
-        const fields = line.trim().split(/\s+/u);
-        if (fields[1]?.endsWith(`:${source}`) && fields[2]?.endsWith(`:${destination}`) && fields[9]) inodes.add(fields[9]);
-      }
-    }
+    const table = await readFile("/proc/net/tcp", "utf8").catch(() => "");
+    const inodes = new Set(tcpConnectionInodes(table, connection));
     if (inodes.size === 0) return false;
     const procEntries = await readdir("/proc");
     for (const entry of procEntries) {
@@ -125,6 +146,12 @@ async function requestBelongsToPid(remotePort: number | undefined, localPort: nu
   } catch {
     return false;
   }
+}
+
+function ipv4ProcHex(address: string | undefined): string | undefined {
+  const octets = address?.split(".").map(Number);
+  if (!octets || octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return undefined;
+  return [...octets].reverse().map((octet) => octet.toString(16).toUpperCase().padStart(2, "0")).join("");
 }
 
 async function isDescendantOrSelf(candidate: number, root: number): Promise<boolean> {

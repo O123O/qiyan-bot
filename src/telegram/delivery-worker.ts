@@ -1,6 +1,6 @@
 import { AppError } from "../core/errors.ts";
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
-import type { DeliveryStore } from "../storage/delivery-store.ts";
+import type { DeliveryRecord, DeliveryStore } from "../storage/delivery-store.ts";
 import type { ChatDeliveryAdapter } from "../chat/contracts.ts";
 
 export class DeliveryWorker {
@@ -12,6 +12,7 @@ export class DeliveryWorker {
     private readonly api: ChatDeliveryAdapter,
     private readonly attachments?: AttachmentStore,
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly onStateChange: (delivery: DeliveryRecord, error?: unknown) => Promise<void> | void = () => undefined,
   ) {}
 
   async processOne(id: string): Promise<void> {
@@ -27,6 +28,7 @@ export class DeliveryWorker {
         ? await this.sendAttachment(delivery, body)
         : await this.api.sendMessage(delivery.destination, body, delivery.replyTo);
       this.store.confirm(id, String(result.message_id));
+      await this.onStateChange(this.store.get(id)!);
     } catch (error) {
       if (isRateLimitError(error)) this.store.markPrepared(id);
       else if (isDeterministicDeliveryError(error)) this.store.fail(id);
@@ -40,6 +42,7 @@ export class DeliveryWorker {
           mandatory: true,
         });
       }
+      if (!isRateLimitError(error)) await this.onStateChange(this.store.get(id)!, error);
       throw error;
     }
   }

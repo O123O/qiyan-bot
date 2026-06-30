@@ -37,10 +37,15 @@ export class AttachmentStore {
 
   async initialize(): Promise<void> { await mkdir(this.root, { recursive: true, mode: 0o700 }); }
 
-  async ingest(scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: IngestMeta): Promise<StoredAttachment> {
+  async ingest(scopeId: string, stream: AsyncIterable<Uint8Array | string>, meta: IngestMeta, requestedId?: FileHandleId): Promise<StoredAttachment> {
     if (meta.declaredSize !== undefined && meta.declaredSize > this.options.maxFileBytes) this.invalid("declared attachment size exceeds limit");
-    const id = `file_${crypto.randomUUID()}` as FileHandleId;
+    const id = requestedId ?? `file_${crypto.randomUUID()}` as FileHandleId;
     const path = resolve(this.root, id);
+    if (requestedId) {
+      const existing = this.get(scopeId, requestedId);
+      if (existing) return existing;
+      await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+    }
     const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
     const hash = createHash("sha256");
     let size = 0;
@@ -62,11 +67,21 @@ export class AttachmentStore {
     await file.close();
     const displayName = this.sanitizeName(meta.displayName);
     const sha256 = hash.digest("hex");
-    this.db.prepare(`INSERT INTO attachments
-      (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-      .run(id, scopeId, displayName, meta.mediaType || "application/octet-stream", path, size, sha256, this.clock.now() + this.ttlMs, this.clock.now());
+    try {
+      this.db.prepare(`INSERT INTO attachments
+        (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
+        .run(id, scopeId, displayName, meta.mediaType || "application/octet-stream", path, size, sha256, this.clock.now() + this.ttlMs, this.clock.now());
+    } catch (error) {
+      await unlink(path).catch(() => undefined);
+      throw error;
+    }
     return { id, displayName, mediaType: meta.mediaType || "application/octet-stream", size, sha256 };
+  }
+
+  get(scopeId: string, id: FileHandleId): StoredAttachment | undefined {
+    const row = this.db.prepare("SELECT id, display_name, media_type, size, sha256 FROM attachments WHERE id = ? AND scope_id = ?").get(id, scopeId) as Record<string, unknown> | undefined;
+    return row ? { id: String(row.id) as FileHandleId, displayName: String(row.display_name), mediaType: String(row.media_type), size: Number(row.size), sha256: String(row.sha256) } : undefined;
   }
 
   async ingestMany(scopeId: string, parts: readonly IngestPart[], maxMessageBytes: number): Promise<StoredAttachment[]> {
@@ -116,6 +131,39 @@ export class AttachmentStore {
     });
   }
 
+  retainForOperation(holdId: string, scopeId: string, ids: readonly FileHandleId[]): void {
+    inTransaction(this.db, () => {
+      for (const id of ids) {
+        this.required(scopeId, id);
+        const inserted = this.db.prepare(`INSERT OR IGNORE INTO operation_attachment_refs
+          (hold_id, scope_id, attachment_id, created_at) VALUES (?, ?, ?, ?)`)
+          .run(holdId, scopeId, id, this.clock.now()).changes;
+        if (inserted) this.db.prepare("UPDATE attachments SET ref_count = ref_count + 1 WHERE id = ?").run(id);
+      }
+    });
+  }
+
+  transferOperationToTurn(holdId: string, endpointId: string, threadId: string, turnId: string): void {
+    inTransaction(this.db, () => {
+      const rows = this.db.prepare("SELECT scope_id, attachment_id FROM operation_attachment_refs WHERE hold_id = ?").all(holdId) as Array<{ scope_id: string; attachment_id: string }>;
+      for (const row of rows) {
+        const inserted = this.db.prepare(`INSERT OR IGNORE INTO turn_attachment_refs
+          (endpoint_id, thread_id, turn_id, scope_id, attachment_id) VALUES (?, ?, ?, ?, ?)`)
+          .run(endpointId, threadId, turnId, row.scope_id, row.attachment_id).changes;
+        if (!inserted) this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(row.attachment_id);
+      }
+      this.db.prepare("DELETE FROM operation_attachment_refs WHERE hold_id = ?").run(holdId);
+    });
+  }
+
+  releaseOperation(holdId: string): void {
+    inTransaction(this.db, () => {
+      const rows = this.db.prepare("SELECT attachment_id FROM operation_attachment_refs WHERE hold_id = ?").all(holdId) as Array<{ attachment_id: string }>;
+      for (const row of rows) this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(row.attachment_id);
+      this.db.prepare("DELETE FROM operation_attachment_refs WHERE hold_id = ?").run(holdId);
+    });
+  }
+
   releaseTurn(endpointId: string, threadId: string, turnId: string): void {
     inTransaction(this.db, () => {
       const rows = this.db.prepare("SELECT attachment_id FROM turn_attachment_refs WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?")
@@ -134,12 +182,16 @@ export class AttachmentStore {
     return rows.length;
   }
 
-  async prepareOutbound(scopeId: string, ownerRoot: string, relativePath: string, displayName = basename(relativePath), mediaType = "application/octet-stream"): Promise<StoredAttachment> {
+  async prepareOutbound(scopeId: string, ownerRoot: string, relativePath: string, displayName = basename(relativePath), mediaType = "application/octet-stream", requestedId?: FileHandleId): Promise<StoredAttachment> {
     if (process.platform !== "linux") this.invalid("race-safe outbound attachments require Linux");
     if (isAbsolute(relativePath) || relativePath.split(/[\\/]+/u).includes("..")) this.invalid("outbound path must remain below the project root");
     const canonicalRoot = await realpath(ownerRoot);
     const candidate = resolve(canonicalRoot, relativePath);
     if (!this.isWithin(canonicalRoot, candidate)) this.invalid("outbound path escapes the project root");
+    if (requestedId) {
+      const existing = this.get(scopeId, requestedId);
+      if (existing) return existing;
+    }
     let source: FileHandle;
     try { source = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW); }
     catch { return this.invalid("outbound path must be a non-symlink file"); }
@@ -149,7 +201,7 @@ export class AttachmentStore {
       if (stat.size > this.options.maxFileBytes) this.invalid("outbound file exceeds limit");
       const actual = await realpath(`/proc/self/fd/${source.fd}`);
       if (!this.isWithin(canonicalRoot, actual)) this.invalid("opened file escapes the project root");
-      return await this.ingest(scopeId, source.createReadStream({ autoClose: false }), { displayName, mediaType, declaredSize: stat.size });
+      return await this.ingest(scopeId, source.createReadStream({ autoClose: false }), { displayName, mediaType, declaredSize: stat.size }, requestedId);
     } finally {
       await source.close().catch(() => undefined);
     }

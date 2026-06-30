@@ -3,7 +3,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { TOOL_NAMES, createCoordinatorTools } from "../../src/coordinator/tools.ts";
-import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer } from "../../src/mcp/server.ts";
+import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -54,6 +54,21 @@ test("a bearer token alone is rejected outside the authorized process tree", asy
   const server = new LoopbackMcpServer(tools, { current: () => undefined }, { host: "127.0.0.1", port: 0, token: "secret", allowedClientPid: () => -1 });
   await server.start(); t.after(() => server.stop());
   assert.equal((await fetch(server.url, { method: "POST", headers: { authorization: "Bearer secret" }, body: "{}" })).status, 403);
+});
+
+test("client socket lookup matches the complete IPv4 tuple instead of only its ports", () => {
+  const table = `
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:C350 0100007F:1234 01 00000000:00000000 00:00000000 00000000 1000 0 11111 1
+   1: 0200007F:C350 0100007F:1234 01 00000000:00000000 00:00000000 00000000 1000 0 22222 1
+  `;
+  assert.deepEqual(tcpConnectionInodes(table, {
+    remoteAddress: "127.0.0.2",
+    remotePort: 0xc350,
+    localAddress: "127.0.0.1",
+    localPort: 0x1234,
+    family: "IPv4",
+  }), ["22222"]);
 });
 
 test("child environment keeps Codex auth but strips Telegram secrets and hides the MCP token from shells", () => {
