@@ -110,8 +110,9 @@ export class SessionLifecycle {
     });
   }
 
-  async reconcileStartup(): Promise<void> {
+  async reconcileStartup(only?: { endpointId: string; threadId: string }): Promise<void> {
     for (const entry of this.runtime.listSessions()) {
+      if (only && (entry.endpointId !== only.endpointId || entry.threadId !== only.threadId)) continue;
       if (entry.managementState === "detaching") {
         await this.pool.request(entry.endpointId, "thread/unsubscribe", { threadId: entry.threadId });
         this.runtime.endEpoch(entry.endpointId, entry.threadId, this.clock.now());

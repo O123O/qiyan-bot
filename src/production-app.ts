@@ -69,6 +69,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let endpointIncident = 0;
   let stopping = false;
   let registryInvalid = false;
+  let operationReconciliationTail: Promise<void> = Promise.resolve();
 
   const phases: AppPhase[] = [
     {
@@ -225,6 +226,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       send_to_session: async (args, context) => {
         const worker = registry.get(args.nickname);
         if (!worker) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
+        if (args.mode === "steer") context.checkpoint({ turnId: sessions.activeTurnId(args.nickname) });
         const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.sourceContextId, id));
         const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
         const holdId = workerAttachmentHoldId(context.sourceContextId, context.attemptId, context.callId);
@@ -526,7 +528,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
   }
 
-  async function reconcileOperations(options: { includeActiveAttempt?: boolean } = {}): Promise<void> {
+  function reconcileOperations(options: { includeActiveAttempt?: boolean } = {}): Promise<void> {
+    const run = operationReconciliationTail.then(
+      () => reconcileOperationsOnce(options),
+      () => reconcileOperationsOnce(options),
+    );
+    operationReconciliationTail = run.catch(() => undefined);
+    return run;
+  }
+
+  async function reconcileOperationsOnce(options: { includeActiveAttempt?: boolean }): Promise<void> {
     const liveAttemptId = coordinator.current()?.attemptId;
     for (const operation of operations.listRecoverable()) {
       if (!options.includeActiveAttempt && operation.attemptId === liveAttemptId) continue;
@@ -568,6 +579,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
             attachments.releaseOperation(holdId);
             operations.fail(operation.id, { message: "thread history proves the requested start did not create a turn" });
             operations.unbindDirective(operation.id);
+          } else if (args.mode === "steer") {
+            const targetTurnId = (operation.receipt as { turnId?: string } | undefined)?.turnId;
+            const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
+            if (target && isTerminalStatus(target.status)) {
+              attachments.releaseOperation(holdId);
+              operations.fail(operation.id, { message: "terminal target history proves the requested steer was not appended" });
+              operations.unbindDirective(operation.id);
+            }
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {
           const session = registry.get(args.nickname);
@@ -596,7 +615,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) operations.succeed(operation.id, { nickname: args.new_nickname });
         } else if (["detach_session", "attach_session"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
-          const state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
+          let state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
+          if (state === "detaching" || state === "attaching") {
+            await lifecycle.reconcileStartup({ endpointId: session!.endpoint, threadId: session!.thread_id });
+            state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
+          }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
           if (state === expected) operations.succeed(operation.id, { nickname: args.nickname });
         } else if (operation.kind === "archive_session") {
@@ -604,7 +627,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           if (!session) continue;
           let state = runtime.getSession(session.endpoint, session.thread_id)?.managementState;
           if (state !== "archived") {
-            const found = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, limit: 100 })).sessions.find((candidate) => candidate.id === session.thread_id);
+            const found = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, search: session.thread_id, limit: 1 })).sessions.find((candidate) => candidate.id === session.thread_id);
             if (found?.archived) {
               runtime.endEpoch(session.endpoint, session.thread_id, Date.now());
               runtime.setSession(session.endpoint, session.thread_id, "archived", "notLoaded");
