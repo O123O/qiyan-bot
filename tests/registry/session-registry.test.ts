@@ -46,3 +46,10 @@ test("concurrent writes preserve both unique registrations", async () => {
   ]);
   assert.deepEqual(Object.keys(registry.snapshot().sessions).sort(), ["one", "two"]);
 });
+
+test("updates the coordinator identity atomically after first app-server start", async () => {
+  const { dir, path, registry } = await fixture();
+  await registry.setCoordinator({ endpoint: "local", thread_id: "real-coordinator", project_dir: dir });
+  assert.equal(registry.snapshot().coordinator.thread_id, "real-coordinator");
+  assert.equal(JSON.parse(await readFile(path, "utf8")).coordinator.thread_id, "real-coordinator");
+});

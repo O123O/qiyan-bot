@@ -58,3 +58,8 @@ test("collection sorts by completion, turn id, and item order", () => {
   assert.deepEqual(store.list("local", "thread", 3).map((message) => `${message.turnId}:${message.itemOrder}`), ["a:2", "b:1", "b:2"]);
 });
 
+test("reads a logical message by its opaque persisted id", () => {
+  const store = new FinalMessageStore(createTestDatabase());
+  const [message] = store.persistTerminalTurn("local", "thread", turn(), 0);
+  assert.equal(store.getById(message!.id)?.body, "first");
+});

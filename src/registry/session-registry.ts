@@ -88,6 +88,12 @@ export class SessionRegistry {
     });
   }
 
+  async setCoordinator(session: RegistrySession): Promise<void> {
+    await this.lock(async () => {
+      await this.replace({ ...this.document, coordinator: await canonicalSession(session) });
+    });
+  }
+
   async rename(oldNickname: string, newNickname: string): Promise<void> {
     await this.lock(async () => {
       const session = this.document.sessions[oldNickname];

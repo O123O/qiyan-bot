@@ -1,6 +1,7 @@
 import type { Database } from "../storage/database.ts";
 
 export interface LogicalFinalMessage {
+  id: string;
   endpointId: string;
   threadId: string;
   turnId: string;
@@ -52,6 +53,11 @@ export class FinalMessageStore {
     return row ? this.fromRow(row) : undefined;
   }
 
+  getById(id: string): LogicalFinalMessage | undefined {
+    const row = this.db.prepare("SELECT * FROM logical_final_messages WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? this.fromRow(row) : undefined;
+  }
+
   private observedAt(endpointId: string, threadId: string, turnId: string, value: number): number {
     this.db.prepare("INSERT OR IGNORE INTO terminal_turn_observations(endpoint_id, thread_id, turn_id, observed_at) VALUES (?, ?, ?, ?)")
       .run(endpointId, threadId, turnId, value);
@@ -66,6 +72,7 @@ export class FinalMessageStore {
 
   private fromRow(row: Record<string, unknown>): LogicalFinalMessage {
     return {
+      id: String(row.id),
       endpointId: String(row.endpoint_id), threadId: String(row.thread_id), turnId: String(row.turn_id), itemId: String(row.item_id),
       completedAt: Number(row.completed_at), itemOrder: Number(row.item_order), body: String(row.body), terminalStatus: String(row.terminal_status),
     };
