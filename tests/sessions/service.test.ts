@@ -116,6 +116,19 @@ test("collect returns coordinator bodies or creates chronological direct deliver
   await assert.rejects(service.collect("payments", 21), RangeError);
 });
 
+test("direct collection recovery fills a frozen partial selection and accepts an empty window", async () => {
+  const { finals, deliveries, service } = await fixture();
+  const one = finals.persistTerminalTurn("local", "thread", { id: "one", status: "completed", completedAt: 1, items: [{ type: "agentMessage", id: "i1", text: "one", phase: "final_answer" }] }, 1)[0]!;
+  const two = finals.persistTerminalTurn("local", "thread", { id: "two", status: "completed", completedAt: 2, items: [{ type: "agentMessage", id: "i2", text: "two", phase: "final_answer" }] }, 2)[0]!;
+  const three = finals.persistTerminalTurn("local", "thread", { id: "three", status: "completed", completedAt: 3, items: [{ type: "agentMessage", id: "i3", text: "three", phase: "final_answer" }] }, 3)[0]!;
+  const selected = [one.id, two.id, three.id];
+  await service.collectSelected("payments", selected.slice(0, 1), { destination: "chat", deliveryKey: "frozen" });
+  const recovered = await service.collectSelected("payments", selected, { destination: "chat", deliveryKey: "frozen" });
+  assert.equal(recovered.length, 3);
+  assert.equal(deliveries.listReady().filter((delivery) => delivery.kind === "collection").length, 3);
+  assert.deepEqual(await service.collectSelected("payments", [], { destination: "chat", deliveryKey: "empty" }), []);
+});
+
 test("goal operations replace, pause, resume and cancel without exposing completion", async () => {
   const { endpoint, service } = await fixture();
   await service.setGoal("payments", "ship it", 1_000);

@@ -16,6 +16,7 @@ import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
 import { createCoordinatorTools, type CoordinatorToolName } from "./coordinator/tools.ts";
 import { EventRelay } from "./events/relay.ts";
+import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, secureShellConfig } from "./mcp/server.ts";
 import { SessionRegistry, type RegistryDocument } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
@@ -69,6 +70,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let endpointIncident = 0;
   let stopping = false;
   let registryInvalid = false;
+  let endpointsCommitted = false;
   let operationReconciliationTail: Promise<void> = Promise.resolve();
 
   const phases: AppPhase[] = [
@@ -137,16 +139,23 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "endpoint",
       start: async () => {
         stopping = false;
-        await endpoint.start();
+        endpointsCommitted = false;
         try {
+          await endpoint.start();
           await coordinatorEndpoint.start();
+          if (endpoint.state !== "ready" || coordinatorEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          endpointsCommitted = true;
         } catch (error) {
-          await endpoint.stop().catch(() => undefined);
+          stopping = true;
+          for (const timer of reconnectTimers.values()) clearTimeout(timer);
+          reconnectTimers.clear();
+          await Promise.all([coordinatorEndpoint.stop(), endpoint.stop()]).catch(() => undefined);
           throw error;
         }
       },
       stop: async () => {
         stopping = true;
+        endpointsCommitted = false;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
         await Promise.all([coordinatorEndpoint.stop(), endpoint.stop()]);
@@ -158,7 +167,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         await lifecycle.reconcileStartup();
         await resumeManagedSessions();
         await relay.reconcileEndpoint(endpoint.id);
-        for (const recovered of deliveries.recoverAfterCrash()) persistDeliveryState(recovered);
+        deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
         acceptingReadyEvents = true;
       }, stop: async () => { acceptingReadyEvents = false; },
@@ -257,7 +266,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         return message;
       },
       collect_messages: async (args, context) => args.direct
-        ? sessions.collect(args.nickname, args.count, { direct: true, destination: String(config.telegramDestinationChatId), deliveryKey: context.sourceContextId })
+        ? sessions.collect(args.nickname, args.count, {
+          direct: true,
+          destination: String(config.telegramDestinationChatId),
+          deliveryKey: context.sourceContextId,
+          onSelected: (messageIds) => context.checkpoint({ messageIds }),
+        })
         : sessions.collect(args.nickname, args.count),
       interrupt_session: async (args, context) => {
         const turnId = args.turn_id ?? sessions.activeTurnId(args.nickname);
@@ -546,9 +560,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         if (operation.kind === "send_chat_message") {
           const id = `chat:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
+          else failRecoveredNoEffect(operation.id, "chat delivery intent was not committed");
         } else if (operation.kind === "send_chat_attachment") {
           const id = `chat-attachment:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
+          else failRecoveredNoEffect(operation.id, "attachment delivery intent was not committed");
         } else if (operation.kind === "prepare_chat_attachment") {
           const id = operationFileHandle(operation.contextId, operation.attemptId, operation.callId);
           let prepared = attachments.get(operation.contextId, id);
@@ -558,9 +574,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           }
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "collect_messages") {
-          const prefix = `collect:${operation.contextId}:`;
-          const ids = (db.prepare("SELECT id FROM deliveries WHERE kind = 'collection' ORDER BY created_at, id").all() as Array<{ id: string }>).map((row) => row.id).filter((id) => id.startsWith(prefix));
-          if (ids.length > 0) operations.succeed(operation.id, { deliveries: ids, count: args.count, nickname: args.nickname });
+          const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
+          const result = Array.isArray(checkpoint?.messageIds)
+            ? await sessions.collectSelected(args.nickname, checkpoint.messageIds, { destination: String(config.telegramDestinationChatId), deliveryKey: operation.contextId })
+            : await sessions.collect(args.nickname, args.count, { direct: true, destination: String(config.telegramDestinationChatId), deliveryKey: operation.contextId });
+          operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
         } else if (operation.kind === "send_to_session") {
           const session = registry.get(args.nickname);
           if (!session) continue;
@@ -591,8 +609,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {
           const session = registry.get(args.nickname);
           const settings = session ? runtime.settings(session.endpoint, session.thread_id) : {};
-          if (operation.kind === "set_session_model" && settings.model === args.model) operations.succeed(operation.id, { pending: true });
-          if (operation.kind === "set_reasoning_effort" && settings.effort === args.effort) operations.succeed(operation.id, { pending: true });
+          const proven = operation.kind === "set_session_model" ? settings.model === args.model : settings.effort === args.effort;
+          if (proven) operations.succeed(operation.id, { pending: true });
+          else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "register_session", "adopt_session"].includes(operation.kind)) {
           let session = registry.get(args.nickname);
           const checkpoint = operation.receipt as { endpoint?: string; threadId?: string; projectDir?: string } | undefined;
@@ -610,9 +629,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
               runtime.beginEpoch(session.endpoint, session.thread_id, native.thread.turns?.at(-1)?.id, Date.now());
             }
             operations.succeed(operation.id, { nickname: args.nickname });
+          } else if (!session && operation.kind !== "create_session") {
+            failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
           }
         } else if (operation.kind === "rename_session") {
           if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) operations.succeed(operation.id, { nickname: args.new_nickname });
+          else if (registry.get(args.old_nickname) && !registry.get(args.new_nickname)) failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
         } else if (["detach_session", "attach_session"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
           let state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
@@ -622,19 +644,24 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
           if (state === expected) operations.succeed(operation.id, { nickname: args.nickname });
+          else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && (state === "detached" || state === "unavailable"))) {
+            failRecoveredNoEffect(operation.id, `durable ${operation.kind === "detach_session" ? "detaching" : "attaching"} marker was not committed`);
+          }
         } else if (operation.kind === "archive_session") {
           const session = registry.get(args.nickname);
           if (!session) continue;
           let state = runtime.getSession(session.endpoint, session.thread_id)?.managementState;
+          let discovered: { archived: boolean } | undefined;
           if (state !== "archived") {
-            const found = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, search: session.thread_id, limit: 1 })).sessions.find((candidate) => candidate.id === session.thread_id);
-            if (found?.archived) {
+            discovered = (await discovery.list({ endpointId: session.endpoint, cwd: session.project_dir, search: session.thread_id, limit: 1 })).sessions.find((candidate) => candidate.id === session.thread_id);
+            if (discovered?.archived) {
               runtime.endEpoch(session.endpoint, session.thread_id, Date.now());
               runtime.setSession(session.endpoint, session.thread_id, "archived", "notLoaded");
               state = "archived";
             }
           }
           if (state === "archived") operations.succeed(operation.id, { nickname: args.nickname });
+          else if (discovered && !discovered.archived) failRecoveredNoEffect(operation.id, "thread archive was not committed");
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
           const current = await sessions.getGoal(args.nickname) as any;
           const goal = current?.goal;
@@ -714,7 +741,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   }
 
   async function handleEndpointUnavailable(target: LocalEndpoint): Promise<void> {
-    if (stopping) return;
+    if (stopping || !endpointsCommitted) return;
     endpointIncident += 1;
     acceptingReadyEvents = false;
     pool.markEndpointUnavailable(target.id);
@@ -790,27 +817,19 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     });
   }
 
-  function persistDeliveryState(delivery: DeliveryRecord): void {
-    if (!new Set(["confirmed", "failed", "uncertain"]).has(delivery.state)) return;
-    const id = `delivery-status:${delivery.id}:${delivery.state}`;
-    db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
-      VALUES (?, 'chat', ?, 'delivery_status', ?, 'pending', ?)`)
-      .run(id, delivery.destination, JSON.stringify({
-        deliveryId: delivery.id,
-        kind: delivery.kind,
-        state: delivery.state,
-        mandatory: delivery.mandatory,
-        telegramMessageId: delivery.telegramMessageId ?? null,
-      }), Date.now());
-    if (schedulerAccepting) void enqueuePendingEvents();
+  function persistDeliveryState(delivery: DeliveryRecord, schedule = true): boolean {
+    const inserted = persistDeliveryStateEvent(db, delivery);
+    if (inserted && schedule && schedulerAccepting) void enqueuePendingEvents();
+    return inserted;
   }
 
   function reconcileDeliveryEvents(): void {
-    const rows = db.prepare("SELECT id FROM deliveries WHERE state IN ('confirmed', 'failed', 'uncertain') ORDER BY created_at, id").all() as Array<{ id: string }>;
-    for (const row of rows) {
-      const delivery = deliveries.get(row.id);
-      if (delivery) persistDeliveryState(delivery);
-    }
+    if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) void enqueuePendingEvents();
+  }
+
+  function failRecoveredNoEffect(operationId: string, message: string): void {
+    operations.fail(operationId, { message });
+    operations.unbindDirective(operationId);
   }
 
   return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });
