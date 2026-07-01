@@ -60,6 +60,10 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.deepEqual(new Set(catalogued), new Set(TOOL_NAMES));
 
   assert.match(policy, /worker final messages are automatically delivered/iu);
+  assert.match(policy, /do not repeat, paraphrase, acknowledge, or announce an automatically delivered result/iu);
+  assert.match(policy, /read a worker body only when the user asks, a supervision decision needs it, or compacted context must be recovered/iu);
+  assert.match(policy, /for monitoring.*follow up until the requested outcome is genuinely resolved/isu);
+  assert.match(policy, /worker notification wakes you.*does not itself justify another user message/isu);
   assert.match(policy, /ask when more than one target remains plausible/iu);
   assert.match(policy, /never silently repoint a nickname/iu);
   assert.match(policy, /state change happened only when its tool receipt proves it/iu);
