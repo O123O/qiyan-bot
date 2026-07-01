@@ -20,7 +20,6 @@ test("safe login prepares the profile and spawns device auth without bot secrets
   const root = await mkdtemp(join(tmpdir(), "codex-bot-login-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const dataDir = join(root, "data");
-  await mkdir(dataDir);
   const child = new FakeChild();
   let call: { command: string; args: readonly string[]; options: Record<string, unknown> } | undefined;
   const completion = runCoordinatorLogin({ dataDir, codexBinary: "/opt/codex" }, {

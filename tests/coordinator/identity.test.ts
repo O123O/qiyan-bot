@@ -212,6 +212,41 @@ test("pending receipt resumes only exact durable provenance", async () => {
   assert.equal(cleared, "receipt-thread");
 });
 
+test("a resume failure preserves an already-proven durable pending receipt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "coordinator-receipt-resume-failure-"));
+  const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
+    version: 1, coordinator: { endpoint: "coordinator-local", thread_id: "pending", project_dir: dir }, sessions: {},
+  });
+  const failure = new JsonRpcResponseError(-32600, "thread not loaded: receipt-thread");
+  const endpoint = {
+    id: "coordinator-local",
+    request: async <T>(method: string) => {
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: "receipt-thread",
+            cwd: dir,
+            threadSource: "bot-nonce",
+            name: "codex-bot-coordinator:bot-nonce",
+            status: { type: "idle" },
+          },
+        } as T;
+      }
+      if (method === "thread/resume") throw failure;
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+  let cleared = false;
+  await assert.rejects(resumeCoordinatorIdentity({
+    registry, endpoint, legacyEndpointId: "local", coordinatorDir: dir, sandboxMode: "workspace-write", config: {},
+    creationNonce: "bot-nonce", pendingThreadId: "receipt-thread",
+    recordPendingThread: async () => { throw new Error("must not record"); },
+    clearPendingThread: async () => { cleared = true; },
+  }), (error: unknown) => error === failure);
+  assert.equal(cleared, false);
+  assert.equal(registry.snapshot().coordinator.thread_id, "pending");
+});
+
 test("registered identity clears a matching stale creation receipt after verified resume", async () => {
   const dir = await mkdtemp(join(tmpdir(), "coordinator-stale-receipt-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {

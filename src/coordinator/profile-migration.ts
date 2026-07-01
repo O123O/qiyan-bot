@@ -32,7 +32,7 @@ export async function recoverCoordinatorProfileAttempts(input: {
   for (const original of active) {
     let turnId = original.turnId;
     let turn = turnId.startsWith("pending:")
-      ? turns.find((candidate) => candidate.items.some((item) => item.type === "userMessage" && item.clientId === original.contextId))
+      ? [...turns].reverse().find((candidate) => candidate.items.some((item) => item.type === "userMessage" && item.clientId === original.contextId))
       : turns.find((candidate) => candidate.id === turnId);
     if (turn && turnId.startsWith("pending:")) {
       input.runtime.bindTurn(original.attemptId, turn.id);

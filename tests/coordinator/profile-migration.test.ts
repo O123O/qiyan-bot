@@ -77,3 +77,30 @@ test("legacy migration verifies thread identity and cwd before changing attempts
     assert.equal(operations.getSourceContext(mismatch)?.state, "active");
   }
 });
+
+test("legacy migration binds a provisional attempt to the newest matching client id", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "repeated", kind: "telegram", sourceId: "repeated", rawText: "repeated", attachmentIds: [] });
+  const runtime = new CoordinatorRuntime(db, operations, new DeliveryStore(db), { destination: "42" });
+  runtime.prepareAttempt("repeated", "attempt-repeated", "user");
+  const coordinatorDir = await mkdtemp(join(tmpdir(), "coordinator-legacy-repeated-"));
+  const completed: string[] = [];
+  await recoverCoordinatorProfileAttempts({
+    runtime,
+    legacyThreadId: "old-coordinator",
+    coordinatorDir,
+    readLegacyThread: async () => ({
+      id: "old-coordinator",
+      cwd: coordinatorDir,
+      turns: [
+        { id: "old-failed", status: "failed", items: [{ type: "userMessage", clientId: "repeated" }] },
+        { id: "new-completed", status: "completed", items: [{ type: "userMessage", clientId: "repeated" }] },
+      ],
+    }),
+    reconcileOperations: async () => {},
+    completeTurn: async (turn) => { completed.push(turn.id); runtime.handleTerminal(turn.id, "done"); },
+  });
+  assert.deepEqual(completed, ["new-completed"]);
+  assert.equal(operations.getSourceContext("repeated")?.state, "completed");
+});

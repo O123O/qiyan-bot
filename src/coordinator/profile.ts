@@ -32,6 +32,7 @@ export interface PreparedCoordinatorProfile {
 
 export async function prepareCoordinatorProfile(dataRoot: string): Promise<PreparedCoordinatorProfile> {
   try {
+    await mkdir(dataRoot, { recursive: true, mode: 0o700 });
     const canonicalDataRoot = await realpath(dataRoot);
     const root = await ensurePrivateDirectory(join(canonicalDataRoot, "coordinator-profile"));
     const home = await ensurePrivateDirectory(join(root, "home"));
@@ -169,14 +170,14 @@ async function writeMarker(path: string, marker: MarkerDocument): Promise<void> 
 
 async function atomicWrite(path: string, contents: Uint8Array): Promise<void> {
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
-  const file = await open(temporary, "wx", 0o600);
   try {
-    await file.writeFile(contents);
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  try {
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      await file.writeFile(contents);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
     await rename(temporary, path);
     const directory = await open(dirname(path), "r");
     try { await directory.sync(); } finally { await directory.close(); }

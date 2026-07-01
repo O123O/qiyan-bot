@@ -86,17 +86,20 @@ async function createOrRecoverPendingThread(
   creation: { nonce: string; name: string; record(threadId: string): Promise<void>; clear(threadId: string): Promise<void> },
 ): Promise<ThreadResponse> {
   if (input.pendingThreadId) {
+    let read: ThreadResponse | undefined;
     try {
-      const read = await input.endpoint.request<ThreadResponse>("thread/read", { threadId: input.pendingThreadId, includeTurns: false });
+      read = await input.endpoint.request<ThreadResponse>("thread/read", { threadId: input.pendingThreadId, includeTurns: false });
+    } catch (error) {
+      if (!isExactThreadNotLoaded(error, input.pendingThreadId)) throw error;
+      await creation.clear(input.pendingThreadId);
+    }
+    if (read) {
       await verifyThread(read.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
       const resumed = await input.endpoint.request<ThreadResponse>("thread/resume", {
         threadId: input.pendingThreadId, cwd: input.coordinatorDir, approvalPolicy: "never", sandbox: input.sandboxMode, config: input.config,
       });
       await verifyThread(resumed.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
       return resumed;
-    } catch (error) {
-      if (!isExactThreadNotLoaded(error, input.pendingThreadId)) throw error;
-      await creation.clear(input.pendingThreadId);
     }
   }
 
