@@ -18,7 +18,7 @@ class RelayEndpoint implements AppServerEndpoint {
   async request<T>(): Promise<T> { return { thread: { turns: this.turns } } as T; }
 }
 
-async function fixture() {
+async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "relay-")));
   const db = createTestDatabase();
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
@@ -30,13 +30,32 @@ async function fixture() {
   runtime.setSession("local", "worker", "managed", "idle");
   runtime.beginEpoch("local", "worker", "baseline", 1);
   const deliveries = new DeliveryStore(db);
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { destination: "42", clock: { now: () => 100 } });
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { destination: "42", clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
   return { db, endpoint, runtime, deliveries, relay };
 }
 
 function terminal(id = "turn-1", status = "completed", text = "done") {
-  return { id, status, completedAt: 10, items: text ? [{ type: "agentMessage", id: `${id}-final`, text, phase: "final_answer" }] : [] };
+  return { id, status, startedAt: 5, completedAt: 10, items: text ? [{ type: "agentMessage", id: `${id}-final`, text, phase: "final_answer" }] : [] };
 }
+
+test("reports terminal metadata after final persistence without copying the body", async () => {
+  const observed: any[] = [];
+  const { db, relay } = await fixture((event) => {
+    assert.ok(db.prepare("SELECT id FROM logical_final_messages WHERE id = ?").get(event.finalMessageId));
+    observed.push(event);
+  });
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
+  assert.deepEqual(observed, [{
+    endpointId: "local",
+    threadId: "worker",
+    turnId: "turn-1",
+    status: "completed",
+    startedAt: 5,
+    completedAt: 10,
+    finalMessageId: "final:local:worker:turn-1:turn-1-final",
+  }]);
+  assert.equal(JSON.stringify(observed).includes("done"), false);
+});
 
 test("managed worker finals create automatic delivery and metadata-only coordinator event exactly once", async () => {
   const { db, deliveries, relay } = await fixture();

@@ -75,3 +75,19 @@ test("failing an operation and releasing its directive are one transaction", () 
   assert.equal(store.get(operation.id)?.state, "failed");
   assert.equal(store.replayDirective("ctx", "pass", { content: "exact" }), undefined);
 });
+
+test("operations receive a monotonic order even when creation timestamps tie", () => {
+  const originalNow = Date.now;
+  Date.now = () => 1_000;
+  try {
+    const store = new OperationStore(createTestDatabase());
+    const first = store.prepare({ contextId: "ctx", attemptId: "a", callId: "one", kind: "send", args: {} });
+    const second = store.prepare({ contextId: "ctx", attemptId: "a", callId: "two", kind: "send", args: {} });
+    assert.equal(first.createdAt, 1_000);
+    assert.equal(second.createdAt, 1_000);
+    assert.ok(second.sequence > first.sequence);
+    assert.equal(store.get(first.id)?.sequence, first.sequence);
+  } finally {
+    Date.now = originalNow;
+  }
+});

@@ -6,7 +6,7 @@ import type { OperationRecord, OperationStore } from "../storage/operation-store
 
 export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
-export interface ToolActionContext extends ToolCallContext { operationId: string; checkpoint(receipt: unknown): void }
+export interface ToolActionContext extends ToolCallContext { operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
 const nickname = z.string().min(1);
 export const COORDINATOR_TOOL_SCHEMAS = {
@@ -29,6 +29,12 @@ export const COORDINATOR_TOOL_SCHEMAS = {
   set_goal: z.object({ nickname, objective: z.string().min(1), token_budget: z.number().int().positive().optional() }).strict(),
   pause_goal: z.object({ nickname }).strict(), resume_goal: z.object({ nickname }).strict(),
   cancel_goal: z.object({ nickname, interrupt_active_turn: z.boolean().optional() }).strict(),
+  update_session_notes: z.object({
+    nickname,
+    project_summary: z.string().max(4_000).nullable().optional(),
+    supervision_objective: z.string().max(4_000).nullable().optional(),
+    pending_follow_up: z.string().max(4_000).nullable().optional(),
+  }).strict().refine((value) => Object.keys(value).some((key) => key !== "nickname"), "at least one manager note field is required"),
   send_chat_message: z.object({ content: z.string(), reply_to: z.number().int().optional() }).strict(),
   prepare_chat_attachment: z.object({ owner: z.string().min(1), relative_path: z.string().min(1) }).strict(),
   send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional(), reply_to: z.number().int().optional() }).strict(),
@@ -86,6 +92,8 @@ export function createCoordinatorTools(
         const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, {
           ...context,
           operationId: operation.id,
+          operationCreatedAt: operation.createdAt,
+          operationSequence: operation.sequence,
           checkpoint: (receipt) => operations.checkpoint(operation!.id, receipt),
         });
         const receipt = directive?.kind === "pass"

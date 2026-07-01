@@ -23,6 +23,12 @@ test("a version-1 database upgrades delivery attachment and reply columns", asyn
       model TEXT, effort TEXT, active_turn_id TEXT, last_error TEXT,
       PRIMARY KEY(endpoint_id, thread_id)
     );
+    CREATE TABLE operations (
+      id TEXT PRIMARY KEY, context_id TEXT NOT NULL, attempt_id TEXT NOT NULL, call_id TEXT NOT NULL,
+      kind TEXT NOT NULL, args_hash TEXT NOT NULL, args_json TEXT NOT NULL, state TEXT NOT NULL,
+      receipt_json TEXT, error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      UNIQUE(context_id, attempt_id, call_id, kind)
+    );
   `);
   old.close();
 
@@ -31,7 +37,7 @@ test("a version-1 database upgrades delivery attachment and reply columns", asyn
   assert.ok(columns.includes("attachment_id"));
   assert.ok(columns.includes("attachment_scope_id"));
   assert.ok(columns.includes("reply_to"));
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 6);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 7);
   assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'turn_attachment_refs'").get());
   assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'operation_attachment_refs'").get());
   assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'session_dashboard_facts'").get());
@@ -59,9 +65,15 @@ test("a newer version-1 database with delivery columns upgrades idempotently", a
       model TEXT, effort TEXT, active_turn_id TEXT, last_error TEXT,
       PRIMARY KEY(endpoint_id, thread_id)
     );
+    CREATE TABLE operations (
+      id TEXT PRIMARY KEY, context_id TEXT NOT NULL, attempt_id TEXT NOT NULL, call_id TEXT NOT NULL,
+      kind TEXT NOT NULL, args_hash TEXT NOT NULL, args_json TEXT NOT NULL, state TEXT NOT NULL,
+      receipt_json TEXT, error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      UNIQUE(context_id, attempt_id, call_id, kind)
+    );
   `);
   old.close();
   const upgraded = openDatabase(path);
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 6);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 7);
   upgraded.close();
 });

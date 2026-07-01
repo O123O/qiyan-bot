@@ -15,6 +15,7 @@ import { SessionDashboard } from "./coordinator/session-dashboard.ts";
 import { resumeCoordinatorIdentity } from "./coordinator/identity.ts";
 import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { CoordinatorScheduler, type CoordinatorJob } from "./coordinator/scheduler.ts";
+import { SessionObservationProcessor } from "./coordinator/session-observer.ts";
 import { createCoordinatorTools, type CoordinatorToolName } from "./coordinator/tools.ts";
 import { prepareCoordinatorWorkspace } from "./coordinator/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
@@ -47,6 +48,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
   let dashboard!: SessionDashboard;
+  let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
   let operations!: OperationStore;
   let deliveries!: DeliveryStore;
@@ -158,16 +160,38 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         discovery = new SessionDiscovery(db, pool);
         lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.sandboxMode });
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
-        relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, { destination: String(config.telegramDestinationChatId), clock: { now: () => Date.now() } }, attachments);
+        observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
+          now: () => Date.now(),
+          readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
+          readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
+          onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
+          onError: () => recordBackgroundFailure("session observation"),
+        });
+        relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, {
+          destination: String(config.telegramDestinationChatId),
+          clock: { now: () => Date.now() },
+          onTerminal: (event) => observations.observeTerminal(event),
+        }, attachments);
         scheduler = new CoordinatorScheduler(runCoordinatorJob, { onError: handleSchedulerFailure });
-        unsubscribers.push(endpoint.onNotification((method, params) => runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"))));
+        unsubscribers.push(endpoint.onNotification((method, params) => {
+          if (!observations.accept(endpoint.id, method, params)) runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"));
+        }));
         unsubscribers.push(coordinatorEndpoint.onNotification((method, params) => runBackground(() => onNotification(coordinatorEndpoint.id, method, params), () => recordBackgroundFailure("coordinator notification"))));
-        unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => { await relay.handlePermissionBlocked(endpoint.id, event); enqueuePendingEvents(); }, () => recordBackgroundFailure("permission notification"))));
+        unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => {
+          await relay.handlePermissionBlocked(endpoint.id, event);
+          if (event.threadId && runtime.getSession(endpoint.id, event.threadId)?.managementState === "managed") {
+            const state = runtime.getSession(endpoint.id, event.threadId)!;
+            runtime.reconcileNativeState(endpoint.id, event.threadId, state.nativeStatus, runtime.activeTurn(endpoint.id, event.threadId), dashboardStore.allocateObservationSequence());
+            dashboardStore.observeLifecycle({ endpointId: endpoint.id, threadId: event.threadId }, Date.now());
+            await renderDashboardSafely();
+          }
+          enqueuePendingEvents();
+        }, () => recordBackgroundFailure("permission notification"))));
         unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
         unsubscribers.push(coordinatorEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => reconcileCoordinatorAttempts(), () => recordBackgroundFailure("coordinator ready reconciliation")); }));
         unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
         unsubscribers.push(coordinatorEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(coordinatorEndpoint), () => recordBackgroundFailure("coordinator unavailable handling"))));
-      }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); },
+      }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); await observations.idle(); },
     },
     {
       name: "endpoint",
@@ -200,11 +224,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       start: async () => {
         await lifecycle.reconcileStartup();
         await resumeManagedSessions();
+        await observations.drain(endpoint.id);
         await relay.reconcileEndpoint(endpoint.id);
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
         acceptingReadyEvents = true;
-      }, stop: async () => { acceptingReadyEvents = false; },
+      }, stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
     },
     {
       name: "coordinator",
@@ -250,33 +275,81 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     return {
       list_managed_sessions: async () => registry.snapshot(),
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
-      get_session_status: async (args) => sessions.status(args.nickname),
+      get_session_status: async (args) => {
+        const live = await sessions.status(args.nickname) as any;
+        const identity = dashboardIdentity(args.nickname);
+        const before = runtime.getSession(identity.endpointId, identity.threadId);
+        const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId) ?? null;
+        const sequence = dashboardStore.allocateObservationSequence();
+        const activeTurn = live.nativeStatus === "active" ? live.activeTurnId ?? undefined : undefined;
+        runtime.reconcileNativeState(identity.endpointId, identity.threadId, live.nativeStatus, activeTurn, sequence);
+        if (before?.nativeStatus !== live.nativeStatus || beforeTurn !== (activeTurn ?? null)) observeLifecycle(args.nickname);
+        observeGoal(args.nickname, live.goal);
+        await renderDashboardSafely();
+        return dashboard.status(args.nickname);
+      },
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread) => context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd }));
+        let settingsObservationSequence: number | undefined;
+        const settings = await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread, currentSettings) => {
+          settingsObservationSequence = dashboardStore.allocateObservationSequence();
+          context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd, currentSettings, settingsObservationSequence });
+        });
+        advanceNativeWatermark(args.nickname);
+        observeLifecycle(args.nickname);
+        observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
+        await renderDashboardSafely();
         return { nickname: args.nickname };
       },
-      register_session: async (args) => { await lifecycle.register(args.nickname, projectEndpoint(args.endpoint), args.thread_id, args.project_dir); return { nickname: args.nickname }; },
+      register_session: async (args) => {
+        await lifecycle.register(args.nickname, projectEndpoint(args.endpoint), args.thread_id, args.project_dir);
+        advanceNativeWatermark(args.nickname);
+        observeLifecycle(args.nickname);
+        await renderDashboardSafely();
+        return { nickname: args.nickname };
+      },
       adopt_session: async (args) => {
         const endpointId = projectEndpoint(args.endpoint);
         const projectDir = args.project_dir ?? String((await pool.request<any>(endpointId, "thread/read", { threadId: args.thread_id, includeTurns: false })).thread.cwd);
-        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir); return { nickname: args.nickname };
+        await lifecycle.adopt(args.nickname, endpointId, args.thread_id, projectDir);
+        advanceNativeWatermark(args.nickname);
+        observeLifecycle(args.nickname);
+        await renderDashboardSafely();
+        return { nickname: args.nickname };
       },
       rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileDashboard(); return { nickname: args.new_nickname }; },
-      detach_session: async (args) => { await lifecycle.detach(args.nickname); return { nickname: args.nickname }; },
-      attach_session: async (args) => { await lifecycle.attach(args.nickname); return { nickname: args.nickname }; },
-      archive_session: async (args) => { await lifecycle.archive(args.nickname); return { nickname: args.nickname }; },
+      detach_session: async (args) => { await lifecycle.detach(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
+      attach_session: async (args) => {
+        const settings = await lifecycle.attach(args.nickname);
+        advanceNativeWatermark(args.nickname);
+        observeLifecycle(args.nickname);
+        observeCurrentSettings(args.nickname, settings);
+        await renderDashboardSafely();
+        return { nickname: args.nickname };
+      },
+      archive_session: async (args) => { await lifecycle.archive(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
       send_to_session: async (args, context) => {
         const worker = registry.get(args.nickname);
         if (!worker) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
-        if (args.mode === "steer") context.checkpoint({ turnId: sessions.activeTurnId(args.nickname) });
+        const pendingSettings = args.mode === "start" ? runtime.settings(worker.endpoint, worker.thread_id) : undefined;
+        const settingsObservationSequence = pendingSettings && (Object.hasOwn(pendingSettings, "model") || Object.hasOwn(pendingSettings, "effort"))
+          ? dashboardStore.allocateObservationSequence()
+          : undefined;
+        context.checkpoint(args.mode === "steer"
+          ? { turnId: sessions.activeTurnId(args.nickname) }
+          : { pendingSettings, ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }) });
         const files = args.attachment_ids.map((id: any) => attachments.toUserInput(context.sourceContextId, id));
         const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
         const holdId = workerAttachmentHoldId(context.sourceContextId, context.attemptId, context.callId);
         if (args.attachment_ids.length > 0) attachments.retainForOperation(holdId, context.sourceContextId, args.attachment_ids);
         let result: Awaited<ReturnType<SessionService["send"]>>;
         try {
-          result = await sessions.send(args.nickname, args.content, { mode: args.mode, clientUserMessageId: `${context.sourceContextId}:${context.callId}`, input });
+          result = await sessions.send(args.nickname, args.content, {
+            mode: args.mode,
+            clientUserMessageId: `${context.sourceContextId}:${context.callId}`,
+            input,
+            ...(pendingSettings ? { settings: pendingSettings } : {}),
+          });
         } catch (error) {
           if (isProvenSendNoEffect(error)) attachments.releaseOperation(holdId);
           throw error;
@@ -290,6 +363,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const turn = history.thread.turns.find((candidate: any) => candidate.id === result.turnId);
           if (turn && isTerminalStatus(turn.status)) attachments.releaseTurn(worker.endpoint, worker.thread_id, result.turnId);
         }
+        observeLastSent(args.nickname, args, result, context.operationSequence);
+        advanceNativeWatermark(args.nickname);
+        if (result.appliedSettings) observeCurrentSettings(args.nickname, result.appliedSettings, Date.now(), settingsObservationSequence);
+        observeLifecycle(args.nickname);
+        await renderDashboardSafely();
         return result;
       },
       read_worker_message: async (args) => {
@@ -311,14 +389,38 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const turnId = args.turn_id ?? sessions.activeTurnId(args.nickname);
         context.checkpoint({ turnId });
         await sessions.interrupt(args.nickname, turnId);
+        advanceNativeWatermark(args.nickname);
+        observeLifecycle(args.nickname);
+        await renderDashboardSafely();
         return { interrupted: true, turnId };
       },
       list_models: async (args) => sessions.models(args.endpoint ?? "local"),
-      set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); return { pending: true }; },
-      set_reasoning_effort: async (args) => { await sessions.setEffort(args.nickname, args.effort); return { pending: true }; },
-      get_goal: async (args) => sessions.getGoal(args.nickname),
-      set_goal: async (args) => sessions.setGoal(args.nickname, args.objective, args.token_budget),
-      pause_goal: async (args) => sessions.pauseGoal(args.nickname), resume_goal: async (args) => sessions.resumeGoal(args.nickname),
+      set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
+      set_reasoning_effort: async (args) => { await sessions.setEffort(args.nickname, args.effort); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
+      get_goal: async (args) => {
+        const result = await sessions.getGoal(args.nickname);
+        observeGoal(args.nickname, result);
+        await renderDashboardSafely();
+        return result;
+      },
+      set_goal: async (args) => {
+        const result = await sessions.setGoal(args.nickname, args.objective, args.token_budget);
+        observeGoal(args.nickname, result);
+        await renderDashboardSafely();
+        return result;
+      },
+      pause_goal: async (args) => {
+        const result = await sessions.pauseGoal(args.nickname);
+        observeGoal(args.nickname, result);
+        await renderDashboardSafely();
+        return result;
+      },
+      resume_goal: async (args) => {
+        const result = await sessions.resumeGoal(args.nickname);
+        observeGoal(args.nickname, result);
+        await renderDashboardSafely();
+        return result;
+      },
       cancel_goal: async (args, context) => {
         if (args.interrupt_active_turn) {
           let turnId: string | null = null;
@@ -326,8 +428,24 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
           context.checkpoint({ turnId });
           if (turnId) await sessions.interrupt(args.nickname, turnId);
+          if (turnId) advanceNativeWatermark(args.nickname);
         }
-        return sessions.cancelGoal(args.nickname);
+        const result = await sessions.cancelGoal(args.nickname);
+        observeGoal(args.nickname, result);
+        observeLifecycle(args.nickname);
+        await renderDashboardSafely();
+        return result;
+      },
+      update_session_notes: async (args, context) => {
+        const { nickname, ...patch } = args;
+        let result;
+        try { result = dashboardStore.updateNotes(dashboardIdentity(nickname), context.operationId, patch, Date.now()); }
+        catch (error) {
+          if (error instanceof AppError) throw error;
+          throw new AppError("OPERATION_CONFLICT", "manager note update was not committed");
+        }
+        await renderDashboardSafely();
+        return result;
       },
       send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.sourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", destination: String(config.telegramDestinationChatId), body: args.content, mandatory: false, replyTo: args.reply_to }).id }),
       prepare_chat_attachment: async (args, context) => {
@@ -351,6 +469,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
 
   async function reconcileDashboard(required = false): Promise<void> {
     dashboardStore.markDirty();
+    await renderDashboardSafely(required);
+  }
+
+  async function renderDashboardSafely(required = false): Promise<void> {
     try { await dashboard.renderIfDirty(); }
     catch (error) {
       queueDashboardWarning();
@@ -368,6 +490,53 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       body: "[system] session dashboard rendering failed; durable state is safe and rendering will retry",
       mandatory: true,
     });
+  }
+
+  function dashboardIdentity(nickname: string): { endpointId: string; threadId: string } {
+    const session = registry.get(nickname);
+    if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${nickname}`);
+    return { endpointId: session.endpoint, threadId: session.thread_id };
+  }
+
+  function observeLifecycle(nickname: string, observedAt = Date.now()): void {
+    dashboardStore.observeLifecycle(dashboardIdentity(nickname), observedAt);
+  }
+
+  function advanceNativeWatermark(nickname: string): void {
+    const identity = dashboardIdentity(nickname);
+    const state = runtime.getSession(identity.endpointId, identity.threadId);
+    if (!state) return;
+    runtime.reconcileNativeState(identity.endpointId, identity.threadId, state.nativeStatus, runtime.activeTurn(identity.endpointId, identity.threadId), dashboardStore.allocateObservationSequence());
+  }
+
+  function observeCurrentSettings(nickname: string, settings: { model?: string; effort?: string | null }, observedAt = Date.now(), observationSequence = dashboardStore.allocateObservationSequence()): void {
+    if (!Object.hasOwn(settings, "model") && !Object.hasOwn(settings, "effort")) return;
+    dashboardStore.observeCurrentSettings(dashboardIdentity(nickname), { ...settings, observedAt }, observationSequence);
+  }
+
+  function observeGoal(nickname: string, response: any, observedAt = Date.now()): void {
+    const goal = response && typeof response === "object" && "goal" in response ? response.goal : response;
+    const sequence = dashboardStore.allocateObservationSequence();
+    if (goal == null) {
+      dashboardStore.observeGoal(dashboardIdentity(nickname), null, observedAt, sequence, observedAt);
+      return;
+    }
+    const updatedAt = normalizeAppServerTime(goal.updatedAt, observedAt);
+    dashboardStore.observeGoal(dashboardIdentity(nickname), {
+      objective: String(goal.objective ?? ""),
+      status: String(goal.status ?? "unknown"),
+      token_budget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : typeof goal.token_budget === "number" ? goal.token_budget : null,
+    }, updatedAt, sequence, updatedAt);
+  }
+
+  function observeLastSent(nickname: string, args: any, result: { mode: "start" | "steer"; turnId: string }, operationSequence: number, observedAt = Date.now()): void {
+    dashboardStore.observeLastSent(dashboardIdentity(nickname), {
+      text: String(args.content),
+      mode: result.mode,
+      attachment_ids: [...args.attachment_ids],
+      turn_id: result.turnId,
+      at: new Date(observedAt).toISOString(),
+    }, operationSequence);
   }
 
   function projectEndpoint(requested?: string): string {
@@ -616,7 +785,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       if (!options.includeActiveAttempt && operation.attemptId === liveAttemptId) continue;
       const args = operation.args as any;
       try {
-        if (operation.kind === "send_chat_message") {
+        if (operation.kind === "update_session_notes") {
+          const result = dashboardStore.noteOperationResult(operation.id);
+          if (result) await succeedRecovered(operation, result);
+          else failRecoveredNoEffect(operation.id, "manager note mutation was not committed");
+        } else if (operation.kind === "send_chat_message") {
           const id = `chat:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
           else failRecoveredNoEffect(operation.id, "chat delivery intent was not committed");
@@ -656,7 +829,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
               attachments.retainForTurn(session.endpoint, session.thread_id, turn.id, operation.contextId, args.attachment_ids);
               if (isTerminalStatus(turn.status)) attachments.releaseTurn(session.endpoint, session.thread_id, turn.id);
             }
-            operations.succeed(operation.id, { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status) });
+            const checkpoint = operation.receipt as { pendingSettings?: { model?: string; effort?: string }; settingsObservationSequence?: number } | undefined;
+            const appliedSettings = args.mode === "start" && checkpoint && Object.hasOwn(checkpoint, "pendingSettings") ? checkpoint.pendingSettings ?? {} : undefined;
+            if (appliedSettings) runtime.consumeSettings(session.endpoint, session.thread_id, appliedSettings);
+            const receipt = { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status), ...(appliedSettings ? { appliedSettings } : {}) };
+            await succeedRecovered(operation, receipt, () => {
+              observeLastSent(args.nickname, args, { mode: args.mode, turnId: turn.id }, operation.sequence);
+              if (appliedSettings) observeCurrentSettings(args.nickname, appliedSettings, operation.createdAt, checkpoint?.settingsObservationSequence);
+              advanceNativeWatermark(args.nickname);
+              observeLifecycle(args.nickname);
+            });
           } else if (args.mode === "start" && history.thread.status?.type === "idle") {
             attachments.releaseOperation(holdId);
             operations.failAndUnbind(operation.id, { message: "thread history proves the requested start did not create a turn" });
@@ -672,7 +854,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           const session = registry.get(args.nickname);
           const settings = session ? runtime.settings(session.endpoint, session.thread_id) : {};
           const proven = operation.kind === "set_session_model" ? settings.model === args.model : settings.effort === args.effort;
-          if (proven) operations.succeed(operation.id, { pending: true });
+          if (proven) await succeedRecovered(operation, { pending: true }, () => observeLifecycle(args.nickname, operation.createdAt));
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "register_session", "adopt_session"].includes(operation.kind)) {
           let session = registry.get(args.nickname);
@@ -690,12 +872,17 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
               runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
               runtime.beginEpoch(session.endpoint, session.thread_id, native.thread.turns?.at(-1)?.id, Date.now());
             }
-            operations.succeed(operation.id, { nickname: args.nickname });
+            await succeedRecovered(operation, { nickname: args.nickname }, () => {
+              advanceNativeWatermark(args.nickname);
+              observeLifecycle(args.nickname);
+              const currentSettings = (checkpoint as any)?.currentSettings;
+              if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+            });
           } else if (!session && operation.kind !== "create_session") {
             failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
           }
         } else if (operation.kind === "rename_session") {
-          if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) operations.succeed(operation.id, { nickname: args.new_nickname });
+          if (!registry.get(args.old_nickname) && registry.get(args.new_nickname)) await succeedRecovered(operation, { nickname: args.new_nickname }, () => dashboardStore.markDirty());
           else if (registry.get(args.old_nickname) && !registry.get(args.new_nickname)) failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
         } else if (["detach_session", "attach_session"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
@@ -705,7 +892,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
             state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
           }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
-          if (state === expected) operations.succeed(operation.id, { nickname: args.nickname });
+          if (state === expected) await succeedRecovered(operation, { nickname: args.nickname }, () => {
+            if (expected === "managed") advanceNativeWatermark(args.nickname);
+            observeLifecycle(args.nickname);
+          });
           else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && state === "detached")) {
             failRecoveredNoEffect(operation.id, `durable ${operation.kind === "detach_session" ? "detaching" : "attaching"} marker was not committed`);
           }
@@ -722,7 +912,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
               state = "archived";
             }
           }
-          if (state === "archived") operations.succeed(operation.id, { nickname: args.nickname });
+          if (state === "archived") await succeedRecovered(operation, { nickname: args.nickname }, () => observeLifecycle(args.nickname));
           else if (discovered && !discovered.archived) failRecoveredNoEffect(operation.id, "thread archive was not committed");
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
           const current = await sessions.getGoal(args.nickname) as any;
@@ -744,7 +934,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
                 : goal == null && cancelInterruptProven;
-          if (proven) operations.succeed(operation.id, current);
+          if (proven) await succeedRecovered(operation, current, () => {
+            observeGoal(args.nickname, current);
+            if (operation.kind === "cancel_goal") observeLifecycle(args.nickname);
+          });
         } else if (operation.kind === "interrupt_session") {
           const session = registry.get(args.nickname);
           if (!session) continue;
@@ -752,7 +945,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           if (!turnId) continue;
           const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
           const turn = history.thread.turns.find((candidate: any) => candidate.id === turnId);
-          if (turn && isTerminalStatus(turn.status)) operations.succeed(operation.id, { interrupted: true, turnId });
+          if (turn && isTerminalStatus(turn.status)) await succeedRecovered(operation, { interrupted: true, turnId }, () => {
+            advanceNativeWatermark(args.nickname);
+            observeLifecycle(args.nickname);
+          });
         }
       } catch {
         // Leave the operation uncertain unless authoritative state proves its exact outcome.
@@ -772,6 +968,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         } catch {
           runtime.setSession(session.endpoint, session.thread_id, "unavailable", "notLoaded");
         }
+        dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
         continue;
       }
@@ -791,12 +988,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const nativeStatus = authoritative.thread.status?.type ?? response.thread.status?.type ?? "idle";
         runtime.setSession(session.endpoint, session.thread_id, "managed", nativeStatus);
         runtime.reconcileNativeState(session.endpoint, session.thread_id, nativeStatus, nativeStatus === "active" ? activeTurn?.id : undefined);
+        observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now());
+        dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         if (!runtime.currentEpoch(session.endpoint, session.thread_id)) {
           const baseline = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => isTerminalStatus(turn.status))?.id;
           runtime.beginEpoch(session.endpoint, session.thread_id, baseline, Date.now());
         }
       } catch {
         runtime.setSession(session.endpoint, session.thread_id, "unavailable", "notLoaded");
+        dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
       }
     }
@@ -810,6 +1010,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     for (const session of runtime.listSessions()) {
       if (session.endpointId === target.id && session.managementState === "managed") {
         runtime.setSession(session.endpointId, session.threadId, "unavailable", "notLoaded");
+        dashboardStore.observeLifecycle({ endpointId: session.endpointId, threadId: session.threadId }, Date.now());
       }
     }
     if (target.id === coordinatorEndpoint.id) {
@@ -831,6 +1032,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
       .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now());
     scheduleReconnect(target);
+    await renderDashboardSafely();
   }
 
   function scheduleReconnect(target: LocalEndpoint): void {
@@ -851,8 +1053,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     await target.start();
     if (target.id === endpoint.id) {
       await resumeManagedSessions();
+      await observations.drain(endpoint.id);
       await relay.reconcileEndpoint(endpoint.id);
       await reconcileOperations();
+      await renderDashboardSafely();
     } else {
       await startOrResumeCoordinator();
       await reconcileOperations();
@@ -893,6 +1097,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     operations.failAndUnbind(operationId, { message });
   }
 
+  async function succeedRecovered(operation: { id: string }, receipt: unknown, project?: () => void): Promise<void> {
+    project?.();
+    operations.succeed(operation.id, receipt);
+    await renderDashboardSafely();
+  }
+
   function recordBackgroundFailure(label: string): void {
     try {
       backgroundIncident += 1;
@@ -913,10 +1123,12 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     discovery.cleanupExpired();
     reconcileDeliveryEvents();
     await reconcileOperations();
+    await observations.drain(endpoint.id);
     if (endpoint.state === "ready") {
       try { await relay.reconcileEndpoint(endpoint.id); }
       catch { recordBackgroundFailure("periodic project reconciliation"); }
     }
+    await renderDashboardSafely();
     if (coordinatorEndpoint.state === "ready") {
       await reconcileCoordinatorAttempts();
       if (!hasOrphanCoordinatorAttempt()) {
@@ -961,6 +1173,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       if (runtime.getSession(session.endpoint, session.thread_id)) continue;
       const response = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: false });
       runtime.setSession(session.endpoint, session.thread_id, "unavailable", response.thread.status?.type ?? "notLoaded");
+      dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
       warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
     }
   }
@@ -980,4 +1193,9 @@ function workerAttachmentHoldId(contextId: string, attemptId: string, callId: st
 
 function isProvenSendNoEffect(error: unknown): boolean {
   return error instanceof AppError && new Set(["UNKNOWN_SESSION", "SESSION_DETACHED", "SESSION_BUSY", "SESSION_IDLE", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED"]).has(error.code);
+}
+
+function normalizeAppServerTime(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.abs(value) < 1_000_000_000_000 ? value * 1_000 : value;
 }

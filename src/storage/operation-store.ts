@@ -19,6 +19,8 @@ function hash(value: unknown): string {
 export interface OperationRecord {
   id: string;
   state: OperationState;
+  createdAt: number;
+  sequence: number;
   receipt?: unknown;
 }
 
@@ -68,7 +70,7 @@ export class OperationStore {
   prepare(input: { contextId: string; attemptId: string; callId: string; kind: string; args: unknown }): OperationRecord {
     const argsJson = canonical(input.args);
     const argsHash = hash(input.args);
-    const existing = this.db.prepare(`SELECT id, state, args_hash, receipt_json FROM operations
+    const existing = this.db.prepare(`SELECT id, state, args_hash, receipt_json, created_at, sequence FROM operations
       WHERE context_id = ? AND attempt_id = ? AND call_id = ? AND kind = ?`)
       .get(input.contextId, input.attemptId, input.callId, input.kind) as Record<string, unknown> | undefined;
     if (existing) {
@@ -78,25 +80,29 @@ export class OperationStore {
       return {
         id: String(existing.id),
         state: String(existing.state) as OperationState,
+        createdAt: Number(existing.created_at),
+        sequence: Number(existing.sequence),
         ...(existing.receipt_json ? { receipt: JSON.parse(String(existing.receipt_json)) } : {}),
       };
     }
     const id = `op_${randomUUID()}`;
     const now = Date.now();
     this.db.prepare(`INSERT INTO operations
-      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)`)
+      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations))`)
       .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now);
-    return { id, state: "prepared" };
+    const created = this.get(id);
+    if (!created) throw new Error("operation insert was not persisted");
+    return created;
   }
 
   get(id: string): OperationRecord | undefined {
-    const row = this.db.prepare("SELECT id, state, receipt_json FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return row ? { id: String(row.id), state: String(row.state) as OperationState, ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}) } : undefined;
+    const row = this.db.prepare("SELECT id, state, receipt_json, created_at, sequence FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? { id: String(row.id), state: String(row.state) as OperationState, createdAt: Number(row.created_at), sequence: Number(row.sequence), ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}) } : undefined;
   }
 
   listRecoverable(): RecoverableOperation[] {
-    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, state, receipt_json
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, state, receipt_json, created_at, sequence
       FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({
       id: String(row.id),
       contextId: String(row.context_id),
@@ -105,6 +111,8 @@ export class OperationStore {
       kind: String(row.kind),
       args: JSON.parse(String(row.args_json)),
       state: String(row.state) as OperationState,
+      createdAt: Number(row.created_at),
+      sequence: Number(row.sequence),
       ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}),
     }));
   }

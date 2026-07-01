@@ -8,7 +8,8 @@ import type { RuntimeStore } from "../storage/runtime-store.ts";
 import { secureShellConfig } from "../mcp/server.ts";
 
 interface ThreadView { id: string; cwd: string; status: { type: string }; turns: Array<{ id: string }> }
-interface ThreadResponse { thread: ThreadView; cwd?: string }
+interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
+export interface CurrentSessionSettings { model?: string; effort?: string | null }
 
 export class SessionLifecycle {
   private readonly tails = new Map<string, Promise<void>>();
@@ -21,19 +22,21 @@ export class SessionLifecycle {
     private readonly execution: { sandboxMode: "read-only" | "workspace-write" | "danger-full-access" } = { sandboxMode: "workspace-write" },
   ) {}
 
-  async create(nickname: string, endpointId: string, projectDir: string, onThreadCreated?: (thread: ThreadView) => void): Promise<void> {
-    await this.lock(`${endpointId}:new:${nickname}`, async () => {
+  async create(nickname: string, endpointId: string, projectDir: string, onThreadCreated?: (thread: ThreadView, settings: CurrentSessionSettings) => void): Promise<CurrentSessionSettings> {
+    return this.lock(`${endpointId}:new:${nickname}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
       const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", {
         cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(), ephemeral: false,
       });
-      onThreadCreated?.(response.thread);
+      const settings = this.responseSettings(response);
+      onThreadCreated?.(response.thread, settings);
       await this.verifyCwd(response.thread.cwd, canonical);
       if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
       await this.registry.register(nickname, { endpoint: endpointId, thread_id: response.thread.id, project_dir: canonical });
       this.runtime.setSession(endpointId, response.thread.id, "managed", response.thread.status.type);
       this.runtime.beginEpoch(endpointId, response.thread.id, this.baseline(response.thread), this.clock.now());
+      return settings;
     });
   }
 
@@ -67,9 +70,9 @@ export class SessionLifecycle {
     });
   }
 
-  async attach(nickname: string): Promise<void> {
+  async attach(nickname: string): Promise<CurrentSessionSettings> {
     const session = this.required(nickname);
-    await this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
+    return this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
       this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
       const before = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(before.thread);
@@ -85,6 +88,7 @@ export class SessionLifecycle {
         this.requireIdle(after.thread);
         this.runtime.beginEpoch(session.endpoint, session.thread_id, this.baseline(after.thread), this.clock.now());
         this.runtime.setSession(session.endpoint, session.thread_id, "managed", "idle");
+        return this.responseSettings(response);
       } catch (error) {
         if (resumed) {
           try { await this.pool.request(session.endpoint, "thread/unsubscribe", { threadId: session.thread_id }); }
@@ -156,6 +160,13 @@ export class SessionLifecycle {
   }
 
   private baseline(thread: ThreadView): string | undefined { return thread.turns.at(-1)?.id; }
+
+  private responseSettings(response: ThreadResponse): CurrentSessionSettings {
+    return {
+      ...(typeof response.model === "string" ? { model: response.model } : {}),
+      ...(typeof response.reasoningEffort === "string" || response.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
+    };
+  }
 
   private async lock<T>(key: string, action: () => Promise<T>): Promise<T> {
     const previous = this.tails.get(key) ?? Promise.resolve();

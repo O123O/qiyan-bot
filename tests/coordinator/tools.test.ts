@@ -8,6 +8,7 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 const expected = [
   "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "register_session", "adopt_session", "rename_session", "detach_session", "attach_session", "archive_session",
   "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
+  "update_session_notes",
   "send_chat_message", "prepare_chat_attachment", "send_chat_attachment",
 ].sort();
 
@@ -100,4 +101,23 @@ test("a proven no-effect error does not consume a pass directive", async () => {
   const receipt = await tools.send_to_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "second" }, args);
   assert.equal((receipt as any).turnId, "turn");
   assert.equal(calls, 2);
+});
+
+test("manager note updates require a bounded partial patch and expose stable operation order", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "5", rawText: "remember this", attachmentIds: [] });
+  const calls: any[] = [];
+  const tools = createCoordinatorTools(operations, {
+    update_session_notes: async (args, context) => {
+      calls.push({ args, sequence: context.operationSequence });
+      return { project_summary: args.project_summary ?? null, supervision_objective: null, pending_follow_up: null, updated_at: "now" };
+    },
+  }, { maxCollectCount: 20 });
+  const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "notes" };
+  await assert.rejects(tools.update_session_notes(context, { nickname: "payments" }));
+  const receipt = await tools.update_session_notes(context, { nickname: "payments", project_summary: "Payments", pending_follow_up: null });
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].sequence > 0);
+  assert.deepEqual(await tools.update_session_notes(context, { nickname: "payments", project_summary: "Payments", pending_follow_up: null }), receipt);
 });

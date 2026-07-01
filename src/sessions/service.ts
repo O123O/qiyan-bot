@@ -102,7 +102,7 @@ export class SessionService {
     const session = this.required(nickname);
     const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false });
     const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
-    const goal = await this.getGoal(nickname).catch(() => undefined);
+    const goal = await this.getGoal(nickname);
     return {
       nickname,
       identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },

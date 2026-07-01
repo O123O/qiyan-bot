@@ -7,7 +7,16 @@ import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
 
-interface TerminalTurn { id: string; status: string; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
+interface TerminalTurn { id: string; status: string; startedAt?: number | null; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
+export interface TerminalObservation {
+  endpointId: string;
+  threadId: string;
+  turnId: string;
+  status: string;
+  startedAt: number | null;
+  completedAt: number;
+  finalMessageId: string | null;
+}
 
 export class EventRelay {
   constructor(
@@ -17,7 +26,7 @@ export class EventRelay {
     private readonly runtime: RuntimeStore,
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
-    private readonly options: { destination: string; clock: Clock },
+    private readonly options: { destination: string; clock: Clock; onTerminal?(event: TerminalObservation): void | Promise<void> },
     private readonly attachments?: Pick<AttachmentStore, "releaseTurn">,
   ) {}
 
@@ -73,6 +82,15 @@ export class EventRelay {
     this.persistEvent(eventId, endpointId, threadId, turn.id, "turn_terminal", {
       final: true, nickname, endpointId, threadId, turnId: turn.id, completedAt: turn.completedAt ?? this.options.clock.now(), status: turn.status,
       finalMessageIds: messages.map((message) => message.id), deliveryState: "prepared",
+    });
+    await this.options.onTerminal?.({
+      endpointId,
+      threadId,
+      turnId: turn.id,
+      status: turn.status,
+      startedAt: turn.startedAt ?? null,
+      completedAt: turn.completedAt ?? this.options.clock.now(),
+      finalMessageId: messages.at(-1)?.id ?? null,
     });
     if (messages.length === 0 && turn.status !== "completed") {
       this.deliveries.prepare({ id: `${eventId}:warning`, kind: "worker_warning", destination: this.options.destination, body: `[${nickname}] turn ${turn.id} ${turn.status} without a final response`, mandatory: true });

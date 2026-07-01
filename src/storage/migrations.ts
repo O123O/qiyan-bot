@@ -252,4 +252,10 @@ export const migrations: readonly Migration[] = [
     const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
     if (!columns.has("native_observation_sequence")) db.exec("ALTER TABLE session_runtime ADD COLUMN native_observation_sequence INTEGER NOT NULL DEFAULT 0");
   },
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("sequence")) db.exec("ALTER TABLE operations ADD COLUMN sequence INTEGER");
+    db.exec("UPDATE operations SET sequence = rowid WHERE sequence IS NULL");
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS operations_sequence_idx ON operations(sequence)");
+  },
 ];

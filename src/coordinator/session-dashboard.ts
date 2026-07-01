@@ -132,6 +132,7 @@ export async function writeDashboardAtomic(path: string, bytes: Uint8Array | str
     const file = await open(temporary, "wx", 0o400);
     try {
       await file.writeFile(bytes);
+      await file.chmod(0o400);
       await file.sync();
     } finally {
       await file.close();

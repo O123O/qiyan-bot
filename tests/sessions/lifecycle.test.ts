@@ -27,7 +27,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
     const thread = { id: this.threadId, cwd: this.cwd, status: { type: this.status }, turns: this.turns };
     if (method === "thread/start" || method === "thread/resume") {
       this.afterResume?.();
-      return { thread: { ...thread, status: { type: this.status } }, cwd: this.cwd } as T;
+      return { thread: { ...thread, status: { type: this.status } }, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
     }
     if (method === "thread/read") return { thread } as T;
     if (method === "thread/unsubscribe" && this.failUnsubscribe) throw new Error("unsubscribe response lost");
@@ -51,7 +51,8 @@ async function fixture() {
 
 test("create and adopt verify canonical cwd and establish a managed epoch baseline", async () => {
   const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
-  await lifecycle.create("payments", "local", dir);
+  const created = await lifecycle.create("payments", "local", dir);
+  assert.deepEqual(created, { model: "gpt-5", effort: "high" });
   assert.equal(registry.get("payments")?.thread_id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1")?.baselineTurnId, "historical");
@@ -122,5 +123,6 @@ test("endpoint loss preserves managed restore state for attach recovery", async 
     managementState: "unavailable",
     restoreState: "managed",
     nativeStatus: "notLoaded",
+    nativeObservationSequence: 0,
   });
 });
