@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build, pack, install, and run a fully bundled `codex-bot` executable that needs no TypeScript source, TSX, development dependencies, or runtime `node_modules`.
+**Goal:** Build, pack, install, and run a fully bundled `codex-bot` executable that needs no TypeScript source, TSX, development dependencies, or runtime npm dependency tree.
 
-**Architecture:** Split the reusable `main()` function from a single unconditional executable entry, bundle that entry and all npm runtime code with esbuild, and package only the executable plus the two coordinator templates. A pack/extract smoke test executes the installed artifact from an isolated directory without dependencies before the live process is stopped.
+**Architecture:** Split the reusable `main()` function from a single unconditional executable entry, bundle that entry and all npm runtime code with esbuild, and package only the executable plus the two coordinator templates. A pack/install smoke test executes npm's installed `.bin` command from an isolated prefix without production dependencies before the live process is stopped.
 
 **Tech Stack:** TypeScript, Node.js 24, esbuild, npm package/bin, Node test runner
 
@@ -24,7 +24,7 @@ Create `tests/bin.test.ts`:
 ```ts
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,17 +42,30 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.equal(metadata.length, 1);
   const archive = join(temp, metadata[0]!.filename);
   const listing = (await execFileAsync("tar", ["-tzf", archive])).stdout.split("\n").filter(Boolean);
-  assert.ok(listing.includes("package/dist/codex-bot"));
-  assert.ok(listing.includes("package/assets/coordinator/AGENTS.md"));
-  assert.ok(listing.includes("package/assets/coordinator/session-status.example.json"));
-  assert.equal(listing.some((path) => /^package\/(?:src|tests|scripts|node_modules)\//u.test(path)), false);
+  assert.deepEqual(listing.sort(), [
+    "package/README.md",
+    "package/assets/coordinator/AGENTS.md",
+    "package/assets/coordinator/session-status.example.json",
+    "package/dist/codex-bot",
+    "package/package.json",
+  ].sort());
 
-  await execFileAsync("tar", ["-xzf", archive, "-C", temp]);
-  const packageRoot = join(temp, "package");
-  const executable = join(packageRoot, "dist", "codex-bot");
-  assert.equal((await readFile(executable, "utf8")).startsWith("#!/usr/bin/env node\n"), true);
-  assert.notEqual((await stat(executable)).mode & 0o111, 0);
+  const installRoot = join(temp, "install");
+  await execFileAsync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, archive]);
+  const packageRoot = join(installRoot, "node_modules", "codex-chat-bot");
+  const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+  assert.deepEqual(manifest.dependencies ?? {}, {});
+  assert.deepEqual((await readdir(packageRoot)).sort(), ["README.md", "assets", "dist", "package.json"]);
   await assert.rejects(stat(join(packageRoot, "node_modules")));
+  const tree = JSON.parse((await execFileAsync("npm", ["ls", "--all", "--json", "--prefix", installRoot])).stdout) as {
+    dependencies?: Record<string, { dependencies?: Record<string, unknown> }>;
+  };
+  assert.deepEqual(Object.keys(tree.dependencies ?? {}), ["codex-chat-bot"]);
+  assert.deepEqual(tree.dependencies?.["codex-chat-bot"]?.dependencies ?? {}, {});
+
+  const executable = join(installRoot, "node_modules", ".bin", "codex-bot");
+  assert.equal((await readFile(join(packageRoot, "dist", "codex-bot"), "utf8")).startsWith("#!/usr/bin/env node\n"), true);
+  assert.notEqual((await stat(executable)).mode & 0o111, 0);
 
   const result = spawnSync(executable, ["--definitely-invalid"], {
     cwd: packageRoot,
@@ -61,7 +74,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
-  assert.equal(result.stderr, "codex-bot: startup failed\n");
+  assert.equal(result.stderr, "codex-bot: CONFIGURATION_ERROR: unknown argument\n");
 
   const workdir = join(temp, "coordinator");
   const startup = spawnSync(executable, ["--workdir", workdir], {
@@ -231,7 +244,7 @@ npm run typecheck
 git diff --check
 ```
 
-Expected: the build creates executable `dist/codex-bot`; the extracted archive runs without `node_modules`; typecheck and diff check pass.
+Expected: the build creates executable `dist/codex-bot`; the npm-installed archive has no nested production dependency tree and its `.bin/codex-bot` link runs; typecheck and diff check pass.
 
 - [ ] **Step 5: Commit the executable**
 
@@ -255,13 +268,14 @@ Replace the development-only launch block near the top of `README.md` with:
 ```bash
 npm install
 npm run build
-npm link
+archive=$(npm pack --silent)
+npm install --global --prefix "$HOME/.local" "./$archive"
 codex-bot --workdir "$HOME/.codex-bot/coordinator"
 ```
 
-`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, Codex authentication, and a `codex` executable; it does not need TSX, TypeScript source files, or runtime `node_modules`.
+`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, Codex authentication, and a `codex` executable; it does not need TSX, TypeScript source files, or a runtime dependency tree.
 
-Create an installable archive with `npm pack`. The archive contains the executable and its two coordinator template assets.
+The archive contains the executable and its two coordinator template assets. `$HOME/.local/bin` must be in `PATH`.
 
 For source development, `npm start -- --workdir "$HOME/.codex-bot/coordinator"` remains available.
 ````
@@ -310,12 +324,13 @@ From `main`:
 ```bash
 npm install
 npm run build
-npm link
+archive=$(npm pack --silent)
+npm install --global --prefix "$HOME/.local" "./$archive"
 command -v codex-bot
 codex-bot --definitely-invalid
 ```
 
-Expected: `command -v` resolves the linked command and the invalid invocation prints only `codex-bot: startup failed` with exit status 1.
+Expected: `command -v` resolves `$HOME/.local/bin/codex-bot` and the invalid invocation prints only `codex-bot: CONFIGURATION_ERROR: unknown argument` with exit status 1.
 
 - [ ] **Step 4: Stop and back up live state**
 

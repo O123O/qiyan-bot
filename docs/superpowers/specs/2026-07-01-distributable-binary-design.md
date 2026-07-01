@@ -12,23 +12,25 @@ The bundle continues to resolve the managed coordinator templates relative to it
 
 ## Build and package metadata
 
-Add esbuild as an explicit development dependency and a deterministic `npm run build` script backed by `scripts/build.mjs`. The build removes stale `dist`, bundles `src/main.ts`, adds the shebang, writes `dist/codex-bot`, and sets mode `0755`.
+Add esbuild as an explicit development dependency and a deterministic `npm run build` script backed by `scripts/build.mjs`. The build removes stale `dist`, bundles the unconditional `src/bin.ts` entry, adds the shebang, writes `dist/codex-bot`, and sets mode `0755`.
 
 The package manifest declares the `codex-bot` bin and a restrictive `files` list. Dependencies used only as bundle inputs are development dependencies so installing the packed artifact does not fetch a runtime dependency tree. The normal source-development commands continue to work after `npm install`.
 
 ## Verification
 
-An integration test builds and packs the package into a temporary directory, extracts it, and verifies:
+An integration test builds and packs the package into a temporary directory, installs it into an isolated npm prefix, and verifies:
 
 - the archive contains the executable and two coordinator assets;
 - it excludes `src`, `tests`, and development tooling;
 - the executable has a shebang and executable mode; and
-- invoking it with an invalid CLI argument returns the stable structural startup error while no `node_modules` directory exists beside it.
+- the installed package declares and installs no production dependency tree;
+- the npm-created `.bin/codex-bot` link invokes correctly; and
+- invoking it with an invalid CLI argument returns the stable structural startup error.
 
 The full repository check also runs the package smoke test. The checked-in `dist` directory remains ignored and is rebuilt from source.
 
 ## Live restart
 
-After build, pack verification, and code review, install the local package command with `npm link`. Back up the configured data directory, registry, and coordinator workdir while the bot is stopped. Stop the existing TSX process through its current terminal, then start `codex-bot --workdir ~/.codex-bot/coordinator` in that same terminal so its existing secret environment is reused without printing it.
+After build, pack verification, and code review, install the packed artifact under the user-owned `$HOME/.local` npm prefix. Back up the configured data directory, registry, and coordinator workdir while the bot is stopped. Stop the existing TSX process through its current terminal, then start `codex-bot --workdir ~/.codex-bot/coordinator` in that same terminal so its existing secret environment is reused without printing it.
 
 Startup must complete before the backup is discarded. If startup fails, retain the backup, report the structural error, and do not expose credentials or blindly reset state.
