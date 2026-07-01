@@ -276,14 +276,15 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       list_managed_sessions: async () => registry.snapshot(),
       discover_sessions: async (args) => discovery.list({ endpointId: projectEndpoint(args.endpoint), ...(args.search ? { search: args.search } : {}), ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.cursor ? { cursor: args.cursor } : {}) }),
       get_session_status: async (args) => {
-        const live = await sessions.status(args.nickname) as any;
         const identity = dashboardIdentity(args.nickname);
         const before = runtime.getSession(identity.endpointId, identity.threadId);
         const beforeTurn = runtime.activeTurn(identity.endpointId, identity.threadId) ?? null;
         const sequence = dashboardStore.allocateObservationSequence();
-        const activeTurn = live.nativeStatus === "active" ? live.activeTurnId ?? undefined : undefined;
-        runtime.reconcileNativeState(identity.endpointId, identity.threadId, live.nativeStatus, activeTurn, sequence);
-        if (before?.nativeStatus !== live.nativeStatus || beforeTurn !== (activeTurn ?? null)) observeLifecycle(args.nickname);
+        const live = await sessions.status(args.nickname, { observeNative: ({ nativeStatus, activeTurnId }) => {
+          const activeTurn = nativeStatus === "active" ? activeTurnId ?? undefined : undefined;
+          const applied = runtime.reconcileNativeState(identity.endpointId, identity.threadId, nativeStatus, activeTurn, sequence);
+          if (applied && (before?.nativeStatus !== nativeStatus || beforeTurn !== (activeTurn ?? null))) observeLifecycle(args.nickname);
+        } }) as any;
         observeGoal(args.nickname, live.goal);
         await renderDashboardSafely();
         return dashboard.status(args.nickname);
@@ -292,9 +293,9 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const endpointId = projectEndpoint(args.endpoint);
         let settingsObservationSequence: number | undefined;
         const settings = await lifecycle.create(args.nickname, endpointId, args.project_dir, (thread, currentSettings) => {
-          hydrateThreadOrder(endpointId, thread);
           settingsObservationSequence = dashboardStore.allocateObservationSequence();
           context.checkpoint({ endpoint: endpointId, threadId: thread.id, projectDir: thread.cwd, currentSettings, settingsObservationSequence });
+          hydrateThreadOrder(endpointId, thread);
         });
         advanceNativeWatermark(args.nickname);
         observeLifecycle(args.nickname);

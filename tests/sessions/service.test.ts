@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
+import { SessionObservationProcessor } from "../../src/coordinator/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
@@ -12,6 +13,7 @@ import { SessionService } from "../../src/sessions/service.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
 class ServiceEndpoint implements AppServerEndpoint {
   readonly id = "local";
@@ -24,6 +26,8 @@ class ServiceEndpoint implements AppServerEndpoint {
   threadTurns: any[] | undefined;
   failNextStart = false;
   goal: any = null;
+  goalBarrier: Promise<void> | undefined;
+  onGoalRequest: (() => void) | undefined;
   loseNextGoalResponse = false;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
@@ -34,7 +38,11 @@ class ServiceEndpoint implements AppServerEndpoint {
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
     if (method === "thread/read") return { thread: { id: "thread", cwd: params.cwd, status: { type: this.status }, turns: this.threadTurns ?? (this.lastClientId ? [{ id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}), items: [{ type: "userMessage", clientId: this.lastClientId }] }] : []) } } as T;
-    if (method === "thread/goal/get") return { goal: this.goal } as T;
+    if (method === "thread/goal/get") {
+      this.onGoalRequest?.();
+      await this.goalBarrier;
+      return { goal: this.goal } as T;
+    }
     if (method === "model/list") return { data: [{ id: "gpt-5" }], nextCursor: null } as T;
     if (method === "thread/goal/set") {
       this.goal = { ...(this.goal ?? {}), ...(params.objective ? { objective: params.objective } : {}), status: params.status, ...(params.tokenBudget ? { tokenBudget: params.tokenBudget } : {}) };
@@ -60,7 +68,7 @@ async function fixture() {
   const finals = new FinalMessageStore(db);
   const deliveries = new DeliveryStore(db);
   const service = new SessionService(pool, registry, runtime, finals, deliveries);
-  return { endpoint, runtime, finals, deliveries, service };
+  return { db, endpoint, registry, runtime, finals, deliveries, service };
 }
 
 test("starts idle sessions, steers active sessions, and interrupts the exact turn", async () => {
@@ -116,6 +124,42 @@ test("status derives the active turn from authoritative history instead of cache
   const status = await service.status("payments") as any;
   assert.equal(status.activeTurnId, "active-turn");
   assert.equal(endpoint.calls.find((call) => call.method === "thread/read")?.params.includeTurns, true);
+});
+
+test("status binds its native snapshot before a blocked goal read so a newer notification wins", async () => {
+  const { db, endpoint, registry, runtime, service } = await fixture();
+  endpoint.status = "active";
+  endpoint.threadTurns = [{ id: "old-turn", status: "inProgress", items: [] }];
+  let releaseGoal!: () => void;
+  endpoint.goalBarrier = new Promise<void>((resolve) => { releaseGoal = resolve; });
+  let goalRequested!: () => void;
+  const waitingForGoal = new Promise<void>((resolve) => { goalRequested = resolve; });
+  endpoint.onGoalRequest = goalRequested;
+  const dashboardStore = new SessionDashboardStore(db);
+  const processor = new SessionObservationProcessor(dashboardStore, registry, runtime, {
+    now: () => 1_000,
+    readThread: async () => ({ turns: endpoint.threadTurns ?? [] }),
+    readGoal: async () => ({ goal: null }),
+    onChanged: () => undefined,
+    onError: (error) => { throw error; },
+  });
+  const statusSequence = dashboardStore.allocateObservationSequence();
+  let nativeObserved = false;
+
+  const status = service.status("payments", {
+    observeNative: ({ nativeStatus, activeTurnId }) => {
+      nativeObserved = true;
+      runtime.reconcileNativeState("local", "thread", nativeStatus, activeTurnId ?? undefined, statusSequence);
+    },
+  });
+  await waitingForGoal;
+  processor.accept("local", "turn/started", { threadId: "thread", turn: { id: "new-turn", startedAt: 2 } });
+  await processor.idle();
+  releaseGoal();
+  await status;
+
+  assert.equal(nativeObserved, true);
+  assert.equal(runtime.activeTurn("local", "thread"), "new-turn");
 });
 
 test("a failed start retains pending settings and steer never consumes them", async () => {

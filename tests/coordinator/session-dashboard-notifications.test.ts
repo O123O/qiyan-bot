@@ -131,6 +131,16 @@ test("quarantines an invalid durable observation without starving later rows", a
   assert.deepEqual(JSON.parse(invalid.error_json), { message: "invalid thread/tokenUsage/updated notification" });
 });
 
+test("an unorderable token observation stays pending without starving later rows", async () => {
+  const value = fixture({ readThread: async () => ({ turns: [] }) });
+  value.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "not-visible-yet", tokenUsage: usage });
+  value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
+  await value.processor.idle();
+
+  assert.deepEqual(value.store.pendingNotifications().map((item) => item.method), ["thread/tokenUsage/updated"]);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
+});
+
 test("terminal observation stores only metadata and cannot clear a newer active turn", async () => {
   const value = fixture({ readThread: async () => ({ turns: [{ id: "old", startedAt: 1 }, { id: "new", startedAt: 2 }] }) });
   value.runtime.setActiveTurn("local", "thread-1", "new");

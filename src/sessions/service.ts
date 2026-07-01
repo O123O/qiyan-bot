@@ -98,15 +98,18 @@ export class SessionService {
     }));
   }
 
-  async status(nickname: string): Promise<unknown> {
+  async status(nickname: string, options: {
+    observeNative?(snapshot: { nativeStatus: string; activeTurnId: string | null }): void;
+  } = {}): Promise<unknown> {
     const session = this.required(nickname);
     const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
     const runtime = this.runtime.getSession(session.endpoint, session.thread_id);
-    const goal = await this.getGoal(nickname);
     const nativeStatus = native.thread.status?.type ?? "unknown";
     const activeTurnId = nativeStatus === "active"
       ? [...(native.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? null
       : null;
+    options.observeNative?.({ nativeStatus, activeTurnId });
+    const goal = await this.getGoal(nickname);
     return {
       nickname,
       identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },

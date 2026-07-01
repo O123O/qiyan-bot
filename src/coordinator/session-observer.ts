@@ -172,7 +172,7 @@ export class SessionObservationProcessor {
         this.store.hydrateTurnOrder(identity, history.turns.map((turn) => ({ id: turn.id, startedAt: turn.startedAt })));
         ordinal = this.store.turnOrdinal(identity, params.turnId);
       }
-      if (ordinal === undefined) throw new Error(`cannot order token usage for turn ${params.turnId}`);
+      if (ordinal === undefined) return "deferred";
       return this.store.observeTokenUsage(identity, params.turnId, tokenUsage, ordinal, notification.sequence);
     }
     if (notification.method === "thread/goal/updated") {
