@@ -4,7 +4,7 @@
 
 **Goal:** Reduce the managed coordinator prompt to coordinator-specific rules, two exact-directive examples, and a categorized MCP tool list.
 
-**Architecture:** This is a policy-only behavior change. The policy test defines the retained safety contract, requires examples only for `/pass` and `/collect`, and rejects the removed ordinary-tool examples; the packaged `AGENTS.md` is then rewritten to that contract without changing tools or runtime code.
+**Architecture:** This is a policy-only behavior change. The policy test defines the retained safety contract, scopes every exposed tool to one catalog category, requires examples only for `/pass` and `/collect`, and rejects the removed ordinary-tool examples; the packaged `AGENTS.md` is then rewritten to that contract without changing tools or runtime code. Concise backend-specific semantics that generic MCP descriptions do not provide—such as pending model/effort behavior—remain in the policy.
 
 **Tech Stack:** Markdown, TypeScript, Node test runner
 
@@ -18,14 +18,74 @@
 
 - [ ] **Step 1: Write the failing policy test**
 
-In `tests/coordinator/policy.test.ts`, replace the expected `## Worked examples` heading with `## Exact directive examples`. Remove assertions requiring create, discover/adopt, status, and manager-note examples, and remove the 4,000-byte minimum. Add this rejection after the exact-directive assertions:
+Replace the contents of `tests/coordinator/policy.test.ts` with the following contract. It checks the actual reduced heading structure, parses each catalog category instead of finding names anywhere in the file, enforces every exact-directive invariant separately, rejects ordinary examples, and removes the old minimum-length assertion:
 
 ```ts
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { TOOL_NAMES } from "../../src/coordinator/tools.ts";
+import { SessionDashboardDocumentSchema } from "../../src/coordinator/dashboard-schema.ts";
+
+const policyPath = fileURLToPath(new URL("../../assets/coordinator/AGENTS.md", import.meta.url));
+const catalog = [
+  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "register_session", "adopt_session", "rename_session", "detach_session", "attach_session", "archive_session"]],
+  ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
+  ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
+  ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
+] as const;
+
+test("packaged coordinator policy is concise and reserves examples for exact directives", async () => {
+  const policy = await readFile(policyPath, "utf8");
+  for (const heading of [
+    "## Routing and state",
+    "## Results and supervision",
+    "## Session dashboard",
+    "## Exact directives",
+    "## Exact directive examples",
+    "## Tool catalog",
+  ]) assert.match(policy, new RegExp(`^${heading}$`, "mu"));
+
+  const catalogued: string[] = [];
+  for (const [label, expected] of catalog) {
+    const line = policy.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
+    assert.ok(line, `missing tool catalog category: ${label}`);
+    const actual = [...line.matchAll(/`([^`]+)`/gu)].map((match) => match[1]!);
+    assert.deepEqual(actual, [...expected]);
+    catalogued.push(...actual);
+  }
+  assert.deepEqual(new Set(catalogued), new Set(TOOL_NAMES));
+
+  assert.match(policy, /worker final messages are automatically delivered/iu);
+  assert.match(policy, /state change happened only when its tool receipt proves it/iu);
+  assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
+  assert.match(policy, /set_goal.*replaces the current goal/isu);
+  assert.match(policy, /never declare or mark a worker goal complete/iu);
+  assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
+  assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*data\/sessions\.json/iu);
+  assert.match(policy, /manager_notes.*update_session_notes/isu);
+  assert.match(policy, /automatically maintained `auto_session_info`/iu);
+  assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
+  assert.match(policy, /no `?watch_session`? tool/iu);
+
+  assert.match(policy, /\/pass.*every character.*attachment IDs in original order exactly/isu);
+  assert.match(policy, /one required ASCII separator/iu);
+  assert.match(policy, /\/pass.*choose the target and `start` or `steer`/isu);
+  assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
+  assert.match(policy, /do not repeat, summarize, or acknowledge directly collected bodies/iu);
+  assert.match(policy, /User: tell payments \/pass  preserve this leading space/u);
+  assert.match(policy, /"content":" preserve this leading space"/u);
+  assert.match(policy, /collect_messages\(\{"nickname":"payments","count":3\}\)/u);
+
   assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
-```
+  assert.doesNotMatch(policy, /codex-bot:(?:managed|user)/u);
 
-Keep the loop requiring every `TOOL_NAMES` entry and all assertions for automatic delivery, exact directives, receipt-backed state, read-only JSON files, dashboard semantics, goals, token meaning, and absence of `watch_session`.
+  const examplePath = fileURLToPath(new URL("../../assets/coordinator/session-status.example.json", import.meta.url));
+  assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
+});
+```
 
 - [ ] **Step 2: Run the policy test to verify it fails**
 
@@ -54,6 +114,7 @@ You are the user's general assistant and the manager of ordinary Codex project s
 - A worker is a normal Codex session that owns project details and may use subagents. Send the user's objective and useful constraints without micromanaging unless asked.
 - Backend registry and app-server state are authoritative. A state change happened only when its tool receipt proves it. If an operation is uncertain, inspect live status before retrying.
 - In `send_to_session`, use `start` for idle work and `steer` only for an already active turn. Interrupt only on explicit user intent or an already-authorized supervision objective.
+- Model and effort changes are pending for the next new turn; they do not change an active turn and steering does not consume them.
 - Permission blocks, detached sessions, cwd mismatches, unavailable endpoints, capacity limits, and worker failures are real states. Never fabricate completion or success.
 
 ## Results and supervision
@@ -113,7 +174,7 @@ Model, goal, and management memory: `list_models`, `set_session_model`, `set_rea
 
 User output and attachments: `send_chat_message`, `prepare_chat_attachment`, `send_chat_attachment`.
 
-MCP tool descriptions and schemas define ordinary usage and exact arguments. Backend validation is authoritative for authorization, canonical paths, exact directives, idempotency, and delivery. Preserve attachment IDs deliberately, never invent backend paths, and never expose tokens, hidden bodies, internal tool chatter, or backend-only identifiers unless diagnosis requires them.
+MCP schemas define ordinary arguments; the catalog above identifies available capabilities. Backend validation is authoritative for authorization, canonical paths, exact directives, idempotency, and delivery. Preserve attachment IDs deliberately, never invent backend paths, and never expose tokens, hidden bodies, internal tool chatter, or backend-only identifiers unless diagnosis requires them.
 ````
 
 - [ ] **Step 4: Run the focused test to verify it passes**
