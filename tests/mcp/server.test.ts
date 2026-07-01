@@ -5,6 +5,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { TOOL_NAMES, createCoordinatorTools } from "../../src/coordinator/tools.ts";
+import { buildCoordinatorChildEnvironment } from "../../src/coordinator/profile.ts";
 import { readLinuxProcessIdentity } from "../../src/core/process-identity.ts";
 import { buildCodexChildEnvironment, coordinatorTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
@@ -123,4 +124,18 @@ test("child environment keeps Codex auth but strips Telegram secrets and hides t
   assert.deepEqual((config["shell_environment_policy.exclude"] as any).includes("CODEX_BOT_MCP_TOKEN"), true);
   assert.equal(config.allow_login_shell, false);
   assert.equal(JSON.stringify(config).includes("mcp-secret"), false);
+});
+
+test("coordinator child overrides only its profile while the worker retains the user profile", () => {
+  const host = { PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth", TELEGRAM_BOT_TOKEN: "secret" };
+  const worker = buildCodexChildEnvironment(host);
+  const coordinator = buildCoordinatorChildEnvironment(host, { home: "/private/manager-home", codexHome: "/private/manager-codex" }, "manager-token");
+  assert.equal(worker.HOME, "/home/user");
+  assert.equal(worker.CODEX_HOME, "/home/user/.codex");
+  assert.equal(worker.CODEX_BOT_MCP_TOKEN, undefined);
+  assert.equal(coordinator.HOME, "/private/manager-home");
+  assert.equal(coordinator.CODEX_HOME, "/private/manager-codex");
+  assert.equal(coordinator.CODEX_BOT_MCP_TOKEN, "manager-token");
+  assert.equal(coordinator.OPENAI_API_KEY, "auth");
+  assert.equal(coordinator.TELEGRAM_BOT_TOKEN, undefined);
 });
