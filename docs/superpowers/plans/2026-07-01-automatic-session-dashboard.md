@@ -407,7 +407,7 @@ Persist only the fields needed for dashboard observation. In particular, never c
 
 Normalize protocol seconds/milliseconds in one helper. Hydrate turn ordinals from authoritative history on startup/reconnect. For token usage, use the stored turn ordinal; when a notification references an unknown turn, read authoritative thread history to establish its order before allowing it to replace a known newer turn. If ordering still cannot be proved, do not promote it over a known newer token row.
 
-There is no app-server settings-read method: `thread/read` contains neither model nor effort. Current settings come only from top-level thread start/resume responses and receive-ordered `thread/settings/updated` notifications. Goal updates use `goal.updatedAt`; goal-clear/tool reconciliation may use the existing goal get endpoint. Identical payload replay remains a no-op.
+There is no app-server settings-read method: `thread/read` contains neither model nor effort. Current settings come only from top-level thread start/resume responses and receive-ordered `thread/settings/updated` notifications. Goal updates use `goal.updatedAt`; goal-clear/tool reconciliation may use the existing goal get endpoint. Replay of the same inbox sequence is a no-op; an identical payload accepted at a newer sequence still advances the ordering watermark.
 
 Runtime lifecycle updates and durable fact writes happen before scheduling the safe renderer. Notification handlers remain idempotent and must not generate chat messages solely for routine dashboard changes.
 
