@@ -21,7 +21,9 @@ npm ci
 cp .env.example .env
 ```
 
-Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, and `TELEGRAM_DESTINATION_CHAT_ID`. The destination is normally the owner's private chat ID. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
+Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, and `COORDINATOR_WORKDIR`. The destination is normally the owner's private chat ID. The coordinator workdir should be a standalone user-owned directory outside both this repository and `DATA_DIR`, for example `$HOME/.codex-bot/coordinator`. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
+
+`--workdir` overrides `COORDINATOR_WORKDIR`. Relative coordinator, data, and registry paths resolve from the shell launch directory; use absolute paths when the bot must behave identically regardless of where it is launched. Startup rejects any direct, nested, or symlink-aliased overlap between the coordinator workdir and authoritative backend state.
 
 Codex authentication may come from the normal `CODEX_HOME` profile or supported environment credentials such as `OPENAI_API_KEY`. The owned app-servers inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
 
@@ -32,6 +34,13 @@ set -a; . ./.env; set +a
 npm start
 ```
 
+Or select the coordinator home explicitly:
+
+```bash
+set -a; . ./.env; set +a
+npm start -- --workdir "$HOME/.codex-bot/coordinator"
+```
+
 Send SIGINT or SIGTERM for graceful shutdown. Startup performs migrations, validates the registry, reconciles missed worker history and uncertain outbox rows, resumes or creates the coordinator, and only then begins Telegram polling.
 
 ## How it behaves
@@ -40,7 +49,21 @@ Ordinary messages go to the coordinator. It chooses a project nickname, asks whe
 
 Every eligible terminal worker response is automatically sent to Telegram as `[nickname] …`. The coordinator receives only compact metadata and decides whether it needs to read the body or follow up. This avoids duplicating project transcripts in the coordinator context. Failed, interrupted, permission-blocked, and unavailable work produces a labeled warning.
 
-The coordinator keeps durable supervision notes in `coordinator/session-status.json`. The notebook records project status, current objectives, last sent work, last worker event, and pending follow-up so supervision intent survives context compaction. SQLite remains authoritative for execution state.
+The coordinator keeps durable supervision notes in `<coordinator-workdir>/session-status.json`. The notebook records project status, current objectives, last sent work, last worker event, and pending follow-up so supervision intent survives context compaction. SQLite remains authoritative for execution state. An invalid existing notebook stops startup without replacing or quarantining its contents.
+
+### Coordinator instructions
+
+On first startup the bot installs its management playbook as `<coordinator-workdir>/AGENTS.md` and records the exact digest in `.codex-bot-agents.sha256`. Both files are bot-managed. Do not edit either one: startup refuses a changed or partially missing pair instead of guessing whether user content can be overwritten. An unchanged policy is upgraded automatically when the packaged playbook changes.
+
+For complete prompt customization, copy the current policy and edit the override:
+
+```bash
+cp "$COORDINATOR_WORKDIR/AGENTS.md" "$COORDINATOR_WORKDIR/AGENTS.override.md"
+```
+
+Codex gives `AGENTS.override.md` precedence in that directory. The bot never creates, reads, updates, or deletes it. Because it replaces the managed prompt completely, retain any routing, automatic-delivery, notebook, exact-directive, goal, attachment, and recovery behavior you still want.
+
+To recover from a managed-policy guard error, either restore `AGENTS.md` to the exact content represented by the stored digest, or move the desired custom policy to `AGENTS.override.md` and delete both `AGENTS.md` and `.codex-bot-agents.sha256`; the bot then reinstalls a fresh managed pair. A coordinator workdir inside a Git worktree is allowed but produces a warning because Codex may also inherit instructions from that repository's project root.
 
 ### Exact pass-through
 
@@ -87,9 +110,12 @@ Coordinator tool effects use a separate operation ledger keyed by source context
 - `data/bot.sqlite3`: offsets, operations, outbox, events, runtime state, epochs, discovery snapshots, and attachment metadata
 - `data/sessions.json`: human-editable session identity registry
 - `data/attachments/`: private temporary attachment snapshots
-- `coordinator/session-status.json`: coordinator-maintained management notebook
+- `<coordinator-workdir>/AGENTS.md`: bot-managed coordinator playbook
+- `<coordinator-workdir>/.codex-bot-agents.sha256`: installed-playbook digest
+- `<coordinator-workdir>/AGENTS.override.md`: optional, entirely user-owned replacement prompt
+- `<coordinator-workdir>/session-status.json`: coordinator-maintained management notebook
 
-Back up the SQLite database, registry, and coordinator notebook together while the bot is stopped. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
+Back up the SQLite database, registry, and external coordinator workdir together while the bot is stopped. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
 
 ## Verification
 
@@ -109,6 +135,7 @@ RUN_TELEGRAM_LIVE=1 npm test -- tests/integration/telegram-live.test.ts
 ## Troubleshooting
 
 - `ENDPOINT_UNAVAILABLE`: check `codex --version`, Codex authentication, proxy variables, and app-server stderr.
+- `CONFIGURATION_ERROR`: check `--workdir`/`COORDINATOR_WORKDIR`, path separation, the managed `AGENTS.md` digest pair, the existing notebook JSON, and the coordinator path stored in the session registry.
 - `CWD_MISMATCH`: the persisted thread directory differs from the registry's canonical project path; do not force-attach it.
 - `SESSION_BUSY`: wait, steer the exact active turn, or interrupt it before lifecycle changes.
 - `PERMISSION_BLOCKED`: the worker requested an approval or permission escalation, which chat auto mode intentionally declines.
