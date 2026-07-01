@@ -1,23 +1,29 @@
 {
   "name": "codex-chat-bot",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "bin": { "codex-bot": "dist/codex-bot" },
+  "files": [
+    "dist/codex-bot",
+    "assets/coordinator/AGENTS.md",
+    "assets/coordinator/session-status.example.json"
+  ],
   "engines": { "node": ">=24" },
   "scripts": {
-    "start": "tsx src/main.ts",
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "start": "tsx src/bin.ts",
     "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
     "generate:codex-schema": "node scripts/generate-app-server-schema.mjs"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "zod": "4.4.3"
-  },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@types/node": "26.0.1",
+    "esbuild": "0.28.1",
     "tsx": "4.22.4",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "zod": "4.4.3"
   }
 }
