@@ -168,12 +168,12 @@ async function readMarker(path: string): Promise<MarkerDocument | undefined> {
     throw error;
   }
   try {
-    const opened = await file.stat();
+    const opened = await file.stat({ bigint: true });
     if (!opened.isFile()) throw managedError("coordinator profile activation marker must be a regular file");
     let parsed: MarkerDocument;
     try { parsed = markerSchema.parse(JSON.parse(await file.readFile("utf8"))) as MarkerDocument; }
     catch { throw managedError("coordinator profile activation marker is invalid"); }
-    const current = await lstat(path);
+    const current = await lstat(path, { bigint: true });
     if (!current.isFile() || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
       throw managedError("coordinator profile activation marker changed unexpectedly");
     }
@@ -213,19 +213,20 @@ async function atomicWrite(path: string, contents: Uint8Array, beforeCommit?: ()
   }
 }
 
-interface DirectoryPin { path: string; dev: number; ino: number }
+interface DirectoryPin { path: string; dev: bigint; ino: bigint }
 
 async function pinDirectory(path: string): Promise<DirectoryPin> {
-  const value = await lstat(path);
+  const value = await lstat(path, { bigint: true });
   if (!value.isDirectory() || value.isSymbolicLink()) throw managedError(`${path} must be a real directory`);
   return { path, dev: value.dev, ino: value.ino };
 }
 
 async function assertPinnedDirectory(pin: DirectoryPin): Promise<void> {
   let value;
-  try { value = await lstat(pin.path); }
+  try { value = await lstat(pin.path, { bigint: true }); }
   catch { throw managedError(`coordinator profile directory ${pin.path} changed unexpectedly`); }
   if (!value.isDirectory() || value.isSymbolicLink() || value.dev !== pin.dev || value.ino !== pin.ino
+    || (value.mode & 0o777n) !== 0o700n
     || await realpath(pin.path).catch(() => undefined) !== pin.path) {
     throw managedError(`coordinator profile directory ${pin.path} changed unexpectedly`);
   }

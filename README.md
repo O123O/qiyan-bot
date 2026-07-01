@@ -40,6 +40,8 @@ DATA_DIR="$HOME/.codex-bot/data" codex-bot coordinator-login
 
 This starts Codex device authentication in the isolated profile. It does not need Telegram variables or start the bot. Supported provider environment credentials such as `OPENAI_API_KEY` may also satisfy the coordinator app-server when Codex does not require its own login. The owned app-servers otherwise inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
 
+The coordinator profile is bot-managed; do not replace or change permissions on its directories while the bot runs. This single-user design trusts other processes under the bot's OS account and prevents accidental profile inheritance, but it is not a boundary against a same-account process deliberately racing filesystem changes. Use a dedicated OS account or container if that threat is relevant.
+
 After exporting the configuration, run the installed command from any directory:
 
 ```bash

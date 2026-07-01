@@ -34,7 +34,7 @@ export async function resumeCoordinatorIdentity(input: {
     await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir });
     if (input.creationNonce !== undefined) {
       const creation = requireCreationMetadata(input.creationNonce);
-      await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
+      await verifyThread(response.thread, { id: identity.thread_id, cwd: configuredDir, nonce: creation.nonce });
     }
     if (input.pendingThreadId !== undefined && input.pendingThreadId !== null) {
       const creation = requireCreationState(input);

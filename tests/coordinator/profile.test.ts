@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -65,6 +65,14 @@ test("detects replacement of a pinned coordinator profile directory", async (t) 
   await mkdir(replacement);
   await rm(profile.codexHome, { recursive: true });
   await symlink(replacement, profile.codexHome);
+  await assert.rejects(profile.assertIntact(), /changed unexpectedly/);
+});
+
+test("detects permission changes on a pinned coordinator profile directory", async (t) => {
+  const { root, dataRoot } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const profile = await prepareCoordinatorProfile(dataRoot);
+  await chmod(profile.codexHome, 0o755);
   await assert.rejects(profile.assertIntact(), /changed unexpectedly/);
 });
 
