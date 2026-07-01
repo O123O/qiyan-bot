@@ -98,12 +98,32 @@ test("a resume response keeps its receipt order so a later settings notification
     model: "old",
     reasoningEffort: "low",
     thread: { status: { type: "idle" }, turns: [] },
-  }, 300, resumeSequence);
+  }, 300, { settings: resumeSequence });
   await value.processor.drain("local");
 
   const current = value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings;
   assert.equal(current.model, "new");
   assert.equal(current.effort, "high");
+});
+
+test("resume orders native state at the later authoritative thread response", async () => {
+  const value = fixture();
+  value.runtime.setSession("local", "thread-1", "unavailable", "notLoaded");
+  const settingsSequence = value.store.allocateObservationSequence();
+  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+  await value.processor.idle();
+  const nativeSequence = value.store.allocateObservationSequence();
+  value.runtime.setSession("local", "thread-1", "managed", "notLoaded");
+
+  value.processor.observeResume("local", "thread-1", {
+    model: "gpt-5",
+    reasoningEffort: "high",
+    thread: { status: { type: "active" }, turns: [{ id: "active-turn", status: "inProgress", startedAt: 2 }] },
+  }, 300, { settings: settingsSequence, native: nativeSequence });
+  await value.processor.drain("local");
+
+  assert.equal(value.runtime.getSession("local", "thread-1")?.nativeStatus, "active");
+  assert.equal(value.runtime.activeTurn("local", "thread-1"), "active-turn");
 });
 
 test("idle waits for a blocked handler and leaves endpoint failures pending for retry", async () => {

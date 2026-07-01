@@ -112,6 +112,23 @@ test("archive requires idle and startup reconciliation completes intermediate st
   assert.ok(endpoint.calls.some((call) => call.method === "thread/archive"));
 });
 
+test("startup reconciliation exposes reattach settings and authoritative history", async () => {
+  const { dir, endpoint, runtime, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", dir);
+  await lifecycle.detach("payments");
+  runtime.setSession("local", "thread-1", "attaching", "idle");
+  endpoint.turns = [{ id: "manual-turn" }];
+  const callbacks: string[] = [];
+
+  await lifecycle.reconcileStartup({ endpointId: "local", threadId: "thread-1" }, {
+    onResumed: (settings) => { callbacks.push(`resumed:${settings.model}`); },
+    onThreadRead: (thread) => { callbacks.push(`read:${thread.turns.at(-1)?.id}`); },
+  });
+
+  assert.equal(runtime.getSession("local", "thread-1")?.managementState, "managed");
+  assert.deepEqual(callbacks, ["resumed:gpt-5", "read:manual-turn"]);
+});
+
 test("a failed attach rollback remains uncertain instead of being classified as no effect", async () => {
   const { dir, endpoint, runtime, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1", dir);

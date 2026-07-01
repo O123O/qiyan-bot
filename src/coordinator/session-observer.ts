@@ -55,9 +55,20 @@ export class SessionObservationProcessor {
     await Promise.all([...this.tails.values()]);
   }
 
-  observeResume(endpointId: string, threadId: string, response: any, observedAt: number, observationSequence = this.store.allocateObservationSequence()): void {
+  observeResume(
+    endpointId: string,
+    threadId: string,
+    response: any,
+    observedAt: number,
+    sequences: { settings?: number; native?: number } = {},
+  ): void {
     const identity = this.managedIdentity(endpointId, threadId);
     if (!identity) return;
+    const sharedSequence = sequences.settings === undefined || sequences.native === undefined
+      ? this.store.allocateObservationSequence()
+      : undefined;
+    const settingsSequence = sequences.settings ?? sharedSequence!;
+    const nativeSequence = sequences.native ?? sharedSequence!;
     const turns = Array.isArray(response?.thread?.turns) ? response.thread.turns : [];
     this.store.hydrateTurnOrder(identity, turns.map((turn: any) => ({ id: String(turn.id), startedAt: finiteOrNull(turn.startedAt) })));
     const nativeStatus = String(response?.thread?.status?.type ?? "notLoaded");
@@ -65,14 +76,14 @@ export class SessionObservationProcessor {
       ? [...turns].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? this.runtime.activeTurn(endpointId, threadId)
       : undefined;
     const before = this.visibleRuntime(identity);
-    this.runtime.reconcileNativeState(endpointId, threadId, nativeStatus, activeTurn, observationSequence);
-    const visibleChanged = before.nativeStatus !== nativeStatus || before.activeTurnId !== (activeTurn ?? null);
+    const nativeApplied = this.runtime.reconcileNativeState(endpointId, threadId, nativeStatus, activeTurn, nativeSequence);
+    const visibleChanged = nativeApplied && (before.nativeStatus !== nativeStatus || before.activeTurnId !== (activeTurn ?? null));
     if (visibleChanged) this.store.observeLifecycle(identity, observedAt);
     const settings = this.store.observeCurrentSettings(identity, {
       ...(typeof response?.model === "string" ? { model: response.model } : {}),
       ...(typeof response?.reasoningEffort === "string" || response?.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
       observedAt,
-    }, observationSequence);
+    }, settingsSequence);
     if (visibleChanged || settings.valueChanged) this.options.onChanged();
   }
 

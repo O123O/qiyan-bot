@@ -322,17 +322,36 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       },
       rename_session: async (args) => { await registry.rename(args.old_nickname, args.new_nickname); await reconcileDashboard(); return { nickname: args.new_nickname }; },
       detach_session: async (args) => { await lifecycle.detach(args.nickname); observeLifecycle(args.nickname); await renderDashboardSafely(); return { nickname: args.nickname }; },
-      attach_session: async (args) => {
+      attach_session: async (args, context) => {
         const session = registry.get(args.nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         let settingsObservationSequence: number | undefined;
-        const settings = await lifecycle.attach(args.nickname, {
-          onResumed: () => { settingsObservationSequence = dashboardStore.allocateObservationSequence(); },
-          onThreadRead: (thread) => hydrateThreadOrder(session.endpoint, thread),
+        let settingsObservedAt: number | undefined;
+        let nativeObservationSequence: number | undefined;
+        let resumedSettings: { model?: string; effort?: string | null } | undefined;
+        const checkpoint = () => context.checkpoint({
+          ...(resumedSettings ? { currentSettings: resumedSettings } : {}),
+          ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }),
+          ...(settingsObservedAt === undefined ? {} : { settingsObservedAt }),
+          ...(nativeObservationSequence === undefined ? {} : { nativeObservationSequence }),
         });
-        advanceNativeWatermark(args.nickname);
+        const settings = await lifecycle.attach(args.nickname, {
+          onResumed: (currentSettings) => {
+            resumedSettings = currentSettings;
+            settingsObservationSequence = dashboardStore.allocateObservationSequence();
+            settingsObservedAt = Date.now();
+            checkpoint();
+          },
+          onThreadRead: (thread) => {
+            nativeObservationSequence = dashboardStore.allocateObservationSequence();
+            hydrateThreadOrder(session.endpoint, thread);
+            checkpoint();
+          },
+        });
+        advanceNativeWatermark(args.nickname, nativeObservationSequence);
         observeLifecycle(args.nickname);
-        observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
+        observeCurrentSettings(args.nickname, settings, settingsObservedAt, settingsObservationSequence);
+        await observations.drain(session.endpoint);
         await renderDashboardSafely();
         return { nickname: args.nickname };
       },
@@ -511,11 +530,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     dashboardStore.observeLifecycle(dashboardIdentity(nickname), observedAt);
   }
 
-  function advanceNativeWatermark(nickname: string): void {
+  function advanceNativeWatermark(nickname: string, observationSequence = dashboardStore.allocateObservationSequence()): void {
     const identity = dashboardIdentity(nickname);
     const state = runtime.getSession(identity.endpointId, identity.threadId);
     if (!state) return;
-    runtime.reconcileNativeState(identity.endpointId, identity.threadId, state.nativeStatus, runtime.activeTurn(identity.endpointId, identity.threadId), dashboardStore.allocateObservationSequence());
+    runtime.reconcileNativeState(identity.endpointId, identity.threadId, state.nativeStatus, runtime.activeTurn(identity.endpointId, identity.threadId), observationSequence);
   }
 
   function observeCurrentSettings(nickname: string, settings: { model?: string; effort?: string | null }, observedAt = Date.now(), observationSequence = dashboardStore.allocateObservationSequence()): void {
@@ -904,16 +923,49 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           else if (registry.get(args.old_nickname) && !registry.get(args.new_nickname)) failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
         } else if (["detach_session", "attach_session"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
+          const saved = operation.receipt as {
+            currentSettings?: { model?: string; effort?: string | null };
+            settingsObservationSequence?: number;
+            settingsObservedAt?: number;
+            nativeObservationSequence?: number;
+          } | undefined;
+          let currentSettings = saved?.currentSettings;
+          let settingsObservationSequence = saved?.settingsObservationSequence;
+          let settingsObservedAt = saved?.settingsObservedAt;
+          let nativeObservationSequence = saved?.nativeObservationSequence;
+          const checkpointAttach = () => operations.checkpoint(operation.id, {
+            ...(currentSettings ? { currentSettings } : {}),
+            ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }),
+            ...(settingsObservedAt === undefined ? {} : { settingsObservedAt }),
+            ...(nativeObservationSequence === undefined ? {} : { nativeObservationSequence }),
+          });
           let state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
           if (state === "detaching" || state === "attaching") {
-            await lifecycle.reconcileStartup({ endpointId: session!.endpoint, threadId: session!.thread_id });
+            await lifecycle.reconcileStartup({ endpointId: session!.endpoint, threadId: session!.thread_id }, operation.kind === "attach_session" ? {
+              onResumed: (settings) => {
+                currentSettings = settings;
+                settingsObservationSequence = dashboardStore.allocateObservationSequence();
+                settingsObservedAt = Date.now();
+                checkpointAttach();
+              },
+              onThreadRead: (thread) => {
+                nativeObservationSequence = dashboardStore.allocateObservationSequence();
+                hydrateThreadOrder(session!.endpoint, thread);
+                checkpointAttach();
+              },
+            } : {});
             state = session ? runtime.getSession(session.endpoint, session.thread_id)?.managementState : undefined;
           }
           const expected = operation.kind === "detach_session" ? "detached" : "managed";
-          if (state === expected) await succeedRecovered(operation, { nickname: args.nickname }, () => {
-            if (expected === "managed") advanceNativeWatermark(args.nickname);
+          if (state === expected && expected === "managed") {
+            advanceNativeWatermark(args.nickname, nativeObservationSequence);
+            if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, settingsObservedAt ?? operation.createdAt, settingsObservationSequence);
             observeLifecycle(args.nickname);
-          });
+            await observations.drain(session!.endpoint);
+            await succeedRecovered(operation, { nickname: args.nickname });
+          } else if (state === expected) {
+            await succeedRecovered(operation, { nickname: args.nickname }, () => observeLifecycle(args.nickname));
+          }
           else if ((operation.kind === "detach_session" && state === "managed") || (operation.kind === "attach_session" && state === "detached")) {
             failRecoveredNoEffect(operation.id, `durable ${operation.kind === "detach_session" ? "detaching" : "attaching"} marker was not committed`);
           }
@@ -1010,12 +1062,14 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         await verifySessionCwd(response.thread.cwd, session.project_dir);
         const authoritative = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: true });
+        const nativeObservationSequence = dashboardStore.allocateObservationSequence();
         hydrateThreadOrder(session.endpoint, authoritative.thread);
-        const activeTurn = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
         const nativeStatus = authoritative.thread.status?.type ?? response.thread.status?.type ?? "idle";
-        runtime.setSession(session.endpoint, session.thread_id, "managed", nativeStatus);
-        runtime.reconcileNativeState(session.endpoint, session.thread_id, nativeStatus, nativeStatus === "active" ? activeTurn?.id : undefined);
-        observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now(), resumeObservationSequence);
+        runtime.setSession(session.endpoint, session.thread_id, "managed", state.nativeStatus);
+        observations.observeResume(session.endpoint, session.thread_id, { ...response, thread: authoritative.thread }, Date.now(), {
+          settings: resumeObservationSequence,
+          native: nativeObservationSequence,
+        });
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         if (!runtime.currentEpoch(session.endpoint, session.thread_id)) {
           const baseline = [...(authoritative.thread.turns ?? [])].reverse().find((turn: any) => isTerminalStatus(turn.status))?.id;

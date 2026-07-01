@@ -122,7 +122,7 @@ export class SessionLifecycle {
     });
   }
 
-  async reconcileStartup(only?: { endpointId: string; threadId: string }): Promise<void> {
+  async reconcileStartup(only?: { endpointId: string; threadId: string }, attachObservers: AttachObservers = {}): Promise<void> {
     for (const entry of this.runtime.listSessions()) {
       if (only && (entry.endpointId !== only.endpointId || entry.threadId !== only.threadId)) continue;
       if (entry.managementState === "detaching") {
@@ -133,7 +133,7 @@ export class SessionLifecycle {
         const nickname = this.nicknameFor(entry.endpointId, entry.threadId);
         this.runtime.endEpoch(entry.endpointId, entry.threadId, this.clock.now());
         this.runtime.setSession(entry.endpointId, entry.threadId, "detached", entry.nativeStatus);
-        if (nickname) await this.attach(nickname);
+        if (nickname) await this.attach(nickname, attachObservers);
       }
     }
   }
