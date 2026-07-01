@@ -42,13 +42,15 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.equal(metadata.length, 1);
   const archive = join(temp, metadata[0]!.filename);
   const listing = (await execFileAsync("tar", ["-tzf", archive])).stdout.split("\n").filter(Boolean);
-  assert.deepEqual(listing.sort(), [
+  const requiredFiles = new Set([
     "package/README.md",
     "package/assets/coordinator/AGENTS.md",
     "package/assets/coordinator/session-status.example.json",
     "package/dist/codex-bot",
     "package/package.json",
-  ].sort());
+  ]);
+  for (const path of requiredFiles) assert.equal(listing.includes(path), true, `missing packed file: ${path}`);
+  assert.deepEqual(listing.filter((path) => !requiredFiles.has(path) && !/^package\/(?:licen[cs]e|notice)(?:\..*)?$/iu.test(path)), []);
 
   const installRoot = join(temp, "install");
   await execFileAsync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, archive]);
@@ -68,7 +70,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.notEqual((await stat(executable)).mode & 0o111, 0);
 
   const result = spawnSync(executable, ["--definitely-invalid"], {
-    cwd: packageRoot,
+    cwd: temp,
     encoding: "utf8",
     env: { PATH: process.env.PATH ?? "" },
   });
@@ -78,7 +80,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
 
   const workdir = join(temp, "coordinator");
   const startup = spawnSync(executable, ["--workdir", workdir], {
-    cwd: packageRoot,
+    cwd: temp,
     encoding: "utf8",
     timeout: 10_000,
     env: {
@@ -338,10 +340,16 @@ Stop the current `npm start` process with SIGINT through its existing terminal a
 
 ```bash
 backup="$HOME/.codex-bot/backups/$(date +%Y%m%d-%H%M%S)"
+data_dir=$(realpath -m -- "${DATA_DIR:-data}")
+registry_path=$(realpath -m -- "${SESSION_REGISTRY_PATH:-data/sessions.json}")
 install -d -m 700 "$backup"
-cp -a /home/xinmm/sources/codex-bot/data "$backup/data"
+cp -a -- "$data_dir" "$backup/data"
+cp -a -- "$registry_path" "$backup/session-registry.json"
+test ! -e "$registry_path.last-good" || cp -a -- "$registry_path.last-good" "$backup/session-registry.last-good.json"
 cp -a "$HOME/.codex-bot/coordinator" "$backup/coordinator"
 ```
+
+Resolve the effective data and registry paths in the same launch directory and environment as the stopped process. The explicit registry copies are required even when they duplicate files already contained by the data-directory backup.
 
 Do not print `/proc/*/environ`, the Telegram token, owner IDs, or message data.
 

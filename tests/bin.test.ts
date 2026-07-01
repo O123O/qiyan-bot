@@ -18,13 +18,15 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.equal(metadata.length, 1);
   const archive = join(temp, metadata[0]!.filename);
   const listing = (await execFileAsync("tar", ["-tzf", archive])).stdout.split("\n").filter(Boolean);
-  assert.deepEqual(listing.sort(), [
+  const requiredFiles = new Set([
     "package/README.md",
     "package/assets/coordinator/AGENTS.md",
     "package/assets/coordinator/session-status.example.json",
     "package/dist/codex-bot",
     "package/package.json",
-  ].sort());
+  ]);
+  for (const path of requiredFiles) assert.equal(listing.includes(path), true, `missing packed file: ${path}`);
+  assert.deepEqual(listing.filter((path) => !requiredFiles.has(path) && !/^package\/(?:licen[cs]e|notice)(?:\..*)?$/iu.test(path)), []);
 
   const installRoot = join(temp, "install");
   await execFileAsync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, archive]);
@@ -44,7 +46,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
   assert.notEqual((await stat(executable)).mode & 0o111, 0);
 
   const result = spawnSync(executable, ["--definitely-invalid"], {
-    cwd: packageRoot,
+    cwd: temp,
     encoding: "utf8",
     env: { PATH: process.env.PATH ?? "" },
   });
@@ -54,7 +56,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
 
   const workdir = join(temp, "coordinator");
   const startup = spawnSync(executable, ["--workdir", workdir], {
-    cwd: packageRoot,
+    cwd: temp,
     encoding: "utf8",
     timeout: 10_000,
     env: {
