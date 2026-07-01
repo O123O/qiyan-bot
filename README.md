@@ -14,12 +14,18 @@ The MVP runs on one machine. One token-free app-server hosts all project session
 
 The bot intentionally runs project sessions with approval policy `never` and the configured non-interactive sandbox. Review this trust model before running it: project sessions can modify files and execute commands without chat approval buttons. `workspace-write` is the default; use `danger-full-access` only for projects you trust. The Telegram adapter discards every non-owner update before storing content or invoking a model, and output is restricted to that owner's private chat ID.
 
-## Setup
+## Build and install
 
 ```bash
-npm ci
-cp .env.example .env
+npm install
+npm run build
+archive=$(npm pack --silent)
+npm install --global --prefix "$HOME/.local" "./$archive"
 ```
+
+`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, Codex authentication, and a `codex` executable; it does not need TSX, TypeScript source files, or a runtime dependency tree.
+
+The archive contains the executable and its two coordinator template assets. `$HOME/.local/bin` must be in `PATH`.
 
 Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, and `COORDINATOR_WORKDIR`. The destination is normally the owner's private chat ID. The coordinator workdir should be a standalone user-owned directory outside both this repository and `DATA_DIR`, for example `$HOME/.codex-bot/coordinator`. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
 
@@ -27,16 +33,16 @@ Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, a
 
 Codex authentication may come from the normal `CODEX_HOME` profile or supported environment credentials such as `OPENAI_API_KEY`. The owned app-servers inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the coordinator app-server, is excluded from model-launched shell commands, and is insufficient without the coordinator process identity.
 
-Run:
+After exporting the configuration, run the installed command from any directory:
 
 ```bash
-set -a; . ./.env; set +a
-npm start
+codex-bot --workdir "$HOME/.codex-bot/coordinator"
 ```
 
-Or select the coordinator home explicitly:
+For source development, copy the example environment, export it, and use the same executable entry through TSX:
 
 ```bash
+cp .env.example .env
 set -a; . ./.env; set +a
 npm start -- --workdir "$HOME/.codex-bot/coordinator"
 ```
