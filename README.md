@@ -21,6 +21,7 @@ npm install
 npm run build
 archive=$(npm pack --silent)
 npm install --global --prefix "$HOME/.local" "./$archive"
+rm -- "$archive"
 ```
 
 `npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, Codex authentication, and a `codex` executable; it does not need TSX, TypeScript source files, or a runtime dependency tree.
