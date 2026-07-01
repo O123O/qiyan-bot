@@ -4,11 +4,31 @@
 
 **Goal:** Prevent Telegram long polling from delaying outgoing messages by giving `getUpdates` an independently managed HTTP dispatcher.
 
-**Architecture:** A focused transport factory creates a polling `TelegramApi` backed by a dedicated Undici dispatcher and a delivery `TelegramApi` backed by the existing global fetch transport. The factory reads Node's already-resolved proxy environment from the HTTPS global agent instead of reparsing CLI flags, and owns an idempotent polling-dispatcher close operation; `TelegramChatAdapter` awaits the entire poller loop before closing it.
+**Architecture:** A focused transport factory creates polling and delivery `TelegramApi` instances backed by two explicit, separately managed Undici dispatchers. The factory reads Node's already-resolved proxy environment from the HTTPS global agent instead of reparsing CLI flags. `TelegramChatAdapter` awaits the entire poller loop before closing polling, and production closes delivery only after its worker stops.
 
 **Tech Stack:** TypeScript, Node.js 24+, Undici 8.5, `node:test`, esbuild, Telegram Bot API
 
 ---
+
+### Reviewed compatibility amendment
+
+Implementation review on supported Node 24 and 25 releases proved that importing the
+standalone Undici entrypoint can replace the dispatcher consulted by Node's global
+fetch. The initial Task 1 snippets that retain global fetch for delivery are therefore
+superseded by these requirements:
+
+- construct two explicit dispatchers from the same Node-resolved proxy configuration,
+  one for polling and one for delivery;
+- pass each dispatcher to the standalone Undici fetch implementation;
+- expose idempotent `closePolling()` and `closeDelivery()` operations;
+- make a stopped adapter terminal so it cannot restart on a closed polling dispatcher;
+- add `ChatAdapter.close()` and invoke it only after `DeliveryWorker.stop()` in the
+  production delivery phase;
+- test distinct dispatcher identity, one close per role, terminal restart rejection,
+  and delivery cleanup.
+
+These reviewed requirements take precedence over conflicting first-pass code snippets
+below and are reflected in the committed implementation and final verification.
 
 ### Task 1: Add the isolated Telegram transport factory
 

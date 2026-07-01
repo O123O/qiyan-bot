@@ -24,13 +24,14 @@ export interface TelegramTransports {
   polling: Pick<TelegramApi, "getUpdates" | "downloadFile">;
   delivery: ChatDeliveryAdapter;
   closePolling(): Promise<void>;
+  closeDelivery(): Promise<void>;
 }
 
 interface TelegramTransportDependencies {
   proxyEnvironment?: () => NodeJS.ProcessEnv | undefined;
-  createDispatcher?: (configuration: PollingDispatcherConfiguration) => PollingDispatcher;
+  createDispatcher?: (configuration: PollingDispatcherConfiguration, role: "polling" | "delivery") => PollingDispatcher;
   pollingFetch?: DispatcherFetch;
-  deliveryFetch?: typeof globalThis.fetch;
+  deliveryFetch?: DispatcherFetch;
 }
 
 export function effectiveProxyEnvironment(agent: ProxyAwareAgent = httpsGlobalAgent as ProxyAwareAgent): NodeJS.ProcessEnv | undefined {
@@ -40,16 +41,21 @@ export function effectiveProxyEnvironment(agent: ProxyAwareAgent = httpsGlobalAg
 export function createTelegramTransports(token: string, dependencies: TelegramTransportDependencies = {}): TelegramTransports {
   const proxyEnv = dependencies.proxyEnvironment ? dependencies.proxyEnvironment() : effectiveProxyEnvironment();
   const configuration = dispatcherConfiguration(proxyEnv);
-  const dispatcher = dependencies.createDispatcher?.(configuration) ?? createDispatcher(configuration);
+  const create = dependencies.createDispatcher ?? ((value: PollingDispatcherConfiguration) => createDispatcher(value));
+  const pollingDispatcher = create(configuration, "polling");
+  const deliveryDispatcher = create(configuration, "delivery");
   const pollingFetch = dependencies.pollingFetch ?? (undiciFetch as unknown as DispatcherFetch);
-  const deliveryFetch = dependencies.deliveryFetch ?? globalThis.fetch;
-  const fetchWithDispatcher: typeof globalThis.fetch = (input, init) => pollingFetch(input, { ...init, dispatcher });
-  let closePromise: Promise<void> | undefined;
+  const deliveryFetch = dependencies.deliveryFetch ?? (undiciFetch as unknown as DispatcherFetch);
+  const fetchWith = (fetch: DispatcherFetch, dispatcher: PollingDispatcher): typeof globalThis.fetch =>
+    (input, init) => fetch(input, { ...init, dispatcher });
+  let closePollingPromise: Promise<void> | undefined;
+  let closeDeliveryPromise: Promise<void> | undefined;
 
   return {
-    polling: new TelegramApi(token, { fetch: fetchWithDispatcher }),
-    delivery: new TelegramApi(token, { fetch: deliveryFetch }),
-    closePolling: () => closePromise ??= dispatcher.close(),
+    polling: new TelegramApi(token, { fetch: fetchWith(pollingFetch, pollingDispatcher) }),
+    delivery: new TelegramApi(token, { fetch: fetchWith(deliveryFetch, deliveryDispatcher) }),
+    closePolling: () => closePollingPromise ??= pollingDispatcher.close(),
+    closeDelivery: () => closeDeliveryPromise ??= deliveryDispatcher.close(),
   };
 }
 

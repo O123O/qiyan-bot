@@ -14,6 +14,8 @@ export class TelegramChatAdapter implements ChatAdapter {
   private readonly poller: TelegramPoller;
   private readonly transports: TelegramTransports;
   private stopping: Promise<void> | undefined;
+  private closing: Promise<void> | undefined;
+  private stopped = false;
 
   constructor(
     db: Database,
@@ -31,12 +33,21 @@ export class TelegramChatAdapter implements ChatAdapter {
     });
   }
 
-  start(): void { this.poller.start(); }
+  start(): void {
+    if (this.stopped) throw new Error("Telegram adapter has stopped and cannot restart");
+    this.poller.start();
+  }
 
   stop(): Promise<void> {
-    return this.stopping ??= (async () => {
-      await this.poller.stop();
-      await this.transports.closePolling();
-    })();
+    if (!this.stopping) {
+      this.stopped = true;
+      this.stopping = (async () => {
+        await this.poller.stop();
+        await this.transports.closePolling();
+      })();
+    }
+    return this.stopping;
   }
+
+  close(): Promise<void> { return this.closing ??= this.transports.closeDelivery(); }
 }

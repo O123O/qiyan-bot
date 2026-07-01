@@ -283,7 +283,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         deliveryWorker = new DeliveryWorker(deliveries, chat.delivery, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
-      stop: async () => { await deliveryWorker.stop(); },
+      stop: async () => { await deliveryWorker.stop(); await chat.close(); },
     },
     { name: "maintenance", start: async () => undefined, stop: async () => undefined },
     {

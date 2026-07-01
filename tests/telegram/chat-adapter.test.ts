@@ -22,6 +22,7 @@ test("adapter uses supplied transports without touching real Telegram", async (c
   context.after(() => db.close());
   const delivery = { sendMessage: async () => ({ message_id: 1 }) };
   let closes = 0;
+  let deliveryCloses = 0;
   const adapter = new TelegramChatAdapter(
     db,
     new OperationStore(db),
@@ -30,11 +31,12 @@ test("adapter uses supplied transports without touching real Telegram", async (c
     {
       createTransports: () => ({
         polling: {
-          getUpdates: async () => [],
+          getUpdates: async () => new Promise<never>(() => undefined),
           downloadFile: async () => ({ stream: Readable.from([]) }),
         },
         delivery,
         closePolling: async () => { closes += 1; },
+        closeDelivery: async () => { deliveryCloses += 1; },
       }),
     },
   );
@@ -42,6 +44,9 @@ test("adapter uses supplied transports without touching real Telegram", async (c
   assert.equal(adapter.delivery, delivery);
   await adapter.stop();
   assert.equal(closes, 1);
+  await Promise.all([adapter.close(), adapter.close()]);
+  assert.equal(deliveryCloses, 1);
+  assert.throws(() => adapter.start(), /stopped/u);
 });
 
 test("adapter waits for polling-owned work and closes its dispatcher exactly once", async (context) => {
@@ -74,6 +79,7 @@ test("adapter waits for polling-owned work and closes its dispatcher exactly onc
     },
     delivery: { sendMessage: async () => ({ message_id: 1 }) },
     closePolling: async () => { closes += 1; },
+    closeDelivery: async () => undefined,
   };
   const adapter = new TelegramChatAdapter(db, new OperationStore(db), attachments, {
     token: "token",

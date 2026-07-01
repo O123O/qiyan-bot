@@ -39,8 +39,8 @@ semantics, delivery recovery, or message contents.
 Add a focused Telegram transport factory that returns:
 
 - a polling `TelegramApi` whose fetch function uses a dedicated Undici dispatcher;
-- a delivery `TelegramApi` that continues to use the normal global fetch transport;
-- an idempotent close operation for the polling agent.
+- a delivery `TelegramApi` whose fetch function uses a second dedicated dispatcher;
+- idempotent close operations for both dispatchers.
 
 The factory preserves Node's effective opt-in environment-proxy policy without
 reimplementing Node's CLI parser. At process startup, Node records the resolved policy
@@ -51,13 +51,21 @@ or a normal `Agent` otherwise. Both choices still provide a pool independent fro
 delivery transport. Lowercase proxy variables retain Undici's documented precedence
 over uppercase variants.
 
+Delivery also uses an explicit dispatcher because loading the standalone Undici
+package can replace the dispatcher consulted by Node's global fetch on supported Node
+24 and 25 releases. Giving both roles explicit, separately constructed dispatchers
+preserves proxy behavior and prevents either role from depending on mutable global
+dispatcher state.
+
 `TelegramChatAdapter` will expose the delivery API as it does today, give the
 polling API to `TelegramPoller`, and own the polling transport lifecycle. On stop,
 it first aborts and awaits the active long poll, then closes the dedicated agent.
 
-Only polling owns an additional agent. This matches the existing production phase
-order: polling is stopped before the delivery worker. Closing a delivery agent from
-`TelegramChatAdapter.stop()` could otherwise race with an in-flight delivery.
+The existing production phase order stops polling before the delivery worker. The
+adapter therefore closes only the polling dispatcher from `stop()`. After the delivery
+worker fully stops, the delivery phase calls `close()` to close the delivery dispatcher
+without racing an in-flight send. A stopped adapter is terminal and rejects restart;
+production creates a fresh adapter for a later application start.
 
 The implementation will add `undici` as a build dependency and use its supported
 `Agent` and `fetch` APIs together. The existing esbuild configuration will bundle it
@@ -71,8 +79,8 @@ contract.
 3. The poller persists and dispatches the accepted source, then starts the next long
    poll on the same dedicated polling agent.
 4. Codex processes the source concurrently.
-5. `DeliveryWorker` calls `sendMessage` or `sendDocument` through the independent
-   global delivery transport, so the active long poll cannot queue its request body.
+5. `DeliveryWorker` calls `sendMessage` or `sendDocument` through the second explicit
+   delivery dispatcher, so the active long poll cannot queue its request body.
 
 ## Error Handling and Shutdown
 
@@ -82,7 +90,7 @@ poll loop behavior remains authoritative. Shutdown awaits `TelegramPoller.stop()
 full before closing the dispatcher. This covers an active long poll, attachment
 download, or `onAccepted` callback rather than closing transport resources while any
 polling-owned work is still running. Repeated or concurrent stops share one close
-operation, and the dispatcher closes exactly once.
+operation, and each dispatcher closes exactly once in its owning shutdown phase.
 
 ## Testing
 

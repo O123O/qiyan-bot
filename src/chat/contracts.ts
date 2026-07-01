@@ -14,4 +14,5 @@ export interface ChatAdapter {
   readonly delivery: ChatDeliveryAdapter;
   start(): void;
   stop(): Promise<void>;
+  close(): Promise<void>;
 }
