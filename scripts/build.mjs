@@ -16,7 +16,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
-  banner: { js: "#!/usr/bin/env node" },
+  banner: { js: "#!/usr/bin/env node\nimport { createRequire as __codexBotCreateRequire } from \"node:module\";\nconst require = __codexBotCreateRequire(import.meta.url);" },
   legalComments: "eof",
   logLevel: "info",
 });
