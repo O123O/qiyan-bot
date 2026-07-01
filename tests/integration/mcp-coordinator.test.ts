@@ -80,14 +80,36 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
   await endpoint.stop();
   await endpoint.start();
   const read = await endpoint.request<any>("thread/read", { threadId: started.thread.id, includeTurns: false });
+  const resumed = await endpoint.request<any>("thread/resume", {
+    threadId: started.thread.id,
+    cwd: workdir,
+    approvalPolicy: "never",
+    sandbox: "workspace-write",
+    config: {},
+  });
   assert.deepEqual({
     start: started.thread.threadSource ?? null,
     read: read.thread.threadSource ?? null,
+    resume: resumed.thread.threadSource ?? null,
     startSource: started.thread.source,
     readSource: read.thread.source,
+    resumeSource: resumed.thread.source,
     name: read.thread.name,
+    resumeName: resumed.thread.name,
     cwd: read.thread.cwd,
-  }, { start: nonce, read: nonce, startSource: started.thread.source, readSource: read.thread.source, name, cwd: workdir });
+    resumeCwd: resumed.thread.cwd,
+  }, {
+    start: nonce,
+    read: nonce,
+    resume: nonce,
+    startSource: started.thread.source,
+    readSource: read.thread.source,
+    resumeSource: resumed.thread.source,
+    name,
+    resumeName: name,
+    cwd: workdir,
+    resumeCwd: workdir,
+  });
 });
 
 test("real coordinator can call its approved manager MCP while a project worker cannot enumerate it", { skip: !enabled, timeout: 180_000 }, async (t) => {
