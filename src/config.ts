@@ -43,6 +43,15 @@ export interface BotConfig {
 
 export interface ConfigOverrides { coordinatorWorkdir?: string }
 
+export interface CoordinatorLoginConfig { dataDir: string; codexBinary: string }
+
+export function loadCoordinatorLoginConfig(env: Record<string, string | undefined>): CoordinatorLoginConfig {
+  return {
+    dataDir: resolve(z.string().min(1).default("data").parse(env.DATA_DIR)),
+    codexBinary: z.string().min(1).default("codex").parse(env.CODEX_BINARY),
+  };
+}
+
 export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides = {}): BotConfig {
   const parsed = configSchema.parse(overrides.coordinatorWorkdir === undefined
     ? env

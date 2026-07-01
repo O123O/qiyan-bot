@@ -1,9 +1,15 @@
 import { z } from "zod";
 import { AppError } from "./core/errors.ts";
 
-export interface CliOptions { coordinatorWorkdir?: string }
+export type CliCommand =
+  | { command: "run"; coordinatorWorkdir?: string }
+  | { command: "coordinator-login" };
 
-export function parseCliArgs(argv: readonly string[]): CliOptions {
+export function parseCliArgs(argv: readonly string[]): CliCommand {
+  if (argv[0] === "coordinator-login") {
+    if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
+    return { command: "coordinator-login" };
+  }
   let coordinatorWorkdir: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -14,7 +20,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     coordinatorWorkdir = value;
     index += 1;
   }
-  return coordinatorWorkdir === undefined ? {} : { coordinatorWorkdir };
+  return coordinatorWorkdir === undefined ? { command: "run" } : { command: "run", coordinatorWorkdir };
 }
 
 export function formatStartupError(error: unknown): string {

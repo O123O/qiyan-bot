@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { loadConfig } from "../src/config.ts";
+import { loadConfig, loadCoordinatorLoginConfig } from "../src/config.ts";
 
 function baseEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
@@ -50,4 +50,12 @@ test("CLI workdir overrides the environment and resolves from the launch directo
 test("CLI workdir takes precedence before an invalid environment workdir is validated", () => {
   const config = loadConfig(baseEnv({ COORDINATOR_WORKDIR: "" }), { coordinatorWorkdir: "from-cli" });
   assert.equal(config.coordinatorWorkdir, resolve("from-cli"));
+});
+
+test("coordinator login configuration needs only data and Codex paths", () => {
+  assert.deepEqual(loadCoordinatorLoginConfig({ DATA_DIR: "private-data", CODEX_BINARY: "/opt/codex" }), {
+    dataDir: resolve("private-data"),
+    codexBinary: "/opt/codex",
+  });
+  assert.deepEqual(loadCoordinatorLoginConfig({}), { dataDir: resolve("data"), codexBinary: "codex" });
 });
