@@ -49,7 +49,11 @@ Ordinary messages go to the coordinator. It chooses a project nickname, asks whe
 
 Every eligible terminal worker response is automatically sent to Telegram as `[nickname] …`. The coordinator receives only compact metadata and decides whether it needs to read the body or follow up. This avoids duplicating project transcripts in the coordinator context. Failed, interrupted, permission-blocked, and unavailable work produces a labeled warning.
 
-The coordinator keeps durable supervision notes in `<coordinator-workdir>/session-status.json`. The notebook records project status, current objectives, last sent work, last worker event, and pending follow-up so supervision intent survives context compaction. SQLite remains authoritative for execution state. An invalid existing notebook stops startup without replacing or quarantining its contents.
+The backend materializes `<coordinator-workdir>/session-status.json` as a mode-0400 session dashboard. It automatically records lifecycle state, active turn, the last instruction, terminal worker metadata, current and pending model/effort, exact observed thread token/context use, and the native goal. The coordinator owns only concise `manager_notes`, updated through `update_session_notes`, so supervision intent survives context compaction without asking the model to maintain JSON. SQLite is authoritative; the JSON file is a replaceable read-only view.
+
+On the first upgraded startup, a version-1 manager notebook is imported exactly once by stable thread identity. `project_status`, `current_objective`, and `pending_follow_up` become manager notes. Legacy last-sent and worker-event fields are not trusted as automatic observations. Invalid, unmatched, ambiguous, or duplicate legacy entries stop startup before the original bytes are replaced. A successful migration is crash-idempotent.
+
+`get_session_status` returns the same complete entry after refreshing live lifecycle and goal state. Token figures describe that Codex thread's context use; they are not account billing, credits, global usage, or rate-limit information.
 
 ### Coordinator instructions
 
@@ -61,7 +65,7 @@ For complete prompt customization, copy the current policy and edit the override
 cp "$COORDINATOR_WORKDIR/AGENTS.md" "$COORDINATOR_WORKDIR/AGENTS.override.md"
 ```
 
-Codex gives `AGENTS.override.md` precedence in that directory. The bot never creates, reads, updates, or deletes it. Because it replaces the managed prompt completely, retain any routing, automatic-delivery, notebook, exact-directive, goal, attachment, and recovery behavior you still want.
+Codex gives `AGENTS.override.md` precedence in that directory. The bot never creates, reads, updates, or deletes it. Because it replaces the managed prompt completely, retain the routing, automatic-delivery, read-only dashboard/registry, exact-directive, goal, attachment, and recovery behavior you still want.
 
 To recover from a managed-policy guard error, either restore `AGENTS.md` to the exact content represented by the stored digest, or move the desired custom policy to `AGENTS.override.md` and delete both `AGENTS.md` and `.codex-bot-agents.sha256`; the bot then reinstalls a fresh managed pair. A coordinator workdir inside a Git worktree is allowed but produces a warning because Codex may also inherit instructions from that repository's project root.
 
@@ -87,7 +91,7 @@ The backend fixes the count from the immutable source message, selects at most 2
 
 ## Sessions and manual work
 
-`data/sessions.json` maps coordinator-assigned nicknames to an endpoint, Codex thread ID, and canonical project directory. Writes are atomic and externally edited invalid JSON is rejected while the last-known-good in-memory registry remains active.
+`data/sessions.json` maps coordinator-assigned nicknames to an endpoint, Codex thread ID, and canonical project directory. The coordinator treats it as read-only and uses typed lifecycle/nickname tools. Backend writes are atomic; an invalid operator replacement is rejected while the last-known-good in-memory registry remains active.
 
 Detach before taking over a managed thread manually. Detach requires idle state, unsubscribes the bot, and ends its managed epoch. Work completed while detached is deliberately not auto-forwarded. Attach performs an idle read, resumes with the registered canonical directory, performs a second idle read, and starts a new epoch whose history baseline excludes detached-period turns.
 
@@ -107,15 +111,17 @@ Coordinator tool effects use a separate operation ledger keyed by source context
 
 ## State, backup, and logs
 
-- `data/bot.sqlite3`: offsets, operations, outbox, events, runtime state, epochs, discovery snapshots, and attachment metadata
-- `data/sessions.json`: human-editable session identity registry
+- `data/bot.sqlite3`: offsets, operations, outbox, events, runtime state, dashboard observations/notes, notification inbox, epochs, discovery snapshots, and attachment metadata
+- `data/sessions.json`: backend session identity registry (read-only to the coordinator)
 - `data/attachments/`: private temporary attachment snapshots
 - `<coordinator-workdir>/AGENTS.md`: bot-managed coordinator playbook
 - `<coordinator-workdir>/.codex-bot-agents.sha256`: installed-playbook digest
 - `<coordinator-workdir>/AGENTS.override.md`: optional, entirely user-owned replacement prompt
-- `<coordinator-workdir>/session-status.json`: coordinator-maintained management notebook
+- `<coordinator-workdir>/session-status.json`: backend-generated mode-0400 session dashboard
 
-Back up the SQLite database, registry, and external coordinator workdir together while the bot is stopped. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
+Back up the SQLite database, registry, and external coordinator workdir together while the bot is stopped. Do not restore `session-status.json` independently from SQLite; it is rebuilt at startup. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
+
+If dashboard rendering fails after a confirmed action, the action remains confirmed. SQLite keeps the projection dirty, emits one structural warning for the failure episode, and maintenance retries without replaying the app-server action. Repair the coordinator directory/path permissions, then wait for maintenance or restart. Startup will not run the coordinator until a complete dashboard has been written.
 
 ## Verification
 
@@ -135,7 +141,7 @@ RUN_TELEGRAM_LIVE=1 npm test -- tests/integration/telegram-live.test.ts
 ## Troubleshooting
 
 - `ENDPOINT_UNAVAILABLE`: check `codex --version`, Codex authentication, proxy variables, and app-server stderr.
-- `CONFIGURATION_ERROR`: check `--workdir`/`COORDINATOR_WORKDIR`, path separation, the managed `AGENTS.md` digest pair, the existing notebook JSON, and the coordinator path stored in the session registry.
+- `CONFIGURATION_ERROR`: check `--workdir`/`COORDINATOR_WORKDIR`, path separation, the managed `AGENTS.md` digest pair, a legacy dashboard awaiting migration, and the coordinator path stored in the session registry.
 - `CWD_MISMATCH`: the persisted thread directory differs from the registry's canonical project path; do not force-attach it.
 - `SESSION_BUSY`: wait, steer the exact active turn, or interrupt it before lifecycle changes.
 - `PERMISSION_BLOCKED`: the worker requested an approval or permission escalation, which chat auto mode intentionally declines.
