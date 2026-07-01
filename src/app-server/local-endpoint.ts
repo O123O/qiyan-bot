@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { AppError } from "../core/errors.ts";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import { JsonRpcClient } from "./json-rpc-client.ts";
@@ -49,7 +49,7 @@ export class LocalEndpoint {
   private protocolIdentity?: LinuxProcessIdentity;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; expectedCodexHome?: string; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
     this.id = options.id ?? "local";
   }
 
@@ -94,13 +94,18 @@ export class LocalEndpoint {
       }
     });
     try {
-      const initialized = await client.request<{ userAgent?: string }>("initialize", {
+      const initialized = await client.request<{ userAgent?: string; codexHome?: string }>("initialize", {
         clientInfo: { name: "codex_chat_bot", title: "Codex Chat Bot", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
       if (this.options.expectedVersion) {
         const actual = /\/(\d+\.\d+\.\d+)(?:\s|\()/u.exec(initialized.userAgent ?? "")?.[1];
         if (actual !== this.options.expectedVersion) throw new AppError("UNSUPPORTED_CAPABILITY", `expected Codex app-server ${this.options.expectedVersion}, received ${actual ?? "unknown"}`);
+      }
+      if (this.options.expectedCodexHome) {
+        const matches = initialized.codexHome !== undefined
+          && await realpath(initialized.codexHome).catch(() => undefined) === await realpath(this.options.expectedCodexHome);
+        if (!matches) throw new AppError("CONFIGURATION_ERROR", "coordinator app-server reported an unexpected CODEX_HOME");
       }
       const protocolIdentity = child.pid === undefined ? undefined : await (this.options.resolveMcpClientIdentity ?? resolveMcpClientIdentity)(child.pid);
       if (this.child !== child || this.client !== client || this.state !== "starting") throw new AppError("ENDPOINT_UNAVAILABLE", "app-server generation changed during initialization");

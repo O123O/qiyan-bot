@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
-import { prepareCoordinatorProfile } from "../../src/coordinator/profile.ts";
+import { assertCoordinatorAuthenticated, prepareCoordinatorProfile, startAuthenticatedCoordinatorEndpoint } from "../../src/coordinator/profile.ts";
 
 async function fixture(): Promise<{ root: string; dataRoot: string }> {
   const root = await mkdtemp(join(tmpdir(), "codex-bot-profile-"));
@@ -97,4 +97,39 @@ test("rejects malformed, noncanonical, unsupported, and symlink activation marke
   await writeFile(target, JSON.stringify({ version: 1, creation_nonce: crypto.randomUUID(), creation_baseline: [] }));
   await symlink(target, join(profileRoot, "profile.json"));
   await assert.rejects(prepareCoordinatorProfile(dataRoot), /activation marker must be a regular file/);
+});
+
+test("coordinator authentication preflight accepts authenticated and external-provider profiles", async () => {
+  const profile = { root: "/private/profile", home: "/private/profile/home", codexHome: "/private/profile/codex" };
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const endpoint = (result: unknown) => ({
+    request: async (method: string, params: unknown) => { requests.push({ method, params }); return result; },
+  });
+  await assertCoordinatorAuthenticated(endpoint({ account: { type: "chatgpt" }, requiresOpenaiAuth: true }), profile);
+  await assertCoordinatorAuthenticated(endpoint({ account: null, requiresOpenaiAuth: false }), profile);
+  assert.deepEqual(requests, [
+    { method: "account/read", params: { refreshToken: false } },
+    { method: "account/read", params: { refreshToken: false } },
+  ]);
+});
+
+test("coordinator authentication failure is actionable and stops a newly started endpoint", async () => {
+  const profile = { root: "/private/profile", home: "/private/profile/home", codexHome: "/private/profile/codex" };
+  const endpoint = {
+    starts: 0,
+    stops: 0,
+    async start() { this.starts += 1; },
+    async stop() { this.stops += 1; },
+    async request() { return { account: null, requiresOpenaiAuth: true }; },
+  };
+  await assert.rejects(
+    startAuthenticatedCoordinatorEndpoint(endpoint, profile),
+    (error: unknown) => error instanceof AppError
+      && error.code === "CONFIGURATION_ERROR"
+      && error.message.includes(profile.home)
+      && error.message.includes(profile.codexHome)
+      && error.message.includes("codex-bot coordinator-login"),
+  );
+  assert.equal(endpoint.starts, 1);
+  assert.equal(endpoint.stops, 1);
 });

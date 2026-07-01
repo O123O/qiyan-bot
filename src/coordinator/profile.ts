@@ -78,6 +78,37 @@ export function buildCoordinatorChildEnvironment(
   return { ...buildCodexChildEnvironment(host, mcpToken), HOME: profile.home, CODEX_HOME: profile.codexHome };
 }
 
+interface AccountEndpoint {
+  request(method: string, params: unknown): Promise<unknown>;
+}
+
+interface StartableAccountEndpoint extends AccountEndpoint {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export async function assertCoordinatorAuthenticated(
+  endpoint: AccountEndpoint,
+  profile: Pick<PreparedCoordinatorProfile, "root" | "home" | "codexHome">,
+): Promise<void> {
+  const response = await endpoint.request("account/read", { refreshToken: false }) as { account: unknown | null; requiresOpenaiAuth: boolean };
+  if (response.account !== null || !response.requiresOpenaiAuth) return;
+  throw managedError(`coordinator Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run codex-bot coordinator-login with DATA_DIR set to ${dirname(profile.root)}`);
+}
+
+export async function startAuthenticatedCoordinatorEndpoint(
+  endpoint: StartableAccountEndpoint,
+  profile: Pick<PreparedCoordinatorProfile, "root" | "home" | "codexHome">,
+): Promise<void> {
+  await endpoint.start();
+  try {
+    await assertCoordinatorAuthenticated(endpoint, profile);
+  } catch (error) {
+    await endpoint.stop().catch(() => undefined);
+    throw error;
+  }
+}
+
 async function ensurePrivateDirectory(path: string): Promise<string> {
   let value;
   try { value = await lstat(path); }

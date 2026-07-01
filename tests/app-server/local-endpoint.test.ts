@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { LocalEndpoint, resolveMcpClientIdentity } from "../../src/app-server/local-endpoint.ts";
@@ -62,6 +65,35 @@ test("rejects an app-server version outside the generated protocol pin", async (
   const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedVersion: "0.142.4" });
   await assert.rejects(endpoint.start(), /expected Codex app-server 0\.142\.4/);
   assert.equal(endpoint.state, "unavailable");
+});
+
+test("attests the coordinator CODEX_HOME before publishing readiness", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "codex-home-attestation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const expected = join(root, "expected");
+  const other = join(root, "other");
+  await mkdir(expected);
+  await mkdir(other);
+
+  const create = (codexHome: string | undefined) => {
+    const child = new FakeChild();
+    child.stdin.on("data", (chunk) => {
+      const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+      if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { ...(codexHome ? { codexHome } : {}) } })}\n`);
+    });
+    return { child, endpoint: new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedCodexHome: expected }) };
+  };
+
+  const matching = create(expected);
+  await matching.endpoint.start();
+  assert.equal(matching.endpoint.state, "ready");
+  await matching.endpoint.stop();
+
+  for (const actual of [other, undefined]) {
+    const mismatching = create(actual);
+    await assert.rejects(mismatching.endpoint.start(), /unexpected CODEX_HOME/);
+    assert.equal(mismatching.endpoint.state, "unavailable");
+  }
 });
 
 test("a delayed exit from an old child cannot close a restarted endpoint", async () => {
