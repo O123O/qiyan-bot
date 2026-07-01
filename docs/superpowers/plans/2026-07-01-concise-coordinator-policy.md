@@ -47,9 +47,11 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
     "## Tool catalog",
   ]) assert.match(policy, new RegExp(`^${heading}$`, "mu"));
 
+  const catalogSection = policy.split(/^## Tool catalog$/mu)[1];
+  assert.ok(catalogSection, "missing tool catalog section");
   const catalogued: string[] = [];
   for (const [label, expected] of catalog) {
-    const line = policy.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
+    const line = catalogSection.split("\n").find((candidate) => candidate.startsWith(`${label}: `));
     assert.ok(line, `missing tool catalog category: ${label}`);
     const actual = [...line.matchAll(/`([^`]+)`/gu)].map((match) => match[1]!);
     assert.deepEqual(actual, [...expected]);
@@ -58,7 +60,12 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.deepEqual(new Set(catalogued), new Set(TOOL_NAMES));
 
   assert.match(policy, /worker final messages are automatically delivered/iu);
+  assert.match(policy, /ask when more than one target remains plausible/iu);
+  assert.match(policy, /never silently repoint a nickname/iu);
   assert.match(policy, /state change happened only when its tool receipt proves it/iu);
+  assert.match(policy, /interrupt only on explicit user intent or an already-authorized supervision objective/iu);
+  assert.match(policy, /permission blocks.*worker failures are real states.*never fabricate/isu);
+  assert.match(policy, /worker notifications contain metadata, not bodies/iu);
   assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
   assert.match(policy, /set_goal.*replaces the current goal/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
@@ -66,8 +73,10 @@ test("packaged coordinator policy is concise and reserves examples for exact dir
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*data\/sessions\.json/iu);
   assert.match(policy, /manager_notes.*update_session_notes/isu);
   assert.match(policy, /automatically maintained `auto_session_info`/iu);
+  assert.match(policy, /automatic values may be `null`.*do not invent/isu);
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
   assert.match(policy, /no `?watch_session`? tool/iu);
+  assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);
 
   assert.match(policy, /\/pass.*every character.*attachment IDs in original order exactly/isu);
   assert.match(policy, /one required ASCII separator/iu);
