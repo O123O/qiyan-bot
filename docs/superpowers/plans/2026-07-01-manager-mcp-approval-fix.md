@@ -8,7 +8,9 @@ The live coordinator attempted `prepare_chat_attachment` twice. Both Codex tool 
 
 The coordinator thread uses `approvalPolicy: "never"` with the production default `workspace-write` sandbox, while `coordinatorTurnConfig()` configures the private manager MCP server without `default_tools_approval_mode`. Omission selects Codex's `auto` mode. Because these MCP tools have no safety annotations, pinned Codex 0.142.4 conservatively treats them as approval-requiring; a non-interactive `never` thread rejects that request.
 
-This server is intentionally safe to pre-approve as a transport boundary: it is loopback-only, requires an in-memory bearer token, verifies the client belongs to the coordinator app-server process tree, requires an active durable source context, validates every typed tool argument, and records state-changing effects in the operation ledger. Project app-servers do not receive the bearer token or manager MCP configuration.
+This server is intentionally safe to pre-approve only if its transport boundary is exact: it is loopback-only, requires an in-memory bearer token, requires an active durable source context, validates every typed tool argument, and records state-changing effects in the operation ledger. Project app-servers do not receive the bearer token or manager MCP configuration.
+
+The bearer token is not a sufficient boundary by itself. A same-user coordinator shell can recover an ancestor app-server environment through `/proc`. Authorization must therefore accept the endpoint wrapper itself or its direct trusted Codex app-server child, but reject deeper descendants such as model-launched shells even when they recover the token. The pinned runtime uses exactly that wrapper/direct-child topology; the real manager integration must continue to prove that the trusted client works.
 
 ## Test-first implementation
 
@@ -16,7 +18,11 @@ This server is intentionally safe to pre-approve as a transport boundary: it is 
 2. Change the real integration test's coordinator sandbox from `danger-full-access` to the production default `workspace-write`. Keep its `approvalPolicy: "never"`, exact one-call assertion, and shell token-hiding check.
 3. Run the focused unit test and the opt-in real integration before changing production code. Confirm the unit assertion fails because the field is absent and the real manager call is rejected before reaching the handler.
 4. Add only `default_tools_approval_mode: "approve"` to the `codex_bot_manager` entry returned by `coordinatorTurnConfig()` in `src/mcp/server.ts`.
-5. Rerun the focused unit and real integration tests and confirm both pass, proving the omitted configuration fails and the explicit approved mode succeeds under `workspace-write`. Then run typecheck, the full test suite, and the package smoke test.
+5. Add a Linux process-boundary regression test that starts the loopback MCP server with a real allowed root PID, proves a direct child can pass the PID boundary, and proves a token-bearing grandchild receives HTTP 403. Confirm the grandchild assertion fails while arbitrary descendants are still authorized.
+6. Replace descendant-or-self authorization with self-or-direct-child authorization. Rerun the process-boundary test and the real manager integration; the former proves shell descendants are denied and the latter proves the pinned trusted app-server child remains accepted.
+7. Update the real integration test name and prompt so it claims only the properties actually proved: the approved manager call reaches the handler under `workspace-write`, and the serialized manager config does not contain the bearer token. Do not claim the shell cannot recover an ancestor environment.
+8. Exercise the existing worker endpoint fixture by starting a worker thread without manager config and querying its MCP server status for that thread; assert `codex_bot_manager` is absent.
+9. Rerun focused tests, typecheck, the full test suite, the real Codex MCP integration, and the package smoke test.
 
 ## Review and deployment
 
