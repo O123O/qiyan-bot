@@ -26,7 +26,7 @@ test("packed codex-bot runs without source files or installed dependencies", asy
     "package/package.json",
   ]);
   for (const path of requiredFiles) assert.equal(listing.includes(path), true, `missing packed file: ${path}`);
-  assert.deepEqual(listing.filter((path) => !requiredFiles.has(path) && !/^package\/(?:licen[cs]e|notice)(?:\..*)?$/iu.test(path)), []);
+  assert.deepEqual(listing.filter((path) => !requiredFiles.has(path) && !/^package\/(?:licen[cs]e|notice)(?:\.[^/]*)?$/iu.test(path)), []);
 
   const installRoot = join(temp, "install");
   await execFileAsync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, archive]);
