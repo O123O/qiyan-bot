@@ -85,6 +85,7 @@ export class EventRelay {
     const epoch = mapping ? this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id) : undefined;
     if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !epoch) return false;
     if (expected && (mapping.session.mapping_id !== expected.mappingId || epoch.id !== expected.epochId)) return false;
+    if (expected) nickname = mapping.nickname;
     if (!authoritative) {
       const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
       const turnIndex = history.thread.turns.findIndex((candidate) => candidate.id === turn.id);

@@ -15,7 +15,7 @@ export interface LifecycleCheckpoint extends MappingIdentity {
   nickname: string;
   project_dir: string;
   lifecycle_state: MappingLifecycleState;
-  step: "transitioned" | "native_unsubscribed" | "native_archived" | "removed";
+  step: "transition_intent" | "transitioned" | "native_unsubscribed" | "native_archived" | "removed";
 }
 
 export function workerThreadStartParams(cwd: string, threadSource: string): { cwd: string; ephemeral: false; threadSource: string } {
@@ -119,6 +119,7 @@ export class SessionLifecycle {
       const session = this.assertExact(nickname, expected, "managed");
       const native = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(native.thread);
+      checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transition_intent"));
       await this.registry.transition(nickname, session, "unadopting");
       this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unadopting", native.thread.status.type);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transitioned"));
@@ -136,6 +137,7 @@ export class SessionLifecycle {
       const session = this.assertExact(nickname, expected, "managed");
       const native = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(native.thread);
+      checkpoint?.(this.checkpoint(nickname, session, "archiving", "transition_intent"));
       await this.registry.transition(nickname, session, "archiving");
       this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archiving", native.thread.status.type);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transitioned"));

@@ -58,7 +58,7 @@ export function removalRecoveryDecision(
   const targetState = operationKind === "unadopt_session" ? "unadopting" : "archiving";
   const sameGeneration = current?.mapping_id === saved.mapping_id
     && current.endpoint === saved.endpoint && current.thread_id === saved.thread_id;
-  const enteredTransition = saved.lifecycle_state === targetState && saved.step !== "prepared";
+  const enteredTransition = saved.lifecycle_state === targetState && saved.step !== undefined && saved.step !== "prepared";
   if (!enteredTransition) {
     if (sameGeneration && current?.lifecycle_state === targetState) return "reconcile";
     return "no_effect";

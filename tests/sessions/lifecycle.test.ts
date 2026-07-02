@@ -172,8 +172,10 @@ test("unadopt is idle-only, unsubscribes without archive, and removes exactly on
 
   endpoint.status = "idle";
   endpoint.calls.length = 0;
-  await lifecycle.unadopt("payments");
+  const checkpoints: string[] = [];
+  await lifecycle.unadopt("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
   assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_unsubscribed", "removed"]);
   assert.ok(runtime.latestEpoch("local", "thread-1", session.mapping_id)?.endedAt);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive" || call.method === "thread/delete"), false);
@@ -189,8 +191,10 @@ test("archive is idle-only, invokes native archive, removes the mapping, and nev
 
   endpoint.status = "idle";
   endpoint.calls.length = 0;
-  await lifecycle.archive("payments");
+  const checkpoints: string[] = [];
+  await lifecycle.archive("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
   assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_archived", "removed"]);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/delete"), false);
 });

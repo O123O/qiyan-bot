@@ -65,9 +65,9 @@ if test -e "$old_auth"; then
   test "$(stat -c %u "$old_auth")" = "$(id -u)"
   test $(( 8#$(stat -c %a "$old_auth") & 077 )) -eq 0
   test "$(stat -c %s "$old_auth")" -le 1048576
-  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$old_auth"
   install -m 600 "$old_auth" "$stage/auth.json"
-  test "$(sha256sum "$old_auth" | cut -d' ' -f1)" = "$(sha256sum "$stage/auth.json" | cut -d' ' -f1)"
+  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$stage/auth.json"
+  staged_auth_sha=$(sha256sum "$stage/auth.json" | cut -d' ' -f1)
 fi
 ```
 
@@ -75,7 +75,7 @@ Abort on any failed check. Do not substitute a symlink, directory, normal Codex 
 
 ```bash
 set -euo pipefail
-qiyan-bot config-check --home "$stage"
+env -i HOME="$HOME" PATH="$PATH" qiyan-bot config-check --home "$stage"
 test "$(sha256sum "$stage/.env" | cut -d' ' -f1)" = "$staged_env_sha"
 ```
 
@@ -97,11 +97,11 @@ if test -f "$stage/auth.json"; then
     "$new_home/data/assistant-profile/codex"
   install -m 600 "$stage/auth.json" \
     "$new_home/data/assistant-profile/codex/auth.json"
-  test "$(sha256sum "$stage/auth.json" | cut -d' ' -f1)" = \
+  test "$staged_auth_sha" = \
     "$(sha256sum "$new_home/data/assistant-profile/codex/auth.json" | cut -d' ' -f1)"
 fi
 
-qiyan-bot config-check --home "$new_home"
+env -i HOME="$HOME" PATH="$PATH" qiyan-bot config-check --home "$new_home"
 ```
 
 If authentication was not retained, or if Codex rejects it, run `qiyan-bot assistant-login --home "$new_home"` while QiYan is stopped. Reauthentication is always a user decision; QiYan never copies credentials automatically.

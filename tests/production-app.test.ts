@@ -15,6 +15,9 @@ test("removal recovery follows the checkpointed mapping generation across crash 
   assert.equal(removalRecoveryDecision("unadopt_session", { ...saved, step: "prepared" }, { ...saved, lifecycle_state: "unadopting" }), "reconcile");
   assert.equal(removalRecoveryDecision("archive_session", { ...saved, step: "prepared" }, { ...saved, lifecycle_state: "unadopting" }), "no_effect");
   assert.equal(removalRecoveryDecision("archive_session", { ...saved, step: "prepared" }, undefined), "no_effect");
+  const archiveIntent = { ...saved, lifecycle_state: "archiving" as const, step: "transition_intent" };
+  assert.equal(removalRecoveryDecision("archive_session", archiveIntent, { ...saved, lifecycle_state: "managed" }), "no_effect");
+  assert.equal(removalRecoveryDecision("archive_session", archiveIntent, undefined), "succeeded");
   const archived = { ...saved, lifecycle_state: "archiving" as const, step: "transitioned" };
   assert.equal(removalRecoveryDecision("archive_session", archived, { ...saved, lifecycle_state: "archiving" }), "reconcile");
   assert.equal(removalRecoveryDecision("archive_session", archived, undefined), "succeeded");

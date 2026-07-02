@@ -59,6 +59,9 @@ test("v0.3 upgrade guide requires a fresh stopped cutover and a non-inheriting s
   assert.match(guide, /set -euo pipefail/u);
   assert.ok(guide.indexOf('config-check --home "$stage"') < guide.indexOf('rm -rf -- "$old_home"'));
   assert.match(guide, /deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH`/u);
+  assert.equal([...guide.matchAll(/env -i HOME="\$HOME" PATH="\$PATH" qiyan-bot config-check/gu)].length, 2);
+  const stagedAuthParse = guide.indexOf('readFileSync(process.argv[1], "utf8"))\' "$stage/auth.json"');
+  assert.ok(stagedAuthParse >= 0 && stagedAuthParse < guide.indexOf("staged_auth_sha="));
   const unset = guide.match(/^UnsetEnvironment=(.+)$/mu)?.[1]?.trim().split(/\s+/u);
   assert.deepEqual(new Set(unset), SERVICE_UNSET_ENV_NAMES);
 });

@@ -187,6 +187,29 @@ test("ready reconciliation cannot deliver across a re-adoption during its histor
   assert.deepEqual(deliveries.listReady(), []);
 });
 
+test("ready reconciliation refreshes the nickname after a concurrent rename", async () => {
+  const { endpoint, registry, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal("missed")];
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  endpoint.request = async <T>() => {
+    entered();
+    await barrier;
+    return { thread: { turns: endpoint.turns } } as T;
+  };
+
+  const pending = relay.reconcileEndpoint("local");
+  await reading;
+  const mapping = registry.get("payments")!;
+  await registry.rename("payments", "billing", mapping);
+  release();
+  await pending;
+
+  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.body), ["[billing] done"]);
+});
+
 test("automatic worker delivery is suppressed for every transitional mapping lifecycle", async () => {
   for (const state of ["adopting", "unadopting", "archiving"] as const) {
     const { registry, runtime, deliveries, relay } = await fixture();
