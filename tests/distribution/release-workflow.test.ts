@@ -8,7 +8,7 @@ test("release workflow validates, checks, packs, and uploads only a versioned ru
 
   for (const required of [
     "tags:", "- \"v*\"", "contents: write", "actions/checkout@v6", "actions/setup-node@v6", "node-version: 24",
-    "npm ci", "GITHUB_REF_NAME", "package.json", "npm run check", "npm pack --silent", "codex-bot.tgz",
+    "npm ci", "GITHUB_REF_NAME", "package.json", "package-lock.json", "npm run check", "npm pack --silent", "codex-bot.tgz",
     "gh release create", "gh release upload", "--clobber", "GH_TOKEN: ${{ github.token }}",
   ]) {
     assert.equal(workflow.includes(required), true, `missing release contract: ${required}`);
