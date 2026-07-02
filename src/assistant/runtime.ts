@@ -1,35 +1,80 @@
+import { randomUUID } from "node:crypto";
+import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { SourceContext } from "../core/types.ts";
 import type { Database } from "../storage/database.ts";
-import type { DeliveryStore } from "../storage/delivery-store.ts";
-import type { OperationStore } from "../storage/operation-store.ts";
 import { inTransaction } from "../storage/database.ts";
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { DeliveryStore } from "../storage/delivery-store.ts";
+import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 
-export interface ActiveAssistantContext { contextId: string; attemptId: string; turnId: string; triggerKind: "user" | "internal" }
+export interface ActiveAssistantContext {
+  attemptId: string;
+  contextId: string;
+  turnId: string;
+  triggerKind: "chat" | "internal";
+  binding?: ConversationBinding;
+  toolFence: number;
+}
+
+export function classifyAttemptEffects(operations: readonly Pick<OperationRecord, "effectClass" | "state">[]): boolean {
+  return operations.some((operation) => operation.effectClass === "side_effecting"
+    && new Set(["dispatched", "uncertain", "succeeded"]).has(operation.state));
+}
 
 export class AssistantRuntime {
   private active: ActiveAssistantContext | undefined;
+  private readonly activeTools = new Map<string, number>();
+  private readonly toolWaiters = new Map<string, Set<() => void>>();
 
-  constructor(private readonly db: Database, private readonly operations: OperationStore, private readonly deliveries: DeliveryStore, private readonly options: { binding: ConversationBinding }) {}
+  constructor(
+    private readonly db: Database,
+    private readonly operations: OperationStore,
+    private readonly deliveries: DeliveryStore,
+    private readonly options: { binding: ConversationBinding },
+  ) {}
 
-  beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "user"); }
+  beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "chat"); }
   beginInternalAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "internal"); }
 
-  prepareAttempt(contextId: string, attemptId: string, triggerKind: "user" | "internal"): void {
+  prepareAttempt(contextId: string, attemptId: string, triggerKind: "user" | "internal" | "chat"): void {
     const provisionalTurnId = `pending:${attemptId}`;
+    const source = this.operations.getSourceContext(contextId);
     inTransaction(this.db, () => {
-      this.db.prepare(`INSERT OR REPLACE INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
-        VALUES (?, ?, ?, ?, 'active', ?)`)
-        .run(attemptId, contextId, provisionalTurnId, triggerKind, Date.now());
+      this.db.prepare(`INSERT OR IGNORE INTO assistant_attempts
+        (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
+        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`)
+        .run(attemptId, contextId, provisionalTurnId, triggerKind === "chat" ? "user" : triggerKind, Date.now(),
+          source?.binding?.adapterId ?? null, source?.binding?.conversationKey ?? null,
+          source?.binding === undefined ? null : JSON.stringify(source.binding.destination),
+          source?.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply));
       this.operations.setSourceState(contextId, "active");
       this.db.prepare("UPDATE event_batches SET state = 'active' WHERE id = ?").run(contextId);
     });
-    this.active = { contextId, attemptId, turnId: provisionalTurnId, triggerKind };
+    this.active = {
+      contextId,
+      attemptId,
+      turnId: provisionalTurnId,
+      triggerKind: triggerKind === "user" ? "chat" : triggerKind,
+      ...(source?.binding ? { binding: source.binding } : {}),
+      toolFence: 0,
+    };
   }
 
   bindTurn(attemptId: string, turnId: string): void {
     this.db.prepare("UPDATE assistant_attempts SET turn_id = ? WHERE id = ? AND state = 'active'").run(turnId, attemptId);
     if (this.active?.attemptId === attemptId) this.active = { ...this.active, turnId };
+  }
+
+  hydrateActive(): ActiveAssistantContext | undefined {
+    const row = this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
+        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
+      FROM assistant_attempts a LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id
+      WHERE a.state = 'active' ORDER BY (l.singleton IS NOT NULL) DESC, a.created_at DESC, a.id DESC LIMIT 1`).get() as Record<string, unknown> | undefined;
+    if (!row) {
+      this.active = undefined;
+      return undefined;
+    }
+    this.active = this.parseActive(row);
+    return this.current();
   }
 
   current(): ActiveAssistantContext | undefined { return this.active ? { ...this.active } : undefined; }
@@ -39,71 +84,208 @@ export class AssistantRuntime {
   }
 
   contextForTurn(turnId: string): ActiveAssistantContext | undefined {
-    const attempt = this.attempt(turnId);
-    return attempt ? { ...attempt } : undefined;
+    const row = this.attemptRow(turnId);
+    return row ? this.parseActive(row) : undefined;
   }
 
   activeAttempts(): ActiveAssistantContext[] {
-    return (this.db.prepare("SELECT context_id, id, turn_id, trigger_kind FROM assistant_attempts WHERE state = 'active' ORDER BY created_at, id").all() as Array<Record<string, unknown>>).map((row) => ({
-      contextId: String(row.context_id),
-      attemptId: String(row.id),
-      turnId: String(row.turn_id),
-      triggerKind: String(row.trigger_kind) as "user" | "internal",
-    }));
+    return (this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
+        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
+      FROM assistant_attempts a LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id
+      WHERE a.state = 'active' ORDER BY a.created_at, a.id`).all() as Array<Record<string, unknown>>).map((row) => this.parseActive(row));
   }
 
-  handleTerminal(turnId: string, finalText?: string): void {
-    const attempt = this.attempt(turnId);
-    if (!attempt) return;
-    inTransaction(this.db, () => {
-      this.db.prepare("UPDATE assistant_attempts SET state = 'completed' WHERE turn_id = ?").run(turnId);
-      this.operations.setSourceState(attempt.contextId, "completed");
-      this.finalizeEventBatch(attempt.contextId, "processed");
-      this.releaseSourceAttachments(attempt.contextId);
-      if (attempt.triggerKind === "user" && finalText) {
-        this.deliveries.prepare({ id: `assistant:${turnId}`, kind: "assistant_final", binding: this.options.binding, body: finalText, mandatory: true });
-      }
+  beginTerminalizing(turnId: string): ActiveAssistantContext | undefined {
+    return inTransaction(this.db, () => {
+      const row = this.attemptRow(turnId);
+      if (!row) return undefined;
+      const attemptId = String(row.id);
+      this.db.prepare(`UPDATE assistant_attempts
+        SET tool_fence = tool_fence + CASE WHEN accepting_tools = 1 THEN 1 ELSE 0 END, accepting_tools = 0
+        WHERE id = ? AND state = 'active'`).run(attemptId);
+      this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
+        WHERE attempt_id = ? AND turn_id = ?`).run(attemptId, turnId);
+      const refreshed = this.attemptRow(turnId)!;
+      const active = this.parseActive(refreshed);
+      if (this.active?.attemptId === attemptId) this.active = active;
+      return active;
     });
-    if (this.active?.turnId === turnId) this.active = undefined;
+  }
+
+  registerTool(attemptId: string): number {
+    const row = this.db.prepare("SELECT state, accepting_tools, tool_fence FROM assistant_attempts WHERE id = ?").get(attemptId) as { state: string; accepting_tools: number; tool_fence: number } | undefined;
+    if (!row || row.state !== "active" || row.accepting_tools !== 1) throw new Error("assistant attempt has terminalized and does not accept new tools");
+    this.activeTools.set(attemptId, (this.activeTools.get(attemptId) ?? 0) + 1);
+    return Number(row.tool_fence);
+  }
+
+  finishTool(attemptId: string): void {
+    const next = Math.max(0, (this.activeTools.get(attemptId) ?? 0) - 1);
+    if (next > 0) this.activeTools.set(attemptId, next);
+    else {
+      this.activeTools.delete(attemptId);
+      for (const resolve of this.toolWaiters.get(attemptId) ?? []) resolve();
+      this.toolWaiters.delete(attemptId);
+    }
+  }
+
+  async fenceTools(attemptId: string, timeoutMs: number): Promise<void> {
+    if ((this.activeTools.get(attemptId) ?? 0) === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        const waiters = this.toolWaiters.get(attemptId) ?? new Set<() => void>();
+        waiters.add(resolve);
+        this.toolWaiters.set(attemptId, waiters);
+      }),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if ((this.activeTools.get(attemptId) ?? 0) > 0) {
+      inTransaction(this.db, () => {
+        this.operations.markAttemptOperationsUncertain(attemptId);
+        this.db.prepare("UPDATE assistant_attempts SET accepting_tools = 0 WHERE id = ?").run(attemptId);
+      });
+    }
+  }
+
+  handleTerminal(turnId: string, status: "completed" | "failed" | "interrupted", finalText?: string, error?: unknown): { recoveryContextId?: string };
+  handleTerminal(turnId: string, finalText?: string): { recoveryContextId?: string };
+  handleTerminal(turnId: string, statusOrText: "completed" | "failed" | "interrupted" | string = "completed", finalText?: string, error?: unknown): { recoveryContextId?: string } {
+    const isStatus = new Set(["completed", "failed", "interrupted"]).has(statusOrText);
+    const status = (isStatus ? statusOrText : "completed") as "completed" | "failed" | "interrupted";
+    const text = isStatus ? finalText : statusOrText;
+    const attempt = this.attemptRow(turnId);
+    if (!attempt) return {};
+    if (String(attempt.state) !== "active") {
+      const recovery = this.existingRecovery(String(attempt.id));
+      return recovery ? { recoveryContextId: recovery } : {};
+    }
+    this.beginTerminalizing(turnId);
+    this.operations.markAttemptOperationsUncertain(String(attempt.id));
+    const result = status === "completed"
+      ? this.completeAttempt(attempt, text)
+      : this.failAttemptGroup(attempt, error ?? status);
+    if (this.active?.attemptId === String(attempt.id)) this.active = undefined;
+    return result;
   }
 
   failAttempt(turnId: string, error: unknown): SourceContext | undefined {
-    const attempt = this.attempt(turnId);
-    if (!attempt) return undefined;
-    const recovery = inTransaction(this.db, () => {
-      const effects = this.db.prepare(`SELECT id, state, receipt_json FROM operations
-        WHERE context_id = ? AND attempt_id = ?
-          AND state IN ('dispatched','succeeded','uncertain')
-          AND kind NOT IN ('list_managed_sessions','discover_sessions','get_session_status','read_worker_message','list_models','get_goal')`)
-        .all(attempt.contextId, attempt.attemptId) as Array<Record<string, unknown>>;
-      this.db.prepare("UPDATE assistant_attempts SET state = 'failed' WHERE turn_id = ?").run(turnId);
-      if (effects.length === 0) {
-        this.operations.setSourceState(attempt.contextId, "pending");
-        this.db.prepare("UPDATE event_batches SET state = 'pending' WHERE id = ?").run(attempt.contextId);
-        return undefined;
-      }
-      const created = this.operations.supersedeWithRecoveryInTransaction(attempt.contextId, effects.map((effect) => ({
-        operationId: String(effect.id),
-        state: effect.state === "succeeded" ? "succeeded" : "uncertain",
-        ...(effect.receipt_json ? { receipt: JSON.parse(String(effect.receipt_json)) } : {}),
-        error: String(error),
-      })));
-      this.finalizeEventBatch(attempt.contextId, "superseded");
-      this.releaseSourceAttachments(attempt.contextId);
-      return created;
-    });
-    if (this.active?.turnId === turnId) this.active = undefined;
-    return recovery;
+    const result = this.handleTerminal(turnId, "failed", undefined, error);
+    return result.recoveryContextId ? this.operations.getSourceContext(result.recoveryContextId) : undefined;
   }
 
-  private begin(contextId: string, attemptId: string, turnId: string, triggerKind: "user" | "internal"): void {
+  private completeAttempt(attempt: Record<string, unknown>, finalText?: string): { recoveryContextId?: string } {
+    const attemptId = String(attempt.id);
+    const members = this.memberContextIds(attempt);
+    inTransaction(this.db, () => {
+      this.db.prepare("UPDATE assistant_attempts SET state = 'completed', accepting_tools = 0 WHERE id = ?").run(attemptId);
+      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'completed', updated_at = ? WHERE attempt_id = ? AND state NOT IN ('failed','superseded')").run(Date.now(), attemptId);
+      for (const contextId of members) {
+        this.operations.setSourceState(contextId, "completed");
+        this.finalizeEventBatch(contextId, "processed");
+        this.releaseSourceAttachments(contextId);
+      }
+      if (this.triggerKind(attempt) === "chat" && finalText) {
+        this.deliveries.prepare({ id: `assistant:${String(attempt.turn_id)}`, kind: "assistant_final", binding: this.bindingForAttempt(attempt), body: finalText, mandatory: true });
+      }
+      this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
+    });
+    return {};
+  }
+
+  private failAttemptGroup(attempt: Record<string, unknown>, error: unknown): { recoveryContextId?: string } {
+    const attemptId = String(attempt.id);
+    const members = this.memberContextIds(attempt);
+    const effects = this.operations.listForAttempt(attemptId);
+    if (!classifyAttemptEffects(effects)) {
+      inTransaction(this.db, () => {
+        this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ?").run(attemptId);
+        this.db.prepare("UPDATE assistant_attempt_sources SET state = 'failed', updated_at = ? WHERE attempt_id = ? AND state NOT IN ('completed','superseded')").run(Date.now(), attemptId);
+        for (const contextId of members) {
+          this.operations.setSourceState(contextId, "pending");
+          this.db.prepare("UPDATE event_batches SET state = 'pending' WHERE id = ?").run(contextId);
+        }
+        this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
+      });
+      return {};
+    }
+
+    return inTransaction(this.db, () => {
+      const recoveryId = `recovery_${randomUUID()}`;
+      const binding = this.bindingForAttempt(attempt);
+      const arrival = Number((this.db.prepare("SELECT next_value FROM arrival_sequence WHERE singleton = 1").get() as { next_value: number }).next_value);
+      this.db.prepare("UPDATE arrival_sequence SET next_value = ? WHERE singleton = 1").run(arrival + 1);
+      const receipts = effects.filter((operation) => operation.effectClass === "side_effecting" && new Set(["dispatched", "uncertain", "succeeded"]).has(operation.state))
+        .map((operation) => ({ operationId: operation.id, state: operation.state, receipt: operation.receipt ?? null, error: String(error) }));
+      this.db.prepare(`INSERT INTO source_contexts
+        (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
+          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
+        VALUES (?, 'recovery', ?, ?, '[]', 'pending', ?, ?, ?, ?, ?, ?, 'internal', 0)`)
+        .run(recoveryId, String(attempt.context_id), JSON.stringify(receipts), Date.now(), binding.adapterId, binding.conversationKey,
+          JSON.stringify(binding.destination), binding.reply === undefined ? null : JSON.stringify(binding.reply), arrival);
+      this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ?").run(attemptId);
+      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'superseded', updated_at = ? WHERE attempt_id = ? AND state <> 'completed'").run(Date.now(), attemptId);
+      for (const contextId of members) {
+        this.db.prepare("UPDATE source_contexts SET state = 'superseded', superseded_by = ? WHERE id = ?").run(recoveryId, contextId);
+        this.finalizeEventBatch(contextId, "superseded");
+        this.releaseSourceAttachments(contextId);
+      }
+      this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
+      return { recoveryContextId: recoveryId };
+    });
+  }
+
+  private begin(contextId: string, attemptId: string, turnId: string, triggerKind: "chat" | "internal"): void {
     this.prepareAttempt(contextId, attemptId, triggerKind);
     this.bindTurn(attemptId, turnId);
   }
 
-  private attempt(turnId: string): ActiveAssistantContext | undefined {
-    const row = this.db.prepare("SELECT context_id, id, turn_id, trigger_kind FROM assistant_attempts WHERE turn_id = ?").get(turnId) as Record<string, unknown> | undefined;
-    return row ? { contextId: String(row.context_id), attemptId: String(row.id), turnId: String(row.turn_id), triggerKind: String(row.trigger_kind) as "user" | "internal" } : undefined;
+  private attemptRow(turnId: string): Record<string, unknown> | undefined {
+    return this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
+      LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.turn_id = ?`).get(turnId) as Record<string, unknown> | undefined;
+  }
+
+  private memberContextIds(attempt: Record<string, unknown>): string[] {
+    const rows = this.db.prepare("SELECT context_id FROM assistant_attempt_sources WHERE attempt_id = ? ORDER BY source_ordinal")
+      .all(String(attempt.id)) as Array<{ context_id: string }>;
+    return rows.length > 0 ? rows.map((row) => row.context_id) : [String(attempt.context_id)];
+  }
+
+  private existingRecovery(attemptId: string): string | undefined {
+    const row = this.db.prepare(`SELECT s.superseded_by FROM assistant_attempt_sources m JOIN source_contexts s ON s.id = m.context_id
+      WHERE m.attempt_id = ? AND s.superseded_by IS NOT NULL LIMIT 1`).get(attemptId) as { superseded_by: string } | undefined;
+    if (row) return row.superseded_by;
+    const legacy = this.db.prepare(`SELECT s.superseded_by FROM assistant_attempts a JOIN source_contexts s ON s.id = a.context_id
+      WHERE a.id = ? AND s.superseded_by IS NOT NULL`).get(attemptId) as { superseded_by: string } | undefined;
+    return legacy?.superseded_by;
+  }
+
+  private triggerKind(attempt: Record<string, unknown>): "chat" | "internal" {
+    return attempt.lease_trigger_kind === "chat" || attempt.trigger_kind === "user" ? "chat" : "internal";
+  }
+
+  private bindingForAttempt(attempt: Record<string, unknown>): ConversationBinding {
+    if (attempt.adapter_id && attempt.conversation_key && attempt.destination_json) {
+      return {
+        adapterId: String(attempt.adapter_id),
+        conversationKey: String(attempt.conversation_key),
+        destination: JSON.parse(String(attempt.destination_json)) as JsonValue,
+        ...(attempt.native_reply_json ? { reply: JSON.parse(String(attempt.native_reply_json)) as JsonValue } : {}),
+      };
+    }
+    return this.operations.getSourceContext(String(attempt.context_id))?.binding ?? this.options.binding;
+  }
+
+  private parseActive(row: Record<string, unknown>): ActiveAssistantContext {
+    return {
+      attemptId: String(row.id),
+      contextId: String(row.context_id),
+      turnId: String(row.turn_id),
+      triggerKind: this.triggerKind(row),
+      ...(row.adapter_id && row.conversation_key && row.destination_json ? { binding: this.bindingForAttempt(row) } : {}),
+      toolFence: Number(row.tool_fence),
+    };
   }
 
   private finalizeEventBatch(contextId: string, state: "processed" | "superseded"): void {

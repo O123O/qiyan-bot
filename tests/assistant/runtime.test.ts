@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AssistantRuntime } from "../../src/assistant/runtime.ts";
+import { AssistantRuntime, classifyAttemptEffects } from "../../src/assistant/runtime.ts";
+import { createAssistantTools } from "../../src/assistant/tools.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
@@ -65,7 +67,8 @@ test("failed-attempt terminalization rolls back if recovery creation fails", () 
   runtime.beginUserAttempt("ctx-fail-atomic", "attempt-fail-atomic", "turn-fail-atomic");
   const operation = operations.prepare({ contextId: "ctx-fail-atomic", attemptId: "attempt-fail-atomic", callId: "call", kind: "send", args: {} });
   operations.markDispatched(operation.id);
-  (operations as any).supersedeWithRecoveryInTransaction = () => { throw new Error("recovery insert failed"); };
+  db.exec(`CREATE TRIGGER fail_recovery_insert BEFORE INSERT ON source_contexts WHEN NEW.kind = 'recovery'
+    BEGIN SELECT RAISE(ABORT, 'recovery insert failed'); END;`);
   assert.throws(() => runtime.failAttempt("turn-fail-atomic", "failed"), /recovery insert failed/);
   assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-fail-atomic'").get() as any).state, "active");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-fail-atomic'").get() as any).state, "active");
@@ -108,4 +111,97 @@ test("successful read-only tools do not force a recovery context after a failed 
   const operation = operations.prepare({ contextId: "ctx-read", attemptId: "a-read", callId: "c", kind: "get_session_status", args: {} });
   operations.succeed(operation.id, { status: "idle" });
   assert.equal(runtime.failAttempt("t-read", "model failed"), undefined);
+});
+
+function multiSourceAttempt() {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  for (const id of ["one", "two"]) {
+    conversations.acceptChatSource({
+      id,
+      nativeSourceId: `native:${id}`,
+      binding,
+      rawText: id,
+      attachmentIds: [],
+      receivedAt: 1,
+    });
+  }
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  conversations.reserveStart("one");
+  conversations.markSubmitted(lease.attemptId, "one", "turn");
+  conversations.reserveNextSteer(lease.attemptId);
+  conversations.markSubmitted(lease.attemptId, "two", "turn");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.hydrateActive();
+  return { db, operations, deliveries, conversations, lease, runtime };
+}
+
+test("multi-source completion terminalizes and releases every admitted source", () => {
+  const { db, runtime } = multiSourceAttempt();
+  for (const id of ["one", "two"]) {
+    db.prepare(`INSERT INTO attachments(id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+      VALUES (?, ?, 'x', 'text/plain', '/tmp/x', 1, 'x', 1, 999, 1)`).run(`file-${id}`, id);
+    db.prepare("UPDATE source_contexts SET attachment_ids_json = ? WHERE id = ?").run(JSON.stringify([`file-${id}`]), id);
+  }
+  runtime.handleTerminal("turn", "completed", "done");
+  assert.deepEqual((db.prepare("SELECT id, state FROM source_contexts ORDER BY id").all() as any[]).map((row) => [row.id, row.state]), [["one", "completed"], ["two", "completed"]]);
+  assert.deepEqual((db.prepare("SELECT context_id, state FROM assistant_attempt_sources ORDER BY source_ordinal").all() as any[]).map((row) => [row.context_id, row.state]), [["one", "completed"], ["two", "completed"]]);
+  assert.deepEqual((db.prepare("SELECT ref_count FROM attachments ORDER BY id").all() as any[]).map((row) => row.ref_count), [0, 0]);
+});
+
+test("effect-free multi-source failure restores every source without releasing attachments", () => {
+  const { db, runtime } = multiSourceAttempt();
+  db.prepare(`INSERT INTO attachments(id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+    VALUES ('file-one', 'one', 'x', 'text/plain', '/tmp/x', 1, 'x', 1, 999, 1)`).run();
+  db.prepare("UPDATE source_contexts SET attachment_ids_json = '[\"file-one\"]' WHERE id = 'one'").run();
+  const result = runtime.handleTerminal("turn", "failed", undefined, new Error("model failed"));
+  assert.deepEqual(result, {});
+  assert.deepEqual((db.prepare("SELECT state FROM source_contexts ORDER BY id").all() as any[]).map((row) => row.state), ["pending", "pending"]);
+  assert.equal(db.prepare("SELECT ref_count FROM attachments WHERE id = 'file-one'").get()!.ref_count, 1);
+});
+
+test("effectful multi-source failure creates one inherited-route recovery and supersedes the group", () => {
+  const { db, operations, lease, runtime } = multiSourceAttempt();
+  const operation = operations.prepare({ contextId: "two", attemptId: lease.attemptId, callId: "send", kind: "send_chat_message", args: {}, effectClass: "side_effecting", toolFence: 0 });
+  operations.markDispatched(operation.id, 0);
+  const result = runtime.handleTerminal("turn", "failed", undefined, new Error("lost"));
+  assert.ok(result.recoveryContextId);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts WHERE kind = 'recovery'").get()!.n, 1);
+  assert.deepEqual((db.prepare("SELECT state FROM source_contexts WHERE id IN ('one','two') ORDER BY id").all() as any[]).map((row) => row.state), ["superseded", "superseded"]);
+  assert.equal(db.prepare("SELECT conversation_key FROM source_contexts WHERE id = ?").get(result.recoveryContextId!)!.conversation_key, binding.conversationKey);
+});
+
+test("attempt effect classification is explicit and conservative", () => {
+  for (const row of [
+    { effectClass: "side_effecting", state: "prepared", effectful: false },
+    { effectClass: "side_effecting", state: "failed", effectful: false },
+    { effectClass: "read_only", state: "succeeded", effectful: false },
+    { effectClass: "side_effecting", state: "dispatched", effectful: true },
+    { effectClass: "side_effecting", state: "uncertain", effectful: true },
+    { effectClass: "side_effecting", state: "succeeded", effectful: true },
+  ] as const) assert.equal(classifyAttemptEffects([row]), row.effectful);
+});
+
+test("terminal tool fencing rejects new dispatch and prevents late success from overwriting uncertainty", async () => {
+  const { operations, lease, runtime } = multiSourceAttempt();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const tools = createAssistantTools(operations, {
+    send_to_session: async () => { await blocked; return { turnId: "worker" }; },
+  }, { maxCollectCount: 20 });
+  const toolFence = runtime.registerTool(lease.attemptId);
+  const call = tools.send_to_session({ sourceContextId: "one", attemptId: lease.attemptId, turnId: "turn", callId: "held", toolFence }, {
+    nickname: "worker", content: "work", attachment_ids: [], mode: "start",
+  }).finally(() => runtime.finishTool(lease.attemptId));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  runtime.beginTerminalizing("turn");
+  await runtime.fenceTools(lease.attemptId, 1);
+  assert.throws(() => runtime.registerTool(lease.attemptId), /terminal/u);
+  release();
+  await assert.rejects(call, /uncertain|terminal/u);
+  const operation = operations.listForAttempt(lease.attemptId).find((item) => item.callId === "held")!;
+  assert.equal(operation.state, "uncertain");
+  assert.equal(operation.receipt, undefined);
 });

@@ -4,7 +4,7 @@ import { AppError } from "../core/errors.ts";
 import { parseDirective } from "../directives/parser.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 
-export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string }
+export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string; toolFence?: number }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 export interface ToolActionContext extends ToolCallContext { operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
@@ -75,9 +75,11 @@ export function createAssistantTools(
         }
       }
 
+      const sideEffecting = name === "collect_messages" ? directive?.kind === "collect" : !READ_ONLY_TOOLS.has(name);
+      const effectClass = sideEffecting ? "side_effecting" : "read_only";
       let operation: OperationRecord | undefined;
       if (directive) operation = operations.replayDirective(context.sourceContextId, directive.kind, directive.binding);
-      operation ??= operations.prepare({ contextId: context.sourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args });
+      operation ??= operations.prepare({ contextId: context.sourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args, effectClass, ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }) });
       if (operation.state === "succeeded") return operation.receipt;
       if (operation.state === "dispatched" || operation.state === "uncertain") throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
       if (operation.state === "failed") throw new AppError("OPERATION_UNCERTAIN", `${name} previously failed and requires reconciliation`);
@@ -85,28 +87,32 @@ export function createAssistantTools(
 
       const action = actions[name];
       if (!action) throw new AppError("UNSUPPORTED_CAPABILITY", `tool is not configured: ${name}`);
-      const sideEffecting = name === "collect_messages" ? directive?.kind === "collect" : !READ_ONLY_TOOLS.has(name);
-      if (sideEffecting) operations.markDispatched(operation.id);
+      if (sideEffecting) operations.markDispatched(operation.id, context.toolFence);
       try {
         const actionResult = await action(directive?.kind === "collect" ? { ...args, direct: true } : args, {
           ...context,
           operationId: operation.id,
           operationCreatedAt: operation.createdAt,
           operationSequence: operation.sequence,
-          checkpoint: (receipt) => operations.checkpoint(operation!.id, receipt),
+          checkpoint: (receipt) => operations.checkpoint(operation!.id, receipt, context.toolFence),
         });
         const receipt = directive?.kind === "pass"
           ? { ...(isRecord(actionResult) ? actionResult : { result: actionResult }), nickname: args.nickname, actualText: args.content, attachmentIds: args.attachment_ids, payloadHash: createHash("sha256").update(args.content).digest("hex") }
           : directive?.kind === "collect"
             ? { deliveries: Array.isArray(actionResult) ? actionResult.map((item) => item.deliveryId) : [], count: args.count, nickname: args.nickname }
             : actionResult;
-        operations.succeed(operation.id, receipt);
+        operations.succeed(operation.id, receipt, context.toolFence);
         return receipt;
       } catch (error) {
+        if (operations.get(operation.id)?.state === "uncertain") {
+          throw error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
+            ? error
+            : new AppError("OPERATION_UNCERTAIN", `${name} terminalized before its result could be committed`);
+        }
         const uncertain = sideEffecting && !isProvenNoEffect(error);
         const failure = { message: error instanceof Error ? error.message : String(error) };
-        if (uncertain) operations.fail(operation.id, failure, true);
-        else operations.failAndUnbind(operation.id, failure);
+        if (uncertain) operations.fail(operation.id, failure, true, context.toolFence);
+        else operations.failAndUnbind(operation.id, failure, context.toolFence);
         throw error;
       }
     };

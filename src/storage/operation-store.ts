@@ -4,6 +4,8 @@ import type { OperationState, SourceContext } from "../core/types.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
 
+const readOnlyOperationKinds = new Set(["list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal"]);
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object") {
@@ -18,6 +20,11 @@ function hash(value: unknown): string {
 
 export interface OperationRecord {
   id: string;
+  contextId: string;
+  attemptId: string;
+  callId: string;
+  kind: string;
+  effectClass: "read_only" | "side_effecting";
   state: OperationState;
   createdAt: number;
   sequence: number;
@@ -92,48 +99,51 @@ export class OperationStore {
     this.db.prepare("UPDATE source_contexts SET state = ? WHERE id = ?").run(state, id);
   }
 
-  prepare(input: { contextId: string; attemptId: string; callId: string; kind: string; args: unknown }): OperationRecord {
+  prepare(input: { contextId: string; attemptId: string; callId: string; kind: string; args: unknown; effectClass?: "read_only" | "side_effecting"; toolFence?: number }): OperationRecord {
+    if (input.toolFence !== undefined) this.assertToolFence(input.attemptId, input.toolFence);
     const argsJson = canonical(input.args);
     const argsHash = hash(input.args);
-    const existing = this.db.prepare(`SELECT id, state, args_hash, receipt_json, created_at, sequence FROM operations
+    const effectClass = input.effectClass ?? (readOnlyOperationKinds.has(input.kind) ? "read_only" : "side_effecting");
+    const existing = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, args_hash, receipt_json, created_at, sequence FROM operations
       WHERE context_id = ? AND attempt_id = ? AND call_id = ? AND kind = ?`)
       .get(input.contextId, input.attemptId, input.callId, input.kind) as Record<string, unknown> | undefined;
     if (existing) {
       if (String(existing.args_hash) !== argsHash) {
         throw new AppError("OPERATION_CONFLICT", "OPERATION_CONFLICT: operation arguments changed");
       }
-      return {
-        id: String(existing.id),
-        state: String(existing.state) as OperationState,
-        createdAt: Number(existing.created_at),
-        sequence: Number(existing.sequence),
-        ...(existing.receipt_json ? { receipt: JSON.parse(String(existing.receipt_json)) } : {}),
-      };
+      if (String(existing.effect_class) !== effectClass) throw new AppError("OPERATION_CONFLICT", "OPERATION_CONFLICT: operation effect class changed");
+      return this.parseOperation(existing);
     }
     const id = `op_${randomUUID()}`;
     const now = Date.now();
     this.db.prepare(`INSERT INTO operations
-      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations))`)
-      .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now);
+      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations), ?)`)
+      .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now, effectClass);
     const created = this.get(id);
     if (!created) throw new Error("operation insert was not persisted");
     return created;
   }
 
   get(id: string): OperationRecord | undefined {
-    const row = this.db.prepare("SELECT id, state, receipt_json, created_at, sequence FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return row ? { id: String(row.id), state: String(row.state) as OperationState, createdAt: Number(row.created_at), sequence: Number(row.sequence), ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}) } : undefined;
+    const row = this.db.prepare("SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? this.parseOperation(row) : undefined;
+  }
+
+  listForAttempt(attemptId: string): OperationRecord[] {
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence
+      FROM operations WHERE attempt_id = ? ORDER BY sequence`).all(attemptId) as Array<Record<string, unknown>>).map((row) => this.parseOperation(row));
   }
 
   listRecoverable(): RecoverableOperation[] {
-    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, state, receipt_json, created_at, sequence
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, effect_class, state, receipt_json, created_at, sequence
       FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({
       id: String(row.id),
       contextId: String(row.context_id),
       attemptId: String(row.attempt_id),
       callId: String(row.call_id),
       kind: String(row.kind),
+      effectClass: String(row.effect_class) as "read_only" | "side_effecting",
       args: JSON.parse(String(row.args_json)),
       state: String(row.state) as OperationState,
       createdAt: Number(row.created_at),
@@ -158,34 +168,54 @@ export class OperationStore {
       .run(contextId, kind, hash(binding), operationId, Date.now());
   }
 
-  markDispatched(id: string): void {
-    this.setState(id, "dispatched");
+  markDispatched(id: string, toolFence?: number): void {
+    this.transition(id, ["prepared"], "dispatched", toolFence);
   }
 
-  checkpoint(id: string, receipt: unknown): void {
-    this.db.prepare("UPDATE operations SET receipt_json = ?, updated_at = ? WHERE id = ? AND state IN ('dispatched', 'uncertain')")
-      .run(JSON.stringify(receipt), Date.now(), id);
+  checkpoint(id: string, receipt: unknown, toolFence?: number): void {
+    const changed = toolFence === undefined
+      ? this.db.prepare("UPDATE operations SET receipt_json = ?, updated_at = ? WHERE id = ? AND state IN ('dispatched', 'uncertain')").run(JSON.stringify(receipt), Date.now(), id).changes
+      : this.db.prepare(`UPDATE operations SET receipt_json = ?, updated_at = ? WHERE id = ? AND state = 'dispatched'
+          AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
+        .run(JSON.stringify(receipt), Date.now(), id, toolFence).changes;
+    if (changed !== 1) this.uncertainTransition(id, "checkpoint");
   }
 
-  succeed(id: string, receipt: unknown): void {
-    this.db.prepare("UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ? WHERE id = ?")
-      .run(JSON.stringify(receipt), Date.now(), id);
+  succeed(id: string, receipt: unknown, toolFence?: number): void {
+    const changed = toolFence === undefined
+      ? this.db.prepare("UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ? WHERE id = ? AND state IN ('prepared','dispatched','uncertain')").run(JSON.stringify(receipt), Date.now(), id).changes
+      : this.db.prepare(`UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ?
+          WHERE id = ? AND state IN ('prepared','dispatched')
+            AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
+        .run(JSON.stringify(receipt), Date.now(), id, toolFence).changes;
+    if (changed !== 1) this.uncertainTransition(id, "success");
   }
 
-  fail(id: string, error: unknown, uncertain = false): void {
-    this.db.prepare("UPDATE operations SET state = ?, error_json = ?, updated_at = ? WHERE id = ?")
-      .run(uncertain ? "uncertain" : "failed", JSON.stringify(error), Date.now(), id);
+  fail(id: string, error: unknown, uncertain = false, toolFence?: number): void {
+    const state = uncertain ? "uncertain" : "failed";
+    const changed = toolFence === undefined
+      ? this.db.prepare("UPDATE operations SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state IN ('prepared','dispatched','uncertain')").run(state, JSON.stringify(error), Date.now(), id).changes
+      : this.db.prepare(`UPDATE operations SET state = ?, error_json = ?, updated_at = ?
+          WHERE id = ? AND state IN ('prepared','dispatched')
+            AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
+        .run(state, JSON.stringify(error), Date.now(), id, toolFence).changes;
+    if (changed !== 1) this.uncertainTransition(id, "failure");
   }
 
   unbindDirective(operationId: string): void {
     this.db.prepare("DELETE FROM directive_consumptions WHERE operation_id = ?").run(operationId);
   }
 
-  failAndUnbind(id: string, error: unknown): void {
+  failAndUnbind(id: string, error: unknown, toolFence?: number): void {
     inTransaction(this.db, () => {
-      this.fail(id, error);
+      this.fail(id, error, false, toolFence);
       this.unbindDirective(id);
     });
+  }
+
+  markAttemptOperationsUncertain(attemptId: string): number {
+    return Number(this.db.prepare(`UPDATE operations SET state = 'uncertain', updated_at = ?
+      WHERE attempt_id = ? AND state = 'dispatched'`).run(Date.now(), attemptId).changes);
   }
 
   supersedeWithRecovery(contextId: string, receipts: readonly unknown[]): SourceContext {
@@ -211,5 +241,41 @@ export class OperationStore {
 
   private setState(id: string, state: OperationState): void {
     this.db.prepare("UPDATE operations SET state = ?, updated_at = ? WHERE id = ?").run(state, Date.now(), id);
+  }
+
+  private transition(id: string, expected: readonly OperationState[], state: OperationState, toolFence?: number): void {
+    const placeholders = expected.map(() => "?").join(",");
+    const changed = toolFence === undefined
+      ? this.db.prepare(`UPDATE operations SET state = ?, updated_at = ? WHERE id = ? AND state IN (${placeholders})`).run(state, Date.now(), id, ...expected).changes
+      : this.db.prepare(`UPDATE operations SET state = ?, updated_at = ? WHERE id = ? AND state IN (${placeholders})
+          AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
+        .run(state, Date.now(), id, ...expected, toolFence).changes;
+    if (changed !== 1) this.uncertainTransition(id, state);
+  }
+
+  private assertToolFence(attemptId: string, toolFence: number): void {
+    const row = this.db.prepare("SELECT accepting_tools, tool_fence FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as { accepting_tools: number; tool_fence: number } | undefined;
+    if (!row || row.accepting_tools !== 1 || row.tool_fence !== toolFence) {
+      throw new AppError("OPERATION_UNCERTAIN", "assistant attempt has terminalized and no longer accepts tool dispatch");
+    }
+  }
+
+  private uncertainTransition(id: string, transition: string): never {
+    throw new AppError("OPERATION_UNCERTAIN", `operation ${id} ${transition} was fenced or already terminalized`);
+  }
+
+  private parseOperation(row: Record<string, unknown>): OperationRecord {
+    return {
+      id: String(row.id),
+      contextId: String(row.context_id),
+      attemptId: String(row.attempt_id),
+      callId: String(row.call_id),
+      kind: String(row.kind),
+      effectClass: String(row.effect_class) as "read_only" | "side_effecting",
+      state: String(row.state) as OperationState,
+      createdAt: Number(row.created_at),
+      sequence: Number(row.sequence),
+      ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}),
+    };
   }
 }

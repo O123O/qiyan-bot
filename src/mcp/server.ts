@@ -11,7 +11,9 @@ import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
 import { APP_VERSION } from "../version.ts";
 
 export interface AssistantContextProvider {
-  current(): { contextId: string; attemptId: string; turnId: string } | undefined;
+  current(): { contextId: string; attemptId: string; turnId: string; toolFence?: number } | undefined;
+  registerTool?(attemptId: string): number;
+  finishTool?(attemptId: string): void;
 }
 
 export class LoopbackMcpServer {
@@ -93,9 +95,20 @@ export class LoopbackMcpServer {
       mcp.registerTool(name, { description: `QiYan assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
         const active = this.contexts.current();
         if (!active) throw new Error("No active assistant source context");
-        const context: ToolCallContext = { sourceContextId: active.contextId, attemptId: active.attemptId, turnId: active.turnId, callId: `mcp:${String(extra.requestId)}` };
-        const result = await this.tools[name](context, args);
-        return { content: [{ type: "text" as const, text: JSON.stringify(result ?? null) }] };
+        const toolFence = this.contexts.registerTool?.(active.attemptId) ?? active.toolFence;
+        const context: ToolCallContext = {
+          sourceContextId: active.contextId,
+          attemptId: active.attemptId,
+          turnId: active.turnId,
+          callId: `mcp:${String(extra.requestId)}`,
+          ...(toolFence === undefined ? {} : { toolFence }),
+        };
+        try {
+          const result = await this.tools[name](context, args);
+          return { content: [{ type: "text" as const, text: JSON.stringify(result ?? null) }] };
+        } finally {
+          this.contexts.finishTool?.(active.attemptId);
+        }
       });
     }
     // SDK 1.29 models stateless mode as an explicitly undefined generator, which
