@@ -1,79 +1,53 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { openDatabase } from "../../src/storage/database.ts";
 
-test("a version-1 database upgrades delivery attachment and reply columns", async () => {
-  const path = join(await mkdtemp(join(tmpdir(), "qiyan-bot-db-")), "bot.sqlite3");
-  const old = new DatabaseSync(path);
-  old.exec(`
-    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-    INSERT INTO schema_migrations(version) VALUES (1);
-    CREATE TABLE deliveries (
-      id TEXT PRIMARY KEY, kind TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL,
-      mandatory INTEGER NOT NULL, state TEXT NOT NULL, telegram_message_id TEXT,
-      attempt_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    );
-    CREATE TABLE session_runtime (
-      endpoint_id TEXT NOT NULL, thread_id TEXT NOT NULL, management_state TEXT NOT NULL,
-      restore_state TEXT, native_status TEXT NOT NULL DEFAULT 'notLoaded', delivery_cursor TEXT,
-      model TEXT, effort TEXT, active_turn_id TEXT, last_error TEXT,
-      PRIMARY KEY(endpoint_id, thread_id)
-    );
-    CREATE TABLE operations (
-      id TEXT PRIMARY KEY, context_id TEXT NOT NULL, attempt_id TEXT NOT NULL, call_id TEXT NOT NULL,
-      kind TEXT NOT NULL, args_hash TEXT NOT NULL, args_json TEXT NOT NULL, state TEXT NOT NULL,
-      receipt_json TEXT, error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-      UNIQUE(context_id, attempt_id, call_id, kind)
-    );
-  `);
-  old.close();
-
-  const upgraded = openDatabase(path);
-  const columns = upgraded.prepare("PRAGMA table_info(deliveries)").all().map((row: any) => row.name);
-  assert.ok(columns.includes("attachment_id"));
-  assert.ok(columns.includes("attachment_scope_id"));
-  assert.ok(columns.includes("reply_to"));
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 7);
-  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'turn_attachment_refs'").get());
-  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'operation_attachment_refs'").get());
-  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'session_dashboard_facts'").get());
-  assert.ok(upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'session_dashboard_notifications'").get());
-  upgraded.close();
+test("fresh absent and empty databases receive the QiYan identity marker", async () => {
+  for (const kind of ["absent", "empty"]) {
+    const root = await mkdtemp(join(tmpdir(), `qiyan-bot-db-${kind}-`));
+    const path = join(root, "bot.sqlite3");
+    if (kind === "empty") await writeFile(path, "");
+    const db = openDatabase(path);
+    const marker = db.prepare("SELECT product, state_version FROM qiyan_state").get()!;
+    assert.equal(marker.product, "qiyan-bot");
+    assert.equal(marker.state_version, 1);
+    db.close();
+  }
 });
 
-test("a newer version-1 database with delivery columns upgrades idempotently", async () => {
-  const path = join(await mkdtemp(join(tmpdir(), "qiyan-bot-db-new-v1-")), "bot.sqlite3");
-  const old = new DatabaseSync(path);
-  old.exec(`
-    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-    INSERT INTO schema_migrations(version) VALUES (1);
-    CREATE TABLE deliveries (
-      id TEXT PRIMARY KEY, kind TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL,
-      attachment_id TEXT, attachment_scope_id TEXT, reply_to INTEGER,
-      mandatory INTEGER NOT NULL, state TEXT NOT NULL, telegram_message_id TEXT,
-      attempt_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    );
-    CREATE TABLE source_contexts(id TEXT PRIMARY KEY);
-    CREATE TABLE attachments(id TEXT PRIMARY KEY);
-    CREATE TABLE session_runtime (
-      endpoint_id TEXT NOT NULL, thread_id TEXT NOT NULL, management_state TEXT NOT NULL,
-      restore_state TEXT, native_status TEXT NOT NULL DEFAULT 'notLoaded', delivery_cursor TEXT,
-      model TEXT, effort TEXT, active_turn_id TEXT, last_error TEXT,
-      PRIMARY KEY(endpoint_id, thread_id)
-    );
-    CREATE TABLE operations (
-      id TEXT PRIMARY KEY, context_id TEXT NOT NULL, attempt_id TEXT NOT NULL, call_id TEXT NOT NULL,
-      kind TEXT NOT NULL, args_hash TEXT NOT NULL, args_json TEXT NOT NULL, state TEXT NOT NULL,
-      receipt_json TEXT, error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-      UNIQUE(context_id, attempt_id, call_id, kind)
-    );
-  `);
-  old.close();
-  const upgraded = openDatabase(path);
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as any).version, 7);
-  upgraded.close();
+test("a pre-QiYan database is rejected without mutation or sidecars", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-legacy-"));
+  const path = join(root, "bot.sqlite3");
+  const legacy = new DatabaseSync(path);
+  legacy.exec("CREATE TABLE legacy_state(value TEXT); INSERT INTO legacy_state(value) VALUES ('preserve-me')");
+  legacy.close();
+  const beforeBytes = await readFile(path);
+  const beforeStat = await stat(path);
+
+  assert.throws(() => openDatabase(path), /not a QiYan Bot state database/);
+  assert.deepEqual(await readFile(path), beforeBytes);
+  const afterStat = await stat(path);
+  assert.equal(afterStat.size, beforeStat.size);
+  assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs);
+  assert.equal(afterStat.ctimeMs, beforeStat.ctimeMs);
+  await assert.rejects(access(`${path}-wal`));
+  await assert.rejects(access(`${path}-shm`));
+
+  const unchanged = new DatabaseSync(path, { readOnly: true });
+  assert.deepEqual(unchanged.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ["legacy_state"]);
+  assert.equal(unchanged.prepare("SELECT value FROM legacy_state").get()!.value, "preserve-me");
+  unchanged.close();
+});
+
+test("an existing QiYan database reopens normally", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-reopen-"));
+  const path = join(root, "bot.sqlite3");
+  openDatabase(path).close();
+  const reopened = openDatabase(path);
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, 7);
+  reopened.close();
 });

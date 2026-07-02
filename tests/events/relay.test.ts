@@ -22,7 +22,7 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "relay-")));
   const db = createTestDatabase();
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    version: 2, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "worker", project_dir: dir } },
   });
   const endpoint = new RelayEndpoint();

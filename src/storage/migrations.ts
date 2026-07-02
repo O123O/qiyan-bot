@@ -4,6 +4,12 @@ export type Migration = string | ((db: DatabaseSync) => void);
 
 export const migrations: readonly Migration[] = [
   `
+  CREATE TABLE qiyan_state (
+    product TEXT PRIMARY KEY,
+    state_version INTEGER NOT NULL
+  );
+  INSERT INTO qiyan_state(product, state_version) VALUES ('qiyan-bot', 1);
+
   CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);
   CREATE TABLE IF NOT EXISTS telegram_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

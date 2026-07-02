@@ -3,9 +3,16 @@ import { mkdtemp, readFile, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { BotConfig } from "../src/config.ts";
-import { buildProductionApp } from "../src/production-app.ts";
+import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
+
+test("only full-access assistant mode emits the structural startup warning", () => {
+  assert.match(assistantAccessWarning("danger-full-access") ?? "", /non-interactively with full filesystem access/);
+  assert.equal(assistantAccessWarning("workspace-write"), undefined);
+  assert.equal(assistantAccessWarning("read-only"), undefined);
+});
 
 test("production prepares the configured assistant workdir before endpoint startup", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-bot-production-workdir-"));
@@ -27,7 +34,7 @@ test("production prepares the configured assistant workdir before endpoint start
     mcpPort: 0,
     attachmentMaxBytes: 1024,
     attachmentStoreMaxBytes: 4096,
-    sandboxMode: "workspace-write",
+    assistantSandboxMode: "danger-full-access",
   };
   const app = await buildProductionApp(config);
   await assert.rejects(app.start());
@@ -42,4 +49,9 @@ test("production prepares the configured assistant workdir before endpoint start
     join(dataDir, "assistant-profile/home"),
     join(dataDir, "assistant-profile/codex"),
   ]) assert.equal((await stat(path)).mode & 0o777, 0o700);
+  const db = new DatabaseSync(join(dataDir, "bot.sqlite3"), { readOnly: true });
+  const warnings = db.prepare("SELECT body FROM deliveries WHERE id = 'assistant-full-access-warning'").all();
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0]!.body), /non-interactively with full filesystem access/);
+  db.close();
 });

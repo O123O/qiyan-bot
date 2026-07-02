@@ -13,7 +13,7 @@ test("a legacy local assistant mapping migrates atomically after exact resume ve
   const dir = await mkdtemp(join(tmpdir(), "assistant-identity-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "legacy-thread", project_dir: dir },
     sessions: {},
   });
@@ -38,7 +38,7 @@ test("legacy assistant migration does not rewrite identity when resumed cwd diff
   const other = await mkdtemp(join(tmpdir(), "assistant-identity-other-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "legacy-thread", project_dir: dir },
     sessions: {},
   });
@@ -61,7 +61,7 @@ test("configured assistant directory mismatch is a safe startup error before app
   const configured = await mkdtemp(join(tmpdir(), "assistant-identity-configured-"));
   const path = join(registered, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "thread", project_dir: registered },
     sessions: {},
   });
@@ -97,7 +97,7 @@ test("first profile activation validates, resets only assistant, then marks", as
     two: { endpoint: "local", thread_id: "two-thread", project_dir: projectTwo },
   };
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "legacy", project_dir: assistantDir },
     sessions,
   });
@@ -129,7 +129,7 @@ test("profile activation is skipped when durable and fails before unsafe mutatio
   const configured = await mkdtemp(join(tmpdir(), "assistant-profile-configured-"));
   const path = join(registered, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "thread", project_dir: registered },
     sessions: {},
   });
@@ -157,7 +157,7 @@ test("profile activation is skipped when durable and fails before unsafe mutatio
 test("fresh pending identity records, materializes, commits, and clears in order", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-two-phase-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
   const order: string[] = [];
   const endpoint = {
@@ -190,7 +190,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
 test("pending receipt resumes only exact durable provenance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-receipt-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
   const calls: string[] = [];
   const endpoint = {
@@ -215,7 +215,7 @@ test("pending receipt resumes only exact durable provenance", async () => {
 test("a resume failure preserves an already-proven durable pending receipt", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-receipt-resume-failure-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
   const failure = new JsonRpcResponseError(-32600, "thread not loaded: receipt-thread");
   const endpoint = {
@@ -250,7 +250,7 @@ test("a resume failure preserves an already-proven durable pending receipt", asy
 test("registered identity clears a matching stale creation receipt after verified resume", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-stale-receipt-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
   });
   const calls: string[] = [];
   const endpoint = {
@@ -284,7 +284,7 @@ test("registered identity clears a matching stale creation receipt after verifie
 test("registered isolated identity always requires its immutable creation nonce", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-registered-provenance-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
   });
   const thread = {
     id: "registered-thread",
@@ -306,7 +306,7 @@ test("registered isolated identity always requires its immutable creation nonce"
 test("registered isolated identity tolerates a user-renamed thread after receipt clearance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-registered-name-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
+    version: 2, assistant: { endpoint: "assistant-local", thread_id: "registered-thread", project_dir: dir }, sessions: {},
   });
   const result = await resumeAssistantIdentity({
     registry,
@@ -327,7 +327,7 @@ test("only exact thread-not-loaded clears a pending receipt", async () => {
   const run = async (failure: Error) => {
     const dir = await mkdtemp(join(tmpdir(), "assistant-receipt-error-"));
     const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-      version: 1, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
+      version: 2, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
     });
     const cleared: string[] = [];
     const recorded: string[] = [];
@@ -372,7 +372,7 @@ test("pending receipt provenance mismatch fails without clearing", async () => {
     const dir = await mkdtemp(join(tmpdir(), "assistant-provenance-"));
     const other = await mkdtemp(join(tmpdir(), "assistant-provenance-other-"));
     const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-      version: 1, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
+      version: 2, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
     });
     let cleared = false;
     const thread = { id: "receipt", cwd: dir, threadSource: "nonce", name: "qiyan-bot-assistant:nonce", status: { type: "idle" } };

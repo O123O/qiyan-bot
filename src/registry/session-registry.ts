@@ -10,7 +10,7 @@ const sessionSchema = z.object({
   description: z.string().optional(),
 });
 const registrySchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   assistant: sessionSchema,
   sessions: z.record(z.string().min(1), sessionSchema),
 });
@@ -53,7 +53,7 @@ async function normalize(document: RegistryDocument): Promise<RegistryDocument> 
     seen.add(key);
     sessions[nickname] = normalized;
   }
-  return { version: 1, assistant: await canonicalSession(parsed.assistant), sessions };
+  return { version: 2, assistant: await canonicalSession(parsed.assistant), sessions };
 }
 
 export class SessionRegistry {

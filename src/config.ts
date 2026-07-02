@@ -1,6 +1,5 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
-import { AppError } from "./core/errors.ts";
 
 const positiveInt = z.coerce.number().int().positive();
 
@@ -8,9 +7,10 @@ const configSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_OWNER_ID: z.coerce.number().int(),
   TELEGRAM_DESTINATION_CHAT_ID: z.coerce.number().int(),
+  HOME: z.string().min(1),
   ASSISTANT_WORKDIR: z.string().min(1).optional(),
-  DATA_DIR: z.string().default("data"),
-  SESSION_REGISTRY_PATH: z.string().default("data/sessions.json"),
+  DATA_DIR: z.string().min(1).optional(),
+  SESSION_REGISTRY_PATH: z.string().min(1).optional(),
   CODEX_BINARY: z.string().default("codex"),
   MAX_CONCURRENT_TURNS: positiveInt.default(4),
   MAX_COLLECT_COUNT: positiveInt.max(100).default(20),
@@ -18,7 +18,7 @@ const configSchema = z.object({
   MCP_PORT: z.coerce.number().int().min(0).max(65_535).default(43_721),
   ATTACHMENT_MAX_BYTES: positiveInt.default(20 * 1024 * 1024),
   ATTACHMENT_STORE_MAX_BYTES: positiveInt.default(1024 * 1024 * 1024),
-  ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("workspace-write"),
+  ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("danger-full-access"),
 }).refine((value) => value.TELEGRAM_DESTINATION_CHAT_ID === value.TELEGRAM_OWNER_ID, {
   path: ["TELEGRAM_DESTINATION_CHAT_ID"],
   message: "must equal TELEGRAM_OWNER_ID for the single-user private-chat MVP",
@@ -38,7 +38,7 @@ export interface BotConfig {
   mcpPort: number;
   attachmentMaxBytes: number;
   attachmentStoreMaxBytes: number;
-  sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  assistantSandboxMode: "read-only" | "workspace-write" | "danger-full-access";
 }
 
 export interface ConfigOverrides { assistantWorkdir?: string }
@@ -46,9 +46,15 @@ export interface ConfigOverrides { assistantWorkdir?: string }
 export interface AssistantLoginConfig { dataDir: string; codexBinary: string }
 
 export function loadAssistantLoginConfig(env: Record<string, string | undefined>): AssistantLoginConfig {
+  const parsed = z.object({
+    HOME: z.string().min(1),
+    DATA_DIR: z.string().min(1).optional(),
+    CODEX_BINARY: z.string().min(1).default("codex"),
+  }).parse(env);
+  const home = resolve(parsed.HOME);
   return {
-    dataDir: resolve(z.string().min(1).default("data").parse(env.DATA_DIR)),
-    codexBinary: z.string().min(1).default("codex").parse(env.CODEX_BINARY),
+    dataDir: resolve(parsed.DATA_DIR ?? join(home, ".qiyan-bot", "data")),
+    codexBinary: parsed.CODEX_BINARY,
   };
 }
 
@@ -56,15 +62,16 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
   const parsed = configSchema.parse(overrides.assistantWorkdir === undefined
     ? env
     : { ...env, ASSISTANT_WORKDIR: overrides.assistantWorkdir });
-  const workdir = parsed.ASSISTANT_WORKDIR;
-  if (!workdir) throw new AppError("CONFIGURATION_ERROR", "ASSISTANT_WORKDIR or --workdir is required");
+  const home = resolve(parsed.HOME);
+  const defaultRoot = join(home, ".qiyan-bot");
+  const dataDir = resolve(parsed.DATA_DIR ?? join(defaultRoot, "data"));
   return {
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     telegramOwnerId: parsed.TELEGRAM_OWNER_ID,
     telegramDestinationChatId: parsed.TELEGRAM_DESTINATION_CHAT_ID,
-    assistantWorkdir: resolve(workdir),
-    dataDir: resolve(parsed.DATA_DIR),
-    sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH),
+    assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "assistant")),
+    dataDir,
+    sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
     codexBinary: parsed.CODEX_BINARY,
     maxConcurrentTurns: parsed.MAX_CONCURRENT_TURNS,
     maxCollectCount: parsed.MAX_COLLECT_COUNT,
@@ -72,6 +79,6 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     mcpPort: parsed.MCP_PORT,
     attachmentMaxBytes: parsed.ATTACHMENT_MAX_BYTES,
     attachmentStoreMaxBytes: parsed.ATTACHMENT_STORE_MAX_BYTES,
-    sandboxMode: parsed.ASSISTANT_SANDBOX_MODE,
+    assistantSandboxMode: parsed.ASSISTANT_SANDBOX_MODE,
   };
 }

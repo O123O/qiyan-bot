@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { migrations } from "./migrations.ts";
@@ -6,11 +6,37 @@ import { migrations } from "./migrations.ts";
 export type Database = DatabaseSync;
 
 export function openDatabase(path: string): Database {
-  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (path !== ":memory:") {
+    const state = existingFileState(path);
+    if (state === "nonempty") assertQiYanDatabase(path);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  }
   const db = new DatabaseSync(path);
   db.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
   migrate(db);
   return db;
+}
+
+function existingFileState(path: string): "missing" | "empty" | "nonempty" {
+  try { return statSync(path).size === 0 ? "empty" : "nonempty"; }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
+function assertQiYanDatabase(path: string): void {
+  let inspector: DatabaseSync | undefined;
+  try {
+    inspector = new DatabaseSync(path, { readOnly: true });
+    const marker = inspector.prepare("SELECT product, state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get() as
+      { product?: unknown; state_version?: unknown } | undefined;
+    if (marker?.product !== "qiyan-bot" || marker.state_version !== 1) throw new Error("invalid marker");
+  } catch {
+    throw new Error("not a QiYan Bot state database");
+  } finally {
+    inspector?.close();
+  }
 }
 
 export function createTestDatabase(): Database {

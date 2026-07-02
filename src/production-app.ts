@@ -38,6 +38,11 @@ import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import { DeliveryWorker } from "./telegram/delivery-worker.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
+const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
+
+export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
+  return mode === "danger-full-access" ? fullAccessWarning : undefined;
+}
 
 export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   const token = randomBytes(32).toString("base64url");
@@ -118,7 +123,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       name: "registry",
       start: async () => {
         registry = await SessionRegistry.open(registryPath, {
-          version: 1,
+          version: 2,
           assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: assistantDir },
           sessions: {},
         });
@@ -127,6 +132,16 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         }
         for (const [index, warning] of assistantWarnings.entries()) {
           deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", destination: String(config.telegramDestinationChatId), body: `[system] ${warning}`, mandatory: true });
+        }
+        const accessWarning = assistantAccessWarning(config.assistantSandboxMode);
+        if (accessWarning) {
+          deliveries.prepare({
+            id: "assistant-full-access-warning",
+            kind: "system_warning",
+            destination: String(config.telegramDestinationChatId),
+            body: `[system] ${accessWarning}`,
+            mandatory: true,
+          });
         }
       }, stop: async () => undefined,
     },
@@ -170,7 +185,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.sandboxMode });
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.assistantSandboxMode });
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -784,7 +799,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       endpoint: assistantEndpoint,
       legacyEndpointId: endpoint.id,
       assistantDir,
-      sandboxMode: config.sandboxMode,
+      sandboxMode: config.assistantSandboxMode,
       config: assistantTurnConfig(mcp.url, token),
       creationNonce: assistantProfile.creationNonce,
       pendingThreadId: assistantProfile.pendingThreadId,
@@ -1096,7 +1111,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           threadId: session.thread_id,
           cwd: session.project_dir,
           approvalPolicy: "never",
-          sandbox: config.sandboxMode,
+          sandbox: config.assistantSandboxMode,
           config: secureShellConfig(),
         });
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();

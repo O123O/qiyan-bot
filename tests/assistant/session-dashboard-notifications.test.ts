@@ -11,7 +11,7 @@ function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Pr
   const runtime = new RuntimeStore(db);
   runtime.setSession("local", "thread-1", "managed", "idle");
   const registry = { snapshot: () => ({
-    version: 1 as const,
+    version: 2 as const,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
   }) };

@@ -9,7 +9,7 @@ async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
@@ -35,20 +35,20 @@ test("invalid external replacement preserves last known-good state", async () =>
   const { path, registry } = await fixture();
   await writeFile(path, "{broken", "utf8");
   assert.equal(await registry.reload(), false);
-  assert.equal(registry.snapshot().version, 1);
+  assert.equal(registry.snapshot().version, 2);
 });
 
 test("invalid startup registry is quarantined and replaced without activating corrupt mappings", async () => {
   const { dir, path } = await fixture();
   await writeFile(path, "{broken", "utf8");
   const registry = await SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   });
   assert.deepEqual(registry.snapshot().sessions, {});
   assert.equal(registry.warnings().length, 1);
-  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2);
 });
 
 test("invalid startup registry without a last-known-good snapshot refuses unsafe reset", async () => {
@@ -56,7 +56,7 @@ test("invalid startup registry without a last-known-good snapshot refuses unsafe
   const path = join(dir, "sessions.json");
   await writeFile(path, "{broken", "utf8");
   await assert.rejects(SessionRegistry.open(path, {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: {},
   }), /no valid last-known-good/);
@@ -65,7 +65,7 @@ test("invalid startup registry without a last-known-good snapshot refuses unsafe
 test("external replacement is activated only after asynchronous mapping validation", async () => {
   const { dir, path, registry } = await fixture();
   await writeFile(path, JSON.stringify({
-    version: 1,
+    version: 2,
     assistant: { endpoint: "local", thread_id: "assistant", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "t1", project_dir: dir } },
   }));
@@ -89,4 +89,20 @@ test("updates the assistant identity atomically after first app-server start", a
   await registry.setAssistant({ endpoint: "local", thread_id: "real-assistant", project_dir: dir });
   assert.equal(registry.snapshot().assistant.thread_id, "real-assistant");
   assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.thread_id, "real-assistant");
+});
+
+test("a version-1 registry is rejected without migration", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-bot-registry-v1-"));
+  const path = join(dir, "sessions.json");
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    assistant: { endpoint: "assistant-local", thread_id: "old", project_dir: dir },
+    sessions: {},
+  }));
+  await assert.rejects(SessionRegistry.open(path, {
+    version: 2,
+    assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir },
+    sessions: {},
+  }), /no valid last-known-good/);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
 });

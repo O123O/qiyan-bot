@@ -18,7 +18,7 @@ async function fixture(options: { existing?: string; assistantRoot?: string } = 
   const runtime = new RuntimeStore(db);
   runtime.setSession("local", "thread-1", "managed", "idle");
   let document: RegistryDocument = {
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: options.assistantRoot ?? root },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
   };
@@ -84,7 +84,7 @@ test("validates and claims the canonical assistant root before inspecting migrat
   const claimed = await fixture();
   claimed.store.claimAssistantRoot(claimed.root);
   (claimed.registry as any).snapshot = () => ({
-    version: 1,
+    version: 2,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/different" },
     sessions: {},
   });

@@ -63,7 +63,7 @@ class ServiceEndpoint implements AppServerEndpoint {
 async function fixture() {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
-    version: 1, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
+    version: 2, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
     sessions: { payments: { endpoint: "local", thread_id: "thread", project_dir: dir } },
   });
   const db = createTestDatabase();

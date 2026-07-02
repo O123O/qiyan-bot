@@ -118,7 +118,7 @@ test("claims one assistant root and migrates every legacy entry exactly once", (
   store.claimAssistantRoot("/manager");
   assert.throws(() => store.claimAssistantRoot("/other"), /assistant root/);
   const registry = {
-    version: 1 as const,
+    version: 2 as const,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/payments" } },
   };
@@ -137,7 +137,7 @@ test("claims one assistant root and migrates every legacy entry exactly once", (
 test("legacy migration rejects unmatched and duplicate stable identities atomically", () => {
   const store = new SessionDashboardStore(createTestDatabase());
   const registry = {
-    version: 1 as const,
+    version: 2 as const,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/payments" } },
   };
