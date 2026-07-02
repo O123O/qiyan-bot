@@ -44,11 +44,11 @@ export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
 export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
 ```
 
-`TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as a assistant message.
+`TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as an assistant message.
 
 ## 4. Authenticate and start
 
-Complete the independent assistant login once, then start the bot:
+Before starting, remember that the assistant defaults to non-interactive `danger-full-access`; workers must use an auto/non-interactive normal Codex configuration because Telegram has no approval UI. Complete the independent assistant login once, then start the bot:
 
 ```bash
 DATA_DIR="$DATA_DIR" qiyan-bot assistant-login

@@ -1,59 +1,57 @@
 # Shared setup
 
-This guide prepares Codex and local bot state. Chat-specific credentials are covered by the individual adapter guide; currently only [Telegram](chat-apps/telegram.md) is implemented.
+This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. Chat credentials are adapter-specific; currently only [Telegram](chat-apps/telegram.md) is implemented.
 
-## Requirements
+## Understand the execution model
 
-- Linux and Node.js 24 or newer
-- the installed `qiyan-bot` command from the [installation guide](installation.md)
-- `codex-cli 0.142.4`, authenticated normally for project workers
-- a standalone assistant workdir, such as `$HOME/.qiyan-bot/assistant`
+The assistant defaults to `danger-full-access` and approval policy `never`. It can use your filesystem non-interactively. Workers inherit your normal HOME, CODEX_HOME, configuration, credentials, skills, proxies, and provider variables; QiYan does not override their sandbox or approval policy.
 
-Project workers use your normal `HOME`, `CODEX_HOME`, configuration, credentials, and skills. The assistant uses an independent profile under the bot data directory. It never copies or links the normal Codex authentication file.
+Chat approvals are unsupported. Configure normal Codex for automatic, non-interactive worker operation before delegating work. Use a dedicated OS account or container if full access is too broad for the host.
 
-## Choose private paths
+## Defaults and optional paths
 
-Use absolute paths for predictable service startup:
+With no path variables, QiYan uses:
 
-```bash
-export DATA_DIR="$HOME/.qiyan-bot/data"
-export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
-export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
-install -d -m 700 "$HOME/.qiyan-bot" "$ASSISTANT_WORKDIR"
+```text
+$HOME/.qiyan-bot/assistant
+$HOME/.qiyan-bot/data
+$HOME/.qiyan-bot/data/sessions.json
+$HOME/qiyan-bot-projects
 ```
 
-Keep the assistant workdir outside the bot source repository and outside `DATA_DIR`. The bot rejects overlapping or symlink-aliased state paths. It creates and owns `AGENTS.md`, `.qiyan-bot-agents.sha256`, and `session-status.json` in the assistant workdir; do not edit those files. Put a complete user replacement prompt in `AGENTS.override.md` if needed.
+For a service, optional absolute overrides are:
+
+```bash
+export ASSISTANT_WORKDIR="$HOME/.qiyan-bot/assistant"
+export DATA_DIR="$HOME/.qiyan-bot/data"
+export SESSION_REGISTRY_PATH="$HOME/.qiyan-bot/data/sessions.json"
+export ASSISTANT_SANDBOX_MODE=danger-full-access
+```
+
+The assistant workdir must be separate from data and registry state. QiYan creates the directories, managed `AGENTS.md`, read-only `assistant-context.json`, and read-only `session-status.json`. Customize the complete prompt with `AGENTS.override.md`; never edit generated files.
 
 ## Authenticate the assistant
 
-Run device authentication once with the same `DATA_DIR` that the bot will use:
+Run device authentication once. If `DATA_DIR` is overridden, provide the same value here:
 
 ```bash
-DATA_DIR="$DATA_DIR" qiyan-bot assistant-login
+qiyan-bot assistant-login
 ```
 
-This command needs no chat credentials and starts no bot. Complete the displayed device flow. If authentication later expires, stop the bot, run this command again, and restart it; the bot does not decide to reauthenticate on your behalf.
+This starts no bot and needs no chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
 
-## Configure and start
+## Configure an adapter and launch
 
-Set the adapter variables from its guide in the same environment, then start from any directory:
+Set adapter variables from its guide. Before launching, remember: the assistant has non-interactive full filesystem access, and workers must already be configured for auto mode because chat approvals are unsupported.
 
 ```bash
-qiyan-bot --workdir "$ASSISTANT_WORKDIR"
+qiyan-bot
 ```
 
-`--workdir` overrides `ASSISTANT_WORKDIR`. SIGINT and SIGTERM perform graceful shutdown. For a long-running deployment, place these values in the private environment mechanism of your service manager rather than a repository file or shell history.
+Use `qiyan-bot --workdir "$ASSISTANT_WORKDIR"` only when overriding the HOME-based assistant path. SIGINT and SIGTERM perform graceful shutdown. Put secrets and configuration in your service manager's private environment, not a repository file or shell history.
 
-The bot intentionally starts project sessions with approval policy `never` because normal chat apps do not provide Codex approval controls. The configured sandbox defaults to `workspace-write`; use `danger-full-access` only for projects you trust. A permission request that still blocks work is reported to chat.
+## Backup
 
-## State and backup
+Stop QiYan, then copy `DATA_DIR`, an external `SESSION_REGISTRY_PATH`, and `ASSISTANT_WORKDIR` together. The isolated profile contains authentication and thread history. Do not restore generated JSON independently from SQLite.
 
-Stop the bot before backup and copy these items together:
-
-- `DATA_DIR`, including SQLite, attachments, and the isolated assistant profile;
-- `SESSION_REGISTRY_PATH` if configured outside `DATA_DIR`; and
-- `ASSISTANT_WORKDIR`.
-
-Treat the backup as secret because the assistant profile contains authentication and thread history. `session-status.json` is a generated read-only view and must not be restored independently from SQLite.
-
-See the root [README](../README.md#troubleshooting) for runtime behavior, recovery guarantees, exact `/pass` and `/collect` directives, and troubleshooting.
+See the root [README](../README.md#troubleshooting) for direct/delegated behavior, protected project paths, `/pass`, `/collect`, recovery, and troubleshooting.

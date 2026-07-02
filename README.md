@@ -1,20 +1,28 @@
 # QiYan Bot
 
-A single-user, self-hosted Telegram bridge for Codex. One persistent Codex thread acts as the assistant; ordinary Codex threads remain ordinary project sessions that can also be resumed manually from their project directories.
+QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram is the first chat adapter; Slack and WeChat are planned behind the same transport-neutral backend.
 
-The MVP runs on one machine. One token-free app-server hosts all project sessions; a second local app-server hosts only the assistant. The split, plus Linux peer-PID authorization on the loopback manager endpoint, prevents a project session from using manager credentials even if it can inspect same-user process environments. The endpoint pool and registry include endpoint IDs so a later release can add SSH-hosted app-servers without changing chat routing or session identity.
+QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server, so you can resume a managed thread manually from its project directory.
+
+## Security model
+
+Read this before installing or launching:
+
+- The assistant defaults to `danger-full-access` with approval policy `never`. It can read, write, and execute as your OS user without an interactive confirmation.
+- Chat approvals are unsupported. Worker sessions receive no QiYan approval, sandbox, or shell override, so your normal Codex configuration must already be suitable for automatic, non-interactive operation. A remaining permission request is reported as blocked.
+- The Telegram adapter accepts only the configured owner and sends only to that owner's private chat. This is not a multi-user service.
+- Use a dedicated OS account or container if other same-account processes are outside your trust boundary.
 
 ## Requirements
 
-- Linux (race-safe outbound attachment handling uses `O_NOFOLLOW` and `/proc/self/fd`)
+- Linux
 - Node.js 24 or newer
-- `codex-cli 0.142.4` authenticated for project work, plus an independently authenticated assistant profile (setup below)
-- A Telegram bot token from BotFather
-- The numeric Telegram user ID of the only authorized owner
-
-The bot intentionally runs project sessions with approval policy `never` and the configured non-interactive sandbox. Review this trust model before running it: project sessions can modify files and execute commands without chat approval buttons. `workspace-write` is the default; use `danger-full-access` only for projects you trust. The Telegram adapter discards every non-owner update before storing content or invoking a model, and output is restricted to that owner's private chat ID.
+- `codex-cli 0.142.4`
+- A Telegram bot token and the numeric user ID of its sole owner
 
 ## Install
+
+QiYan is distributed through GitHub Releases, not the npm registry. Do not use `npm install -g qiyan-bot` without the Release URL.
 
 ```bash
 npm install --global \
@@ -24,7 +32,7 @@ export PATH="$HOME/.local/bin:$PATH"
 qiyan-bot --version
 ```
 
-The latest-Release package is a fully bundled executable with no runtime npm dependency tree. Before the first GitHub Release exists, or to build current `main` without Git, follow the [installation guide](docs/installation.md).
+The Release archive is a bundled runtime with no production dependency tree. For digest verification and a no-Git source build, see the [installation guide](docs/installation.md).
 
 Setup guides:
 
@@ -33,147 +41,97 @@ Setup guides:
 - [Slack — planned](docs/chat-apps/slack.md)
 - [WeChat — planned](docs/chat-apps/wechat.md)
 
-Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, and `ASSISTANT_WORKDIR`. The destination is normally the owner's private chat ID. The assistant workdir should be a standalone user-owned directory outside both this repository and `DATA_DIR`, for example `$HOME/.qiyan-bot/assistant`. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
+## Configure and run
 
-`--workdir` overrides `ASSISTANT_WORKDIR`. Relative assistant, data, and registry paths resolve from the shell launch directory; use absolute paths when the bot must behave identically regardless of where it is launched. Startup rejects any direct, nested, or symlink-aliased overlap between the assistant workdir and authoritative backend state.
-
-Project workers use the account runner's normal `HOME`, `CODEX_HOME`, configuration, and skills. The assistant uses private `HOME` and `CODEX_HOME` directories below `<DATA_DIR>/assistant-profile` and never copies or links credentials from the normal profile. Authenticate it once after setting the same `DATA_DIR` used by the bot:
+Authenticate the isolated assistant profile once. This does not copy or link your normal Codex authentication:
 
 ```bash
-DATA_DIR="$HOME/.qiyan-bot/data" qiyan-bot assistant-login
+qiyan-bot assistant-login
 ```
 
-This starts Codex device authentication in the isolated profile. It does not need Telegram variables or start the bot. Supported provider environment credentials such as `OPENAI_API_KEY` may also satisfy the assistant app-server when Codex does not require its own login. The owned app-servers otherwise inherit only the environment needed by Codex and proxy settings. Telegram secrets are removed. A random loopback MCP bearer token exists only in the assistant app-server, is excluded from model-launched shell commands, and is insufficient without the assistant process identity.
-
-The assistant profile is bot-managed; do not replace or change permissions on its directories while the bot runs. This single-user design trusts other processes under the bot's OS account and prevents accidental profile inheritance, but it is not a boundary against a same-account process deliberately racing filesystem changes. Use a dedicated OS account or container if that threat is relevant.
-
-After exporting the configuration, run the installed command from any directory:
+Set the Telegram credentials in a private shell or service environment:
 
 ```bash
-qiyan-bot --workdir "$HOME/.qiyan-bot/assistant"
+export TELEGRAM_BOT_TOKEN='<botfather-token>'
+export TELEGRAM_OWNER_ID='<numeric-user-id>'
+export TELEGRAM_DESTINATION_CHAT_ID="$TELEGRAM_OWNER_ID"
 ```
 
-For source development, copy the example environment, export it, and use the same executable entry through TSX:
+Before launching, remember that the assistant is non-interactive `danger-full-access`, while workers must be configured in your normal Codex profile for automatic operation because chat approvals are unsupported.
 
 ```bash
-cp .env.example .env
-set -a; . ./.env; set +a
-npm start -- --workdir "$HOME/.qiyan-bot/assistant"
+qiyan-bot
 ```
 
-Send SIGINT or SIGTERM for graceful shutdown. Startup performs migrations, validates the registry, reconciles missed worker history and uncertain outbox rows, resumes or creates the assistant, and only then begins Telegram polling.
+The HOME-based defaults are:
 
-On the first startup after upgrading to isolated profiles, the bot creates a new assistant thread inside the private profile. It preserves all project-session mappings and durable manager state, but does not copy the old assistant transcript from the normal Codex home. Thread creation uses a durable nonce-tagged receipt so an app-server or process crash cannot silently select an unrelated thread.
+- assistant workdir: `$HOME/.qiyan-bot/assistant`
+- data and isolated profile: `$HOME/.qiyan-bot/data`
+- session registry: `$HOME/.qiyan-bot/data/sessions.json`
+- delegated fallback root: `$HOME/qiyan-bot-projects`
 
-## How it behaves
+`--workdir`, `ASSISTANT_WORKDIR`, `DATA_DIR`, `SESSION_REGISTRY_PATH`, and `ASSISTANT_SANDBOX_MODE` override those defaults independently. Use absolute paths for a service. The assistant sandbox override affects only the assistant; it never changes worker policy.
 
-Ordinary messages go to the assistant. It chooses a project nickname, asks when the target is ambiguous, and uses typed manager tools to create, adopt, detach, attach, archive, message, interrupt, and inspect project sessions. It can change the next-turn model or reasoning effort and get, replace, pause, resume, or cancel native goals. Goal completion is controlled by Codex, not by this bot.
+## Direct work and delegated sessions
 
-Every eligible terminal worker response is automatically sent to Telegram as `[nickname] …`. The assistant receives only compact metadata and decides whether it needs to read the body or follow up. This avoids duplicating project transcripts in the assistant context. Failed, interrupted, permission-blocked, and unavailable work produces a labeled warning.
+QiYan reads `assistant-context.json` to translate phrases such as “my Documents” to your real home, because the assistant's shell `~` points to its isolated HOME. Small, personal, one-off, and cross-project tasks are normally done directly with absolute paths.
 
-The backend materializes `<assistant-workdir>/session-status.json` as a mode-0400 session dashboard. It automatically records lifecycle state, active turn, the last instruction, terminal worker metadata, current and pending model/effort, exact observed thread token/context use, and the native goal. The assistant owns only concise `manager_notes`, updated through `update_session_notes`, so supervision intent survives context compaction without asking the model to maintain JSON. SQLite is authoritative; the JSON file is a replaceable read-only view.
+For sustained coding or project work, QiYan creates or resumes a worker session. Explicit project paths may be existing or newly created. If no path is appropriate, the backend exclusively creates `$HOME/qiyan-bot-projects/<nickname>`. It rejects broad roots, assistant/bot state overlap, traversal, symlink redirection, fallback collisions, and a directory whose device/inode identity changes before dispatch.
 
-On the first upgraded startup, a version-1 manager notebook is imported exactly once by stable thread identity. `project_status`, `current_objective`, and `pending_follow_up` become manager notes. Legacy last-sent and worker-event fields are not trusted as automatic observations. Invalid, unmatched, ambiguous, or duplicate legacy entries stop startup before the original bytes are replaced. A successful migration is crash-idempotent.
+Every eligible worker final is automatically delivered as `[nickname] …`. The assistant receives metadata and reads the full body only when the user or supervision requires it. `session-status.json`, `assistant-context.json`, and the registry are generated, read-only state; do not edit them.
 
-`get_session_status` returns the same complete entry after refreshing live lifecycle and goal state. Token figures describe that Codex thread's context use; they are not account billing, credits, global usage, or rate-limit information.
-
-### Assistant instructions
-
-On first startup the bot installs its management playbook as `<assistant-workdir>/AGENTS.md` and records the exact digest in `.qiyan-bot-agents.sha256`. Both files are bot-managed. Do not edit either one: startup refuses a changed or partially missing pair instead of guessing whether user content can be overwritten. An unchanged policy is upgraded automatically when the packaged playbook changes.
-
-For complete prompt customization, copy the current policy and edit the override:
-
-```bash
-cp "$ASSISTANT_WORKDIR/AGENTS.md" "$ASSISTANT_WORKDIR/AGENTS.override.md"
-```
-
-Codex gives `AGENTS.override.md` precedence in that directory. The bot never creates, reads, updates, or deletes it. Because it replaces the managed prompt completely, retain the routing, automatic-delivery, read-only dashboard/registry, exact-directive, goal, attachment, and recovery behavior you still want.
-
-To recover from a managed-policy guard error, either restore `AGENTS.md` to the exact content represented by the stored digest, or move the desired custom policy to `AGENTS.override.md` and delete both `AGENTS.md` and `.qiyan-bot-agents.sha256`; the bot then reinstalls a fresh managed pair. A assistant workdir inside a Git worktree is allowed but produces a warning because Codex may also inherit instructions from that repository's project root.
-
-The assistant does not inherit the account runner's home-scoped Codex configuration or skills. Put assistant-only Codex configuration in `<DATA_DIR>/assistant-profile/codex/config.toml`, home-scoped skills in `<DATA_DIR>/assistant-profile/home/.agents/skills`, or project-scoped skills in `<assistant-workdir>/.agents/skills`. If the assistant workdir is inside a Git worktree, Codex can also inherit that repository's parent `AGENTS.md`, `.codex/config.toml`, and `.agents/skills`; startup warns about this boundary.
-
-### Exact pass-through
-
-Use `/pass ` when wording must reach a worker unchanged:
+Use exact pass-through when wording must reach a worker unchanged:
 
 ```text
-tell payments /pass  preserve these two leading spaces
+tell payments /pass  preserve this leading space
 ```
 
-The assistant still selects the nickname and whether to start or steer. The backend verifies the content byte-for-byte against the original Telegram text and preserves attachment order. The authorization is single-use and replay-safe. Text after `/pass ` is opaque, including another `/collect` string.
-
-### Direct collection
-
-Use `/collect` or `/collect N` to send the newest eligible worker finals directly to Telegram:
+Use direct collection when worker finals should bypass assistant summarization:
 
 ```text
 report payments /collect 3
 ```
 
-The backend fixes the count from the immutable source message, selects at most 20 messages by stable terminal order, emits them chronologically, and returns only delivery receipts to the assistant. Without the directive, normal collection returns bodies to the assistant for inspection or summarization.
+## Assistant instructions and customization
 
-## Sessions and manual work
+QiYan installs `<assistant-workdir>/AGENTS.md` and records its digest. Startup upgrades an unchanged policy and rejects a modified or partially missing managed pair. Put a complete replacement prompt in `AGENTS.override.md`; the bot never reads or modifies that user-owned file.
 
-`data/sessions.json` maps assistant-assigned nicknames to an endpoint, Codex thread ID, and canonical project directory. The assistant treats it as read-only and uses typed lifecycle/nickname tools. Backend writes are atomic; an invalid operator replacement is rejected while the last-known-good in-memory registry remains active.
+The assistant also does not inherit home-scoped user skills. Put assistant-only configuration in `<DATA_DIR>/assistant-profile/codex/config.toml`, home skills in `<DATA_DIR>/assistant-profile/home/.agents/skills`, or project-scoped skills in the assistant workdir. Workers continue to use your normal Codex configuration and skills unchanged.
 
-Detach before taking over a managed thread manually. Detach requires idle state, unsubscribes the bot, and ends its managed epoch. Work completed while detached is deliberately not auto-forwarded. Attach performs an idle read, resumes with the registered canonical directory, performs a second idle read, and starts a new epoch whose history baseline excludes detached-period turns.
+## State and backup
 
-Discovery scans all top-level persisted Codex threads on an endpoint, across archived and non-archived pages and every source kind. It filters ephemeral and child/subagent threads, then returns stable opaque snapshot pages. This lets the assistant adopt sessions that were created outside the bot.
+- `<DATA_DIR>/bot.sqlite3`: operations, outbox, events, runtime, observations, and attachment metadata
+- `<DATA_DIR>/sessions.json`: registry v2 with assistant and worker identities
+- `<DATA_DIR>/assistant-profile/`: isolated authentication, configuration, and assistant thread storage
+- `<assistant-workdir>/AGENTS.md`: managed assistant policy
+- `<assistant-workdir>/assistant-context.json`: mode-0400 real-home context
+- `<assistant-workdir>/session-status.json`: mode-0400 session dashboard
 
-## Attachments
+This is a fresh QiYan state format. Pre-QiYan databases and registries are rejected without migration or mutation. Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
 
-Inbound Telegram photos and documents are streamed into a mode-0600 private store with actual byte limits, SHA-256 metadata, per-message and total quotas, opaque source-context-scoped handles, retention counts, and expiry cleanup. Images become app-server `localImage` inputs; other files become `mention` inputs.
+## Attachments and recovery
 
-For outbound project files, the assistant names a managed owner and a relative path. Linux opens the final component with `O_NOFOLLOW`, verifies the opened descriptor remains beneath the canonical owner root, and snapshots it into the private store before upload. Absolute paths, traversal, symlinks, non-regular files, growing files, cross-context handles, and oversized content are rejected.
+Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.
 
-## Delivery and recovery
+Telegram delivery and assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash.
 
-Telegram output uses a durable outbox. Rows move through prepared, dispatched, and confirmed states. A crash after transmission but before confirmation is inherently ambiguous; on restart, mandatory results are retried with a stable label such as `[payments · recovery retry d_ab12]`, so a duplicate is visible rather than silently lost. Optional assistant tool output reports `DELIVERY_UNCERTAIN` instead of retransmitting automatically.
-
-Assistant tool effects use a separate operation ledger keyed by source context, attempt, MCP request ID, kind, and canonical arguments. Identical calls replay receipts; changed arguments conflict. After a lost response, operations are reconciled where the app-server exposes proof. Irreconcilable operations become uncertain and are never blindly retransmitted. A failed assistant attempt with dispatched effects is atomically superseded by one recovery context containing the stored receipts.
-
-## State, backup, and logs
-
-- `data/bot.sqlite3`: offsets, operations, outbox, events, runtime state, dashboard observations/notes, notification inbox, epochs, discovery snapshots, and attachment metadata
-- `data/sessions.json`: backend session identity registry (read-only to the assistant)
-- `data/attachments/`: private temporary attachment snapshots
-- `<DATA_DIR>/assistant-profile/profile.json`: isolated assistant activation and crash-recovery receipt
-- `<DATA_DIR>/assistant-profile/codex/`: isolated assistant Codex configuration, authentication, and thread storage
-- `<DATA_DIR>/assistant-profile/home/`: isolated assistant operating-system home and optional home-scoped skills
-- `<assistant-workdir>/AGENTS.md`: bot-managed assistant playbook
-- `<assistant-workdir>/.qiyan-bot-agents.sha256`: installed-playbook digest
-- `<assistant-workdir>/AGENTS.override.md`: optional, entirely user-owned replacement prompt
-- `<assistant-workdir>/session-status.json`: backend-generated mode-0400 session dashboard
-
-Back up the SQLite database, registry, complete assistant profile, and external assistant workdir together while the bot is stopped. The assistant profile contains authentication secrets and thread history; protect the backup accordingly. Do not restore `session-status.json` independently from SQLite; it is rebuilt at startup. Attachment blobs are transient; include them only if outstanding handles must survive restore. Logs contain structural metadata only and must never include ignored sender content, message bodies, tokens, or attachment bytes.
-
-If dashboard rendering fails after a confirmed action, the action remains confirmed. SQLite keeps the projection dirty, emits one structural warning for the failure episode, and maintenance retries without replaying the app-server action. Repair the assistant directory/path permissions, then wait for maintenance or restart. Startup will not run the assistant until a complete dashboard has been written.
-
-## Verification
+## Development
 
 ```bash
+npm ci
 npm run check
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/app-server.test.ts
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-assistant.test.ts
-npm test -- tests/integration/recovery.test.ts
-```
-
-The real-app-server tests pin the generated protocol to Codex 0.142.4 and make a small model request. The Telegram live test is additionally gated and sends a real message:
-
-```bash
-RUN_TELEGRAM_LIVE=1 npm test -- tests/integration/telegram-live.test.ts
 ```
 
 ## Troubleshooting
 
-- `ENDPOINT_UNAVAILABLE`: check `codex --version`, the applicable project or assistant authentication, proxy variables, and app-server stderr.
-- Assistant authentication required: run `DATA_DIR="<the bot's data directory>" qiyan-bot assistant-login`, complete device authentication, then restart the bot. Do not copy the normal profile's `auth.json`.
-- `CONFIGURATION_ERROR`: check `--workdir`/`ASSISTANT_WORKDIR`, path separation, the managed `AGENTS.md` digest pair, a legacy dashboard awaiting migration, and the assistant path stored in the session registry.
-- `CWD_MISMATCH`: the persisted thread directory differs from the registry's canonical project path; do not force-attach it.
-- `SESSION_BUSY`: wait, steer the exact active turn, or interrupt it before lifecycle changes.
-- `PERMISSION_BLOCKED`: the worker requested an approval or permission escalation, which chat auto mode intentionally declines.
-- `OPERATION_UNCERTAIN` or `DELIVERY_UNCERTAIN`: inspect the receipt/state before deciding whether a human-visible retry is safe.
-- No Telegram input: verify the numeric owner ID. Other senders, edited messages, callbacks, channels, and unsupported media are intentionally ignored while their update offsets still advance.
+- Assistant authentication required: stop QiYan, run `qiyan-bot assistant-login`, complete the device flow, and restart. Do not copy the normal profile's `auth.json`.
+- `CONFIGURATION_ERROR`: check HOME/path separation, managed-file guards, registry v2, and the QiYan database marker.
+- `CWD_MISMATCH`: the native thread directory differs from the pinned registry path.
+- `SESSION_BUSY`: wait, steer the active turn, or explicitly interrupt it.
+- `PERMISSION_BLOCKED`: the user's normal worker configuration still requested an approval that chat cannot provide.
+- `OPERATION_UNCERTAIN` or `DELIVERY_UNCERTAIN`: inspect status before deciding whether a human-visible retry is safe.
+- No Telegram input: verify the numeric owner ID and ensure no second process is polling the same bot token.
 
-Slack and WeChat adapters, SSH endpoints, multi-user tenancy, interactive approval UI, and arbitrary remote recipients are deliberately deferred. Chat adapters should normalize into the same canonical message and attachment contracts; SSH endpoints should implement the existing endpoint interface and preserve the same registry and recovery rules.
+SSH endpoints, Slack, WeChat, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.

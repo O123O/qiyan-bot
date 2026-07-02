@@ -16,13 +16,24 @@ const catalog = [
 test("packaged assistant policy is concise and reserves examples for exact directives", async () => {
   const policy = await readFile(policyPath, "utf8");
   for (const heading of [
+    "## Direct work and delegation",
     "## Routing and state",
     "## Results and supervision",
-    "## Session dashboard",
+    "## Managed state",
     "## Exact directives",
     "## Exact directive examples",
     "## Tool catalog",
   ]) assert.match(policy, new RegExp(`^${heading}$`, "mu"));
+  assert.ok(policy.indexOf("## Direct work and delegation") < policy.indexOf("## Routing and state"));
+
+  assert.match(policy, /general-purpose personal assistant/iu);
+  assert.match(policy, /prefer direct work for small, personal, one-off, or cross-project tasks/iu);
+  assert.match(policy, /delegate deliberately.*resumable transcript/isu);
+  assert.match(policy, /read `assistant-context\.json` and `session-status\.json`.*after context compaction/isu);
+  assert.match(policy, /never use bare shell `~`.*isolated HOME/isu);
+  assert.match(policy, /absolute paths derived from `assistant-context\.json\.user_home`/iu);
+  assert.match(policy, /never create or root a project worker in the assistant workdir.*QiYan state/isu);
+  assert.match(policy, /omit `project_dir`.*backend exclusively creates `default_projects_root\/<nickname>`/isu);
 
   const catalogSection = policy.split(/^## Tool catalog$/mu)[1];
   assert.ok(catalogSection, "missing tool catalog section");
@@ -51,7 +62,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /set_goal.*replaces the current goal/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
-  assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*data\/sessions\.json/iu);
+  assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*sessions\.json/iu);
   assert.match(policy, /manager_notes.*update_session_notes/isu);
   assert.match(policy, /clear `pending_follow_up` with `null` when resolved/iu);
   assert.match(policy, /automatically maintained `auto_session_info`/iu);

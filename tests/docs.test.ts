@@ -5,6 +5,11 @@ import test from "node:test";
 
 test("README links to all focused guides and every local guide target exists", async () => {
   const readme = await readFile(resolve("README.md"), "utf8");
+  assert.ok(readme.indexOf("general-purpose personal assistant") < readme.indexOf("Telegram"));
+  assert.match(readme, /handle small filesystem tasks directly/iu);
+  assert.match(readme, /ordinary, resumable Codex sessions/iu);
+  assert.match(readme, /Telegram is the first chat adapter/iu);
+  assert.match(readme, /fresh QiYan state format.*rejected without migration/isu);
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
   for (const expected of [
     "docs/installation.md",
@@ -27,6 +32,29 @@ test("installation guide covers Release install, no-Git source build, version, a
     assert.equal(guide.includes(required), true, `installation guide is missing: ${required}`);
   }
   assert.match(guide, /without Git/iu);
+  assert.match(guide, /GitHub Release assets.*no supported npm-registry package/isu);
+  assert.match(guide, /nonempty GitHub `sha256:` asset digest/iu);
+  assert.match(guide, /test -n "\$digest"/u);
+});
+
+test("full-access and non-interactive worker warnings precede installation and launch", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const install = await readFile(resolve("docs/installation.md"), "utf8");
+  const setup = await readFile(resolve("docs/setup.md"), "utf8");
+  const telegram = await readFile(resolve("docs/chat-apps/telegram.md"), "utf8");
+  for (const [name, document, marker] of [
+    ["README install", readme, "npm install --global"],
+    ["installation", install, "npm install --global"],
+    ["README launch", readme, "\nqiyan-bot\n"],
+    ["setup launch", setup, "\nqiyan-bot\n"],
+    ["Telegram launch", telegram, "qiyan-bot --workdir"],
+  ] as const) {
+    const boundary = document.indexOf(marker);
+    assert.ok(boundary >= 0, `${name} marker missing`);
+    const before = document.slice(0, boundary);
+    assert.match(before, /danger-full-access|full filesystem access/iu, `${name} lacks the assistant warning before the command`);
+    assert.match(before, /chat approvals? (?:are|is) (?:unsupported|unavailable)|no approval UI/iu, `${name} lacks the worker warning before the command`);
+  }
 });
 
 test("Telegram guide is actionable for the implemented private single-user adapter", async () => {
