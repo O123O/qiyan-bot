@@ -14,19 +14,24 @@ The MVP runs on one machine. One token-free app-server hosts all project session
 
 The bot intentionally runs project sessions with approval policy `never` and the configured non-interactive sandbox. Review this trust model before running it: project sessions can modify files and execute commands without chat approval buttons. `workspace-write` is the default; use `danger-full-access` only for projects you trust. The Telegram adapter discards every non-owner update before storing content or invoking a model, and output is restricted to that owner's private chat ID.
 
-## Build and install
+## Install
 
 ```bash
-npm install
-npm run build
-archive=$(npm pack --silent)
-npm install --global --prefix "$HOME/.local" "./$archive"
-rm -- "$archive"
+npm install --global \
+  --prefix "$HOME/.local" \
+  https://github.com/O123O/codex-bot/releases/latest/download/codex-bot.tgz
+export PATH="$HOME/.local/bin:$PATH"
+codex-bot --version
 ```
 
-`npm run build` creates a fully bundled `dist/codex-bot` executable. The installed command needs Node.js 24+, a `codex` executable, and the two Codex profiles described below; it does not need TSX, TypeScript source files, or a runtime dependency tree.
+The latest-Release package is a fully bundled executable with no runtime npm dependency tree. Before the first GitHub Release exists, or to build current `main` without Git, follow the [installation guide](docs/installation.md).
 
-The archive contains the executable and its two coordinator template assets. `$HOME/.local/bin` must be in `PATH`.
+Setup guides:
+
+- [Shared Codex and coordinator setup](docs/setup.md)
+- [Telegram — implemented](docs/chat-apps/telegram.md)
+- [Slack — planned](docs/chat-apps/slack.md)
+- [WeChat — planned](docs/chat-apps/wechat.md)
 
 Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `TELEGRAM_DESTINATION_CHAT_ID`, and `COORDINATOR_WORKDIR`. The destination is normally the owner's private chat ID. The coordinator workdir should be a standalone user-owned directory outside both this repository and `DATA_DIR`, for example `$HOME/.codex-bot/coordinator`. Export the variables with your preferred secret manager; the program does not parse `.env` itself.
 

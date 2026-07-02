@@ -1,0 +1,73 @@
+# Telegram setup
+
+Status: Implemented
+
+The Telegram adapter is a single-user private-chat bridge. It ignores every update not sent by the configured numeric Telegram user ID, and it sends output only to that same private chat.
+
+## 1. Create the bot
+
+Open the official [@BotFather](https://t.me/BotFather), send `/newbot`, and follow the prompts. Telegram returns a bot token. Anyone with this token controls the bot, so do not paste it into source files, issue trackers, screenshots, or shell history. Revoke and replace it through @BotFather if it is exposed.
+
+Open the new bot's private chat and press **Start** or send a message. Telegram bots cannot initiate this first conversation.
+
+## 2. Find your numeric owner ID
+
+If you do not already know it, stop any process polling this bot, send the bot a fresh private message, and read that update once. The following keeps the token out of the typed command line and prints only unique sender IDs:
+
+```bash
+read -rsp 'Telegram bot token: ' TELEGRAM_BOT_TOKEN; printf '\n'
+export TELEGRAM_BOT_TOKEN
+node <<'NODE'
+const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getUpdates`);
+const payload = await response.json();
+if (!response.ok || payload.ok !== true) throw new Error("Telegram getUpdates failed");
+const ids = new Set(payload.result.flatMap((update) => {
+  const message = update.message ?? update.edited_message;
+  return message?.from?.id === undefined ? [] : [message.from.id];
+}));
+for (const id of ids) console.log(id);
+NODE
+```
+
+Choose the ID belonging to your private message. Telegram's Bot API exposes user IDs as numeric values. Do not use a username or the bot's own ID.
+
+## 3. Set the private-chat configuration
+
+In the shell or private service environment that will start the bot:
+
+```bash
+# TELEGRAM_BOT_TOKEN is already set by the private prompt above.
+export TELEGRAM_OWNER_ID='<your-numeric-user-id>'
+export TELEGRAM_DESTINATION_CHAT_ID="$TELEGRAM_OWNER_ID"
+export DATA_DIR="$HOME/.codex-bot/data"
+export SESSION_REGISTRY_PATH="$HOME/.codex-bot/data/sessions.json"
+export COORDINATOR_WORKDIR="$HOME/.codex-bot/coordinator"
+```
+
+`TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as a coordinator message.
+
+## 4. Authenticate and start
+
+Complete the independent coordinator login once, then start the bot:
+
+```bash
+DATA_DIR="$DATA_DIR" codex-bot coordinator-login
+codex-bot --workdir "$COORDINATOR_WORKDIR"
+```
+
+Keep that process running. Long polling receives Telegram updates; outbound replies use an independent transport, so one slow poll does not delay a ready response.
+
+## 5. Smoke test
+
+In the bot's private chat:
+
+1. Send a simple greeting and confirm the coordinator responds.
+2. Ask it to list available Codex sessions, then start or adopt a harmless project session with a memorable nickname.
+3. Send `tell <nickname> /pass exact words` and verify the worker receives the text after `/pass ` unchanged.
+4. Send `report <nickname> /collect 1` and verify the newest eligible worker final is delivered directly.
+5. Send a small text attachment and ask the worker to inspect it.
+6. Ask the coordinator to send a small project file back as an attachment.
+
+Worker terminal responses are delivered automatically with their session nickname. The coordinator receives compact metadata and reads a full worker body only when management requires it.
+
+If there is no input, confirm you messaged the bot before startup, the numeric owner ID is correct, and no other process is calling `getUpdates` for the same token. If replies are slow, inspect bot/app-server logs separately from Telegram delivery timing; sending itself should not wait for the long-poll request to finish.
