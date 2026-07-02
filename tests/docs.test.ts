@@ -60,8 +60,15 @@ test("v0.3 upgrade guide requires a fresh stopped cutover and a non-inheriting s
   assert.ok(guide.indexOf('config-check --home "$stage"') < guide.indexOf('rm -rf -- "$old_home"'));
   assert.match(guide, /deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH`/u);
   assert.equal([...guide.matchAll(/env -i HOME="\$HOME" PATH="\$PATH" qiyan-bot config-check/gu)].length, 2);
-  const stagedAuthParse = guide.indexOf('readFileSync(process.argv[1], "utf8"))\' "$stage/auth.json"');
-  assert.ok(stagedAuthParse >= 0 && stagedAuthParse < guide.indexOf("staged_auth_sha="));
+  assert.ok([...guide.matchAll(/O_NOFOLLOW/gu)].length >= 2);
+  assert.ok([...guide.matchAll(/fstatSync/gu)].length >= 2);
+  const stagedAuthParse = guide.indexOf('JSON.parse(bytes.toString("utf8"))');
+  assert.ok(stagedAuthParse >= 0 && stagedAuthParse < guide.indexOf("STAGED_AUTH, bytes"));
+  const pathGate = guide.indexOf('OLD_HOME="$old_home" NEW_HOME="$new_home"');
+  assert.ok(pathGate >= 0 && pathGate < guide.indexOf('rm -rf -- "$old_home"'));
+  for (const invariant of ["old_home cannot be a filesystem root", "new_home must be $HOME/.qiyan-bot", "staging must be outside", "must not overlap"]) {
+    assert.equal(guide.includes(invariant), true, `v0.3 cutover path gate is missing: ${invariant}`);
+  }
   const unset = guide.match(/^UnsetEnvironment=(.+)$/mu)?.[1]?.trim().split(/\s+/u);
   assert.deepEqual(new Set(unset), SERVICE_UNSET_ENV_NAMES);
 });

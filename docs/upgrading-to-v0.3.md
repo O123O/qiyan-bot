@@ -30,14 +30,11 @@ stage=$(mktemp -d "$HOME/.qiyan-v03-cutover.XXXXXX")
 chmod 700 "$stage"
 ```
 
-Set `old_config` to the old private `.env` or stopped service `EnvironmentFile`. The following fail-fast block validates the source descriptor and writes a new mode-0600 dotenv containing only adapter values and still-valid non-path settings. It deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH` so incompatible external state cannot be reopened.
+Set `old_config` to the old private `.env` or stopped service `EnvironmentFile`. The following fail-fast block opens it once with no-follow semantics, validates that descriptor, and writes a new mode-0600 dotenv containing only adapter values and still-valid non-path settings. It deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH` so incompatible external state cannot be reopened.
 
 ```bash
 set -euo pipefail
 old_config="$old_home/.env"       # replace with the old EnvironmentFile if needed
-test -f "$old_config" && test ! -L "$old_config"
-test "$(stat -c %u "$old_config")" = "$(id -u)"
-test $(( 8#$(stat -c %a "$old_config") & 077 )) -eq 0
 SOURCE_CONFIG="$old_config" STAGED_ENV="$stage/.env" node <<'NODE'
 const fs = require("node:fs");
 const { parseEnv } = require("node:util");
@@ -46,7 +43,19 @@ const retained = [
   "CODEX_BINARY", "MAX_CONCURRENT_TURNS", "MAX_COLLECT_COUNT", "MCP_HOST", "MCP_PORT",
   "ATTACHMENT_MAX_BYTES", "ATTACHMENT_STORE_MAX_BYTES", "ASSISTANT_SANDBOX_MODE",
 ];
-const values = parseEnv(fs.readFileSync(process.env.SOURCE_CONFIG, "utf8"));
+const fd = fs.openSync(process.env.SOURCE_CONFIG,
+  fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+let contents;
+try {
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 || stat.size > 65536) {
+    throw new Error("old configuration is not a private current-user regular file");
+  }
+  contents = fs.readFileSync(fd, "utf8");
+} finally {
+  fs.closeSync(fd);
+}
+const values = parseEnv(contents);
 for (const key of retained.slice(0, 3)) if (!values[key]) throw new Error(`missing ${key}`);
 const body = retained.filter((key) => values[key] !== undefined)
   .map((key) => `${key}=${JSON.stringify(values[key])}`).join("\n") + "\n";
@@ -61,12 +70,23 @@ To retain the isolated assistant login, apply the same checks to its own auth fi
 set -euo pipefail
 old_auth="$old_data_dir/assistant-profile/codex/auth.json"
 if test -e "$old_auth"; then
-  test -f "$old_auth" && test ! -L "$old_auth"
-  test "$(stat -c %u "$old_auth")" = "$(id -u)"
-  test $(( 8#$(stat -c %a "$old_auth") & 077 )) -eq 0
-  test "$(stat -c %s "$old_auth")" -le 1048576
-  install -m 600 "$old_auth" "$stage/auth.json"
-  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$stage/auth.json"
+  SOURCE_AUTH="$old_auth" STAGED_AUTH="$stage/auth.json" node <<'NODE'
+const fs = require("node:fs");
+const fd = fs.openSync(process.env.SOURCE_AUTH,
+  fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+let bytes;
+try {
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 || stat.size > 1048576) {
+    throw new Error("old auth is not a private current-user regular file");
+  }
+  bytes = fs.readFileSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+JSON.parse(bytes.toString("utf8"));
+fs.writeFileSync(process.env.STAGED_AUTH, bytes, { flag: "wx", mode: 0o600 });
+NODE
   staged_auth_sha=$(sha256sum "$stage/auth.json" | cut -d' ' -f1)
 fi
 ```
@@ -83,8 +103,43 @@ test "$(sha256sum "$stage/.env" | cut -d' ' -f1)" = "$staged_env_sha"
 
 Only after staging passes, remove the old QiYan home and the new default target, then create the fresh private layout. If the old installation used external state directories, they may be deleted separately after you verify their exact resolved paths; v0.3 will not reference them because every path override was dropped.
 
+First run this mandatory path gate. It rejects symlink aliases, `/`, the user home, non-private or foreign directories, a modified new-home target, and any overlap among distinct old home, new home, and staging paths:
+
 ```bash
 set -euo pipefail
+OLD_HOME="$old_home" NEW_HOME="$new_home" STAGE="$stage" USER_HOME="$HOME" node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const uid = process.getuid();
+function privateRealDirectory(label, input) {
+  const resolved = path.resolve(input);
+  const value = fs.lstatSync(resolved);
+  if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid || (value.mode & 0o077) !== 0) {
+    throw new Error(`${label} must be a private current-user real directory`);
+  }
+  const canonical = fs.realpathSync(resolved);
+  if (canonical !== resolved) throw new Error(`${label} must not use a symlink alias`);
+  return canonical;
+}
+function contains(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+function overlaps(left, right) { return contains(left, right) || contains(right, left); }
+const home = privateRealDirectory("HOME", process.env.USER_HOME);
+const oldHome = privateRealDirectory("old_home", process.env.OLD_HOME);
+const stage = privateRealDirectory("stage", process.env.STAGE);
+const requiredNewHome = path.join(home, ".qiyan-bot");
+if (path.resolve(process.env.NEW_HOME) !== requiredNewHome) throw new Error("new_home must be $HOME/.qiyan-bot");
+let newHome = requiredNewHome;
+if (fs.existsSync(requiredNewHome)) newHome = privateRealDirectory("new_home", requiredNewHome);
+if (oldHome === path.parse(oldHome).root || oldHome === home || contains(oldHome, home)) {
+  throw new Error("old_home cannot be a filesystem root, HOME, or an ancestor of HOME");
+}
+if (overlaps(stage, oldHome) || overlaps(stage, newHome)) throw new Error("staging must be outside both QiYan homes");
+if (oldHome !== newHome && overlaps(oldHome, newHome)) throw new Error("distinct old and new QiYan homes must not overlap");
+NODE
+
 rm -rf -- "$old_home"
 if test "$new_home" != "$old_home"; then rm -rf -- "$new_home"; fi
 install -d -m 700 "$new_home" "$new_home/qiyan-workdir" "$new_home/data"
