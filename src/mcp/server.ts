@@ -173,7 +173,22 @@ const inheritedEnvironmentKeys = new Set([
   "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 ]);
 
-export function buildCodexChildEnvironment(host: NodeJS.ProcessEnv, mcpToken?: string): NodeJS.ProcessEnv {
+const workerCredentialDenylist = new Set([
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_OWNER_ID",
+  "TELEGRAM_DESTINATION_CHAT_ID",
+  "QIYAN_BOT_MCP_TOKEN",
+]);
+
+export function buildWorkerChildEnvironment(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(host)) {
+    if (value !== undefined && !workerCredentialDenylist.has(key)) result[key] = value;
+  }
+  return result;
+}
+
+export function buildAssistantBaseEnvironment(host: NodeJS.ProcessEnv, mcpToken?: string): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(host)) {
     if (value !== undefined && (inheritedEnvironmentKeys.has(key) || key.startsWith("LC_"))) result[key] = value;

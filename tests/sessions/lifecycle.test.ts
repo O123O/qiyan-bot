@@ -63,6 +63,9 @@ test("create and adopt verify canonical cwd and establish a managed epoch baseli
   assert.equal(registry.get("billing")?.thread_id, "thread-2");
   assert.equal(runtime.currentEpoch("local", "thread-2")?.baselineTurnId, "historical");
   assert.deepEqual(adoptedTurns, [{ id: "historical" }]);
+  const started = endpoint.calls.find((call) => call.method === "thread/start")!.params;
+  assert.deepEqual(started, { cwd: dir, ephemeral: false });
+  for (const key of ["approvalPolicy", "sandbox", "config"]) assert.equal(Object.hasOwn(started, key), false);
 });
 
 test("adoption rejects active or cwd-mismatched sessions", async () => {
@@ -97,6 +100,9 @@ test("detach ends the epoch and attach requires idle both before and after resum
   });
   assert.equal(runtime.currentEpoch("local", "thread-1")?.baselineTurnId, "detached-turn");
   assert.deepEqual(callbacks, ["resumed:gpt-5", "read:detached-turn"]);
+  const resumed = endpoint.calls.filter((call) => call.method === "thread/resume").at(-1)!.params;
+  assert.deepEqual(resumed, { threadId: "thread-1", cwd: dir });
+  for (const key of ["approvalPolicy", "sandbox", "config"]) assert.equal(Object.hasOwn(resumed, key), false);
 });
 
 test("archive requires idle and startup reconciliation completes intermediate states", async () => {

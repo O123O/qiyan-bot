@@ -8,7 +8,7 @@ import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { createAssistantTools } from "../../src/assistant/tools.ts";
 import { buildAssistantChildEnvironment } from "../../src/assistant/profile.ts";
-import { buildCodexChildEnvironment, assistantTurnConfig, LoopbackMcpServer, secureShellConfig } from "../../src/mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -121,16 +121,21 @@ test("real assistant can call its approved manager MCP while a project worker ca
   const token = "integration-secret-token";
   const workerCodexHome = await mkdtemp(join(tmpdir(), "qiyan-bot-worker-home-"));
   t.after(() => rm(workerCodexHome, { recursive: true, force: true }));
-  const endpoint = new LocalEndpoint({ id: "assistant-local", codexBinary: "codex", env: buildCodexChildEnvironment(process.env, token), requestTimeoutMs: 30_000 });
-  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildCodexChildEnvironment({ ...process.env, CODEX_HOME: workerCodexHome }), requestTimeoutMs: 30_000 });
+  const userHome = process.env.HOME!;
+  const endpoint = new LocalEndpoint({
+    id: "assistant-local",
+    codexBinary: "codex",
+    env: buildAssistantChildEnvironment(process.env, { home: userHome, codexHome: process.env.CODEX_HOME ?? join(userHome, ".codex") }, token),
+    requestTimeoutMs: 30_000,
+  });
+  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildWorkerChildEnvironment({ ...process.env, CODEX_HOME: workerCodexHome }), requestTimeoutMs: 30_000 });
   let active = { contextId: "ctx", attemptId: "attempt", turnId: "pending" };
   const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientProcess: () => endpoint.mcpClientIdentity });
   await mcp.start(); t.after(() => mcp.stop());
   await endpoint.start(); t.after(() => endpoint.stop());
   await worker.start(); t.after(() => worker.stop());
   const workerThread = await worker.request<any>("thread/start", {
-    cwd: await mkdtemp(join(tmpdir(), "qiyan-bot-worker-mcp-")), approvalPolicy: "never", sandbox: "workspace-write", ephemeral: true,
-    config: secureShellConfig(),
+    cwd: await mkdtemp(join(tmpdir(), "qiyan-bot-worker-mcp-")), ephemeral: true,
   });
   const workerServerNames: string[] = [];
   let cursor: string | null | undefined;

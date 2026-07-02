@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/pro
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
-import { buildCodexChildEnvironment } from "../mcp/server.ts";
+import { buildAssistantBaseEnvironment } from "../mcp/server.ts";
 
 const markerSchema = z.object({
   version: z.literal(1),
@@ -101,7 +101,7 @@ export function buildAssistantChildEnvironment(
   profile: Pick<PreparedAssistantProfile, "home" | "codexHome">,
   mcpToken?: string,
 ): NodeJS.ProcessEnv {
-  return { ...buildCodexChildEnvironment(host, mcpToken), HOME: profile.home, CODEX_HOME: profile.codexHome };
+  return { ...buildAssistantBaseEnvironment(host, mcpToken), HOME: profile.home, CODEX_HOME: profile.codexHome };
 }
 
 interface AccountEndpoint {

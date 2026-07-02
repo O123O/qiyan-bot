@@ -5,7 +5,6 @@ import { AppError } from "../core/errors.ts";
 import type { ManagementState } from "../core/types.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
-import { secureShellConfig } from "../mcp/server.ts";
 
 interface ThreadView { id: string; cwd: string; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -13,6 +12,14 @@ export interface CurrentSessionSettings { model?: string; effort?: string | null
 interface AttachObservers {
   onResumed?(settings: CurrentSessionSettings): void;
   onThreadRead?(thread: ThreadView): void;
+}
+
+export function workerThreadStartParams(cwd: string): { cwd: string; ephemeral: false } {
+  return { cwd, ephemeral: false };
+}
+
+export function workerThreadResumeParams(threadId: string, cwd: string): { threadId: string; cwd: string } {
+  return { threadId, cwd };
 }
 
 export class SessionLifecycle {
@@ -23,16 +30,13 @@ export class SessionLifecycle {
     private readonly registry: SessionRegistry,
     private readonly runtime: RuntimeStore,
     private readonly clock: Clock,
-    private readonly execution: { sandboxMode: "read-only" | "workspace-write" | "danger-full-access" } = { sandboxMode: "workspace-write" },
   ) {}
 
   async create(nickname: string, endpointId: string, projectDir: string, onThreadCreated?: (thread: ThreadView, settings: CurrentSessionSettings) => void): Promise<CurrentSessionSettings> {
     return this.lock(`${endpointId}:new:${nickname}`, async () => {
       if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
       const canonical = await realpath(projectDir);
-      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", {
-        cwd: canonical, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(), ephemeral: false,
-      });
+      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(canonical));
       const settings = this.responseSettings(response);
       onThreadCreated?.(response.thread, settings);
       await this.verifyCwd(response.thread.cwd, canonical);
@@ -84,9 +88,11 @@ export class SessionLifecycle {
       this.runtime.setSession(session.endpoint, session.thread_id, "attaching", "idle");
       let resumed = false;
       try {
-        const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", {
-          threadId: session.thread_id, cwd: session.project_dir, approvalPolicy: "never", sandbox: this.execution.sandboxMode, config: secureShellConfig(),
-        });
+        const response = await this.pool.request<ThreadResponse>(
+          session.endpoint,
+          "thread/resume",
+          workerThreadResumeParams(session.thread_id, session.project_dir),
+        );
         resumed = true;
         const settings = this.responseSettings(response);
         observers.onResumed?.(settings);

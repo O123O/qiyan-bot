@@ -23,11 +23,11 @@ import { createAssistantTools, type AssistantToolName } from "./assistant/tools.
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
-import { buildCodexChildEnvironment, assistantTurnConfig, LoopbackMcpServer, secureShellConfig } from "./mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer } from "./mcp/server.ts";
 import { SessionRegistry, type RegistryDocument } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
-import { SessionLifecycle } from "./sessions/lifecycle.ts";
+import { SessionLifecycle, workerThreadResumeParams } from "./sessions/lifecycle.ts";
 import { SessionService } from "./sessions/service.ts";
 import { inTransaction, openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
@@ -174,7 +174,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     {
       name: "subscriptions",
       start: async () => {
-        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildCodexChildEnvironment(process.env), expectedVersion: SUPPORTED_CODEX_VERSION });
+        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), expectedVersion: SUPPORTED_CODEX_VERSION });
         assistantEndpoint = new LocalEndpoint({
           id: "assistant-local",
           codexBinary: config.codexBinary,
@@ -185,7 +185,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         discovery = new SessionDiscovery(db, pool);
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, { sandboxMode: config.assistantSandboxMode });
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() });
         sessions = new SessionService(pool, registry, runtime, finals, deliveries);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -1107,13 +1107,10 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       if (state.managementState === "unavailable" && state.restoreState !== "managed") continue;
       if (state.managementState !== "managed" && state.managementState !== "unavailable") continue;
       try {
-        const response = await endpoint.request<any>("thread/resume", {
-          threadId: session.thread_id,
-          cwd: session.project_dir,
-          approvalPolicy: "never",
-          sandbox: config.assistantSandboxMode,
-          config: secureShellConfig(),
-        });
+        const response = await endpoint.request<any>(
+          "thread/resume",
+          workerThreadResumeParams(session.thread_id, session.project_dir),
+        );
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         await verifySessionCwd(response.thread.cwd, session.project_dir);
         const authoritative = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: true });

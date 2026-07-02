@@ -7,7 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
 import { buildAssistantChildEnvironment } from "../../src/assistant/profile.ts";
 import { readLinuxProcessIdentity } from "../../src/core/process-identity.ts";
-import { buildCodexChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -111,13 +111,27 @@ test("client socket lookup matches the complete IPv4 tuple instead of only its p
   }), ["22222"]);
 });
 
-test("child environment keeps Codex auth but strips Telegram secrets and hides the MCP token from shells", () => {
-  const env = buildCodexChildEnvironment({ PATH: "/bin", HOME: "/home/u", CODEX_HOME: "/codex", OPENAI_API_KEY: "auth", TELEGRAM_BOT_TOKEN: "leak", OTHER_SECRET: "no" }, "mcp-secret");
+test("worker environment preserves user configuration while removing only exact bot credentials", () => {
+  const env = buildWorkerChildEnvironment({
+    PATH: "/bin",
+    HOME: "/home/u",
+    CODEX_HOME: "/codex",
+    OPENAI_API_KEY: "auth",
+    USER_MCP_TOKEN: "user-tool-auth",
+    CUSTOM_TOOL_HOME: "/custom/tools",
+    TELEGRAM_THEME: "dark",
+    TELEGRAM_BOT_TOKEN: "bot-secret",
+    TELEGRAM_OWNER_ID: "42",
+    TELEGRAM_DESTINATION_CHAT_ID: "42",
+    QIYAN_BOT_MCP_TOKEN: "manager-secret",
+  });
   assert.equal(env.OPENAI_API_KEY, "auth");
-  assert.equal(env.TELEGRAM_BOT_TOKEN, undefined);
-  assert.equal(env.OTHER_SECRET, undefined);
-  assert.equal(env.QIYAN_BOT_MCP_TOKEN, "mcp-secret");
-  assert.equal(buildCodexChildEnvironment({ PATH: "/bin" }).QIYAN_BOT_MCP_TOKEN, undefined);
+  assert.equal(env.USER_MCP_TOKEN, "user-tool-auth");
+  assert.equal(env.CUSTOM_TOOL_HOME, "/custom/tools");
+  assert.equal(env.TELEGRAM_THEME, "dark");
+  for (const key of ["TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "QIYAN_BOT_MCP_TOKEN"]) {
+    assert.equal(env[key], undefined);
+  }
   const config = assistantTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret");
   const manager = (config.mcp_servers as { qiyan_bot_manager: Record<string, unknown> }).qiyan_bot_manager;
   assert.equal(manager.default_tools_approval_mode, "approve");
@@ -126,16 +140,23 @@ test("child environment keeps Codex auth but strips Telegram secrets and hides t
   assert.equal(JSON.stringify(config).includes("mcp-secret"), false);
 });
 
-test("assistant child overrides only its profile while the worker retains the user profile", () => {
-  const host = { PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth", TELEGRAM_BOT_TOKEN: "secret" };
-  const worker = buildCodexChildEnvironment(host);
+test("assistant child is allowlisted while the worker retains the complete user environment", () => {
+  const host = {
+    PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth",
+    USER_MCP_TOKEN: "worker-only", TELEGRAM_THEME: "dark", TELEGRAM_BOT_TOKEN: "secret",
+  };
+  const worker = buildWorkerChildEnvironment(host);
   const assistant = buildAssistantChildEnvironment(host, { home: "/private/manager-home", codexHome: "/private/manager-codex" }, "manager-token");
   assert.equal(worker.HOME, "/home/user");
   assert.equal(worker.CODEX_HOME, "/home/user/.codex");
   assert.equal(worker.QIYAN_BOT_MCP_TOKEN, undefined);
+  assert.equal(worker.USER_MCP_TOKEN, "worker-only");
+  assert.equal(worker.TELEGRAM_THEME, "dark");
   assert.equal(assistant.HOME, "/private/manager-home");
   assert.equal(assistant.CODEX_HOME, "/private/manager-codex");
   assert.equal(assistant.QIYAN_BOT_MCP_TOKEN, "manager-token");
   assert.equal(assistant.OPENAI_API_KEY, "auth");
+  assert.equal(assistant.USER_MCP_TOKEN, undefined);
+  assert.equal(assistant.TELEGRAM_THEME, undefined);
   assert.equal(assistant.TELEGRAM_BOT_TOKEN, undefined);
 });
