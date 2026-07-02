@@ -97,6 +97,27 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.equal(configCheck.stdout, "Configuration OK.\n");
   assert.equal(configCheck.stderr, "");
 
+  const overlappingHome = join(temp, "overlapping-qiyan-home");
+  const overlappingState = join(overlappingHome, "shared-state");
+  await mkdir(overlappingHome, { mode: 0o700 });
+  await writeFile(join(overlappingHome, ".env"), [
+    "TELEGRAM_BOT_TOKEN=private-file-token",
+    "TELEGRAM_OWNER_ID=7",
+    "TELEGRAM_DESTINATION_CHAT_ID=7",
+    `ASSISTANT_WORKDIR=${overlappingState}`,
+    `DATA_DIR=${overlappingState}`,
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const rejectedConfig = spawnSync(executable, ["config-check", "--home", overlappingHome], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "", HOME: temp },
+  });
+  assert.equal(rejectedConfig.status, 1);
+  assert.equal(rejectedConfig.stdout, "");
+  assert.match(rejectedConfig.stderr, /must be separate from backend state/);
+  await assert.rejects(stat(overlappingState), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+
   const result = spawnSync(executable, ["--definitely-invalid"], {
     cwd: temp,
     encoding: "utf8",

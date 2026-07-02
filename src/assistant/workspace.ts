@@ -30,13 +30,27 @@ export interface PreparedAssistantWorkspace {
   warnings: string[];
 }
 
+export async function validateAssistantWorkspacePaths(options: Pick<AssistantWorkspaceOptions, "workdir" | "dataDir" | "registryPath">): Promise<void> {
+  const requestedRoot = resolve(options.workdir);
+  const requestedDataRoot = resolve(options.dataDir);
+  const requestedRegistryPath = resolve(options.registryPath);
+  assertSeparated(requestedRoot, requestedDataRoot, "configured data directory");
+  assertSeparated(requestedRoot, requestedRegistryPath, "configured registry path");
+  const [projectedRoot, projectedDataRoot, projectedRegistryPath] = await Promise.all([
+    canonicalProjectedPath(requestedRoot),
+    canonicalProjectedPath(requestedDataRoot),
+    canonicalProjectedPath(requestedRegistryPath),
+  ]);
+  assertSeparated(projectedRoot, projectedDataRoot, "canonical data directory");
+  assertSeparated(projectedRoot, projectedRegistryPath, "canonical registry path");
+}
+
 export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptions): Promise<PreparedAssistantWorkspace> {
   try {
     const requestedRoot = resolve(options.workdir);
     const requestedDataRoot = resolve(options.dataDir);
     const requestedRegistryPath = resolve(options.registryPath);
-    assertSeparated(requestedRoot, requestedDataRoot, "configured data directory");
-    assertSeparated(requestedRoot, requestedRegistryPath, "configured registry path");
+    await validateAssistantWorkspacePaths(options);
 
     await mkdir(options.workdir, { recursive: true, mode: 0o700 });
     await mkdir(options.dataDir, { recursive: true, mode: 0o700 });

@@ -71,11 +71,24 @@ export class EventRelay {
   private async handleTerminal(endpointId: string, threadId: string, turn: TerminalTurn, knownNickname?: string, authoritative = false): Promise<void> {
     const mapping = this.mapping(endpointId, threadId);
     const state = mapping ? this.runtime.getSession(endpointId, threadId, mapping.session.mapping_id) : undefined;
-    const nickname = knownNickname ?? mapping?.nickname;
-    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id)) return;
+    let nickname = knownNickname ?? mapping?.nickname;
+    const epoch = mapping ? this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id) : undefined;
+    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !epoch) return;
     if (!authoritative) {
       const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
-      turn = history.thread.turns.find((candidate) => candidate.id === turn.id) ?? turn;
+      const turnIndex = history.thread.turns.findIndex((candidate) => candidate.id === turn.id);
+      if (turnIndex < 0) return;
+      if (epoch.baselineTurnId) {
+        const baselineIndex = history.thread.turns.findIndex((candidate) => candidate.id === epoch.baselineTurnId);
+        if (baselineIndex < 0 || turnIndex <= baselineIndex) return;
+      }
+      turn = history.thread.turns[turnIndex]!;
+      const current = this.mapping(endpointId, threadId);
+      const currentState = current ? this.runtime.getSession(endpointId, threadId, current.session.mapping_id) : undefined;
+      const currentEpoch = current ? this.runtime.currentEpoch(endpointId, threadId, current.session.mapping_id) : undefined;
+      if (!current || current.session.mapping_id !== mapping.session.mapping_id || current.session.lifecycle_state !== "managed"
+        || currentState?.managementState !== "managed" || currentEpoch?.id !== epoch.id) return;
+      nickname = current.nickname;
     }
     this.runtime.clearActiveTurn(endpointId, threadId, mapping.session.mapping_id, turn.id);
     this.pool.markTurnTerminal(endpointId, threadId, turn.id);

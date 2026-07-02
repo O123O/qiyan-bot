@@ -52,6 +52,10 @@ export async function loadConfigSource(
 
   await mkdir(requested, { recursive: true, mode: 0o700 });
   const qiyanHome = await requirePrivateDirectory(requested, expectedUid);
+  const currentProjectsRoot = await projectedCanonical(join(userHome, "qiyan-projects"));
+  if (qiyanHome !== requested || qiyanHome !== projected) throw managedError("QIYAN_HOME changed unexpectedly during creation");
+  if (contains(qiyanHome, userHome)) throw managedError("QIYAN_HOME cannot equal or contain the user home");
+  if (overlaps(qiyanHome, currentProjectsRoot)) throw managedError("QIYAN_HOME cannot overlap the user project root");
   const dotenvPath = join(qiyanHome, ".env");
   const dotenv = await readPrivateDotenv(dotenvPath, {
     ...(expectedUid === undefined ? {} : { expectedUid }),
@@ -95,7 +99,7 @@ async function readPrivateDotenv(
     if (options.expectedUid !== undefined && opened.uid !== BigInt(options.expectedUid)) throw managedError("QiYan .env must be owned by the current user");
     if ((opened.mode & 0o077n) !== 0n || (opened.mode & 0o400n) === 0n) throw managedError("QiYan .env must have private owner-only permissions");
     if (opened.size > BigInt(options.maxBytes)) throw managedError("QiYan .env is too large");
-    const contents = await file.readFile("utf8");
+    const contents = await readBoundedUtf8(file, options.maxBytes);
     const current = await lstat(path, { bigint: true }).catch(() => undefined);
     if (!current?.isFile() || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
       throw managedError("QiYan .env changed unexpectedly while it was read");
@@ -134,11 +138,28 @@ async function requireRealDirectory(path: string, label: string): Promise<string
 }
 
 async function requirePrivateDirectory(path: string, expectedUid?: number): Promise<string> {
-  const value = await lstat(path, { bigint: true });
-  if (!value.isDirectory() || value.isSymbolicLink()) throw managedError("QIYAN_HOME must be a real directory");
-  if (expectedUid !== undefined && value.uid !== BigInt(expectedUid)) throw managedError("QIYAN_HOME must be owned by the current user");
-  if ((value.mode & 0o777n) !== 0o700n) throw managedError("QIYAN_HOME must have private mode 0700 permissions");
-  return realpath(path);
+  const initial = await lstat(path, { bigint: true });
+  if (!initial.isDirectory() || initial.isSymbolicLink()) throw managedError("QIYAN_HOME must be a real directory");
+  if (expectedUid !== undefined && initial.uid !== BigInt(expectedUid)) throw managedError("QIYAN_HOME must be owned by the current user");
+  if ((initial.mode & 0o777n) !== 0o700n) throw managedError("QIYAN_HOME must have private mode 0700 permissions");
+  const canonical = await realpath(path);
+  const current = await lstat(path, { bigint: true });
+  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== initial.dev || current.ino !== initial.ino) {
+    throw managedError("QIYAN_HOME changed unexpectedly during creation");
+  }
+  return canonical;
+}
+
+async function readBoundedUtf8(file: Awaited<ReturnType<typeof open>>, maxBytes: number): Promise<string> {
+  const bytes = Buffer.alloc(maxBytes + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await file.read(bytes, offset, bytes.length - offset, offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  if (offset > maxBytes) throw managedError("QiYan .env is too large");
+  return bytes.subarray(0, offset).toString("utf8");
 }
 
 async function projectedCanonical(path: string): Promise<string> {

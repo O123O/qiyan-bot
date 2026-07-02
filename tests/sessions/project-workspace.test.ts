@@ -93,6 +93,23 @@ test("dispatch revalidation rejects directory replacement and symlink insertion"
   await assert.rejects(value.policy.assertDispatchable(second), /real directory|protected|changed unexpectedly/);
 });
 
+test("dispatch revalidation detects replacement after its canonical safety check", async () => {
+  const value = await fixture();
+  const prepared = await value.policy.prepareCreate("raced", "~/Documents/raced");
+  const policy = value.policy as any;
+  const originalAssertSafe = policy.assertSafe.bind(policy);
+  let swapped = false;
+  policy.assertSafe = async (candidate: string) => {
+    await originalAssertSafe(candidate);
+    if (swapped || candidate !== prepared.path) return;
+    swapped = true;
+    await rename(prepared.path, `${prepared.path}-original`);
+    await mkdir(prepared.path, { mode: 0o700 });
+  };
+
+  await assert.rejects(value.policy.assertDispatchable(prepared), /changed unexpectedly/);
+});
+
 test("prepared directories are retained when later work fails", async () => {
   const value = await fixture();
   const prepared = await value.policy.prepareCreate("retained", "~/Documents/retained");

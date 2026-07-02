@@ -43,7 +43,7 @@ qiyan-bot config-check
 qiyan-bot assistant-login
 ```
 
-This starts no bot and needs no chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
+`config-check` validates the complete adapter configuration, including required Telegram values. `assistant-login` itself starts no bot and does not need chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
 
 ## Configure an adapter and launch
 

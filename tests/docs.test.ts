@@ -9,7 +9,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(readme, /handle small filesystem tasks directly/iu);
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
   assert.match(readme, /Telegram is the first chat adapter/iu);
-  assert.match(readme, /fresh QiYan state format.*rejected without migration/isu);
+  assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
   const beforeInstall = readme.slice(0, firstInstall);
@@ -18,6 +18,7 @@ test("README links to all focused guides and every local guide target exists", a
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
   for (const expected of [
     "docs/installation.md",
+    "docs/upgrading-to-v0.3.md",
     "docs/setup.md",
     "docs/chat-apps/telegram.md",
     "docs/chat-apps/slack.md",
@@ -40,6 +41,20 @@ test("installation guide covers Release install, no-Git source build, version, a
   assert.match(guide, /GitHub Release assets.*no supported npm-registry package/isu);
   assert.match(guide, /nonempty GitHub `sha256:` asset digest/iu);
   assert.match(guide, /test -n "\$digest"/u);
+  assert.match(guide, /older than v0\.3\.0.*do \*\*not\*\* use the generic updater/isu);
+});
+
+test("v0.3 upgrade guide requires a fresh stopped cutover and a non-inheriting service", async () => {
+  const guide = await readFile(resolve("docs/upgrading-to-v0.3.md"), "utf8");
+  for (const required of [
+    "destructive", "disable --now", "auth.json", "rm -rf", "config-check", "WorkingDirectory=",
+    "ExecStart=", "--home", "UnsetEnvironment=", "EnvironmentFile=", "assistant-login", "round trip",
+  ]) {
+    assert.equal(guide.includes(required), true, `v0.3 cutover guide is missing: ${required}`);
+  }
+  assert.match(guide, /only values carried forward.*configuration.*auth\.json/isu);
+  assert.match(guide, /Do not add `EnvironmentFile=`/u);
+  assert.match(guide, /old managed sessions.*not adopted automatically/isu);
 });
 
 test("full-access and non-interactive worker warnings precede installation and launch", async () => {
@@ -92,6 +107,8 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(setup, /do not use.*EnvironmentFile/iu);
   assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
   assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
+  assert.match(readme, /Before opening a managed thread.*unadopt_session.*adopt it again/isu);
+  assert.match(setup, /config-check.*required Telegram values.*assistant-login.*does not need chat credentials/isu);
 });
 
 test("Slack and WeChat pages are explicit roadmap stubs rather than fake setup guides", async () => {

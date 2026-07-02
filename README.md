@@ -2,7 +2,7 @@
 
 QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram is the first chat adapter; Slack and WeChat are planned behind the same transport-neutral backend.
 
-QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server, so you can resume a managed thread manually from its project directory.
+QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
 
 ## Security model
 
@@ -43,6 +43,7 @@ The Release archive is a bundled runtime with no production dependency tree. For
 Setup guides:
 
 - [Shared Codex and assistant setup](docs/setup.md)
+- [Required fresh cutover for versions before v0.3.0](docs/upgrading-to-v0.3.md)
 - [Telegram — implemented](docs/chat-apps/telegram.md)
 - [Slack — planned](docs/chat-apps/slack.md)
 - [WeChat — planned](docs/chat-apps/wechat.md)
@@ -126,7 +127,7 @@ The assistant also does not inherit home-scoped user skills. Put assistant-only 
 - `<assistant-workdir>/assistant-context.json`: mode-0400 real-home/QiYan-home context
 - `<assistant-workdir>/session-status.json`: mode-0400 session dashboard
 
-This is a fresh QiYan state format. Pre-QiYan databases and registries are rejected without migration or mutation. Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
+This is the v0.3 fresh QiYan state format. State created before v0.3.0 is rejected without migration or mutation. Do not use the generic updater for that first transition: follow the [required destructive fresh-cutover guide](docs/upgrading-to-v0.3.md). Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
 
 ## Attachments and recovery
 

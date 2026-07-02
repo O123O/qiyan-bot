@@ -82,7 +82,11 @@ export class ProjectWorkspacePolicy {
     const canonical = await realpath(prepared.path).catch(() => undefined);
     if (canonical !== prepared.path) throw managedError("project workspace changed unexpectedly");
     await this.assertSafe(canonical);
-    if (value.dev !== BigInt(prepared.identity.device) || value.ino !== BigInt(prepared.identity.inode)) {
+    const current = await lstat(prepared.path, { bigint: true }).catch(() => undefined);
+    const currentCanonical = await realpath(prepared.path).catch(() => undefined);
+    if (!current?.isDirectory() || current.isSymbolicLink() || currentCanonical !== prepared.path
+      || current.dev !== value.dev || current.ino !== value.ino
+      || current.dev !== BigInt(prepared.identity.device) || current.ino !== BigInt(prepared.identity.inode)) {
       throw managedError("project workspace changed unexpectedly");
     }
   }

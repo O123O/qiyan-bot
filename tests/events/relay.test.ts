@@ -42,10 +42,11 @@ function terminal(id = "turn-1", status = "completed", text = "done") {
 
 test("reports terminal metadata after final persistence without copying the body", async () => {
   const observed: any[] = [];
-  const { db, relay } = await fixture((event) => {
+  const { db, endpoint, relay } = await fixture((event) => {
     assert.ok(db.prepare("SELECT id FROM logical_final_messages WHERE id = ?").get(event.finalMessageId));
     observed.push(event);
   });
+  endpoint.turns = [terminal("baseline"), terminal()];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   assert.deepEqual(observed, [{
     endpointId: "local",
@@ -60,7 +61,8 @@ test("reports terminal metadata after final persistence without copying the body
 });
 
 test("managed worker finals create automatic delivery and metadata-only assistant event exactly once", async () => {
-  const { db, deliveries, relay } = await fixture();
+  const { db, endpoint, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal()];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal() });
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] done"]);
@@ -70,7 +72,8 @@ test("managed worker finals create automatic delivery and metadata-only assistan
 });
 
 test("failed no-final turns warn, transitional turns are excluded, and permission blocks are deduplicated", async () => {
-  const { db, registry, deliveries, relay } = await fixture();
+  const { db, endpoint, registry, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal("bad", "failed", "")];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("bad", "failed", "") });
   await relay.handlePermissionBlocked("local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} });
   await relay.handlePermissionBlocked("local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} });
@@ -94,7 +97,7 @@ test("ready reconciliation reads history after baseline and advances a durable c
 
 test("terminal notification with partial items reads the authoritative completed turn", async () => {
   const { endpoint, deliveries, relay } = await fixture();
-  endpoint.turns = [terminal("readback", "completed", "from history")];
+  endpoint.turns = [terminal("baseline"), terminal("readback", "completed", "from history")];
   await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("readback", "completed", "") });
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] from history"]);
 });
@@ -117,6 +120,42 @@ test("replaying an older terminal does not clear a newer active worker turn", as
   await relay.reconcileEndpoint("local");
   assert.equal(runtime.activeTurn("local", "worker", mappingId), "current");
   assert.equal(runtime.getSession("local", "worker", mappingId)?.nativeStatus, "active");
+});
+
+test("a delayed terminal from before the current mapping epoch is not delivered after re-adoption", async () => {
+  const { endpoint, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("old"), terminal("baseline")];
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("old") });
+  assert.deepEqual(deliveries.listReady(), []);
+});
+
+test("a mapping generation change during authoritative read suppresses the delayed terminal", async () => {
+  const { endpoint, registry, runtime, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal("delayed")];
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  endpoint.request = async <T>() => {
+    entered();
+    await barrier;
+    return { thread: { turns: endpoint.turns } } as T;
+  };
+
+  const pending = relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("delayed") });
+  await reading;
+  const old = registry.get("payments")!;
+  await registry.transition("payments", old, "unadopting");
+  await registry.removeIfMatch("payments", old);
+  const replacement = { ...old, mapping_id: "mapping-2", lifecycle_state: "adopting" as const };
+  await registry.reserve("payments", replacement);
+  await registry.promote("payments", replacement);
+  runtime.setSession("local", "worker", "mapping-2", "managed", "idle");
+  runtime.beginEpoch("local", "worker", "mapping-2", "baseline", 2);
+  release();
+  await pending;
+
+  assert.deepEqual(deliveries.listReady(), []);
 });
 
 test("automatic worker delivery is suppressed for every transitional mapping lifecycle", async () => {

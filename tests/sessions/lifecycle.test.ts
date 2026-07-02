@@ -117,7 +117,34 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   await lifecycle.reconcileAdopting();
   assert.equal(required(registry).mapping_id, reserved.mapping_id);
   assert.equal(required(registry).lifecycle_state, "managed");
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
+});
+
+test("startup reconstructs a missing runtime row for an exact managed generation", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const managed = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" };
+  await registry.createManaged("payments", managed);
+
+  const resumed = await lifecycle.reconcileManaged("payments", required(registry));
+
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read"]);
+  assert.deepEqual(endpoint.calls[1]?.params, { threadId: "thread-1" });
+  assert.equal(resumed.thread.id, "thread-1");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
+  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+});
+
+test("adopting reconciliation validates native cwd before resuming", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture();
+  await registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable", lifecycle_state: "adopting",
+  });
+  endpoint.cwd = join(dir, "drifted");
+
+  await assert.rejects(lifecycle.reconcileAdopting(), /cwd|directory/iu);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
+  assert.equal(required(registry).lifecycle_state, "adopting");
 });
 
 test("unadopt is idle-only, unsubscribes without archive, and removes exactly one mapping", async () => {

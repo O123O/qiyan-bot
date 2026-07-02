@@ -22,10 +22,6 @@ export function workerThreadStartParams(cwd: string, threadSource: string): { cw
   return { cwd, ephemeral: false, threadSource };
 }
 
-export function workerThreadResumeParams(threadId: string, cwd: string): { threadId: string; cwd: string } {
-  return { threadId, cwd };
-}
-
 export class SessionLifecycle {
   constructor(
     private readonly pool: AppServerPool,
@@ -167,17 +163,47 @@ export class SessionLifecycle {
         const project = await this.workspaces.prepareExisting(session.project_dir);
         await this.workspaces.assertDispatchable(project);
         if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
+        const before = await this.read(session.endpoint, session.thread_id);
+        this.requireIdle(before.thread);
+        await this.verifyCwd(before.thread.cwd, project.path);
+        this.assertExact(nickname, expected, "adopting");
         await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id });
-        const native = await this.read(session.endpoint, session.thread_id);
+        const afterResume = this.assertExact(nickname, expected, "adopting");
+        const native = await this.read(afterResume.endpoint, afterResume.thread_id);
         this.requireIdle(native.thread);
         await this.verifyCwd(native.thread.cwd, project.path);
-        await this.registry.promote(nickname, session);
-        this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "managed", native.thread.status.type);
-        if (!this.runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)) {
-          this.runtime.beginEpoch(session.endpoint, session.thread_id, session.mapping_id, this.baseline(native.thread), this.clock.now());
+        await this.workspaces.assertDispatchable(project);
+        const promotable = this.assertExact(nickname, expected, "adopting");
+        await this.registry.promote(nickname, promotable);
+        this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
+        if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
+          this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
         }
       });
     }
+  }
+
+  async reconcileManaged(nickname: string, expected: RegistrySession): Promise<ThreadResponse> {
+    return this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.assertExact(nickname, expected, "managed");
+      const project = await this.workspaces.prepareExisting(session.project_dir);
+      await this.workspaces.assertDispatchable(project);
+      if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
+      const before = await this.read(session.endpoint, session.thread_id);
+      await this.verifyCwd(before.thread.cwd, project.path);
+      this.assertExact(nickname, expected, "managed");
+      const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id });
+      const afterResume = this.assertExact(nickname, expected, "managed");
+      const authoritative = await this.read(afterResume.endpoint, afterResume.thread_id);
+      await this.verifyCwd(authoritative.thread.cwd, project.path);
+      await this.workspaces.assertDispatchable(project);
+      const current = this.assertExact(nickname, expected, "managed");
+      this.runtime.setSession(current.endpoint, current.thread_id, current.mapping_id, "managed", authoritative.thread.status.type);
+      if (!this.runtime.currentEpoch(current.endpoint, current.thread_id, current.mapping_id)) {
+        this.runtime.beginEpoch(current.endpoint, current.thread_id, current.mapping_id, this.baseline(authoritative.thread), this.clock.now());
+      }
+      return { ...resumed, thread: authoritative.thread };
+    });
   }
 
   async reconcileRemovals(): Promise<void> {

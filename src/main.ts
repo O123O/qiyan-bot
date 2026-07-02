@@ -5,6 +5,7 @@ import { loadConfigSource } from "./config-source.ts";
 import { runAssistantLogin } from "./assistant/login.ts";
 import { readPackageInfo } from "./distribution/package-info.ts";
 import { updateFromLatestRelease } from "./distribution/update.ts";
+import { validateAssistantWorkspacePaths } from "./assistant/workspace.ts";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const command = parseCliArgs(argv);
@@ -26,7 +27,8 @@ export async function main(env = process.env, argv: readonly string[] = process.
   }
   const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
   if (command.command === "config-check") {
-    loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome });
+    const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome });
+    await validateAssistantWorkspacePaths({ workdir: config.assistantWorkdir, dataDir: config.dataDir, registryPath: config.sessionRegistryPath });
     process.stdout.write("Configuration OK.\n");
     return;
   }
