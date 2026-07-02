@@ -25,6 +25,7 @@ const configSchema = z.object({
 });
 
 export interface BotConfig {
+  qiyanHome: string;
   telegramBotToken: string;
   telegramOwnerId: number;
   telegramDestinationChatId: number;
@@ -42,36 +43,36 @@ export interface BotConfig {
   assistantSandboxMode: "read-only" | "workspace-write" | "danger-full-access";
 }
 
-export interface ConfigOverrides { assistantWorkdir?: string }
+export interface ConfigOverrides { qiyanHome: string; assistantWorkdir?: string }
 
 export interface AssistantLoginConfig { dataDir: string; codexBinary: string }
 
-export function loadAssistantLoginConfig(env: Record<string, string | undefined>): AssistantLoginConfig {
+export function loadAssistantLoginConfig(env: Record<string, string | undefined>, qiyanHome: string): AssistantLoginConfig {
   const parsed = z.object({
     HOME: z.string().min(1),
     DATA_DIR: z.string().min(1).optional(),
     CODEX_BINARY: z.string().min(1).default("codex"),
   }).parse(env);
-  const home = resolve(parsed.HOME);
   return {
-    dataDir: resolve(parsed.DATA_DIR ?? join(home, ".qiyan-bot", "data")),
+    dataDir: resolve(parsed.DATA_DIR ?? join(qiyanHome, "data")),
     codexBinary: parsed.CODEX_BINARY,
   };
 }
 
-export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides = {}): BotConfig {
+export function loadConfig(env: Record<string, string | undefined>, overrides: ConfigOverrides): BotConfig {
   const parsed = configSchema.parse(overrides.assistantWorkdir === undefined
     ? env
     : { ...env, ASSISTANT_WORKDIR: overrides.assistantWorkdir });
   const home = resolve(parsed.HOME);
-  const defaultRoot = join(home, ".qiyan-bot");
+  const defaultRoot = resolve(overrides.qiyanHome);
   const dataDir = resolve(parsed.DATA_DIR ?? join(defaultRoot, "data"));
   return {
+    qiyanHome: defaultRoot,
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     telegramOwnerId: parsed.TELEGRAM_OWNER_ID,
     telegramDestinationChatId: parsed.TELEGRAM_DESTINATION_CHAT_ID,
     userHome: home,
-    assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "assistant")),
+    assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "qiyan-workdir")),
     dataDir,
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
     codexBinary: parsed.CODEX_BINARY,

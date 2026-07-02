@@ -4,6 +4,7 @@ import { readFile, readdir, readlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { BOT_SECRET_ENV_NAMES } from "../config-source.ts";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import type { AssistantToolName, ToolCallContext, ToolHandler } from "../assistant/tools.ts";
 import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
@@ -175,17 +176,10 @@ const inheritedEnvironmentKeys = new Set([
   "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
 ]);
 
-const workerCredentialDenylist = new Set([
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_OWNER_ID",
-  "TELEGRAM_DESTINATION_CHAT_ID",
-  "QIYAN_BOT_MCP_TOKEN",
-]);
-
 export function buildWorkerChildEnvironment(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(host)) {
-    if (value !== undefined && !workerCredentialDenylist.has(key)) result[key] = value;
+    if (value !== undefined && !BOT_SECRET_ENV_NAMES.has(key)) result[key] = value;
   }
   return result;
 }
@@ -210,6 +204,6 @@ export function secureShellConfig(): Record<string, unknown> {
   return {
     allow_login_shell: false,
     "shell_environment_policy.inherit": "core",
-    "shell_environment_policy.exclude": ["QIYAN_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID"],
+    "shell_environment_policy.exclude": [...BOT_SECRET_ENV_NAMES],
   };
 }

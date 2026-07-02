@@ -80,6 +80,23 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.equal(version.stdout, "0.2.0\n");
   assert.equal(version.stderr, "");
 
+  const checkedHome = join(temp, "checked-qiyan-home");
+  await mkdir(checkedHome, { mode: 0o700 });
+  await writeFile(join(checkedHome, ".env"), [
+    "TELEGRAM_BOT_TOKEN=private-file-token",
+    "TELEGRAM_OWNER_ID=7",
+    "TELEGRAM_DESTINATION_CHAT_ID=7",
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const configCheck = spawnSync(executable, ["config-check", "--home", checkedHome], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "", HOME: temp },
+  });
+  assert.equal(configCheck.status, 0);
+  assert.equal(configCheck.stdout, "Configuration OK.\n");
+  assert.equal(configCheck.stderr, "");
+
   const result = spawnSync(executable, ["--definitely-invalid"], {
     cwd: temp,
     encoding: "utf8",

@@ -21,6 +21,7 @@ test("production prepares the configured assistant workdir before endpoint start
   const registryPath = join(root, "backend-registry", "sessions.json");
   const policyAsset = fileURLToPath(new URL("../assets/assistant/AGENTS.md", import.meta.url));
   const config: BotConfig = {
+    qiyanHome: join(root, "qiyan-home"),
     telegramBotToken: "test-token",
     telegramOwnerId: 42,
     telegramDestinationChatId: 42,

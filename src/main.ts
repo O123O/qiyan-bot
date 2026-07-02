@@ -1,6 +1,7 @@
 import { createApp } from "./app.ts";
 import { parseCliArgs } from "./cli.ts";
 import { loadConfig, loadAssistantLoginConfig } from "./config.ts";
+import { loadConfigSource } from "./config-source.ts";
 import { runAssistantLogin } from "./assistant/login.ts";
 import { readPackageInfo } from "./distribution/package-info.ts";
 import { updateFromLatestRelease } from "./distribution/update.ts";
@@ -19,10 +20,20 @@ export async function main(env = process.env, argv: readonly string[] = process.
     return;
   }
   if (command.command === "assistant-login") {
-    await runAssistantLogin(loadAssistantLoginConfig(env), env);
+    const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
+    await runAssistantLogin(loadAssistantLoginConfig(loaded.values, loaded.qiyanHome), loaded.hostEnv);
     return;
   }
-  const app = await createApp(loadConfig(env, command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }));
+  const loaded = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
+  if (command.command === "config-check") {
+    loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome });
+    process.stdout.write("Configuration OK.\n");
+    return;
+  }
+  const app = await createApp(loadConfig(loaded.values, {
+    qiyanHome: loaded.qiyanHome,
+    ...(command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }),
+  }));
   await app.start();
   let stopping = false;
   const stop = () => {
