@@ -147,7 +147,7 @@ RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-assistant.test.ts
 ## Troubleshooting
 
 - Assistant authentication required: stop QiYan, run `qiyan-bot assistant-login`, complete the device flow, and restart. Do not copy the normal profile's `auth.json`.
-- `CONFIGURATION_ERROR`: run `qiyan-bot config-check`; check private file modes, path separation, managed-file guards, registry v3, and state marker 2.
+- `CONFIGURATION_ERROR`: run `qiyan-bot config-check` for dotenv and path validation. Startup separately enforces managed-file guards, registry v3, and state marker 2.
 - `CWD_MISMATCH`: the native thread directory differs from the pinned registry path.
 - `SESSION_BUSY`: wait, steer the active turn, or explicitly interrupt it.
 - `PERMISSION_BLOCKED`: the user's normal worker configuration still requested an approval that chat cannot provide.

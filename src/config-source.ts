@@ -28,6 +28,8 @@ export const SUPPORTED_DOTENV_KEYS = new Set([
   "ASSISTANT_SANDBOX_MODE",
 ]);
 
+export const SERVICE_UNSET_ENV_NAMES = new Set(["QIYAN_HOME", ...SUPPORTED_DOTENV_KEYS, "QIYAN_BOT_MCP_TOKEN"]);
+
 export interface LoadedConfigSource {
   qiyanHome: string;
   dotenvPath: string;

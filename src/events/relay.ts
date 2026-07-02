@@ -8,6 +8,7 @@ import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
 
 interface TerminalTurn { id: string; status: string; startedAt?: number | null; completedAt: number | null; items: Array<{ type: string; id: string; text?: string; phase?: string | null }> }
+interface ExpectedGeneration { mappingId: string; epochId: string }
 export interface TerminalObservation {
   endpointId: string;
   threadId: string;
@@ -52,7 +53,9 @@ export class EventRelay {
       const state = this.runtime.getSession(endpointId, session.thread_id, session.mapping_id);
       const epoch = this.runtime.currentEpoch(endpointId, session.thread_id, session.mapping_id);
       if (state?.managementState !== "managed" || !epoch) continue;
+      const expected = { mappingId: session.mapping_id, epochId: epoch.id };
       const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId: session.thread_id, includeTurns: true });
+      if (!this.isCurrentGeneration(endpointId, session.thread_id, expected)) continue;
       const turns = response.thread.turns;
       let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
       if (epoch.baselineTurnId && index === 0) continue;
@@ -62,32 +65,38 @@ export class EventRelay {
       }
       for (const turn of turns.slice(index)) {
         if (!new Set(["completed", "failed", "interrupted"]).has(turn.status)) break;
-        await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true);
+        if (!await this.handleTerminal(endpointId, session.thread_id, turn, nickname, true, expected)) break;
         this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
       }
     }
   }
 
-  private async handleTerminal(endpointId: string, threadId: string, turn: TerminalTurn, knownNickname?: string, authoritative = false): Promise<void> {
+  private async handleTerminal(
+    endpointId: string,
+    threadId: string,
+    turn: TerminalTurn,
+    knownNickname?: string,
+    authoritative = false,
+    expected?: ExpectedGeneration,
+  ): Promise<boolean> {
     const mapping = this.mapping(endpointId, threadId);
     const state = mapping ? this.runtime.getSession(endpointId, threadId, mapping.session.mapping_id) : undefined;
     let nickname = knownNickname ?? mapping?.nickname;
     const epoch = mapping ? this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id) : undefined;
-    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !epoch) return;
+    if (!mapping || mapping.session.lifecycle_state !== "managed" || !nickname || state?.managementState !== "managed" || !epoch) return false;
+    if (expected && (mapping.session.mapping_id !== expected.mappingId || epoch.id !== expected.epochId)) return false;
     if (!authoritative) {
       const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(endpointId, "thread/read", { threadId, includeTurns: true });
       const turnIndex = history.thread.turns.findIndex((candidate) => candidate.id === turn.id);
-      if (turnIndex < 0) return;
+      if (turnIndex < 0) return false;
       if (epoch.baselineTurnId) {
         const baselineIndex = history.thread.turns.findIndex((candidate) => candidate.id === epoch.baselineTurnId);
-        if (baselineIndex < 0 || turnIndex <= baselineIndex) return;
+        if (baselineIndex < 0 || turnIndex <= baselineIndex) return false;
       }
       turn = history.thread.turns[turnIndex]!;
-      const current = this.mapping(endpointId, threadId);
-      const currentState = current ? this.runtime.getSession(endpointId, threadId, current.session.mapping_id) : undefined;
-      const currentEpoch = current ? this.runtime.currentEpoch(endpointId, threadId, current.session.mapping_id) : undefined;
-      if (!current || current.session.mapping_id !== mapping.session.mapping_id || current.session.lifecycle_state !== "managed"
-        || currentState?.managementState !== "managed" || currentEpoch?.id !== epoch.id) return;
+      const directExpected = { mappingId: mapping.session.mapping_id, epochId: epoch.id };
+      if (!this.isCurrentGeneration(endpointId, threadId, directExpected)) return false;
+      const current = this.mapping(endpointId, threadId)!;
       nickname = current.nickname;
     }
     this.runtime.clearActiveTurn(endpointId, threadId, mapping.session.mapping_id, turn.id);
@@ -115,6 +124,15 @@ export class EventRelay {
       this.deliveries.prepare({ id: `worker:${endpointId}:${threadId}:${message.turnId}:${message.itemId}`, kind: "worker_final", destination: this.options.destination, body: `[${nickname}${status}] ${message.body}`, mandatory: true });
     }
     this.attachments?.releaseTurn(endpointId, threadId, turn.id);
+    return true;
+  }
+
+  private isCurrentGeneration(endpointId: string, threadId: string, expected: ExpectedGeneration): boolean {
+    const current = this.mapping(endpointId, threadId);
+    const state = current ? this.runtime.getSession(endpointId, threadId, current.session.mapping_id) : undefined;
+    const epoch = current ? this.runtime.currentEpoch(endpointId, threadId, current.session.mapping_id) : undefined;
+    return current?.session.mapping_id === expected.mappingId && current.session.lifecycle_state === "managed"
+      && state?.managementState === "managed" && epoch?.id === expected.epochId;
   }
 
   private persistEvent(id: string, endpointId: string, threadId: string, turnId: string | undefined, kind: string, payload: unknown): void {

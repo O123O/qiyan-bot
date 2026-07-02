@@ -161,23 +161,38 @@ export class SessionLifecycle {
       await this.gate.run(expected.endpoint, expected.thread_id, async () => {
         const session = this.assertExact(nickname, expected, "adopting");
         const project = await this.workspaces.prepareExisting(session.project_dir);
-        await this.workspaces.assertDispatchable(project);
-        if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
-        const before = await this.read(session.endpoint, session.thread_id);
-        this.requireIdle(before.thread);
-        await this.verifyCwd(before.thread.cwd, project.path);
-        this.assertExact(nickname, expected, "adopting");
-        await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id });
-        const afterResume = this.assertExact(nickname, expected, "adopting");
-        const native = await this.read(afterResume.endpoint, afterResume.thread_id);
-        this.requireIdle(native.thread);
-        await this.verifyCwd(native.thread.cwd, project.path);
-        await this.workspaces.assertDispatchable(project);
-        const promotable = this.assertExact(nickname, expected, "adopting");
-        await this.registry.promote(nickname, promotable);
-        this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
-        if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
-          this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
+        let resumed = false;
+        try {
+          await this.workspaces.assertDispatchable(project);
+          if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
+          const before = await this.read(session.endpoint, session.thread_id);
+          this.requireIdle(before.thread);
+          await this.verifyCwd(before.thread.cwd, project.path);
+          this.assertExact(nickname, expected, "adopting");
+          await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id });
+          resumed = true;
+          const afterResume = this.assertExact(nickname, expected, "adopting");
+          const native = await this.read(afterResume.endpoint, afterResume.thread_id);
+          this.requireIdle(native.thread);
+          await this.verifyCwd(native.thread.cwd, project.path);
+          await this.workspaces.assertDispatchable(project);
+          const promotable = this.assertExact(nickname, expected, "adopting");
+          await this.registry.promote(nickname, promotable);
+          this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
+          if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
+            this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
+          }
+        } catch (error) {
+          const current = this.registry.get(nickname);
+          if (resumed && current?.lifecycle_state === "adopting" && sameMapping(current, expected)) {
+            try {
+              await this.pool.request(current.endpoint, "thread/unsubscribe", { threadId: current.thread_id });
+              if (!await this.registry.removeIfMatch(nickname, current)) throw new Error("adopting reservation changed during rollback");
+            } catch {
+              throw new AppError("OPERATION_UNCERTAIN", "adoption recovery failed and its subscription rollback could not be confirmed");
+            }
+          }
+          throw error;
         }
       });
     }

@@ -147,6 +147,19 @@ test("adopting reconciliation validates native cwd before resuming", async () =>
   assert.equal(required(registry).lifecycle_state, "adopting");
 });
 
+test("adopting reconciliation rolls back a proven subscription when post-resume validation fails", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture();
+  await registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable", lifecycle_state: "adopting",
+  });
+  endpoint.onResume = () => { endpoint.cwd = join(dir, "drifted-after-resume"); };
+
+  await assert.rejects(lifecycle.reconcileAdopting(), /cwd|directory/iu);
+
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
+  assert.equal(registry.get("payments"), undefined);
+});
+
 test("unadopt is idle-only, unsubscribes without archive, and removes exactly one mapping", async () => {
   const { registry, endpoint, runtime, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");

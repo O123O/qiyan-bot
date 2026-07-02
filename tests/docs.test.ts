@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import test from "node:test";
+import { SERVICE_UNSET_ENV_NAMES } from "../src/config-source.ts";
 
 test("README links to all focused guides and every local guide target exists", async () => {
   const readme = await readFile(resolve("README.md"), "utf8");
@@ -55,6 +56,11 @@ test("v0.3 upgrade guide requires a fresh stopped cutover and a non-inheriting s
   assert.match(guide, /only values carried forward.*configuration.*auth\.json/isu);
   assert.match(guide, /Do not add `EnvironmentFile=`/u);
   assert.match(guide, /old managed sessions.*not adopted automatically/isu);
+  assert.match(guide, /set -euo pipefail/u);
+  assert.ok(guide.indexOf('config-check --home "$stage"') < guide.indexOf('rm -rf -- "$old_home"'));
+  assert.match(guide, /deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH`/u);
+  const unset = guide.match(/^UnsetEnvironment=(.+)$/mu)?.[1]?.trim().split(/\s+/u);
+  assert.deepEqual(new Set(unset), SERVICE_UNSET_ENV_NAMES);
 });
 
 test("full-access and non-interactive worker warnings precede installation and launch", async () => {

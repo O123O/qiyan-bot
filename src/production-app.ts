@@ -50,14 +50,22 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
 export type RemovalRecoveryDecision = "pending" | "no_effect" | "reconcile" | "succeeded";
 
 export function removalRecoveryDecision(
-  saved: Partial<RegistrySession> | undefined,
+  operationKind: "unadopt_session" | "archive_session",
+  saved: (Partial<RegistrySession> & { step?: string }) | undefined,
   current: RegistrySession | undefined,
 ): RemovalRecoveryDecision {
-  if (!saved?.endpoint || !saved.thread_id || !saved.project_dir || !saved.mapping_id) return "pending";
-  if (!current || current.mapping_id !== saved.mapping_id
-    || current.endpoint !== saved.endpoint || current.thread_id !== saved.thread_id) return "succeeded";
-  if (current.lifecycle_state === "unadopting" || current.lifecycle_state === "archiving") return "reconcile";
-  if (current.lifecycle_state === "managed") return "no_effect";
+  if (!saved?.endpoint || !saved.thread_id || !saved.project_dir || !saved.mapping_id) return "no_effect";
+  const targetState = operationKind === "unadopt_session" ? "unadopting" : "archiving";
+  const sameGeneration = current?.mapping_id === saved.mapping_id
+    && current.endpoint === saved.endpoint && current.thread_id === saved.thread_id;
+  const enteredTransition = saved.lifecycle_state === targetState && saved.step !== "prepared";
+  if (!enteredTransition) {
+    if (sameGeneration && current?.lifecycle_state === targetState) return "reconcile";
+    return "no_effect";
+  }
+  if (!sameGeneration) return "succeeded";
+  if (current?.lifecycle_state === targetState) return "reconcile";
+  if (current?.lifecycle_state === "managed") return "no_effect";
   return "pending";
 }
 
@@ -1031,11 +1039,11 @@ export async function buildProductionApp(
           const saved = operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
           const nickname = saved?.nickname ?? args.nickname;
           let current = registry.get(nickname);
-          let decision = removalRecoveryDecision(saved, current);
+          let decision = removalRecoveryDecision(operation.kind, saved, current);
           if (decision === "reconcile") {
             await lifecycle.reconcileRemoval(nickname, current!);
             current = registry.get(nickname);
-            decision = removalRecoveryDecision(saved, current);
+            decision = removalRecoveryDecision(operation.kind, saved, current);
           }
           if (decision === "succeeded") {
             await succeedRecovered(operation, { nickname, mapping_id: saved!.mapping_id }, () => dashboardStore.markDirty());

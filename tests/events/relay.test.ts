@@ -158,6 +158,35 @@ test("a mapping generation change during authoritative read suppresses the delay
   assert.deepEqual(deliveries.listReady(), []);
 });
 
+test("ready reconciliation cannot deliver across a re-adoption during its history read", async () => {
+  const { endpoint, registry, runtime, deliveries, relay } = await fixture();
+  endpoint.turns = [terminal("baseline"), terminal("missed")];
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  endpoint.request = async <T>() => {
+    entered();
+    await barrier;
+    return { thread: { turns: endpoint.turns } } as T;
+  };
+
+  const pending = relay.reconcileEndpoint("local");
+  await reading;
+  const old = registry.get("payments")!;
+  await registry.transition("payments", old, "unadopting");
+  await registry.removeIfMatch("payments", old);
+  const replacement = { ...old, mapping_id: "mapping-2", lifecycle_state: "adopting" as const };
+  await registry.reserve("payments", replacement);
+  await registry.promote("payments", replacement);
+  runtime.setSession("local", "worker", "mapping-2", "managed", "idle");
+  runtime.beginEpoch("local", "worker", "mapping-2", "baseline", 2);
+  release();
+  await pending;
+
+  assert.deepEqual(deliveries.listReady(), []);
+});
+
 test("automatic worker delivery is suppressed for every transitional mapping lifecycle", async () => {
   for (const state of ["adopting", "unadopting", "archiving"] as const) {
     const { registry, runtime, deliveries, relay } = await fixture();
