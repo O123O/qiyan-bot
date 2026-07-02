@@ -104,6 +104,12 @@ export class ConversationStore {
     return row ? this.parseLease(row) : undefined;
   }
 
+  nextPendingCandidate(): { kind: "chat" | "internal"; contextId: string } | undefined {
+    const row = this.db.prepare(`SELECT id, source_class FROM source_contexts
+      WHERE state = 'pending' ORDER BY arrival_sequence, id LIMIT 1`).get() as { id: string; source_class: string } | undefined;
+    return row ? { kind: row.source_class === "chat" ? "chat" : "internal", contextId: row.id } : undefined;
+  }
+
   acquireLease(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {
     return inTransaction(this.db, () => {
       if (this.lease()) this.conflict("assistant lease already exists");
@@ -113,7 +119,7 @@ export class ConversationStore {
       if (candidate.kind === "chat" && !source.binding) this.conflict("chat lease candidate has no binding");
 
       const attemptId = `attempt_${randomUUID()}`;
-      const clientUserMessageId = `client_${randomUUID()}`;
+      const clientUserMessageId = source.id;
       const now = Date.now();
       this.db.prepare(`INSERT INTO assistant_attempts
         (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
@@ -162,7 +168,7 @@ export class ConversationStore {
         WHERE state = 'pending' AND source_class = 'chat' AND adapter_id = ? AND conversation_key = ?
         ORDER BY arrival_sequence, id`).all(lease.binding.adapterId, lease.binding.conversationKey) as Array<{ id: string }>;
       const next = rows.map((row) => this.source(row.id)).find((source) => !this.membershipForSource(source.id));
-      return next ? this.reserve(lease, next, "steer", `client_${randomUUID()}`) : undefined;
+      return next ? this.reserve(lease, next, "steer", next.id) : undefined;
     });
   }
 
@@ -173,7 +179,11 @@ export class ConversationStore {
         .run(turnId, Date.now(), attemptId, contextId).changes;
       if (changed !== 1) this.conflict("submission is no longer unresolved");
       this.db.prepare("UPDATE assistant_attempts SET turn_id = ? WHERE id = ?").run(turnId, attemptId);
-      const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'active', turn_id = ?, steer_paused = 0, pause_reason = NULL
+      const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease
+        SET phase = CASE WHEN phase = 'terminalizing' THEN phase ELSE 'active' END,
+            turn_id = ?,
+            steer_paused = CASE WHEN phase = 'terminalizing' THEN 1 ELSE 0 END,
+            pause_reason = CASE WHEN phase = 'terminalizing' THEN pause_reason ELSE NULL END
         WHERE singleton = 1 AND attempt_id = ? AND (turn_id IS NULL OR turn_id = ?)`)
         .run(turnId, attemptId, turnId).changes;
       if (leaseChanged !== 1) this.conflict("lease changed while binding submission");
@@ -203,6 +213,13 @@ export class ConversationStore {
     });
   }
 
+  pauseSteering(attemptId: string, reason: string): void {
+    inTransaction(this.db, () => {
+      if (this.db.prepare("UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = ? WHERE singleton = 1 AND attempt_id = ? AND phase = 'active'")
+        .run(reason, attemptId).changes !== 1) this.conflict("attempt cannot pause steering");
+    });
+  }
+
   beginTerminalizing(turnId: string): AssistantLease | undefined {
     return inTransaction(this.db, () => {
       const current = this.lease();
@@ -227,6 +244,9 @@ export class ConversationStore {
       if (!current) return;
       if (current.attemptId !== attemptId) this.conflict("another attempt owns the lease");
       this.db.prepare("DELETE FROM assistant_turn_lease WHERE singleton = 1 AND attempt_id = ?").run(attemptId);
+      this.db.prepare(`UPDATE assistant_attempts SET state = 'failed'
+        WHERE id = ? AND state = 'active'
+          AND NOT EXISTS (SELECT 1 FROM assistant_attempt_sources WHERE attempt_id = ? AND state = 'submitted')`).run(attemptId, attemptId);
     });
   }
 
