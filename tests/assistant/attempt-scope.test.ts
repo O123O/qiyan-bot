@@ -132,3 +132,70 @@ test("malformed admitted safeguard blocks fallback and restored pending rejects 
   scope.notifyMembership(reserved.contextId);
   await assert.rejects(scope.waitUntilSubmitted(lease.attemptId, reserved.contextId), /not admitted|restored/u);
 });
+
+test("concurrent retries of one call ID consume one safeguard and replay one operation", async () => {
+  const value = fixture();
+  admitNext(value);
+  admitNext(value);
+  const input = {
+    attemptId: value.lease.attemptId,
+    callId: "same-call",
+    tool: "send_to_session" as const,
+    args: { nickname: "worker", content: "first", attachment_ids: ["file-one"], mode: "start" },
+  };
+  const [left, right] = await Promise.all([value.scope.resolveSafeguard(input), value.scope.resolveSafeguard(input)]);
+  assert.equal(left.operation.id, right.operation.id);
+  assert.equal(value.operations.listForAttempt(value.lease.attemptId).filter((operation) => operation.callId === "same-call").length, 1);
+  assert.equal(value.db.prepare("SELECT COUNT(*) AS n FROM directive_consumptions").get()!.n, 1);
+});
+
+test("an attachment-bearing steer waits for positive native admission before dispatch", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.acceptChatSource({ id: "owner", nativeSourceId: "owner", binding, rawText: "owner", attachmentIds: [], receivedAt: 1 });
+  conversations.acceptChatSource({ id: "with-file", nativeSourceId: "with-file", binding, rawText: "ordinary follow-up", attachmentIds: ["file"], receivedAt: 2 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+  conversations.reserveStart("owner");
+  conversations.markSubmitted(lease.attemptId, "owner", "turn");
+  const pending = conversations.reserveNextSteer(lease.attemptId)!;
+  const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
+  let settled = false;
+  const resolving = scope.resolveSafeguard({
+    attemptId: lease.attemptId,
+    callId: "send-file",
+    tool: "send_to_session",
+    args: { nickname: "worker", content: "work", attachment_ids: ["file"], mode: "steer" },
+  }).then((value) => { settled = true; return value; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  conversations.markSubmitted(lease.attemptId, pending.contextId, "turn");
+  scope.notifyMembership(pending.contextId);
+  await resolving;
+  assert.deepEqual(scope.resolveAttachment(lease.attemptId, "file"), { contextId: "with-file", attachmentId: "file" });
+});
+
+test("an attachment-bearing steer proven absent rejects before preparing an operation", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.acceptChatSource({ id: "owner", nativeSourceId: "owner", binding, rawText: "owner", attachmentIds: [], receivedAt: 1 });
+  conversations.acceptChatSource({ id: "with-file", nativeSourceId: "with-file", binding, rawText: "ordinary follow-up", attachmentIds: ["file"], receivedAt: 2 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+  conversations.reserveStart("owner");
+  conversations.markSubmitted(lease.attemptId, "owner", "turn");
+  const pending = conversations.reserveNextSteer(lease.attemptId)!;
+  const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
+  const resolving = scope.resolveSafeguard({
+    attemptId: lease.attemptId,
+    callId: "send-file",
+    tool: "send_to_session",
+    args: { nickname: "worker", content: "work", attachment_ids: ["file"], mode: "steer" },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  conversations.restorePending(lease.attemptId, pending.contextId);
+  scope.notifyMembership(pending.contextId);
+  await assert.rejects(resolving, /not admitted|restored/u);
+  assert.equal(operations.listForAttempt(lease.attemptId).length, 0);
+  assert.throws(() => scope.resolveAttachment(lease.attemptId, "file"), (error: unknown) => error instanceof AppError && error.code === "ATTACHMENT_INVALID");
+});

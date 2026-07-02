@@ -234,3 +234,43 @@ test("causal finals retain the attempt binding while destinationless internal re
   assert.equal(row.conversation_key, null);
   assert.equal(deliveries.listReady().filter((delivery) => delivery.id.includes("internal-turn")).length, 0);
 });
+
+test("a steer proven not admitted stays pending when the owning turn completes", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  for (const id of ["owner", "restored"]) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText: id, attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+  conversations.reserveStart("owner");
+  conversations.markSubmitted(lease.attemptId, "owner", "turn");
+  conversations.reserveNextSteer(lease.attemptId);
+  conversations.restorePending(lease.attemptId, "restored");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.hydrateActive();
+  runtime.handleTerminal("turn", "completed", "done");
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'owner'").get()!.state, "completed");
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'restored'").get()!.state, "pending");
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'restored'").get()!.state, "failed");
+});
+
+test("terminal handling cannot delete a lease with an unresolved native submission", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  for (const id of ["owner", "unresolved"]) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText: id, attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+  conversations.reserveStart("owner");
+  conversations.markSubmitted(lease.attemptId, "owner", "turn");
+  conversations.reserveNextSteer(lease.attemptId);
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  runtime.hydrateActive();
+
+  runtime.handleTerminal("turn", "completed", "premature");
+
+  assert.equal(db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.state, "active");
+  assert.ok(db.prepare("SELECT attempt_id FROM assistant_turn_lease WHERE attempt_id = ?").get(lease.attemptId));
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'unresolved'").get()!.state, "steer_submitting");
+  assert.equal(deliveries.get("assistant:turn"), undefined);
+});

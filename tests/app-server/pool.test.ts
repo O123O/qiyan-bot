@@ -135,6 +135,24 @@ test("ambiguous starts and endpoint loss retain caller-owned provisional claims"
   pool.releaseTurnCapacityClaim(claim);
 });
 
+test("active thread state prevents empty full history from proving a lost start absent", async () => {
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") throw new Error("response lost");
+      return { thread: { status: { type: "active" }, turns: [] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, reconciliationTimeoutMs: 0 });
+  const claim = pool.claimTurnCapacity("local", "assistant", "claim-active-empty");
+  await assert.rejects(
+    pool.startTurn("local", { threadId: "assistant", clientUserMessageId: "message", input: [] }, claim),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  assert.equal(pool.activeTurnCount, 1);
+  pool.releaseTurnCapacityClaim(claim);
+});
+
 test("only full item views can prove a client message absent", async () => {
   for (const itemsView of ["summary", "notLoaded"] as const) {
     const endpoint: AppServerEndpoint = {

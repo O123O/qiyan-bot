@@ -13,6 +13,7 @@ export interface TurnCapacityClaim {
 }
 
 export interface ThreadHistory {
+  status?: string | { type?: string };
   turns: Array<{
     id: string;
     status: string;
@@ -250,7 +251,8 @@ export class AppServerPool {
         || (candidateTurnId !== undefined && turn.id === candidateTurnId));
       if (actual) return actual;
       if (Date.now() >= deadline) {
-        if (history.thread.turns.every((turn) => turn.itemsView === "full")) throw new StartProvenAbsentError();
+        const threadStatus = typeof history.thread.status === "string" ? history.thread.status : history.thread.status?.type;
+        if (threadStatus === "idle" && history.thread.turns.every((turn) => turn.itemsView === "full")) throw new StartProvenAbsentError();
         throw new AppError("OPERATION_UNCERTAIN", "turn/start outcome could not be proven because thread history was incomplete");
       }
       await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(this.options.reconciliationPollMs ?? 25);

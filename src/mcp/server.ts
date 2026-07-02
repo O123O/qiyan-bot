@@ -16,6 +16,35 @@ export interface AssistantContextProvider {
   finishTool?(attemptId: string): void;
 }
 
+export class ToolReadinessGate {
+  private readyState = false;
+  private stopped = false;
+  private readonly waiters = new Set<{ resolve(): void; reject(error: Error): void }>();
+
+  async wait(): Promise<void> {
+    if (this.readyState) return;
+    if (this.stopped) throw new Error("assistant tools are unavailable during shutdown");
+    await new Promise<void>((resolve, reject) => this.waiters.add({ resolve, reject }));
+  }
+
+  ready(): void {
+    if (this.stopped) return;
+    this.readyState = true;
+    for (const waiter of this.waiters) waiter.resolve();
+    this.waiters.clear();
+  }
+
+  block(): void { this.readyState = false; }
+
+  stop(): void {
+    this.stopped = true;
+    this.readyState = false;
+    const error = new Error("assistant tools are unavailable during shutdown");
+    for (const waiter of this.waiters) waiter.reject(error);
+    this.waiters.clear();
+  }
+}
+
 export class LoopbackMcpServer {
   private http: HttpServer | undefined;
   private readonly activeServers = new Set<McpServer>();
@@ -24,7 +53,13 @@ export class LoopbackMcpServer {
   constructor(
     private readonly tools: Record<AssistantToolName, ToolHandler>,
     private readonly contexts: AssistantContextProvider,
-    private readonly options: { host: "127.0.0.1"; port: number; token: string; allowedClientProcess?: () => LinuxProcessIdentity | undefined },
+    private readonly options: {
+      host: "127.0.0.1";
+      port: number;
+      token: string;
+      allowedClientProcess?: () => LinuxProcessIdentity | undefined;
+      beforeToolCall?: () => Promise<void>;
+    },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
     if (!options.token) throw new Error("MCP bearer token is required");
@@ -93,6 +128,7 @@ export class LoopbackMcpServer {
     );
     for (const name of TOOL_NAMES) {
       mcp.registerTool(name, { description: `QiYan assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
+        await this.options.beforeToolCall?.();
         const active = this.contexts.current();
         if (!active) throw new Error("No active assistant source context");
         const toolFence = this.contexts.registerTool?.(active.attemptId) ?? active.toolFence;

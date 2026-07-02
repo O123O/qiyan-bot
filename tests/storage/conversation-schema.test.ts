@@ -12,6 +12,8 @@ test("conversation steering schema has one lease and ordered attempt members", (
   for (const name of ["adapter_id", "conversation_key", "destination_json", "reply_json", "receipt_json"]) assert.ok(deliveryColumns.has(name), name);
   const operationColumns = new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
   assert.ok(operationColumns.has("effect_class"));
+  const operationIndexes = new Set((db.prepare("PRAGMA index_list(operations)").all() as Array<{ name: string }>).map((row) => row.name));
+  assert.ok(operationIndexes.has("operations_attempt_call_kind_idx"));
 });
 
 test("only one assistant lease row is allowed and it references an attempt", () => {

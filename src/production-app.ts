@@ -28,7 +28,7 @@ import { createAssistantTools, type AssistantToolName } from "./assistant/tools.
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
-import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer } from "./mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, ToolReadinessGate } from "./mcp/server.ts";
 import { SessionRegistry, type RegistryDocument, type RegistrySession } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
@@ -128,6 +128,8 @@ export async function buildProductionApp(
   const unsubscribers: Array<() => void> = [];
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
+  const terminalProcessing = new Map<string, Promise<void>>();
+  const assistantToolReadiness = new ToolReadinessGate();
   let endpointIncident = 0;
   let stopping = false;
   let registryInvalid = false;
@@ -229,7 +231,13 @@ export async function buildProductionApp(
         assistant = new AssistantRuntime(db, operations, deliveries, { binding: administrativeBinding });
         const actions = buildActions();
         const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount, attemptScope });
-        mcp = new LoopbackMcpServer(tools, assistant, { host: config.mcpHost, port: config.mcpPort, token, allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity });
+        mcp = new LoopbackMcpServer(tools, assistant, {
+          host: config.mcpHost,
+          port: config.mcpPort,
+          token,
+          allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity,
+          beforeToolCall: () => assistantToolReadiness.wait(),
+        });
         await mcp.start();
       }, stop: async () => { await mcp.stop(); },
     },
@@ -288,9 +296,19 @@ export async function buildProductionApp(
           enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"))));
         unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
-        unsubscribers.push(assistantEndpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => dispatcher.recover(), () => recordBackgroundFailure("assistant ready reconciliation")); }));
+        unsubscribers.push(assistantEndpoint.onReady(() => {
+          if (acceptingReadyEvents) runBackground(async () => {
+            await dispatcher.recover();
+            await dispatcher.idle();
+            assistant.hydrateActive();
+            assistantToolReadiness.ready();
+          }, () => recordBackgroundFailure("assistant ready reconciliation"));
+        }));
         unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
-        unsubscribers.push(assistantEndpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(assistantEndpoint), () => recordBackgroundFailure("assistant unavailable handling"))));
+        unsubscribers.push(assistantEndpoint.onUnavailable(() => {
+          assistantToolReadiness.block();
+          runBackground(() => handleEndpointUnavailable(assistantEndpoint), () => recordBackgroundFailure("assistant unavailable handling"));
+        }));
       }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); await observations.idle(); },
     },
     {
@@ -364,10 +382,11 @@ export async function buildProductionApp(
             () => recordBackgroundFailure("deferred assistant terminal"),
           ),
         });
+        await dispatcher.recover();
+        await dispatcher.idle();
         assistant.hydrateActive();
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await dispatcher.recover();
         await lifecycle.reconcileAdopting();
         await lifecycle.reconcileRemovals();
         await resumeManagedSessions();
@@ -376,6 +395,7 @@ export async function buildProductionApp(
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
         acceptingReadyEvents = true;
+        assistantToolReadiness.ready();
       }, stop: async () => undefined,
     },
     {
@@ -383,12 +403,18 @@ export async function buildProductionApp(
       start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await dispatcher.enqueueInternal("startup"); },
       stop: async () => {
         stopping = true;
+        assistantToolReadiness.stop();
         schedulerAccepting = false;
         const active = assistant.current();
         if (active && !active.turnId.startsWith("pending:")) {
           assistant.beginTerminalizing(active.turnId);
           await assistant.fenceTools(active.attemptId, 1_000);
-          await pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined);
+          let interruptTimer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined),
+            new Promise<void>((resolve) => { interruptTimer = setTimeout(resolve, 1_000); }),
+          ]);
+          if (interruptTimer) clearTimeout(interruptTimer);
         }
         await dispatcher.stop();
       },
@@ -746,11 +772,25 @@ export async function buildProductionApp(
     await enqueuePendingEvents();
   }
 
-  async function processAssistantTerminal(params: any): Promise<void> {
+  function processAssistantTerminal(params: any): Promise<void> {
+    const turnId = String(params.turn.id);
+    const existing = terminalProcessing.get(turnId);
+    if (existing) return existing;
+    const processing = processAssistantTerminalOnce(params).finally(() => {
+      if (terminalProcessing.get(turnId) === processing) terminalProcessing.delete(turnId);
+    });
+    terminalProcessing.set(turnId, processing);
+    return processing;
+  }
+
+  async function processAssistantTerminalOnce(params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
     await dispatcher.terminal(params.turn);
+    await dispatcher.idle();
     const attemptBefore = assistant.contextForTurn(params.turn.id);
     if (!attemptBefore) return;
+    if (conversations.membersForAttempt(attemptBefore.attemptId)
+      .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state))) return;
     assistant.beginTerminalizing(params.turn.id);
     await assistant.fenceTools(attemptBefore.attemptId, 1_000);
     const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
@@ -1122,9 +1162,11 @@ export async function buildProductionApp(
         throw error;
       }
       await startOrResumeAssistant();
-      await reconcileOperations();
-      assistant.hydrateActive();
       await dispatcher.recover();
+      await dispatcher.idle();
+      assistant.hydrateActive();
+      await reconcileOperations();
+      assistantToolReadiness.ready();
       schedulerAccepting = true;
     }
     acceptingReadyEvents = true;

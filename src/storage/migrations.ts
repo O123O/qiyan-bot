@@ -346,4 +346,8 @@ export const migrations: readonly Migration[] = [
   ALTER TABLE deliveries ADD COLUMN reply_json TEXT;
   ALTER TABLE deliveries ADD COLUMN receipt_json TEXT;
   `,
+  `
+  CREATE UNIQUE INDEX operations_attempt_call_kind_idx
+    ON operations(attempt_id, call_id, kind);
+  `,
 ];

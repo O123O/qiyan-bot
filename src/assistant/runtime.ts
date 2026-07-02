@@ -161,6 +161,9 @@ export class AssistantRuntime {
       const recovery = this.existingRecovery(String(attempt.id));
       return recovery ? { recoveryContextId: recovery } : {};
     }
+    const unresolved = this.db.prepare(`SELECT context_id FROM assistant_attempt_sources
+      WHERE attempt_id = ? AND state IN ('start_submitting', 'steer_submitting', 'uncertain') LIMIT 1`).get(String(attempt.id));
+    if (unresolved) return {};
     this.beginTerminalizing(turnId);
     this.operations.markAttemptOperationsUncertain(String(attempt.id));
     const result = status === "completed"
@@ -180,7 +183,7 @@ export class AssistantRuntime {
     const members = this.memberContextIds(attempt);
     inTransaction(this.db, () => {
       this.db.prepare("UPDATE assistant_attempts SET state = 'completed', accepting_tools = 0 WHERE id = ?").run(attemptId);
-      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'completed', updated_at = ? WHERE attempt_id = ? AND state NOT IN ('failed','superseded')").run(Date.now(), attemptId);
+      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'completed', updated_at = ? WHERE attempt_id = ? AND state = 'submitted'").run(Date.now(), attemptId);
       for (const contextId of members) {
         this.operations.setSourceState(contextId, "completed");
         this.finalizeEventBatch(contextId, "processed");
@@ -227,7 +230,7 @@ export class AssistantRuntime {
         .run(recoveryId, String(attempt.context_id), JSON.stringify(receipts), Date.now(), binding?.adapterId ?? null, binding?.conversationKey ?? null,
           binding === undefined ? null : JSON.stringify(binding.destination), binding?.reply === undefined ? null : JSON.stringify(binding.reply), arrival);
       this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ?").run(attemptId);
-      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'superseded', updated_at = ? WHERE attempt_id = ? AND state <> 'completed'").run(Date.now(), attemptId);
+      this.db.prepare("UPDATE assistant_attempt_sources SET state = 'superseded', updated_at = ? WHERE attempt_id = ? AND state = 'submitted'").run(Date.now(), attemptId);
       for (const contextId of members) {
         this.db.prepare("UPDATE source_contexts SET state = 'superseded', superseded_by = ? WHERE id = ?").run(recoveryId, contextId);
         this.finalizeEventBatch(contextId, "superseded");
@@ -249,7 +252,7 @@ export class AssistantRuntime {
   }
 
   private memberContextIds(attempt: Record<string, unknown>): string[] {
-    const rows = this.db.prepare("SELECT context_id FROM assistant_attempt_sources WHERE attempt_id = ? ORDER BY source_ordinal")
+    const rows = this.db.prepare("SELECT context_id FROM assistant_attempt_sources WHERE attempt_id = ? AND state IN ('submitted','completed') ORDER BY source_ordinal")
       .all(String(attempt.id)) as Array<{ context_id: string }>;
     return rows.length > 0 ? rows.map((row) => row.context_id) : [String(attempt.context_id)];
   }

@@ -11,6 +11,7 @@ import type { CanonicalChatSource } from "../../src/core/types.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
+import { OperationStore } from "../../src/storage/operation-store.ts";
 
 function binding(adapterId: string, conversationKey: string): ConversationBinding {
   return { adapterId, conversationKey, destination: { id: conversationKey } };
@@ -86,6 +87,28 @@ test("lease acquisition notices every already-pending losing chat, including all
   next.store.createInternalSource({ id: "internal", kind: "event_batch", sourceId: "batch", rawText: "events", attachmentIds: [], receivedAt: 90 });
   next.store.acquireLease({ kind: "internal", contextId: "internal" }, "internal-claim");
   assert.equal(next.deliveries.get("queued:chat")?.body, "[system] queued");
+});
+
+test("a route-bound recovery turn queues chat input and never reserves it as a steer", () => {
+  const { db, deliveries, store } = fixture();
+  const route = binding("telegram", "chat-1");
+  new OperationStore(db).createSourceContext({
+    id: "recovery",
+    kind: "recovery",
+    sourceId: "failed-chat",
+    rawText: "reconcile side effects",
+    attachmentIds: [],
+    binding: route,
+  });
+  const lease = store.acquireLease({ kind: "internal", contextId: "recovery" }, "claim");
+  store.reserveStart("recovery");
+  store.markSubmitted(lease.attemptId, "recovery", "turn");
+
+  const accepted = store.acceptChatSource(message("follow-up", route));
+  assert.equal(accepted.disposition, "queued");
+  assert.equal(deliveries.get("queued:follow-up")?.body, "[system] queued");
+  assert.equal(store.reserveNextSteer(lease.attemptId), undefined);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'follow-up'").get()!.state, "pending");
 });
 
 test("reservations pair source and membership state and allow only one unresolved native submission", () => {

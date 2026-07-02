@@ -22,7 +22,9 @@ async function legacyDatabase(): Promise<{ path: string; db: DatabaseSync }> {
   const legacy = new DatabaseSync(path);
   legacy.exec("PRAGMA foreign_keys=ON");
   legacy.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)");
-  for (let index = 0; index < migrations.length - 1; index += 1) {
+  const preConversationRoutingVersion = 7;
+  assert.ok(migrations.length > preConversationRoutingVersion);
+  for (let index = 0; index < preConversationRoutingVersion; index += 1) {
     legacy.exec("BEGIN IMMEDIATE");
     const migration = migrations[index]!;
     if (typeof migration === "function") migration(legacy);

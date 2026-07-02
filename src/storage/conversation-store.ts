@@ -149,7 +149,7 @@ export class ConversationStore {
       const lease = this.requiredLease();
       if (lease.attemptId !== attemptId || lease.phase !== "active" || lease.steerPaused) this.conflict("attempt is not accepting steering");
       this.assertNoUnresolvedSubmission();
-      if (!lease.binding) return undefined;
+      if (lease.triggerKind !== "chat" || !lease.binding) return undefined;
       const rows = this.db.prepare(`SELECT id FROM source_contexts
         WHERE state = 'pending' AND source_class = 'chat' AND adapter_id = ? AND conversation_key = ?
         ORDER BY arrival_sequence, id`).all(lease.binding.adapterId, lease.binding.conversationKey) as Array<{ id: string }>;
@@ -261,7 +261,7 @@ export class ConversationStore {
   private disposition(source: StoredSource): "pending" | "owner" | "queued" {
     const lease = this.lease();
     if (!lease) return "pending";
-    return lease.binding && source.binding && sameConversation(lease.binding, source.binding) ? "owner" : "queued";
+    return lease.triggerKind === "chat" && lease.binding && source.binding && sameConversation(lease.binding, source.binding) ? "owner" : "queued";
   }
 
   private acquireLeaseInTransaction(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {

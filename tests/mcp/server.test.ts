@@ -53,6 +53,35 @@ test("inactive assistant context is rejected and non-loopback binding is refused
   await client.close(); await server.stop();
 });
 
+test("assistant tools wait at the MCP boundary until startup reconciliation is ready", async (t) => {
+  const operations = new OperationStore(createTestDatabase());
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "ordinary", attachmentIds: [] });
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => { release = resolve; });
+  let called = false;
+  const tools = createAssistantTools(operations, {
+    list_managed_sessions: async () => { called = true; return []; },
+  }, { maxCollectCount: 20 });
+  const server = new LoopbackMcpServer(
+    tools,
+    { current: () => ({ contextId: "ctx", attemptId: "a", turnId: "t" }) },
+    { host: "127.0.0.1", port: 0, token: "secret", beforeToolCall: () => ready },
+  );
+  await server.start();
+  t.after(() => server.stop());
+  const client = new Client({ name: "test", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: { authorization: "Bearer secret" } } }) as any);
+
+  const pending = client.callTool({ name: "list_managed_sessions", arguments: {} });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(called, false);
+  release();
+  assert.equal((await pending).isError, undefined);
+  assert.equal(called, true);
+  await client.close();
+  await server.stop();
+});
+
 test("a bearer token alone is rejected outside the authorized process tree", async (t) => {
   const operations = new OperationStore(createTestDatabase());
   const tools = createAssistantTools(operations, {}, { maxCollectCount: 20 });

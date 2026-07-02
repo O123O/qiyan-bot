@@ -1,5 +1,6 @@
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
 import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
+import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { AssistantLease, ConversationStore, ReservedSubmission } from "../storage/conversation-store.ts";
@@ -42,6 +43,7 @@ interface DispatcherOptions {
   onDeferredTerminal?: (turn: TurnSnapshot) => void;
   scheduler?: AssistantScheduler;
   retryMs?: number;
+  stopWaitMs?: number;
 }
 
 export class ConversationDispatcher {
@@ -156,7 +158,21 @@ export class ConversationDispatcher {
     this.unsubscribeCapacity();
     this.cancelRetry();
     if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
-    await this.idle();
+    const lease = this.store.lease();
+    if (lease) {
+      const unresolved = this.store.membersForAttempt(lease.attemptId)
+        .find((member) => new Set(["start_submitting", "steer_submitting"]).has(member.state));
+      if (unresolved) {
+        this.store.markUncertain(lease.attemptId, unresolved.contextId);
+        this.options.membershipObserver?.notifyMembership(unresolved.contextId);
+      }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.idle(),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, this.options.stopWaitMs ?? 1_000); }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 
   private pump(): void {
@@ -289,9 +305,10 @@ export class ConversationDispatcher {
       if (claim) this.pool.bindTurnCapacityClaim(claim, positive.id);
       if (isTerminal(positive.status)) {
         this.noteConversationPeriod();
-      this.store.beginTerminalizing(positive.id);
-      this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
+        this.store.beginTerminalizing(positive.id);
+        this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
         this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, positive.id);
+        this.options.onDeferredTerminal?.(positive);
       } else this.pump();
       return;
     }
@@ -301,7 +318,10 @@ export class ConversationDispatcher {
       ? thread.turns.find((turn) => turn.id === submission.expectedTurnId)
       : undefined;
     const noActiveTurn = !thread.turns.some((turn) => !isTerminal(turn.status));
-    const provenAbsent = allFull && (submission.submissionKind === "steer" ? !!expected && isTerminal(expected.status) : noActiveTurn);
+    const threadStatus = typeof thread.status === "string" ? thread.status : thread.status?.type;
+    const provenAbsent = allFull && (submission.submissionKind === "steer"
+      ? !!expected && isTerminal(expected.status)
+      : noActiveTurn && threadStatus === "idle");
     if (!provenAbsent) return;
 
     this.store.restorePending(submission.attemptId, submission.contextId);
@@ -335,8 +355,8 @@ export class ConversationDispatcher {
   private launch<T>(promise: Promise<T>, success: (value: T) => void, failure: (error: unknown) => void): void {
     this.networkCount += 1;
     void promise.then(
-      (value) => this.post(() => success(value)),
-      (error) => this.post(() => failure(error)),
+      (value) => this.post(() => { if (!this.stopped) success(value); }),
+      (error) => this.post(() => { if (!this.stopped) failure(error); }),
     ).finally(() => {
       this.networkCount -= 1;
       if (this.networkCount === 0) {
@@ -381,7 +401,13 @@ export class ConversationDispatcher {
   }
 
   private isKnownNonSteerable(error: unknown): boolean {
-    return error instanceof AppError && new Set(["SESSION_IDLE", "OPERATION_CONFLICT"]).has(error.code);
+    if (error instanceof AppError) return new Set(["SESSION_IDLE", "OPERATION_CONFLICT"]).has(error.code);
+    if (!(error instanceof JsonRpcResponseError) || !error.data || typeof error.data !== "object") return false;
+    const data = error.data as Record<string, unknown>;
+    const info = data.codexErrorInfo && typeof data.codexErrorInfo === "object"
+      ? data.codexErrorInfo as Record<string, unknown>
+      : data;
+    return Object.hasOwn(info, "activeTurnNotSteerable");
   }
 
   private noteConversationPeriod(): void {

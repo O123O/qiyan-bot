@@ -64,7 +64,7 @@ test("an existing QiYan database reopens normally", async () => {
   const path = join(root, "bot.sqlite3");
   openDatabase(path).close();
   const reopened = openDatabase(path);
-  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, 8);
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, 9);
   reopened.close();
 });
 

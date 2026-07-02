@@ -81,24 +81,10 @@ export class AttemptScope {
     args: unknown;
     toolFence?: number;
   }): Promise<SafeguardResolution> {
-    const replay = this.operations.findForCall(input.attemptId, input.callId, input.tool);
-    if (replay) {
-      const source = this.source(replay.contextId);
-      const parsed = parseDirective(source.rawText, source.attachmentIds, this.options.maxCollectCount);
-      const directiveKind = this.validate(input.tool, input.args, parsed, source.attachmentIds, false);
-      const operation = this.operations.prepare({
-        contextId: replay.contextId,
-        attemptId: input.attemptId,
-        callId: input.callId,
-        kind: input.tool,
-        args: input.args,
-        effectClass: directiveKind || input.tool === "send_to_session" ? "side_effecting" : "read_only",
-        ...(input.toolFence === undefined ? {} : { toolFence: input.toolFence }),
-      });
-      return this.resolution(replay.contextId, operation, true, directiveKind);
-    }
-
     while (true) {
+      const replay = this.operations.findForCall(input.attemptId, input.callId, input.tool);
+      if (replay) return this.replayResolution(input, replay);
+      await this.waitForAttachmentAdmission(input.attemptId, input.tool, input.args);
       const selected = this.select(input.attemptId, input.tool);
       if (selected.kind === "exhausted") throw new AppError("DIRECTIVE_ALREADY_CONSUMED", `all /${selected.directive} safeguards in this attempt are already consumed`);
       if (selected.kind === "mismatch") throw new AppError("DIRECTIVE_MISMATCH", `next safeguard source requires /${selected.directive}`);
@@ -129,9 +115,45 @@ export class AttemptScope {
         });
       } catch (error) {
         if (error instanceof RetrySelection) continue;
+        const concurrent = this.operations.findForCall(input.attemptId, input.callId, input.tool);
+        if (concurrent) return this.replayResolution(input, concurrent);
         throw error;
       }
     }
+  }
+
+  private async waitForAttachmentAdmission(attemptId: string, tool: GuardedTool, args: unknown): Promise<void> {
+    if (tool !== "send_to_session") return;
+    const attachmentIds = (args as { attachment_ids?: unknown }).attachment_ids;
+    if (!Array.isArray(attachmentIds) || attachmentIds.length === 0) return;
+    const members = this.admittedSources(attemptId);
+    const contexts = new Set<string>();
+    for (const attachmentId of attachmentIds) {
+      if (typeof attachmentId !== "string") throw new AppError("ATTACHMENT_INVALID", "attachment identifier is invalid");
+      const owner = members.find((member) => this.source(member.contextId).attachmentIds.includes(attachmentId));
+      if (!owner) throw new AppError("ATTACHMENT_INVALID", "attachment is not reserved by this assistant attempt");
+      contexts.add(owner.contextId);
+    }
+    for (const contextId of contexts) await this.waitUntilSubmitted(attemptId, contextId);
+  }
+
+  private replayResolution(
+    input: { attemptId: string; callId: string; tool: GuardedTool; args: unknown; toolFence?: number },
+    replay: OperationRecord,
+  ): SafeguardResolution {
+    const source = this.source(replay.contextId);
+    const parsed = parseDirective(source.rawText, source.attachmentIds, this.options.maxCollectCount);
+    const directiveKind = this.validate(input.tool, input.args, parsed, source.attachmentIds, false);
+    const operation = this.operations.prepare({
+      contextId: replay.contextId,
+      attemptId: input.attemptId,
+      callId: input.callId,
+      kind: input.tool,
+      args: input.args,
+      effectClass: directiveKind || input.tool === "send_to_session" ? "side_effecting" : "read_only",
+      ...(input.toolFence === undefined ? {} : { toolFence: input.toolFence }),
+    });
+    return this.resolution(replay.contextId, operation, true, directiveKind);
   }
 
   private select(attemptId: string, tool: GuardedTool): Selection {
