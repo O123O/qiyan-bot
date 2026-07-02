@@ -7,7 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
 import { buildAssistantChildEnvironment } from "../../src/assistant/profile.ts";
 import { readLinuxProcessIdentity } from "../../src/core/process-identity.ts";
-import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tcpConnectionInodes } from "../../src/mcp/server.ts";
+import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, tcpConnectionInodes, ToolReadinessGate } from "../../src/mcp/server.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 
@@ -80,6 +80,20 @@ test("assistant tools wait at the MCP boundary until startup reconciliation is r
   assert.equal(called, true);
   await client.close();
   await server.stop();
+});
+
+test("reconnect blocks tool readiness until the owning recovery pipeline reopens it", async () => {
+  const gate = new ToolReadinessGate();
+  gate.ready();
+  await gate.wait();
+  gate.block();
+  let released = false;
+  const pending = gate.wait().then(() => { released = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(released, false);
+  gate.ready();
+  await pending;
+  assert.equal(released, true);
 });
 
 test("a bearer token alone is rejected outside the authorized process tree", async (t) => {

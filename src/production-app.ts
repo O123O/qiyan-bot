@@ -296,14 +296,6 @@ export async function buildProductionApp(
           enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"))));
         unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
-        unsubscribers.push(assistantEndpoint.onReady(() => {
-          if (acceptingReadyEvents) runBackground(async () => {
-            await dispatcher.recover();
-            await dispatcher.idle();
-            assistant.hydrateActive();
-            assistantToolReadiness.ready();
-          }, () => recordBackgroundFailure("assistant ready reconciliation"));
-        }));
         unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
         unsubscribers.push(assistantEndpoint.onUnavailable(() => {
           assistantToolReadiness.block();

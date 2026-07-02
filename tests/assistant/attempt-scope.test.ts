@@ -133,6 +133,23 @@ test("malformed admitted safeguard blocks fallback and restored pending rejects 
   await assert.rejects(scope.waitUntilSubmitted(lease.attemptId, reserved.contextId), /not admitted|restored/u);
 });
 
+test("a directive steer proven absent no longer governs fresh tool calls in the old turn", async () => {
+  const value = fixture();
+  const absent = admitNext(value, false);
+  value.conversations.restorePending(value.lease.attemptId, absent.contextId);
+  value.scope.notifyMembership(absent.contextId);
+
+  const resolved = await value.scope.resolveSafeguard({
+    attemptId: value.lease.attemptId,
+    callId: "ordinary-after-absence",
+    tool: "send_to_session",
+    args: { nickname: "worker", content: "new work", attachment_ids: [], mode: "steer" },
+  });
+  assert.equal(resolved.effectiveSourceContextId, "primary");
+  assert.equal(resolved.directiveKind, undefined);
+  assert.equal(resolved.operation.contextId, "primary");
+});
+
 test("concurrent retries of one call ID consume one safeguard and replay one operation", async () => {
   const value = fixture();
   admitNext(value);

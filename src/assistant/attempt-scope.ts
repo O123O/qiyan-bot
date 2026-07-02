@@ -157,7 +157,8 @@ export class AttemptScope {
   }
 
   private select(attemptId: string, tool: GuardedTool): Selection {
-    const members = this.admittedSources(attemptId);
+    const members = this.admittedSources(attemptId)
+      .filter((member) => !new Set(["pending", "failed", "superseded"]).has(member.state));
     if (members.length === 0) throw new AppError("OPERATION_CONFLICT", "attempt has no admitted sources");
     const expected = tool === "send_to_session" ? "pass" : "collect";
     let sawExpected = false;
