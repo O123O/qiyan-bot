@@ -31,7 +31,7 @@ export class SessionLifecycle {
     private readonly registry: SessionRegistry,
     private readonly runtime: RuntimeStore,
     private readonly clock: Clock,
-    private readonly workspaces: Pick<ProjectWorkspacePolicy, "assertDispatchable">,
+    private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
   ) {}
 
   async create(
@@ -96,11 +96,14 @@ export class SessionLifecycle {
     const session = this.required(nickname);
     return this.lock(`${session.endpoint}:${session.thread_id}`, async () => {
       this.requireManagementState(session.endpoint, session.thread_id, ["detached", "unavailable"]);
+      const project = await this.workspaces.prepareExisting(session.project_dir);
+      await this.workspaces.assertDispatchable(project);
       const before = await this.read(session.endpoint, session.thread_id);
       this.requireIdle(before.thread);
       this.runtime.setSession(session.endpoint, session.thread_id, "attaching", "idle");
       let resumed = false;
       try {
+        await this.workspaces.assertDispatchable(project);
         const response = await this.pool.request<ThreadResponse>(
           session.endpoint,
           "thread/resume",

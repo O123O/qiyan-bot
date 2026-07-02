@@ -234,7 +234,6 @@ export const migrations: readonly Migration[] = [
   CREATE TABLE IF NOT EXISTS session_dashboard_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     assistant_root TEXT,
-    legacy_migration_complete INTEGER NOT NULL DEFAULT 0,
     dirty INTEGER NOT NULL DEFAULT 1,
     revision INTEGER NOT NULL DEFAULT 0,
     next_observation_sequence INTEGER NOT NULL DEFAULT 1,

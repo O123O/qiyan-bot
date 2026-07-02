@@ -80,28 +80,12 @@ export const SessionDashboardDocumentSchema = z.object({
   sessions: z.record(z.string().min(1), SessionDashboardEntrySchema),
 }).strict();
 
-const legacyEntry = z.object({
-  thread_id: z.string().min(1),
-  project_status: z.string().default(""),
-  current_objective: z.string().optional(),
-  last_sent: z.object({ message: z.string(), at: z.string() }).optional(),
-  last_worker_event: z.object({ message_id: z.string(), status: z.string(), at: z.string() }).optional(),
-  pending_follow_up: z.string().nullable().optional(),
-  updated_at: z.string(),
-});
-
-export const LegacyNotebookDocumentSchema = z.object({
-  version: z.literal(1),
-  sessions: z.record(z.string(), legacyEntry),
-});
-
 const appServerTokenUsage = z.object({
   total: z.object({ totalTokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative() }).strict(),
   last: z.object({ totalTokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative() }).strict(),
   modelContextWindow: z.number().int().nonnegative().nullable(),
 }).strict();
 
-export type LegacyNotebookDocument = z.infer<typeof LegacyNotebookDocumentSchema>;
 export type SessionDashboardDocument = z.infer<typeof SessionDashboardDocumentSchema>;
 export type SessionDashboardEntry = z.infer<typeof SessionDashboardEntrySchema>;
 export type ManagerNotes = z.infer<typeof ManagerNotesSchema>;

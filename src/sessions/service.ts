@@ -76,7 +76,7 @@ export class SessionService {
     if (!options.direct) return messages;
     if (!options.destination) throw new TypeError("destination is required for direct collection");
     options.onSelected?.(messages.map((message) => message.id));
-    return this.prepareCollection(nickname, session, messages, options.destination, options.deliveryKey ?? "legacy");
+    return this.prepareCollection(nickname, session, messages, options.destination, options.deliveryKey ?? "direct-collection");
   }
 
   async collectSelected(nickname: string, messageIds: readonly string[], options: { destination: string; deliveryKey: string }): Promise<Array<{ deliveryId: string }>> {

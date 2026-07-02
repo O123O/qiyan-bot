@@ -53,7 +53,7 @@ export class TelegramApi {
   }
 
   async sendDocument(chatId: number | string, file: { stream: AsyncIterable<Uint8Array | string>; size: number; displayName: string; mediaType: string; caption?: string; replyTo?: number }): Promise<{ message_id: number }> {
-    const boundary = `codexbot-${crypto.randomUUID()}`;
+    const boundary = `qiyanbot-${crypto.randomUUID()}`;
     const safeName = file.displayName.replace(/["\r\n]/gu, "_");
     const captionPart = file.caption === undefined ? "" : `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${file.caption}\r\n`;
     const replyPart = file.replyTo === undefined ? "" : `--${boundary}\r\nContent-Disposition: form-data; name="reply_parameters"\r\n\r\n${JSON.stringify({ message_id: file.replyTo, allow_sending_without_reply: true })}\r\n`;

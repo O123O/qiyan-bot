@@ -9,50 +9,27 @@ import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
 
-test("a legacy local assistant mapping migrates atomically after exact resume verification", async () => {
+test("an assistant mapping on another endpoint is rejected before app-server access", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-identity-"));
   const path = join(dir, "sessions.json");
   const registry = await SessionRegistry.open(path, {
     version: 2,
-    assistant: { endpoint: "local", thread_id: "legacy-thread", project_dir: dir },
+    assistant: { endpoint: "local", thread_id: "other-thread", project_dir: dir },
     sessions: {},
   });
-  const calls: Array<{ method: string; params: any }> = [];
+  let requests = 0;
   const endpoint = {
     id: "assistant-local",
-    request: async <T>(method: string, params: any) => {
-      calls.push({ method, params });
-      return { thread: { id: "legacy-thread", cwd: dir, status: { type: "idle" } } } as T;
-    },
+    request: async <T>() => { requests += 1; return {} as T; },
   };
-  const resumed = await resumeAssistantIdentity({ registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {} });
-  assert.deepEqual(resumed, { threadId: "legacy-thread", nativeStatus: "idle" });
-  assert.equal(calls[0]?.method, "thread/resume");
-  assert.equal(calls[0]?.params.threadId, "legacy-thread");
-  assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.endpoint, "assistant-local");
-  assert.equal(JSON.parse(await readFile(`${path}.last-good`, "utf8")).assistant.endpoint, "assistant-local");
-});
-
-test("legacy assistant migration does not rewrite identity when resumed cwd differs", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "assistant-identity-bad-"));
-  const other = await mkdtemp(join(tmpdir(), "assistant-identity-other-"));
-  const path = join(dir, "sessions.json");
-  const registry = await SessionRegistry.open(path, {
-    version: 2,
-    assistant: { endpoint: "local", thread_id: "legacy-thread", project_dir: dir },
-    sessions: {},
-  });
   await assert.rejects(resumeAssistantIdentity({
     registry,
-    endpoint: {
-      id: "assistant-local",
-      request: async <T>() => ({ thread: { id: "legacy-thread", cwd: other, status: { type: "idle" } } } as T),
-    },
-    legacyEndpointId: "local",
+    endpoint,
     assistantDir: dir,
     sandboxMode: "workspace-write",
     config: {},
-  }), /working directory/);
+  }), /unknown endpoint/);
+  assert.equal(requests, 0);
   assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.endpoint, "local");
 });
 
@@ -71,7 +48,6 @@ test("configured assistant directory mismatch is a safe startup error before app
     await resumeAssistantIdentity({
       registry,
       endpoint: { id: "assistant-local", request: async <T>() => { requests += 1; return {} as T; } },
-      legacyEndpointId: "local",
       assistantDir: configured,
       sandboxMode: "workspace-write",
       config: {},
@@ -98,27 +74,22 @@ test("first profile activation validates, resets only assistant, then marks", as
   };
   const registry = await SessionRegistry.open(path, {
     version: 2,
-    assistant: { endpoint: "assistant-local", thread_id: "legacy", project_dir: assistantDir },
+    assistant: { endpoint: "assistant-local", thread_id: "previous", project_dir: assistantDir },
     sessions,
   });
   const order: string[] = [];
   const activated = await activateAssistantProfileIdentity({
     registry,
     endpointId: "assistant-local",
-    legacyEndpointId: "local",
     assistantDir,
     activationRequired: true,
-    beforeReset: async () => {
-      order.push("reconcile");
-      assert.equal(registry.snapshot().assistant.thread_id, "legacy");
-    },
     markActivated: async () => {
       order.push("marker");
       assert.equal(JSON.parse(await readFile(path, "utf8")).assistant.thread_id, "pending");
     },
   });
   assert.equal(activated, true);
-  assert.deepEqual(order, ["reconcile", "marker"]);
+  assert.deepEqual(order, ["marker"]);
   assert.equal(registry.snapshot().assistant.thread_id, "pending");
   assert.equal(registry.snapshot().assistant.endpoint, "assistant-local");
   assert.deepEqual(registry.snapshot().sessions, sessions);
@@ -135,21 +106,21 @@ test("profile activation is skipped when durable and fails before unsafe mutatio
   });
   let callbacks = 0;
   assert.equal(await activateAssistantProfileIdentity({
-    registry, endpointId: "assistant-local", legacyEndpointId: "local", assistantDir: registered, activationRequired: false,
-    beforeReset: async () => { callbacks += 1; }, markActivated: async () => { callbacks += 1; },
+    registry, endpointId: "assistant-local", assistantDir: registered, activationRequired: false,
+    markActivated: async () => { callbacks += 1; },
   }), false);
   assert.equal(callbacks, 0);
 
   await assert.rejects(activateAssistantProfileIdentity({
-    registry, endpointId: "assistant-local", legacyEndpointId: "local", assistantDir: configured, activationRequired: true,
-    beforeReset: async () => { callbacks += 1; }, markActivated: async () => {},
+    registry, endpointId: "assistant-local", assistantDir: configured, activationRequired: true,
+    markActivated: async () => {},
   }), /does not match configured workdir/);
   assert.equal(callbacks, 0);
   assert.equal(registry.snapshot().assistant.thread_id, "thread");
 
   await assert.rejects(activateAssistantProfileIdentity({
-    registry, endpointId: "assistant-local", legacyEndpointId: "local", assistantDir: registered, activationRequired: true,
-    beforeReset: async () => {}, markActivated: async () => { throw new Error("marker failed"); },
+    registry, endpointId: "assistant-local", assistantDir: registered, activationRequired: true,
+    markActivated: async () => { throw new Error("marker failed"); },
   }), /marker failed/);
   assert.equal(registry.snapshot().assistant.thread_id, "pending");
 });
@@ -178,7 +149,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
     },
   };
   const result = await resumeAssistantIdentity({
-    registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: null,
     recordPendingThread: async (id) => { order.push(`record:${id}`); assert.equal(registry.snapshot().assistant.thread_id, "pending"); },
     clearPendingThread: async (id) => { order.push(`clear:${id}`); assert.equal(registry.snapshot().assistant.thread_id, id); },
@@ -203,7 +174,7 @@ test("pending receipt resumes only exact durable provenance", async () => {
   };
   let cleared: string | undefined;
   const result = await resumeAssistantIdentity({
-    registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: "receipt-thread",
     recordPendingThread: async () => { throw new Error("must not record"); }, clearPendingThread: async (id) => { cleared = id; },
   });
@@ -238,7 +209,7 @@ test("a resume failure preserves an already-proven durable pending receipt", asy
   };
   let cleared = false;
   await assert.rejects(resumeAssistantIdentity({
-    registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: "receipt-thread",
     recordPendingThread: async () => { throw new Error("must not record"); },
     clearPendingThread: async () => { cleared = true; },
@@ -271,7 +242,7 @@ test("registered identity clears a matching stale creation receipt after verifie
   };
   let cleared: string | undefined;
   const result = await resumeAssistantIdentity({
-    registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: "registered-thread",
     recordPendingThread: async () => { throw new Error("must not record"); },
     clearPendingThread: async (id) => { cleared = id; },
@@ -295,8 +266,7 @@ test("registered isolated identity always requires its immutable creation nonce"
   };
   await assert.rejects(resumeAssistantIdentity({
     registry,
-    endpoint: { id: "assistant-local", request: async <T>() => ({ thread } as T) },
-    legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    endpoint: { id: "assistant-local", request: async <T>() => ({ thread } as T) }, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: null,
     recordPendingThread: async () => {}, clearPendingThread: async () => {},
   }), /creation nonce/);
@@ -315,8 +285,7 @@ test("registered isolated identity tolerates a user-renamed thread after receipt
       request: async <T>() => ({
         thread: { id: "registered-thread", cwd: dir, threadSource: "bot-nonce", name: "My manager", status: { type: "idle" } },
       } as T),
-    },
-    legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+    }, assistantDir: dir, sandboxMode: "workspace-write", config: {},
     creationNonce: "bot-nonce", pendingThreadId: null,
     recordPendingThread: async () => {}, clearPendingThread: async () => {},
   });
@@ -342,7 +311,7 @@ test("only exact thread-not-loaded clears a pending receipt", async () => {
       },
     };
     const action = resumeAssistantIdentity({
-      registry, endpoint, legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+      registry, endpoint, assistantDir: dir, sandboxMode: "workspace-write", config: {},
       creationNonce: "bot-nonce", pendingThreadId: "lost",
       recordPendingThread: async (id) => { recorded.push(id); }, clearPendingThread: async (id) => { cleared.push(id); },
     });
@@ -382,8 +351,7 @@ test("pending receipt provenance mismatch fails without clearing", async () => {
     if (field === "name") thread.name = "other";
     await assert.rejects(resumeAssistantIdentity({
       registry,
-      endpoint: { id: "assistant-local", request: async <T>() => ({ thread } as T) },
-      legacyEndpointId: "local", assistantDir: dir, sandboxMode: "workspace-write", config: {},
+      endpoint: { id: "assistant-local", request: async <T>() => ({ thread } as T) }, assistantDir: dir, sandboxMode: "workspace-write", config: {},
       creationNonce: "nonce", pendingThreadId: "receipt", recordPendingThread: async () => {}, clearPendingThread: async () => { cleared = true; },
     }), /identity|working directory|nonce|name/);
     assert.equal(cleared, false);

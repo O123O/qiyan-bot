@@ -15,7 +15,6 @@ interface ThreadResponse {
 export async function resumeAssistantIdentity(input: {
   registry: SessionRegistry;
   endpoint: AssistantEndpoint;
-  legacyEndpointId: string;
   assistantDir: string;
   sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
   config: Record<string, unknown>;
@@ -24,7 +23,7 @@ export async function resumeAssistantIdentity(input: {
   recordPendingThread?(threadId: string): Promise<void>;
   clearPendingThread?(threadId: string): Promise<void>;
 }): Promise<{ threadId: string; nativeStatus: string }> {
-  const { identity, configuredDir } = await validateRegistration(input.registry, input.endpoint.id, input.legacyEndpointId, input.assistantDir);
+  const { identity, configuredDir } = await validateRegistration(input.registry, input.endpoint.id, input.assistantDir);
   let response: ThreadResponse;
   if (identity.thread_id === "pending") {
     const creation = requireCreationState(input);
@@ -52,15 +51,12 @@ export async function resumeAssistantIdentity(input: {
 export async function activateAssistantProfileIdentity(input: {
   registry: SessionRegistry;
   endpointId: string;
-  legacyEndpointId: string;
   assistantDir: string;
   activationRequired: boolean;
-  beforeReset(): Promise<void>;
   markActivated(): Promise<void>;
 }): Promise<boolean> {
   if (!input.activationRequired) return false;
-  await validateRegistration(input.registry, input.endpointId, input.legacyEndpointId, input.assistantDir);
-  await input.beforeReset();
+  await validateRegistration(input.registry, input.endpointId, input.assistantDir);
   await input.registry.setAssistant({ endpoint: input.endpointId, thread_id: "pending", project_dir: input.assistantDir });
   await input.markActivated();
   return true;
@@ -135,9 +131,9 @@ function isExactThreadNotLoaded(error: unknown, threadId: string): boolean {
   return error instanceof JsonRpcResponseError && error.code === -32600 && error.rpcMessage === `thread not loaded: ${threadId}`;
 }
 
-async function validateRegistration(registry: SessionRegistry, endpointId: string, legacyEndpointId: string, assistantDir: string) {
+async function validateRegistration(registry: SessionRegistry, endpointId: string, assistantDir: string) {
   const identity = registry.snapshot().assistant;
-  if (identity.endpoint !== endpointId && identity.endpoint !== legacyEndpointId) {
+  if (identity.endpoint !== endpointId) {
     throw new AppError("CONFIGURATION_ERROR", "the assistant registry entry uses an unknown endpoint");
   }
   const configuredDir = await realpath(assistantDir);

@@ -15,7 +15,6 @@ import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
 import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthenticatedAssistantEndpoint, type PreparedAssistantProfile } from "./assistant/profile.ts";
-import { recoverAssistantProfileAttempts, type LegacyAssistantTurn } from "./assistant/profile-migration.ts";
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler, type AssistantJob } from "./assistant/scheduler.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
@@ -158,7 +157,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     {
       name: "dashboard",
       start: async () => {
-        dashboard = new SessionDashboard(dashboardStore, registry, runtime, { root: assistantDir, path: dashboardPath, now: () => Date.now() });
+        dashboard = new SessionDashboard(dashboardStore, registry, runtime, { root: assistantDir, path: dashboardPath });
         try { await dashboard.initializeAndRender(); }
         catch (error) { queueDashboardWarning(); throw error; }
       },
@@ -275,10 +274,8 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         await activateAssistantProfileIdentity({
           registry,
           endpointId: assistantEndpoint.id,
-          legacyEndpointId: endpoint.id,
           assistantDir,
           activationRequired: assistantProfile.activationRequired,
-          beforeReset: recoverLegacyAssistantAttempts,
           markActivated: () => assistantProfile.markActivated(),
         });
         await startOrResumeAssistant();
@@ -818,7 +815,6 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     const resumed = await resumeAssistantIdentity({
       registry,
       endpoint: assistantEndpoint,
-      legacyEndpointId: endpoint.id,
       assistantDir,
       sandboxMode: config.assistantSandboxMode,
       config: assistantTurnConfig(mcp.url, token),
@@ -828,21 +824,6 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       clearPendingThread: (threadId) => assistantProfile.clearPendingThread(threadId),
     });
     runtime.setSession(assistantEndpoint.id, resumed.threadId, "managed", resumed.nativeStatus);
-  }
-
-  async function recoverLegacyAssistantAttempts(): Promise<void> {
-    const legacy = registry.snapshot().assistant;
-    await recoverAssistantProfileAttempts({
-      runtime: assistant,
-      legacyThreadId: legacy.thread_id,
-      assistantDir,
-      readLegacyThread: async () => (await endpoint.request<any>("thread/read", { threadId: legacy.thread_id, includeTurns: true })).thread,
-      reconcileOperations: () => reconcileOperations({ includeActiveAttempt: true }),
-      completeTurn: async (turn: LegacyAssistantTurn) => {
-        const messages = finals.persistTerminalTurn(assistantEndpoint.id, legacy.thread_id, turn as any, Date.now());
-        assistant.handleTerminal(turn.id, messages.map((message) => message.body).join("\n") || undefined);
-      },
-    });
   }
 
   async function reconcileAssistantAttempts(): Promise<void> {
@@ -971,6 +952,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           let session = registry.get(args.nickname);
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
+          if (project) await projectWorkspaces.assertDispatchable(project);
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
           if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
@@ -1158,9 +1140,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
       if (state.managementState === "unavailable" && state.restoreState !== "managed") continue;
       if (state.managementState !== "managed" && state.managementState !== "unavailable") continue;
       try {
+        const project = await projectWorkspaces.prepareExisting(session.project_dir);
+        await projectWorkspaces.assertDispatchable(project);
         const response = await endpoint.request<any>(
           "thread/resume",
-          workerThreadResumeParams(session.thread_id, session.project_dir),
+          workerThreadResumeParams(session.thread_id, project.path),
         );
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         await verifySessionCwd(response.thread.cwd, session.project_dir);
@@ -1355,6 +1339,8 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
     }
     for (const session of Object.values(document.sessions)) {
       if (session.endpoint !== endpoint.id) throw new Error(`unknown endpoint: ${session.endpoint}`);
+      const project = await projectWorkspaces.prepareExisting(session.project_dir);
+      await projectWorkspaces.assertDispatchable(project);
       const response = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: false });
       await verifySessionCwd(response.thread.cwd, session.project_dir);
     }
@@ -1363,6 +1349,8 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
   async function initializeNewRegistryMappings(): Promise<void> {
     for (const [nickname, session] of Object.entries(registry.snapshot().sessions)) {
       if (runtime.getSession(session.endpoint, session.thread_id)) continue;
+      const project = await projectWorkspaces.prepareExisting(session.project_dir);
+      await projectWorkspaces.assertDispatchable(project);
       const response = await endpoint.request<any>("thread/read", { threadId: session.thread_id, includeTurns: false });
       runtime.setSession(session.endpoint, session.thread_id, "unavailable", response.thread.status?.type ?? "notLoaded");
       dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());

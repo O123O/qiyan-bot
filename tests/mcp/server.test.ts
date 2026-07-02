@@ -144,6 +144,7 @@ test("assistant child is allowlisted while the worker retains the complete user 
   const host = {
     PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth",
     USER_MCP_TOKEN: "worker-only", TELEGRAM_THEME: "dark", TELEGRAM_BOT_TOKEN: "secret",
+    SSL_CERT_FILE: "/custom/ca.pem", SSL_CERT_DIR: "/custom/ca", NODE_EXTRA_CA_CERTS: "/custom/node-ca.pem",
   };
   const worker = buildWorkerChildEnvironment(host);
   const assistant = buildAssistantChildEnvironment(host, { home: "/private/manager-home", codexHome: "/private/manager-codex" }, "manager-token");
@@ -156,6 +157,9 @@ test("assistant child is allowlisted while the worker retains the complete user 
   assert.equal(assistant.CODEX_HOME, "/private/manager-codex");
   assert.equal(assistant.QIYAN_BOT_MCP_TOKEN, "manager-token");
   assert.equal(assistant.OPENAI_API_KEY, "auth");
+  assert.equal(assistant.SSL_CERT_FILE, "/custom/ca.pem");
+  assert.equal(assistant.SSL_CERT_DIR, "/custom/ca");
+  assert.equal(assistant.NODE_EXTRA_CA_CERTS, "/custom/node-ca.pem");
   assert.equal(assistant.USER_MCP_TOKEN, undefined);
   assert.equal(assistant.TELEGRAM_THEME, undefined);
   assert.equal(assistant.TELEGRAM_BOT_TOKEN, undefined);

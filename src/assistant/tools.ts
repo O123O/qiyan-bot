@@ -121,5 +121,6 @@ function isRecord(value: unknown): value is Record<string, unknown> { return val
 const provenNoEffectCodes = new Set([
   "UNKNOWN_SESSION", "AMBIGUOUS_SESSION", "SESSION_DETACHED", "SESSION_BUSY", "SESSION_IDLE", "THREAD_NOT_FOUND",
   "UNSUPPORTED_CAPABILITY", "ATTACHMENT_INVALID", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED",
+  "CONFIGURATION_ERROR",
 ]);
 function isProvenNoEffect(error: unknown): boolean { return error instanceof AppError && provenNoEffectCodes.has(error.code); }

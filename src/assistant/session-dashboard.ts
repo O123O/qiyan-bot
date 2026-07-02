@@ -6,7 +6,6 @@ import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import { SessionDashboardStore } from "../storage/session-dashboard-store.ts";
 import {
-  LegacyNotebookDocumentSchema,
   SessionDashboardDocumentSchema,
   type SessionDashboardDocument,
   type SessionDashboardEntry,
@@ -16,7 +15,6 @@ interface RegistryView { snapshot(): RegistryDocument }
 interface DashboardOptions {
   root: string;
   path: string;
-  now(): number;
   writer?: (path: string, bytes: Uint8Array | string) => Promise<void>;
 }
 
@@ -41,28 +39,9 @@ export class SessionDashboard {
     this.store.claimAssistantRoot(this.options.root);
     const state = await dashboardFileState(this.options.path);
     if (state === "special") throw new AppError("CONFIGURATION_ERROR", "assistant dashboard path must be a regular file");
-    if (!this.store.legacyMigrationComplete()) {
-      if (state === "missing") {
-        this.store.completeEmptyLegacyMigration();
-      } else {
-        const source = await readFile(this.options.path, "utf8");
-        let value: unknown;
-        try { value = JSON.parse(source); }
-        catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
-        if (isRecord(value) && value.version === 1) {
-          try { this.store.importLegacy(LegacyNotebookDocumentSchema.parse(value), registry, this.options.now()); }
-          catch (error) {
-            if (error instanceof AppError) throw error;
-            throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json");
-          }
-        } else if (isRecord(value) && value.version === 2) {
-          try { SessionDashboardDocumentSchema.parse(value); }
-          catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
-          this.store.completeEmptyLegacyMigration();
-        } else {
-          throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json");
-        }
-      }
+    if (state === "regular") {
+      try { SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(this.options.path, "utf8"))); }
+      catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
     }
     this.store.markDirty();
     await this.renderIfDirty();
@@ -155,10 +134,6 @@ async function dashboardFileState(path: string): Promise<"missing" | "regular" |
     if (isErrno(error, "ENOENT")) return "missing";
     throw error;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {

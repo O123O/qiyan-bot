@@ -23,7 +23,7 @@ async function fixture(options: { existing?: string; assistantRoot?: string } = 
     sessions: { payments: { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments" } },
   };
   const registry = { snapshot: () => structuredClone(document) };
-  const dashboard = new SessionDashboard(store, registry, runtime, { root, path, now: () => 1_000 });
+  const dashboard = new SessionDashboard(store, registry, runtime, { root, path });
   return { root, path, db, store, runtime, registry, dashboard, rename: (nickname: string) => {
     const session = document.sessions.payments!;
     document = { ...document, sessions: { [nickname]: session } };
@@ -42,37 +42,10 @@ test("creates and atomically renders a missing version-2 dashboard as mode 0400"
   assert.equal((await stat(value.path)).mode & 0o777, 0o400);
 });
 
-test("migrates only legacy manager fields and preserves exact bytes on invalid input", async () => {
-  const legacy = JSON.stringify({ version: 1, sessions: { old: {
-    thread_id: "thread-1",
-    project_status: "working",
-    current_objective: "finish",
-    last_sent: { message: "unverified", at: "old" },
-    last_worker_event: { message_id: "old", status: "completed", at: "old" },
-    pending_follow_up: "check",
-    updated_at: "old",
-  } } });
-  const value = await fixture({ existing: legacy });
-  await value.dashboard.initializeAndRender();
-  const entry = JSON.parse(await readFile(value.path, "utf8")).sessions.payments;
-  assert.equal(entry.manager_notes.project_summary, "working");
-  assert.equal(entry.manager_notes.supervision_objective, "finish");
-  assert.equal(entry.manager_notes.pending_follow_up, "check");
-  assert.equal(entry.auto_session_info.last_sent, null);
-  assert.equal(entry.auto_session_info.last_worker_event, null);
-
+test("rejects invalid existing dashboards without replacing their bytes", async () => {
   const invalid = await fixture({ existing: "not json" });
   await assert.rejects(invalid.dashboard.initializeAndRender(), /invalid assistant dashboard/);
   assert.equal(await readFile(invalid.path, "utf8"), "not json");
-  assert.equal(invalid.store.legacyMigrationComplete(), false);
-});
-
-test("fails unmatched legacy migration without replacing the source file", async () => {
-  const source = JSON.stringify({ version: 1, sessions: { stale: { thread_id: "missing", project_status: "working", updated_at: "old" } } });
-  const value = await fixture({ existing: source });
-  await assert.rejects(value.dashboard.initializeAndRender(), /exactly one/);
-  assert.equal(await readFile(value.path, "utf8"), source);
-  assert.equal(value.store.legacyMigrationComplete(), false);
 });
 
 test("validates and claims the canonical assistant root before inspecting migration input", async () => {
@@ -89,17 +62,6 @@ test("validates and claims the canonical assistant root before inspecting migrat
     sessions: {},
   });
   await assert.rejects(claimed.dashboard.initializeAndRender(), /assistant.*workdir/);
-});
-
-test("rebuilds after a crash between the migration marker and file replacement", async () => {
-  const source = JSON.stringify({ version: 1, sessions: { old: { thread_id: "thread-1", project_status: "working", updated_at: "old" } } });
-  const value = await fixture({ existing: source });
-  value.store.claimAssistantRoot(value.root);
-  value.store.importLegacy(JSON.parse(source), value.registry.snapshot(), 500);
-  await value.dashboard.initializeAndRender();
-  const document = JSON.parse(await readFile(value.path, "utf8"));
-  assert.equal(document.version, 2);
-  assert.equal(document.sessions.payments.manager_notes.project_summary, "working");
 });
 
 test("rename changes only the rendered key while stable notes remain", async () => {
@@ -120,7 +82,6 @@ test("render failures remain dirty, warn once per episode, and retry", async () 
   const dashboard = new SessionDashboard(value.store, value.registry, value.runtime, {
     root: value.root,
     path: value.path,
-    now: () => 1_000,
     writer: async (path, bytes) => {
       if (fail) throw new Error("private filesystem detail");
       await writeDashboardAtomic(path, bytes);
@@ -147,7 +108,6 @@ test("a mutation during filesystem IO remains dirty for a second serialized rend
   const dashboard = new SessionDashboard(value.store, value.registry, value.runtime, {
     root: value.root,
     path: value.path,
-    now: () => 1_000,
     writer: async (path, bytes) => {
       calls += 1;
       if (calls === 1) { started(); await blocked; }

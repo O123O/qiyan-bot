@@ -1,11 +1,9 @@
 import { AppError } from "../core/errors.ts";
-import type { RegistryDocument } from "../registry/session-registry.ts";
 import {
   DashboardGoalSchema,
   DashboardTokenUsageSchema,
   LastSentSchema,
   LastWorkerEventSchema,
-  LegacyNotebookDocumentSchema,
   ManagerNotesSchema,
   SessionNotesPatchSchema,
   toIsoTimestamp,
@@ -13,7 +11,6 @@ import {
   type DashboardTokenUsage,
   type LastSent,
   type LastWorkerEvent,
-  type LegacyNotebookDocument,
   type ManagerNotes,
   type SessionNotesPatch,
 } from "../assistant/dashboard-schema.ts";
@@ -330,41 +327,6 @@ export class SessionDashboardStore {
         throw new AppError("CONFIGURATION_ERROR", "dashboard database is claimed by a different assistant root");
       }
       if (row.assistant_root === null) this.db.prepare("UPDATE session_dashboard_meta SET assistant_root = ? WHERE singleton = 1").run(canonicalRoot);
-    });
-  }
-
-  legacyMigrationComplete(): boolean { return Number(this.meta().legacy_migration_complete) === 1; }
-
-  completeEmptyLegacyMigration(): void {
-    this.db.prepare("UPDATE session_dashboard_meta SET legacy_migration_complete = 1 WHERE singleton = 1").run();
-  }
-
-  importLegacy(document: LegacyNotebookDocument, registry: RegistryDocument, now: number): void {
-    if (this.legacyMigrationComplete()) return;
-    const parsed = LegacyNotebookDocumentSchema.parse(document);
-    inTransaction(this.db, () => {
-      if (this.legacyMigrationComplete()) return;
-      const mapped = new Set<string>();
-      const writes: Array<{ identity: DashboardIdentity; notes: ManagerNotes }> = [];
-      for (const [nickname, entry] of Object.entries(parsed.sessions)) {
-        const matches = Object.values(registry.sessions).filter((session) => session.thread_id === entry.thread_id);
-        if (matches.length !== 1) throw new AppError("CONFIGURATION_ERROR", `legacy dashboard entry ${nickname} must match exactly one registered session`);
-        const session = matches[0]!;
-        const key = `${session.endpoint}\0${session.thread_id}`;
-        if (mapped.has(key)) throw new AppError("CONFIGURATION_ERROR", `legacy dashboard stable identity appears more than once: ${entry.thread_id}`);
-        mapped.add(key);
-        writes.push({
-          identity: { endpointId: session.endpoint, threadId: session.thread_id },
-          notes: ManagerNotesSchema.parse({
-            project_summary: entry.project_status,
-            supervision_objective: entry.current_objective ?? null,
-            pending_follow_up: entry.pending_follow_up ?? null,
-            updated_at: toIsoTimestamp(now),
-          }),
-        });
-      }
-      for (const write of writes) this.writeNotes(write.identity, write.notes, now);
-      this.db.prepare("UPDATE session_dashboard_meta SET legacy_migration_complete = 1, dirty = 1, revision = revision + 1 WHERE singleton = 1").run();
     });
   }
 

@@ -47,14 +47,21 @@ async function fixture() {
   const runtime = new RuntimeStore(createTestDatabase());
   const project = { path: dir, created: false, fallback: false, identity: { device: "1", inode: "1" } };
   const checked: string[] = [];
+  let blocked = false;
   const lifecycle = new SessionLifecycle(
     new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
     registry,
     runtime,
     { now: () => 10_000 },
-    { assertDispatchable: async (prepared) => { checked.push(prepared.path); } },
+    {
+      prepareExisting: async () => project,
+      assertDispatchable: async (prepared) => {
+        checked.push(prepared.path);
+        if (blocked) throw new AppError("CONFIGURATION_ERROR", "project workspace overlaps protected QiYan state");
+      },
+    },
   );
-  return { dir, registry, endpoint, runtime, lifecycle, project, checked };
+  return { dir, registry, endpoint, runtime, lifecycle, project, checked, block: () => { blocked = true; } };
 }
 
 test("create and adopt verify canonical cwd and establish a managed epoch baseline", async () => {
@@ -164,4 +171,15 @@ test("endpoint loss preserves managed restore state for attach recovery", async 
     nativeStatus: "notLoaded",
     nativeObservationSequence: 0,
   });
+});
+
+test("attach rejects a newly protected project path before app-server access", async () => {
+  const { project, endpoint, lifecycle, block } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1", project);
+  await lifecycle.detach("payments");
+  endpoint.calls.length = 0;
+  block();
+  await assert.rejects(lifecycle.attach("payments"), (error: unknown) =>
+    error instanceof AppError && error.code === "CONFIGURATION_ERROR");
+  assert.deepEqual(endpoint.calls, []);
 });

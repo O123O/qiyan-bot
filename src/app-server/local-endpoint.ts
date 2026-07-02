@@ -5,6 +5,7 @@ import { AppError } from "../core/errors.ts";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import { JsonRpcClient } from "./json-rpc-client.ts";
 import type { RpcRequest } from "./protocol.ts";
+import { APP_VERSION } from "../version.ts";
 
 export interface PermissionBlockedEvent {
   method: string;
@@ -96,7 +97,7 @@ export class LocalEndpoint {
     });
     try {
       const initialized = await client.request<{ userAgent?: string; codexHome?: string }>("initialize", {
-        clientInfo: { name: "qiyan_bot", title: "QiYan Bot", version: "0.1.0" },
+        clientInfo: { name: "qiyan_bot", title: "QiYan Bot", version: APP_VERSION },
         capabilities: { experimentalApi: true },
       });
       if (this.options.expectedVersion) {

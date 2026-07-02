@@ -61,9 +61,13 @@ jobs:
           retired_role="coor""dinator"
           retired_product="codex""-bot"
           retired_package="codex""-chat-bot"
+          retired_compact="codex""bot"
+          retired_spaced="Codex"" bot"
           if grep -RIFni -- "$retired_role" extracted/package \
             || grep -RIFn -- "$retired_product" extracted/package \
-            || grep -RIFn -- "$retired_package" extracted/package
+            || grep -RIFn -- "$retired_package" extracted/package \
+            || grep -RIFn -- "$retired_compact" extracted/package \
+            || grep -RIFn -- "$retired_spaced" extracted/package
           then
             echo "release package contains a retired product identifier" >&2
             exit 1

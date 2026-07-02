@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 const execFileAsync = promisify(execFile);
@@ -43,6 +44,8 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     ["CODEX", "_BOT_"].join(""),
     [retiredRole, "-local"].join(""),
     ["codex", "_bot_manager"].join(""),
+    ["codex", "bot"].join(""),
+    ["Codex", " bot"].join(""),
   ];
   const identityFailures: string[] = [];
   for (const path of await collectFiles(packageRoot)) {
@@ -113,6 +116,31 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     default_projects_root: join(temp, "qiyan-bot-projects"),
   });
   assert.equal(listing.includes("package/assets/assistant/assistant-context.json"), false);
+
+  const legacyRoot = join(temp, "legacy-state");
+  await mkdir(join(legacyRoot, "data"), { recursive: true });
+  const legacyDatabasePath = join(legacyRoot, "data", "bot.sqlite3");
+  const legacyDatabase = new DatabaseSync(legacyDatabasePath);
+  legacyDatabase.exec("CREATE TABLE old_state(value TEXT)");
+  legacyDatabase.close();
+  const rejectedState = spawnSync(executable, [], {
+    cwd: temp,
+    encoding: "utf8",
+    timeout: 10_000,
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: legacyRoot,
+      TELEGRAM_BOT_TOKEN: "pack-test-token",
+      TELEGRAM_OWNER_ID: "1",
+      TELEGRAM_DESTINATION_CHAT_ID: "1",
+      DATA_DIR: join(legacyRoot, "data"),
+      SESSION_REGISTRY_PATH: join(legacyRoot, "registry", "sessions.json"),
+      ASSISTANT_WORKDIR: join(legacyRoot, "assistant"),
+      MCP_PORT: "0",
+    },
+  });
+  assert.equal(rejectedState.status, 1);
+  assert.equal(rejectedState.stderr, "qiyan-bot: CONFIGURATION_ERROR: not a QiYan Bot state database\n");
 
   const globalRoot = join(temp, "global");
   await execFileAsync("npm", ["install", "--global", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", globalRoot, archive]);

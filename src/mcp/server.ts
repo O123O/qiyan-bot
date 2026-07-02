@@ -7,6 +7,7 @@ import { z } from "zod";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import type { AssistantToolName, ToolCallContext, ToolHandler } from "../assistant/tools.ts";
 import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
+import { APP_VERSION } from "../version.ts";
 
 export interface AssistantContextProvider {
   current(): { contextId: string; attemptId: string; turnId: string } | undefined;
@@ -84,11 +85,11 @@ export class LoopbackMcpServer {
 
   private async createProtocolServer(): Promise<{ mcp: McpServer; transport: StreamableHTTPServerTransport }> {
     const mcp = new McpServer(
-      { name: "qiyan-bot-manager", version: "0.1.0" },
+      { name: "qiyan-bot-manager", version: APP_VERSION },
       { instructions: "Assistant-only manager tools. Choose the correct managed session, ask the user when ambiguous, and use ordinary send/collect tools for /pass and /collect." },
     );
     for (const name of TOOL_NAMES) {
-      mcp.registerTool(name, { description: `Codex bot assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
+      mcp.registerTool(name, { description: `QiYan assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
         const active = this.contexts.current();
         if (!active) throw new Error("No active assistant source context");
         const context: ToolCallContext = { sourceContextId: active.contextId, attemptId: active.attemptId, turnId: active.turnId, callId: `mcp:${String(extra.requestId)}` };
@@ -171,6 +172,7 @@ const inheritedEnvironmentKeys = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "CODEX_HOME",
   "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
   "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
 ]);
 
 const workerCredentialDenylist = new Set([

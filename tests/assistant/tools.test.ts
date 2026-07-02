@@ -110,6 +110,24 @@ test("a proven no-effect error does not consume a pass directive", async () => {
   assert.equal(calls, 2);
 });
 
+test("configuration rejection is recorded as proven no effect", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "path", rawText: "create it", attachmentIds: [] });
+  let calls = 0;
+  const tools = createAssistantTools(operations, {
+    create_session: async () => {
+      calls += 1;
+      if (calls === 1) throw new AppError("CONFIGURATION_ERROR", "project directory must be absolute");
+      return { nickname: "docs" };
+    },
+  }, { maxCollectCount: 20 });
+  const base = { sourceContextId: "ctx", attemptId: "a", turnId: "t" };
+  await assert.rejects(tools.create_session({ ...base, callId: "first" }, { nickname: "docs", project_dir: "relative" }), /must be absolute/);
+  assert.equal((db.prepare("SELECT state FROM operations WHERE call_id = 'first'").get() as any).state, "failed");
+  assert.deepEqual(await tools.create_session({ ...base, callId: "second" }, { nickname: "docs", project_dir: "/tmp/docs" }), { nickname: "docs" });
+});
+
 test("manager note updates require a bounded partial patch and expose stable operation order", async () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

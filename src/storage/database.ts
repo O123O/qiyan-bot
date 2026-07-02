@@ -2,6 +2,7 @@ import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { migrations } from "./migrations.ts";
+import { AppError } from "../core/errors.ts";
 
 export type Database = DatabaseSync;
 
@@ -33,7 +34,7 @@ function assertQiYanDatabase(path: string): void {
       { product?: unknown; state_version?: unknown } | undefined;
     if (marker?.product !== "qiyan-bot" || marker.state_version !== 1) throw new Error("invalid marker");
   } catch {
-    throw new Error("not a QiYan Bot state database");
+    throw new AppError("CONFIGURATION_ERROR", "not a QiYan Bot state database");
   } finally {
     inspector?.close();
   }

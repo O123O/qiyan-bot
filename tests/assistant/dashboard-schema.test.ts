@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  LegacyNotebookDocumentSchema,
   SessionDashboardDocumentSchema,
   SessionNotesPatchSchema,
   normalizeTokenUsage,
@@ -39,22 +38,6 @@ test("parses a complete strict version-2 dashboard", () => {
   assert.deepEqual(SessionDashboardDocumentSchema.parse(document), document);
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, extra: true }));
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, sessions: { payments: { ...document.sessions.payments, extra: true } } }));
-});
-
-test("parses legacy manager fields without requiring legacy automatic facts", () => {
-  const parsed = LegacyNotebookDocumentSchema.parse({
-    version: 1,
-    sessions: {
-      old: {
-        thread_id: "thread-1",
-        project_status: "working",
-        current_objective: "finish tests",
-        pending_follow_up: "check migration",
-        updated_at: "legacy-time",
-      },
-    },
-  });
-  assert.equal(parsed.sessions.old?.project_status, "working");
 });
 
 test("manager note patches require a field and accept null clearing", () => {

@@ -17,6 +17,8 @@ const retired = [
   ["CODEX", "_BOT_"].join(""),
   [retiredRole, "-local"].join(""),
   ["codex", "_bot_manager"].join(""),
+  ["codex", "bot"].join(""),
+  ["Codex", " bot"].join(""),
 ];
 
 test("active source and documentation use only the QiYan identity", async () => {
