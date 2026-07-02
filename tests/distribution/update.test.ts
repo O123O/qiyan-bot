@@ -52,7 +52,7 @@ test("updates the detected prefix with exact safe npm arguments and re-reads the
   let observed: { command: string; args: readonly string[]; options: UpdateSpawnOptions } | undefined;
   const runner: UpdateRunner = async (command, args, options) => {
     observed = { command, args, options };
-    await writeManifest(packageRoot, "0.2.0");
+    await writeManifest(packageRoot, "0.3.0");
     return { code: 0, signal: null };
   };
 
@@ -62,7 +62,7 @@ test("updates the detected prefix with exact safe npm arguments and re-reads the
     runner,
   });
 
-  assert.deepEqual(result, { prefix: resolve(prefix), version: "0.2.0" });
+  assert.deepEqual(result, { prefix: resolve(prefix), version: "0.3.0" });
   assert.equal(observed?.command, "npm");
   assert.deepEqual(observed?.args, [
     "install", "--global", "--prefix", resolve(prefix), "--ignore-scripts", "--no-audit", "--no-fund", LATEST_RELEASE_URL,

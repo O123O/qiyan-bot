@@ -36,7 +36,7 @@ test("initializes app-server before becoming ready", async () => {
   await endpoint.start();
   assert.equal(endpoint.state, "ready");
   assert.equal(requests[0]?.method, "initialize");
-  assert.equal((requests[0]?.params as any).clientInfo.version, "0.2.0");
+  assert.equal((requests[0]?.params as any).clientInfo.version, "0.3.0");
   assert.equal(requests[1]?.method, "initialized");
   await endpoint.stop();
   assert.equal(child.killed, true);
