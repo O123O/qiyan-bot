@@ -32,6 +32,7 @@ export function preparedProjectWorkspaceFromCheckpoint(value: unknown): Prepared
 
 export class ProjectWorkspacePolicy {
   private readonly requestedUserHome: string;
+  private readonly requestedQiYanHome: string;
   private readonly requestedAssistantWorkdir: string;
   private readonly requestedDataDir: string;
   private readonly requestedRegistryDir: string;
@@ -39,16 +40,18 @@ export class ProjectWorkspacePolicy {
 
   constructor(options: {
     userHome: string;
+    qiyanHome: string;
     assistantWorkdir: string;
     dataDir: string;
     registryPath: string;
     defaultProjectsRoot?: string;
   }) {
     this.requestedUserHome = resolve(options.userHome);
+    this.requestedQiYanHome = resolve(options.qiyanHome);
     this.requestedAssistantWorkdir = resolve(options.assistantWorkdir);
     this.requestedDataDir = resolve(options.dataDir);
     this.requestedRegistryDir = resolve(dirname(options.registryPath));
-    this.requestedDefaultProjectsRoot = resolve(options.defaultProjectsRoot ?? join(this.requestedUserHome, "qiyan-bot-projects"));
+    this.requestedDefaultProjectsRoot = resolve(options.defaultProjectsRoot ?? join(this.requestedUserHome, "qiyan-projects"));
   }
 
   async prepareCreate(nickname: string, requested?: string): Promise<PreparedProjectWorkspace> {
@@ -135,6 +138,7 @@ export class ProjectWorkspacePolicy {
     const userHome = await projectedCanonical(this.requestedUserHome);
     if (contains(candidate, userHome)) throw managedError("project workspace cannot be a broad parent of the user home");
     const protectedPaths = await Promise.all([
+      this.requestedQiYanHome,
       this.requestedAssistantWorkdir,
       this.requestedDataDir,
       this.requestedRegistryDir,

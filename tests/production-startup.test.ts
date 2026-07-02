@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ test("production prepares the configured assistant workdir before endpoint start
   const dataDir = join(root, "backend-data");
   const registryPath = join(root, "backend-registry", "sessions.json");
   const policyAsset = fileURLToPath(new URL("../assets/assistant/AGENTS.md", import.meta.url));
+  const changedDirectories: string[] = [];
   const config: BotConfig = {
     qiyanHome: join(root, "qiyan-home"),
     telegramBotToken: "test-token",
@@ -38,7 +39,8 @@ test("production prepares the configured assistant workdir before endpoint start
     attachmentStoreMaxBytes: 4096,
     assistantSandboxMode: "danger-full-access",
   };
-  const app = await buildProductionApp(config);
+  await mkdir(config.qiyanHome, { mode: 0o700 });
+  const app = await buildProductionApp(config, { chdir: (path) => { changedDirectories.push(path); } });
   await assert.rejects(app.start());
   await app.stop();
 
@@ -46,10 +48,12 @@ test("production prepares the configured assistant workdir before endpoint start
   assert.match(await readFile(join(workdir, ".qiyan-bot-agents.sha256"), "utf8"), /^[a-f0-9]{64}\n$/u);
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "assistant-context.json"), "utf8")), {
-    version: 1,
+    version: 2,
     user_home: await realpath(root),
-    default_projects_root: join(await realpath(root), "qiyan-bot-projects"),
+    qiyan_home: await realpath(config.qiyanHome),
+    default_projects_root: join(await realpath(root), "qiyan-projects"),
   });
+  assert.deepEqual(changedDirectories, [await realpath(workdir)]);
   assert.equal((await stat(join(workdir, "assistant-context.json"))).mode & 0o777, 0o400);
   assert.equal(JSON.parse(await readFile(registryPath, "utf8")).assistant.project_dir, await realpath(workdir));
   for (const path of [

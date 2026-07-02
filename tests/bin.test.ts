@@ -128,9 +128,10 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.equal(await readFile(join(workdir, "AGENTS.md"), "utf8"), await readFile(join(packageRoot, "assets", "assistant", "AGENTS.md"), "utf8"));
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "session-status.json"), "utf8")), { version: 2, sessions: {} });
   assert.deepEqual(JSON.parse(await readFile(join(workdir, "assistant-context.json"), "utf8")), {
-    version: 1,
+    version: 2,
     user_home: temp,
-    default_projects_root: join(temp, "qiyan-bot-projects"),
+    qiyan_home: join(temp, ".qiyan-bot"),
+    default_projects_root: join(temp, "qiyan-projects"),
   });
   assert.equal(listing.includes("package/assets/assistant/assistant-context.json"), false);
 

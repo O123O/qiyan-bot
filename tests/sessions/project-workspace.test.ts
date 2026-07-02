@@ -9,17 +9,19 @@ import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy } from "
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "qiyan-project-policy-"));
   const userHome = join(root, "home");
-  const assistantWorkdir = join(userHome, ".qiyan-bot", "assistant");
-  const dataDir = join(userHome, ".qiyan-bot", "data");
+  const qiyanHome = join(userHome, ".qiyan-bot");
+  const assistantWorkdir = join(qiyanHome, "qiyan-workdir");
+  const dataDir = join(qiyanHome, "data");
   const registryPath = join(dataDir, "sessions.json");
   await Promise.all([mkdir(assistantWorkdir, { recursive: true }), mkdir(dataDir, { recursive: true })]);
   return {
     root,
     userHome: await realpath(userHome),
+    qiyanHome: await realpath(qiyanHome),
     assistantWorkdir: await realpath(assistantWorkdir),
     dataDir: await realpath(dataDir),
     registryPath,
-    policy: new ProjectWorkspacePolicy({ userHome, assistantWorkdir, dataDir, registryPath }),
+    policy: new ProjectWorkspacePolicy({ userHome, qiyanHome, assistantWorkdir, dataDir, registryPath }),
   };
 }
 
@@ -36,7 +38,7 @@ test("prepares explicit and exclusive fallback project directories", async () =>
   await assert.rejects(value.policy.prepareCreate("relative", "relative/path"), /absolute or begin with ~\//);
 
   const fallback = await value.policy.prepareCreate("payments");
-  assert.equal(fallback.path, join(value.userHome, "qiyan-bot-projects", "payments"));
+  assert.equal(fallback.path, join(value.userHome, "qiyan-projects", "payments"));
   assert.equal(fallback.created, true);
   assert.equal(fallback.fallback, true);
   assert.equal((await stat(fallback.path)).mode & 0o777, 0o700);
@@ -52,6 +54,9 @@ test("rejects broad roots, QiYan state overlap, traversal, and symlink aliases",
     "/",
     value.userHome,
     dirname(value.userHome),
+    value.qiyanHome,
+    join(value.qiyanHome, "unrelated-sibling"),
+    dirname(value.qiyanHome),
     value.assistantWorkdir,
     join(value.assistantWorkdir, "child"),
     dirname(value.assistantWorkdir),
@@ -61,10 +66,15 @@ test("rejects broad roots, QiYan state overlap, traversal, and symlink aliases",
   ];
   for (const path of rejected) await assert.rejects(value.policy.prepareCreate("blocked", path), /protected|broad/);
   await assert.rejects(value.policy.prepareCreate("traversal", `${value.userHome}/Documents/../../`), /protected|broad/);
+  await assert.rejects(value.policy.prepareCreate("missing", join(value.qiyanHome, "missing", "child")), /protected/);
 
   const alias = join(value.root, "data-alias");
   await symlink(value.dataDir, alias, "dir");
   await assert.rejects(value.policy.prepareExisting(alias), /protected/);
+
+  const homeAlias = join(value.root, "qiyan-home-alias");
+  await symlink(value.qiyanHome, homeAlias, "dir");
+  await assert.rejects(value.policy.prepareExisting(homeAlias), /protected/);
 });
 
 test("dispatch revalidation rejects directory replacement and symlink insertion", async () => {

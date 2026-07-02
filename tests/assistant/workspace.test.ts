@@ -26,12 +26,13 @@ async function fixtureWithTemplates(policy: string, options: { nestedInGit?: boo
   const dataDir = join(root, "backend-data");
   const registryPath = join(root, "backend-registry", "sessions.json");
   const userHome = join(root, "home");
-  await mkdir(userHome);
+  const qiyanHome = join(userHome, ".qiyan-bot");
+  await mkdir(qiyanHome, { recursive: true, mode: 0o700 });
   await writeFile(policyTemplate, policy);
   return {
     workdir,
     policyTemplate,
-    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate, userHome },
+    options: { workdir, dataDir, registryPath, policyTemplatePath: policyTemplate, userHome, qiyanHome },
   };
 }
 
@@ -43,9 +44,10 @@ test("installs the managed policy and returns the generated dashboard path", asy
   assert.equal(prepared.dashboardPath, join(prepared.root, "session-status.json"));
   assert.equal(prepared.contextPath, join(prepared.root, "assistant-context.json"));
   assert.deepEqual(JSON.parse(await readFile(prepared.contextPath, "utf8")), {
-    version: 1,
+    version: 2,
     user_home: await realpath(fixture.options.userHome),
-    default_projects_root: join(await realpath(fixture.options.userHome), "qiyan-bot-projects"),
+    qiyan_home: await realpath(fixture.options.qiyanHome),
+    default_projects_root: join(await realpath(fixture.options.userHome), "qiyan-projects"),
   });
   assert.equal((await stat(prepared.contextPath)).mode & 0o777, 0o400);
   await assert.rejects(readFile(prepared.dashboardPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");

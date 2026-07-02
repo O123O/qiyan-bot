@@ -14,6 +14,7 @@ export interface AssistantWorkspaceOptions {
   registryPath: string;
   policyTemplatePath: string;
   userHome: string;
+  qiyanHome: string;
   defaultProjectsRoot?: string;
 }
 
@@ -24,6 +25,7 @@ export interface PreparedAssistantWorkspace {
   dashboardPath: string;
   contextPath: string;
   userHome: string;
+  qiyanHome: string;
   defaultProjectsRoot: string;
   warnings: string[];
 }
@@ -44,7 +46,8 @@ export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptio
     const dataRoot = await realpath(options.dataDir);
     const registryPath = await canonicalFilePath(options.registryPath);
     const userHome = await realpath(options.userHome);
-    const defaultProjectsRoot = await canonicalProjectedPath(options.defaultProjectsRoot ?? join(userHome, "qiyan-bot-projects"));
+    const qiyanHome = await realpath(options.qiyanHome);
+    const defaultProjectsRoot = await canonicalProjectedPath(options.defaultProjectsRoot ?? join(userHome, "qiyan-projects"));
     assertSeparated(root, requestedDataRoot, "configured data directory");
     assertSeparated(root, requestedRegistryPath, "configured registry path");
     assertSeparated(requestedRoot, dataRoot, "canonical data directory");
@@ -83,15 +86,16 @@ export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptio
     const contextPath = join(root, CONTEXT_FILE);
     const contextDigestPath = join(root, CONTEXT_DIGEST_FILE);
     const context = Buffer.from(`${JSON.stringify({
-      version: 1,
+      version: 2,
       user_home: userHome,
+      qiyan_home: qiyanHome,
       default_projects_root: defaultProjectsRoot,
     }, null, 2)}\n`);
     await installGeneratedContext(contextPath, contextDigestPath, context);
 
     const gitRoot = await findGitAncestor(root);
     const warnings = gitRoot ? [`Assistant workdir ${root} is inside Git worktree ${gitRoot}; Codex may inherit parent instructions, project configuration, and repository skills.`] : [];
-    return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), contextPath, userHome, defaultProjectsRoot, warnings };
+    return { root, dataRoot, registryPath, dashboardPath: join(root, "session-status.json"), contextPath, userHome, qiyanHome, defaultProjectsRoot, warnings };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw managedError(`cannot prepare assistant workdir ${options.workdir}`);

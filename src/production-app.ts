@@ -44,7 +44,10 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
 }
 
-export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
+export async function buildProductionApp(
+  config: BotConfig,
+  options: { chdir?: (path: string) => void } = {},
+): Promise<BotApp> {
   const token = randomBytes(32).toString("base64url");
 
   let assistantDir = config.assistantWorkdir;
@@ -102,6 +105,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
           registryPath: config.sessionRegistryPath,
           policyTemplatePath: join(assistantAssetRoot, "AGENTS.md"),
           userHome: config.userHome,
+          qiyanHome: config.qiyanHome,
         });
         assistantDir = prepared.root;
         dataDir = prepared.dataRoot;
@@ -110,6 +114,7 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         assistantWarnings = prepared.warnings;
         projectWorkspaces = new ProjectWorkspacePolicy({
           userHome: prepared.userHome,
+          qiyanHome: prepared.qiyanHome,
           assistantWorkdir: prepared.root,
           dataDir: prepared.dataRoot,
           registryPath: prepared.registryPath,
@@ -117,6 +122,11 @@ export async function buildProductionApp(config: BotConfig): Promise<BotApp> {
         });
         assistantProfile = await prepareAssistantProfile(dataDir);
       },
+      stop: async () => undefined,
+    },
+    {
+      name: "assistant-working-directory",
+      start: async () => { (options.chdir ?? ((path: string) => process.chdir(path)))(assistantDir); },
       stop: async () => undefined,
     },
     {
