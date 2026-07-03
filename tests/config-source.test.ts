@@ -52,6 +52,26 @@ test("loads an owner-only dotenv below host values without mutating process or c
   assert.equal(process.env.TELEGRAM_BOT_TOKEN, processTokenBeforeLoad);
 });
 
+test("accepts Slack adapter and primary selection keys from the private dotenv", async () => {
+  const value = await fixture();
+  await writeDotenv(value.qiyanHome, [
+    "SLACK_APP_TOKEN=xapp-test",
+    "SLACK_BOT_TOKEN=xoxb-test",
+    "SLACK_USER_TOKEN=xoxp-test",
+    "SLACK_TEAM_ID=T123",
+    "SLACK_OWNER_USER_ID=U123",
+    "PRIMARY_CHAT_APP=slack",
+    "",
+  ].join("\n"));
+  const loaded = await loadConfigSource({ HOME: value.home });
+  assert.equal(loaded.values.SLACK_APP_TOKEN, "xapp-test");
+  assert.equal(loaded.values.SLACK_BOT_TOKEN, "xoxb-test");
+  assert.equal(loaded.values.SLACK_USER_TOKEN, "xoxp-test");
+  assert.equal(loaded.values.SLACK_TEAM_ID, "T123");
+  assert.equal(loaded.values.SLACK_OWNER_USER_ID, "U123");
+  assert.equal(loaded.values.PRIMARY_CHAT_APP, "slack");
+});
+
 test("resolves CLI home over environment home and defaults to the real user home", async () => {
   const value = await fixture();
   const environmentHome = join(value.home, "environment-qiyan");

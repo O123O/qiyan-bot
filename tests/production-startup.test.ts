@@ -23,9 +23,10 @@ test("production prepares the configured assistant workdir before endpoint start
   const changedDirectories: string[] = [];
   const config: BotConfig = {
     qiyanHome: join(root, "qiyan-home"),
-    telegramBotToken: "test-token",
-    telegramOwnerId: 42,
-    telegramDestinationChatId: 42,
+    chat: {
+      primary: "telegram",
+      telegram: { token: "test-token", ownerId: 42, destinationChatId: 42 },
+    },
     userHome: root,
     assistantWorkdir: workdir,
     dataDir,

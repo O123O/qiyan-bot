@@ -166,13 +166,23 @@ test("worker environment preserves user configuration while removing only exact 
     TELEGRAM_BOT_TOKEN: "bot-secret",
     TELEGRAM_OWNER_ID: "42",
     TELEGRAM_DESTINATION_CHAT_ID: "42",
+    SLACK_APP_TOKEN: "xapp-secret",
+    SLACK_BOT_TOKEN: "xoxb-secret",
+    SLACK_USER_TOKEN: "xoxp-secret",
+    SLACK_TEAM_ID: "T123",
+    SLACK_OWNER_USER_ID: "U123",
+    PRIMARY_CHAT_APP: "telegram",
     QIYAN_BOT_MCP_TOKEN: "manager-secret",
   });
   assert.equal(env.OPENAI_API_KEY, "auth");
   assert.equal(env.USER_MCP_TOKEN, "user-tool-auth");
   assert.equal(env.CUSTOM_TOOL_HOME, "/custom/tools");
   assert.equal(env.TELEGRAM_THEME, "dark");
-  for (const key of ["TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID", "QIYAN_BOT_MCP_TOKEN"]) {
+  for (const key of [
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_DESTINATION_CHAT_ID",
+    "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TEAM_ID", "SLACK_OWNER_USER_ID", "PRIMARY_CHAT_APP",
+    "QIYAN_BOT_MCP_TOKEN",
+  ]) {
     assert.equal(env[key], undefined);
   }
   const config = assistantTurnConfig("http://127.0.0.1:1/mcp", "mcp-secret");
@@ -187,6 +197,8 @@ test("assistant child is allowlisted while the worker retains the complete user 
   const host = {
     PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth",
     USER_MCP_TOKEN: "worker-only", TELEGRAM_THEME: "dark", TELEGRAM_BOT_TOKEN: "secret",
+    SLACK_APP_TOKEN: "xapp-secret", SLACK_BOT_TOKEN: "xoxb-secret", SLACK_USER_TOKEN: "xoxp-secret",
+    SLACK_TEAM_ID: "T123", SLACK_OWNER_USER_ID: "U123", PRIMARY_CHAT_APP: "slack",
     SSL_CERT_FILE: "/custom/ca.pem", SSL_CERT_DIR: "/custom/ca", NODE_EXTRA_CA_CERTS: "/custom/node-ca.pem",
   };
   const worker = buildWorkerChildEnvironment(host);
@@ -206,4 +218,8 @@ test("assistant child is allowlisted while the worker retains the complete user 
   assert.equal(assistant.USER_MCP_TOKEN, undefined);
   assert.equal(assistant.TELEGRAM_THEME, undefined);
   assert.equal(assistant.TELEGRAM_BOT_TOKEN, undefined);
+  for (const key of ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TEAM_ID", "SLACK_OWNER_USER_ID", "PRIMARY_CHAT_APP"]) {
+    assert.equal(worker[key], undefined);
+    assert.equal(assistant[key], undefined);
+  }
 });

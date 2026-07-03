@@ -83,11 +83,13 @@ export async function buildProductionApp(
   config: BotConfig,
   options: { chdir?: (path: string) => void } = {},
 ): Promise<BotApp> {
+  const telegramConfig = config.chat.telegram;
+  if (!telegramConfig) throw new AppError("UNSUPPORTED_CAPABILITY", "Slack production composition is not available yet");
   const token = randomBytes(32).toString("base64url");
   const administrativeBinding: ConversationBinding = {
     adapterId: "telegram",
-    conversationKey: `telegram:${config.telegramDestinationChatId}`,
-    destination: { chatId: String(config.telegramDestinationChatId) },
+    conversationKey: `telegram:${telegramConfig.destinationChatId}`,
+    destination: { chatId: String(telegramConfig.destinationChatId) },
   };
 
   let assistantDir = config.assistantWorkdir;
@@ -415,8 +417,8 @@ export async function buildProductionApp(
       name: "delivery",
       start: async () => {
         chat = new TelegramChatAdapter(db, attachments, {
-          token: config.telegramBotToken,
-          ownerId: config.telegramOwnerId,
+          token: telegramConfig.token,
+          ownerId: telegramConfig.ownerId,
           maxMessageBytes: config.attachmentMaxBytes,
           onMessage: (source, checkpoint) => dispatcher.accept(source, checkpoint),
         });

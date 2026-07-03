@@ -15,8 +15,74 @@ function baseEnv(overrides: Record<string, string | undefined> = {}): Record<str
 
 const qiyanHome = "/home/test-user/private-qiyan";
 
-test("loadConfig requires the Telegram token", () => {
-  assert.throws(() => loadConfig({}, { qiyanHome }), /TELEGRAM_BOT_TOKEN/);
+test("loadConfig requires at least one complete chat adapter", () => {
+  assert.throws(() => loadConfig({ HOME: "/home/test-user" }, { qiyanHome }), /chat adapter/i);
+  assert.throws(() => loadConfig({ HOME: "/home/test-user", TELEGRAM_BOT_TOKEN: "partial" }, { qiyanHome }), /Telegram.*group/i);
+  assert.throws(() => loadConfig({ HOME: "/home/test-user", SLACK_APP_TOKEN: "xapp-partial" }, { qiyanHome }), /Slack.*group/i);
+});
+
+test("loadConfig accepts Telegram-only and Slack-only adapter groups", () => {
+  assert.deepEqual(loadConfig(baseEnv(), { qiyanHome }).chat, {
+    primary: "telegram",
+    telegram: { token: "secret", ownerId: 42, destinationChatId: 42 },
+  });
+  assert.deepEqual(loadConfig({
+    HOME: "/home/test-user",
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_TEAM_ID: "T123",
+    SLACK_OWNER_USER_ID: "U123",
+  }, { qiyanHome }).chat, {
+    primary: "slack",
+    slack: {
+      appToken: "xapp-test",
+      botToken: "xoxb-test",
+      userToken: "xoxp-test",
+      teamId: "T123",
+      ownerUserId: "U123",
+    },
+  });
+});
+
+test("loadConfig requires an exact configured primary when both adapters exist", () => {
+  const both = baseEnv({
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_TEAM_ID: "T123",
+    SLACK_OWNER_USER_ID: "U123",
+  });
+  assert.throws(() => loadConfig(both, { qiyanHome }), /PRIMARY_CHAT_APP/);
+  assert.equal(loadConfig({ ...both, PRIMARY_CHAT_APP: "slack" }, { qiyanHome }).chat.primary, "slack");
+  assert.equal(loadConfig({ ...both, PRIMARY_CHAT_APP: "telegram" }, { qiyanHome }).chat.primary, "telegram");
+  assert.throws(() => loadConfig({
+    HOME: "/home/test-user",
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_TEAM_ID: "T123",
+    SLACK_OWNER_USER_ID: "U123",
+    PRIMARY_CHAT_APP: "telegram",
+  }, { qiyanHome }), /PRIMARY_CHAT_APP/);
+});
+
+test("loadConfig rejects malformed Slack credential identities", () => {
+  const slack = {
+    HOME: "/home/test-user",
+    SLACK_APP_TOKEN: "xapp-test",
+    SLACK_BOT_TOKEN: "xoxb-test",
+    SLACK_USER_TOKEN: "xoxp-test",
+    SLACK_TEAM_ID: "T123",
+    SLACK_OWNER_USER_ID: "U123",
+  };
+  for (const [key, value] of [
+    ["SLACK_APP_TOKEN", "xoxb-wrong"],
+    ["SLACK_BOT_TOKEN", "xoxp-wrong"],
+    ["SLACK_USER_TOKEN", "xoxb-wrong"],
+    ["SLACK_TEAM_ID", "U123"],
+    ["SLACK_OWNER_USER_ID", "T123"],
+  ] as const) assert.throws(() => loadConfig({ ...slack, [key]: value }, { qiyanHome }), new RegExp(key));
 });
 
 test("loadConfig applies bounded defaults", () => {
