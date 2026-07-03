@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
+import { DeliveryWorker } from "../../src/chat/delivery-worker.ts";
 import { SlackDeliveryAdapter, slackClientMessageId } from "../../src/slack/delivery-adapter.ts";
 import { SlackApiError, type SlackBotClient } from "../../src/slack/clients.ts";
+import { createTestDatabase } from "../../src/storage/database.ts";
+import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
 function client(overrides: Partial<SlackBotClient> = {}) {
   const messages: Record<string, unknown>[] = [];
@@ -50,6 +54,21 @@ test("Slack delivery posts DMs and thread replies with stable UUID client IDs", 
   assert.match(slackClientMessageId("delivery-one"), /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
   assert.equal(slackClientMessageId("delivery-one"), slackClientMessageId("delivery-one"));
   assert.notEqual(slackClientMessageId("delivery-one"), slackClientMessageId("delivery-two"));
+});
+
+test("a successful message response without an identity becomes durably uncertain", async () => {
+  const fake = client({ postMessage: async () => ({ ok: true, channel: "D123" }) });
+  const adapter = new SlackDeliveryAdapter("T123", fake.value);
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({
+    id: "missing-message-id", kind: "chat", mandatory: true, body: "hello",
+    binding: { adapterId: "slack", conversationKey: "slack:T123:dm:D123", destination: { workspaceId: "T123", channelId: "D123" } },
+  });
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: adapter }]));
+
+  await assert.rejects(worker.processOne(delivery.id), (error: unknown) =>
+    error instanceof SlackApiError && error.deterministic === false && error.safeToRetry === false);
+  assert.equal(store.get(delivery.id)?.state, "uncertain");
 });
 
 test("Slack documents use upload-v2 with the frozen channel thread and return opaque file IDs", async () => {

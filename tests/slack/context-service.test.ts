@@ -207,14 +207,33 @@ test("search fails actionably on page one and returns explicit partial coverage 
   assert.equal(JSON.stringify(result).includes("next"), false);
 });
 
-test("search identifies rate-limited and authorization-limited continuations", async () => {
+test("search reports every first-page Slack failure category actionably", async () => {
+  for (const [category, message] of [
+    ["rate_limited", /rate limit.*retry/i],
+    ["authorization", /authorization|scope/i],
+    ["invalid_request", /invalid|rejected/i],
+    ["service", /service.*unavailable|try again/i],
+    ["unknown", /search is unavailable/i],
+  ] as const) {
+    const failure = new SlackApiError("sanitized Slack failure", undefined, undefined, false, false, category);
+    const fake = searchHarness(() => { throw failure; });
+    const service = new SlackContextService(bot({}).client, "T123", {
+      search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.now(),
+    });
+    await assert.rejects(service.search("launch"), message);
+  }
+});
+
+test("search identifies every Slack continuation failure category", async () => {
   for (const [category, marker, warning] of [
     ["rate_limited", "rate_limited", /rate limit/i],
     ["authorization", "authorization_failed", /authorization|scope/i],
+    ["invalid_request", "invalid_request", /invalid|rejected/i],
+    ["service", "service_unavailable", /service.*unavailable|try again/i],
+    ["unknown", "pagination_failed", /continuation failed/i],
   ] as const) {
-    const failure = Object.assign(
-      new SlackApiError("sanitized Slack continuation failure", category === "rate_limited" ? 429 : undefined, undefined, false, false),
-      { category },
+    const failure = new SlackApiError(
+      "sanitized Slack continuation failure", category === "rate_limited" ? 429 : undefined, undefined, false, false, category,
     );
     const fake = searchHarness((_args, call) => {
       if (call > 1) throw failure;

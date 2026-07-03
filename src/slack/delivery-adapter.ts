@@ -30,7 +30,7 @@ export class SlackDeliveryAdapter implements ChatDeliveryAdapter {
     });
     const messageTs = stringField(result, "ts");
     const channelId = stringField(result, "channel") ?? target.channelId;
-    if (!messageTs) throw new SlackApiError("Slack chat.postMessage returned no message identity", undefined, undefined, true, false);
+    if (!messageTs) throw new SlackApiError("Slack chat.postMessage returned no message identity", undefined, undefined, false, false);
     return { channelId, messageTs };
   }
 

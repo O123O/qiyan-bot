@@ -109,7 +109,7 @@ export class SlackContextService implements ChatHistoryProvider {
           ...(cursor ? { cursor } : {}),
         });
       } catch (error) {
-        if (page === 0) throw new AppError("ENDPOINT_UNAVAILABLE", "Slack search is unavailable; verify the read-only user token and search scopes");
+        if (page === 0) throw firstPageFailure(error);
         complete = false;
         const failure = continuationFailure(error);
         warning = failure.warning;
@@ -367,7 +367,35 @@ function continuationFailure(error: unknown): { marker: string; warning: string 
       warning: "Slack search continuation failed authorization or scope checks; remaining requested coverage was omitted.",
     };
   }
+  if (error instanceof SlackApiError && error.category === "invalid_request") {
+    return {
+      marker: "invalid_request",
+      warning: "Slack rejected the search continuation as invalid; returned results are partial.",
+    };
+  }
+  if (error instanceof SlackApiError && error.category === "service") {
+    return {
+      marker: "service_unavailable",
+      warning: "Slack search service became unavailable; returned results are partial and a later retry may complete them.",
+    };
+  }
   return { marker: "pagination_failed", warning: "Slack search continuation failed; returned results are partial." };
+}
+
+function firstPageFailure(error: unknown): AppError {
+  if (error instanceof SlackApiError && error.category === "rate_limited") {
+    return new AppError("ENDPOINT_UNAVAILABLE", "Slack search hit a rate limit; retry the request later.");
+  }
+  if (error instanceof SlackApiError && error.category === "authorization") {
+    return new AppError("ENDPOINT_UNAVAILABLE", "Slack search authorization or scope validation failed; verify the read-only user token and search scopes.");
+  }
+  if (error instanceof SlackApiError && error.category === "invalid_request") {
+    return new AppError("ENDPOINT_UNAVAILABLE", "Slack rejected the search request as invalid; narrow the query or date range.");
+  }
+  if (error instanceof SlackApiError && error.category === "service") {
+    return new AppError("ENDPOINT_UNAVAILABLE", "Slack search service is unavailable; try again later.");
+  }
+  return new AppError("ENDPOINT_UNAVAILABLE", "Slack search is unavailable; verify the read-only user token and search scopes");
 }
 
 function withinDateBounds(item: IndexedSearchMatch, fromMs: number | undefined, toMs: number): boolean {
