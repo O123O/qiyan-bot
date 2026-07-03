@@ -2,7 +2,7 @@
 
 Date: 2026-07-03
 
-Status: Approved design
+Status: Approved design, amended after security/API review
 
 ## Objective
 
@@ -28,7 +28,7 @@ Multi-workspace installation, posting as the owner, private content outside the 
 Use Slack's focused official Node SDK packages rather than Bolt or raw protocols:
 
 - `@slack/socket-mode` owns the WebSocket connection, acknowledgements, and reconnect behavior.
-- `@slack/web-api` owns Slack Web API formatting, retries, rate-limit handling, pagination, and the current file-upload flow.
+- `@slack/web-api` owns Slack Web API formatting, pagination, and the current file-upload flow. SDK retries are disabled for side-effecting clients; QiYan alone decides whether a failed write is proven safe to retry.
 
 Bolt is not used because QiYan already owns application lifecycle, routing, persistence, delivery, and tool dispatch. Raw WebSocket and HTTP implementations would duplicate reconnection, acknowledgement, rate-limit, and upload behavior without improving the product boundary.
 
@@ -88,7 +88,7 @@ Slack startup validation must prove that:
 - the bot identity differs from the owner identity;
 - Socket Mode can establish a connection;
 - public Real-time Search is available;
-- granted private, IM, MPIM, file, and user-search coverage is recorded accurately;
+- requested private, IM, MPIM, file, and user-search coverage is recorded without claiming that `assistant.search.info` can reveal per-user consent that Slack does not expose;
 - the bot can open or resolve its DM with the owner.
 
 A configured but invalid adapter is a startup configuration failure. A runtime Slack disconnection does not stop Telegram.
@@ -129,18 +129,18 @@ For the first release, the owner copies the app, bot, and user tokens plus works
 Socket Mode delivery must not create a loss window. Each authorized event follows this sequence:
 
 1. Validate envelope shape, team ID, event type, and owner user ID.
-2. Normalize only the fields required for later processing and insert a durable Slack inbox row.
+2. Normalize only the fields required for later processing, assign a monotonic inbox arrival sequence, and insert a durable Slack inbox row. For an authorized mention, atomically record its pending thread activation in the same transaction.
 3. Acknowledge the Socket Mode envelope after that insert commits.
 4. Process pending inbox rows asynchronously.
-5. Download authorized trigger attachments into the shared attachment store.
+5. Download authorized trigger attachments into the shared attachment store using deterministic stable-message-and-file-derived handles.
 6. Create a canonical source and accept it through the conversation dispatcher.
 7. Mark the inbox row processed in the same transaction that accepts or deduplicates the source.
 
 If inbox persistence fails, do not acknowledge; Slack may redeliver. Unauthorized users, unsupported events, bot messages, service messages, and irrelevant channel messages are acknowledged and discarded without retaining their content.
 
-Persist only normalized event fields. Never persist the Socket Mode `action_token`; the selected design uses the read-only user token for search.
+Persist only normalized event fields and per-file download state. Never persist the Socket Mode `action_token`; the selected design uses the read-only user token for search.
 
-Slack event ID deduplicates envelopes. The stable native message identity is workspace, channel, and message timestamp, which deduplicates overlapping `app_mention` and `message.*` delivery of the same Slack message.
+Slack event ID deduplicates envelopes. The stable native message identity is workspace, channel, and message timestamp, which deduplicates overlapping `app_mention` and `message.*` delivery of the same Slack message. Canonical source scope and attachment handles derive from that stable message identity—not event ID. The single ordered ingress worker checks for an already accepted canonical source before any file work, so overlapping events cause at most one file download or permanent-failure decision, one warning, one attachment row, and one retain.
 
 ## Activation and conversation identity
 
@@ -151,7 +151,7 @@ Activation rules are deterministic:
 - A non-mention owner message in a public or private channel is eligible only when its thread was previously activated as a QiYan conversation.
 - Other channel traffic is ignored at ingress. QiYan may later retrieve it explicitly as context.
 
-Activated chat conversations are recorded durably rather than inferred only from the current lease. This lets an owner continue an already activated Slack thread without mentioning QiYan again, including while that thread is queued behind another app's active conversation.
+Activated chat conversations are recorded durably rather than inferred only from the current lease. A mention's activation commits with its inbox row before Socket Mode acknowledgement, not later with asynchronous source processing, so an immediate owner follow-up cannot race ahead and be discarded. Inbox processing remains ordered by its committed monotonic sequence—even for equal timestamps—and an older transient failure blocks later rows. This lets an owner continue an already activated Slack thread without mentioning QiYan again, including while that thread is queued behind another app's active conversation.
 
 Conversation keys are:
 
@@ -209,10 +209,12 @@ get_chat_history(scope, count, before?)
 
 The current source binding selects the adapter. For Slack:
 
-- `scope="conversation"` reads the active thread or DM;
-- `scope="channel"` reads recent messages from the active channel;
+- `scope="conversation"` uses `conversations.replies` with the persisted root timestamp for a channel thread, including the root and replies, and uses `conversations.history` for a DM;
+- `scope="channel"` uses `conversations.history` for the active channel;
 - `count` is bounded by the tool schema;
 - `before` is an optional opaque platform timestamp from an earlier result.
+
+History returns the newest `count` messages before the requested boundary and renders that window oldest-to-newest for model context, plus the next opaque `before` boundary. A supplied `before` is exclusive, matching Slack's `latest` boundary with `inclusive=false`, so adjacent calls neither duplicate nor skip a timestamp. Because `conversations.replies` pages oldest-first, thread history consumes all pages up to the boundary into a bounded `count`-sized ring, deduplicates the root timestamp, and then selects the newest window. DM/channel history consumes Slack's newest-first pages only until the window is full.
 
 Telegram initially returns an explicit unsupported-capability error because the Bot API cannot retrieve arbitrary historical chat messages.
 
@@ -231,45 +233,28 @@ Dates accept an ISO `YYYY-MM-DD` date or ISO-8601 timestamp and are normalized t
 
 Slack does not expose its Activity feed through an API. Consequently, “all mentions” means all exact matches returned by Slack's supported search index across the coverage authorized for the user token, not a promise to reproduce historical Activity notifications.
 
-Both tools report searched and unavailable coverage categories so QiYan never describes a partial private search as workspace-complete.
+Both tools report the channel/content categories requested from Slack, state that Slack enforced the user token's current authorization, and identify any explicit API errors or omitted categories. Because `assistant.search.info` exposes AI-search availability but not each private-consent grant, QiYan must not describe a private search as workspace-complete merely because the call succeeded.
 
 If search fails before yielding any page, the tool returns an actionable error. If a later page fails after earlier pages were collected, the tool materializes those results with `complete=false` and a warning naming the omitted coverage or rate-limited continuation. It never labels a partial result as all mentions.
 
-## Large search result policy
+## Transient search result policy
 
-`search_slack` and `get_slack_mentions` share one result materializer. They do not expose Slack cursors to QiYan.
+Slack's Real-time Search terms prohibit storing or copying retrieved result data. Therefore `search_slack` and `get_slack_mentions` never write result bodies to SQLite, operation receipts, logs, dashboards, or files. They share an in-memory response limiter and do not expose Slack cursors to QiYan.
 
-Results are sorted newest first with a stable channel-and-timestamp tie break. Return results inline only when both are true:
+Results are requested newest first and stabilized with a channel-and-timestamp tie break. The backend consumes every Slack cursor to determine total count and completion through an incremental limiter that discards bodies outside the bounded prefix immediately; it never accumulates the complete normalized result set. It returns only the newest prefix satisfying both limits:
 
-- match count is at most 30;
-- combined rendered result text is at most 3,000 Unicode-whitespace-delimited words.
+- at most 30 matches;
+- at most 3,000 Unicode-whitespace-delimited rendered words.
 
-Otherwise write a human-readable Markdown report below the private QiYan data directory, for example:
+The response contains `count`, `returned_count`, `truncated`, `order="newest_first"`, `complete`, requested/limited coverage metadata, and the transient `results` prefix. When truncated, it includes an explicit warning telling QiYan to narrow the query or date range; it never creates a report path. `complete` describes Slack pagination, while `truncated` independently describes the model-facing prefix.
 
-```text
-<data-dir>/tmp/slack-results/slack-mentions-<random>.md
-```
-
-The directory is owner-only and report files are regular mode-`0600` files created without following symlinks. Filenames are randomized. The tool response contains:
-
-```json
-{
-  "count": 184,
-  "large_result": true,
-  "path": "/private/path/slack-mentions-random.md",
-  "order": "newest_first",
-  "complete": true,
-  "coverage": ["public", "private", "im", "mpim"]
-}
-```
-
-Inline responses contain the same metadata plus `results`. Maintenance and startup cleanup delete reports older than 24 hours. Reports never contain access tokens, action tokens, raw authorization responses, or unrelated Slack payload fields.
+These two tools bypass durable operation-receipt replay because even a read-only receipt would retain result content. Retrying the same call may observe newer Slack state. The only copies are the in-memory call result and the immediate model context needed to answer the owner's request.
 
 ## Attachments
 
-Authorized trigger messages may include Slack-hosted files. The ingress worker downloads them with the bot token because the bot is a member of the triggering conversation. Downloads stream into the existing attachment store and retain its byte limit, total quota, randomized private paths, immutable source scope, and expiry rules.
+Authorized trigger messages may include Slack-hosted files. The ingress worker downloads them with the bot token because the bot is a member of the triggering conversation. Downloads stream into the existing attachment store and retain its byte limit, total quota, private paths, immutable source scope, and expiry rules. Each Slack file uses a deterministic handle derived from workspace, channel, message timestamp, and Slack file ID; the inbox records per-file completion. The worker checks for that handle before requesting another download. A crash or overlapping Slack event reuses the same object and cannot create quota-consuming duplicates.
 
-Transient download failures retain the Slack inbox row for retry. A permanent access or file failure preserves any text portion of the message, creates an explicit unavailable-file placeholder for QiYan, and queues a warning in the same causal Slack conversation. An attachment-only message with a permanent failure still produces a source containing the placeholder, so it is not silently lost.
+Transient download failures retain the Slack inbox row for retry. A permanent access or file failure preserves the immutable owner text and stores a separate immutable failed-attachment descriptor. QiYan receives an explicit unavailable-file text item beside, not inside, the owner text, and the backend queues a warning in the same causal Slack conversation. An attachment-only message with a permanent failure still produces a source containing that descriptor, so it is not silently lost. Attempt-scoped `/pass` validation rejects the matched directive source when that source has a failed attachment rather than authorizing a text-only send that silently drops the file; a failed attachment on an unrelated ordinary attempt member does not invalidate another source's valid directive.
 
 Outbound files use the current `files.getUploadURLExternal` plus upload plus `files.completeUploadExternal` sequence through the official SDK convenience API. The deprecated `files.upload` method is forbidden.
 
@@ -279,7 +264,7 @@ Slack message delivery uses the existing outbox and immutable `ConversationBindi
 
 Use a stable `client_msg_id` derived from the delivery ID when Slack accepts it. Message and file receipts persist Slack channel, timestamp, and file identifiers as opaque JSON.
 
-The official SDK honors Slack rate-limit responses and `Retry-After`. Retryable transport failures retain durable delivery state. A file upload whose effect is uncertain is not blindly repeated; it becomes an uncertain delivery and produces one mandatory visible warning, matching the existing no-duplicate side-effect policy.
+Side-effecting Slack Web API clients use zero automatic retries and reject rate-limited calls back to QiYan. A write is retried only when its error proves no effect (for example, a pre-dispatch rate limit); ambiguous transport or upload-stage failures become uncertain. A file upload whose effect is uncertain is not blindly repeated and produces one mandatory visible warning, matching the existing no-duplicate side-effect policy.
 
 Runtime Socket Mode disconnection triggers SDK reconnect without stopping other chat adapters. Slack-bound outbox rows remain pending or uncertain until Slack recovers. Revocation of the read-only user token disables Slack search tools with an actionable warning but leaves bot messaging available. Startup with invalid configured credentials fails rather than silently disabling Slack.
 
@@ -287,11 +272,15 @@ Runtime Socket Mode disconnection triggers SDK reconnect without stopping other 
 
 Add durable schema for:
 
-- normalized Slack inbox rows and their retry/processed state;
+- normalized Slack inbox rows, deterministic per-file download checkpoints, and retry/processed state;
 - activated chat-conversation identities;
 - the latest accepted owner route.
 
+Chat source rows also gain immutable failed-attachment metadata so unavailable Slack files survive source acceptance, Codex input construction, safeguard validation, and restart without mutating the owner's raw text.
+
 Existing Telegram source, attempt, lease, operation, attachment, and delivery tables remain authoritative. Slack sources use `kind="slack"` and `source_class="chat"`. Migration preserves existing Telegram installations and derives the initial latest route from the configured primary adapter only when no accepted-route record exists.
+
+Routing backfill accepts an optional legacy Telegram binding. A fresh Slack-only database has no legacy Telegram rows and completes without one. Before writable open enables WAL or applies schema migrations, an immutable read-only preflight inspects an existing database. If a pre-cutover database still contains Telegram rows whose binding must be reconstructed, startup requires the matching Telegram configuration and fails without changing database bytes or sidecars when it is absent; Slack primary-DM resolution is never used to reinterpret historical Telegram data.
 
 ## Test strategy
 
@@ -304,8 +293,9 @@ Existing Telegram source, attempt, lease, operation, attachment, and delivery ta
 - Leading mention removal and exact `/pass` and `/collect` payload preservation.
 - Conversation keys and thread-root behavior.
 - Search coverage, exact owner-mention filtering, UTC date bounds, complete cursor consumption, and newest-first stable ordering.
-- The 30-match and 3,000-word inline boundaries.
-- Markdown report contents, path confinement, regular-file checks, mode `0600`, and 24-hour expiry.
+- Multi-page thread/DM/channel history, root inclusion, chronological output, and exclusive `before` boundaries.
+- The 30-match and 3,000-word transient-prefix boundaries.
+- No Real-time Search result bodies in SQLite, files, logs, operation receipts, or dashboards.
 - Token redaction, dotenv validation, and child-environment isolation.
 
 ### Component tests with injected Slack clients
@@ -314,9 +304,10 @@ Existing Telegram source, attempt, lease, operation, attachment, and delivery ta
 - No acknowledgement on persistence failure.
 - Redelivery and duplicate-envelope handling.
 - Restart processing of pending inbox rows.
-- Authenticated attachment download, retry, permanent failure placeholder, and quotas.
+- Authenticated attachment download, deterministic crash recovery, permanent failure descriptors, and quotas.
+- `/pass` refusal when the matched directive source has an unavailable attachment, without contaminating another source's directive.
 - Threaded bot messages, DM messages, `client_msg_id`, and file upload v2.
-- Rate-limit and transport failure behavior.
+- Zero SDK write retries plus proven-no-effect rate-limit and ambiguous transport behavior.
 - Narrow read-only user client method allowlist.
 
 ### Integration tests
