@@ -25,9 +25,27 @@ export interface SlackSocketModeClient {
 
 interface SlackChatAdapterDependencies {
   clients?: SlackClients;
-  createSocketModeClient?: (options: { appToken: string }) => SlackSocketModeClient;
+  createSocketModeClient?: (options: {
+    appToken: string;
+    autoReconnectEnabled: boolean;
+    clientOptions: {
+      rejectRateLimitedCalls: boolean;
+      retryConfig: { retries: number };
+      timeout: number;
+    };
+    clientPingTimeout: number;
+    serverPingTimeout: number;
+  }) => SlackSocketModeClient;
   now?: () => number;
+  setReconnectTimer?: (callback: () => void, delayMs: number) => object;
+  clearReconnectTimer?: (timer: object) => void;
 }
+
+const SLACK_CLIENT_PING_TIMEOUT_MS = 30_000;
+const SLACK_SERVER_PING_TIMEOUT_MS = 60_000;
+const SLACK_CONNECTION_OPEN_TIMEOUT_MS = 10_000;
+const SLACK_RECONNECT_DELAY_MS = 1_000;
+const SLACK_MAX_RECONNECT_DELAY_MS = 30_000;
 
 export class SlackChatAdapter implements ChatAdapter {
   readonly delivery: SlackDeliveryAdapter;
@@ -40,6 +58,8 @@ export class SlackChatAdapter implements ChatAdapter {
   private readonly workspace: SlackWorkspaceStore;
   private readonly worker: SlackIngressWorker;
   private readonly now: () => number;
+  private readonly setReconnectTimer: (callback: () => void, delayMs: number) => object;
+  private readonly clearReconnectTimer: (timer: object) => void;
   private contextService: SlackContextService | undefined;
   private handler: SlackEnvelopeHandler | undefined;
   private identity: SlackStartupIdentity | undefined;
@@ -48,6 +68,11 @@ export class SlackChatAdapter implements ChatAdapter {
   private stopping: Promise<void> | undefined;
   private socketStarted = false;
   private subscribed = false;
+  private reconnectTimer: object | undefined;
+  private reconnectTask: Promise<void> | undefined;
+  private reconnectFailures = 0;
+  private reconnectNeeded = false;
+  private reconnectGeneration = 0;
   private readonly eventTasks = new Set<Promise<void>>();
 
   private readonly socketListener = (value: unknown): void => {
@@ -60,6 +85,11 @@ export class SlackChatAdapter implements ChatAdapter {
       .catch(() => undefined);
     this.eventTasks.add(task);
     void task.finally(() => { this.eventTasks.delete(task); });
+  };
+
+  private readonly disconnectedListener = (): void => {
+    this.reconnectNeeded = true;
+    this.scheduleReconnect();
   };
 
   constructor(
@@ -75,10 +105,20 @@ export class SlackChatAdapter implements ChatAdapter {
     dependencies: SlackChatAdapterDependencies = {},
   ) {
     this.clients = dependencies.clients ?? createSlackClients(options.config);
-    this.socket = (dependencies.createSocketModeClient ?? ((value) => new SocketModeClient({ appToken: value.appToken })))(
-      { appToken: options.config.appToken },
-    );
+    this.socket = (dependencies.createSocketModeClient ?? ((value) => new SocketModeClient(value)))({
+      appToken: options.config.appToken,
+      autoReconnectEnabled: false,
+      clientOptions: {
+        rejectRateLimitedCalls: true,
+        retryConfig: { retries: 0 },
+        timeout: SLACK_CONNECTION_OPEN_TIMEOUT_MS,
+      },
+      clientPingTimeout: SLACK_CLIENT_PING_TIMEOUT_MS,
+      serverPingTimeout: SLACK_SERVER_PING_TIMEOUT_MS,
+    });
     this.now = dependencies.now ?? Date.now;
+    this.setReconnectTimer = dependencies.setReconnectTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.clearReconnectTimer = dependencies.clearReconnectTimer ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
     this.delivery = new SlackDeliveryAdapter(this.clients.bot);
     this.history = { getHistory: (binding, request) => this.context.getHistory(binding, request) };
     this.inbox = new SlackInboxStore(db);
@@ -128,6 +168,7 @@ export class SlackChatAdapter implements ChatAdapter {
     return this.starting ??= (async () => {
       await this.worker.recoverAndDrain();
       this.socket.on("slack_event", this.socketListener);
+      this.socket.on("disconnected", this.disconnectedListener);
       this.subscribed = true;
       this.worker.start();
       try {
@@ -158,9 +199,51 @@ export class SlackChatAdapter implements ChatAdapter {
   close(): Promise<void> { return this.stop(); }
 
   private unsubscribe(): void {
-    if (!this.subscribed) return;
-    this.socket.off("slack_event", this.socketListener);
-    this.subscribed = false;
+    this.reconnectGeneration += 1;
+    this.reconnectNeeded = false;
+    if (this.subscribed) {
+      this.socket.off("slack_event", this.socketListener);
+      this.socket.off("disconnected", this.disconnectedListener);
+      this.subscribed = false;
+    }
+    if (this.reconnectTimer) {
+      this.clearReconnectTimer(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.reconnectNeeded || !this.socketStarted || !this.subscribed || this.stopping || this.reconnectTimer || this.reconnectTask) return;
+    const delayMs = Math.min(
+      SLACK_RECONNECT_DELAY_MS * (2 ** Math.min(this.reconnectFailures, 5)),
+      SLACK_MAX_RECONNECT_DELAY_MS,
+    );
+    const generation = this.reconnectGeneration;
+    const timer = this.setReconnectTimer(() => {
+      if (this.reconnectTimer !== timer || generation !== this.reconnectGeneration) return;
+      this.reconnectTimer = undefined;
+      if (!this.socketStarted || !this.subscribed || this.stopping) return;
+      this.reconnectNeeded = false;
+      let failed = false;
+      let connected = false;
+      const task = Promise.resolve()
+        .then(() => this.socket.start())
+        .then(
+          () => { connected = true; this.reconnectFailures = 0; },
+          () => { failed = true; this.reconnectFailures += 1; this.reconnectNeeded = true; },
+        )
+        .finally(() => {
+          if (this.reconnectTask !== task) return;
+          this.reconnectTask = undefined;
+          if (generation !== this.reconnectGeneration || !this.subscribed || this.stopping) {
+            if (connected) void this.socket.disconnect().catch(() => undefined);
+            return;
+          }
+          if (failed || this.reconnectNeeded) this.scheduleReconnect();
+        });
+      this.reconnectTask = task;
+    }, delayMs);
+    this.reconnectTimer = timer;
   }
 
   private async settleEventTasks(): Promise<void> {

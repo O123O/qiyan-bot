@@ -20,8 +20,16 @@ const config: SlackConfig = { appToken: "xapp-secret", botToken: "xoxb-secret", 
 class FakeSocket extends EventEmitter implements SlackSocketModeClient {
   starts = 0;
   disconnects = 0;
-  onStart?: () => Promise<void> | void;
-  async start(): Promise<unknown> { this.starts += 1; await this.onStart?.(); return { ok: true }; }
+  startError: Error | undefined;
+  onStart: (() => Promise<void> | void) | undefined;
+  async start(): Promise<unknown> {
+    this.starts += 1;
+    await this.onStart?.();
+    const error = this.startError;
+    this.startError = undefined;
+    if (error) throw error;
+    return { ok: true };
+  }
   async disconnect(): Promise<void> { this.disconnects += 1; }
 }
 
@@ -122,7 +130,17 @@ test("Slack initializes identities, recovers ingress, subscribes before connect,
   const conversations = new ConversationStore(db, deliveries, attachments);
   const order: string[] = [];
   const socket = new FakeSocket();
-  let factoryOptions: { appToken: string } | undefined;
+  let factoryOptions: {
+    appToken: string;
+    autoReconnectEnabled: boolean;
+    clientOptions: {
+      rejectRateLimitedCalls: boolean;
+      retryConfig: { retries: number };
+      timeout: number;
+    };
+    clientPingTimeout: number;
+    serverPingTimeout: number;
+  } | undefined;
   let accepted = 0;
   const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
     config,
@@ -137,7 +155,17 @@ test("Slack initializes identities, recovers ingress, subscribes before connect,
   new SlackInboxStore(db).accept(pendingEvent());
   await adapter.initialize();
   assert.deepEqual(order, ["bot-auth", "user-auth", "search-info", "open-dm"]);
-  assert.deepEqual(factoryOptions, { appToken: "xapp-secret" });
+  assert.deepEqual(factoryOptions, {
+    appToken: "xapp-secret",
+    autoReconnectEnabled: false,
+    clientOptions: {
+      rejectRateLimitedCalls: true,
+      retryConfig: { retries: 0 },
+      timeout: 10_000,
+    },
+    clientPingTimeout: 30_000,
+    serverPingTimeout: 60_000,
+  });
   assert.deepEqual(adapter.primaryBinding, { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } });
   assert.deepEqual(await adapter.delivery.sendMessage(
     { workspaceId: "T1", channelId: "D1" }, "initialized", undefined, { deliveryId: "initialized-delivery" },
@@ -185,6 +213,102 @@ test("Slack start requires successful initialization and never reaches a private
   await assert.rejects(adapter.start(), /initialize/i);
   assert.equal(socket.starts, 0);
   db.close();
+});
+
+test("Slack reconnects independently of heartbeat tolerance and cancels a pending reconnect on stop", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-reconnect-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  const socket = new FakeSocket();
+  const timers: Array<{ callback: () => void; delayMs: number; cancelled: boolean }> = [];
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config,
+    maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, {
+    clients: clients([]),
+    createSocketModeClient: () => socket,
+    setReconnectTimer: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearReconnectTimer: (value) => { (value as (typeof timers)[number]).cancelled = true; },
+  });
+
+  await adapter.initialize();
+  await adapter.start();
+  socket.startError = new Error("temporary reconnect failure");
+  socket.emit("disconnected");
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0]?.delayMs, 1_000);
+
+  timers[0]?.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.starts, 2);
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1]?.delayMs, 2_000);
+
+  socket.onStart = () => { socket.emit("disconnected"); };
+  timers[1]?.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.starts, 3);
+  socket.onStart = undefined;
+  assert.equal(timers.length, 3);
+  assert.equal(timers[2]?.delayMs, 1_000);
+
+  await adapter.stop();
+  assert.equal(timers[2]?.cancelled, true);
+  timers[2]?.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.starts, 3);
+});
+
+test("Slack stop fences an unresolved reconnect without waiting for it", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-reconnect-stop-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  const socket = new FakeSocket();
+  let reconnect: (() => void) | undefined;
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config,
+    maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, {
+    clients: clients([]),
+    createSocketModeClient: () => socket,
+    setReconnectTimer: (callback) => { reconnect = callback; return {}; },
+    clearReconnectTimer: () => undefined,
+  });
+
+  await adapter.initialize();
+  await adapter.start();
+  let releaseStart: (() => void) | undefined;
+  socket.onStart = () => new Promise<void>((resolve) => { releaseStart = resolve; });
+  socket.emit("disconnected");
+  reconnect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.starts, 2);
+
+  const stopped = adapter.stop();
+  try {
+    const outcome = await Promise.race([
+      stopped.then(() => "stopped"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timed-out"), 50)),
+    ]);
+    assert.equal(outcome, "stopped");
+  } finally {
+    releaseStart?.();
+    await stopped;
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.disconnects, 2);
 });
 
 test("Slack stop waits for an accepted event and its drain to finish", async (context) => {
