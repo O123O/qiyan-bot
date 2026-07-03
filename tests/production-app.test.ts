@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isUncertainAssistantTransportFailure, registryReloadPreservesWorkerMappings, removalRecoveryDecision } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, registryReloadPreservesWorkerMappings, removalRecoveryDecision } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
+import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
@@ -41,4 +42,16 @@ test("live registry reload permits metadata edits but rejects every worker lifec
     ...current,
     sessions: { worker: { ...worker, mapping_id: "mapping-2" } },
   }), false);
+});
+
+test("production chat history resolves the immutable assistant-attempt binding", async () => {
+  const binding = { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } } as const;
+  const seen: unknown[] = [];
+  const registry = new ChatAdapterRegistry([{
+    delivery: { id: "slack", sendMessage: async () => ({ ok: true }) },
+    history: { getHistory: async (actualBinding, request) => { seen.push({ actualBinding, request }); return { messages: [] }; } },
+  }]);
+  const action = createChatHistoryAction(() => registry, (attemptId) => { assert.equal(attemptId, "attempt-1"); return binding; });
+  assert.deepEqual(await action({ scope: "channel", count: 5 }, { attemptId: "attempt-1" }), { messages: [] });
+  assert.deepEqual(seen, [{ actualBinding: binding, request: { scope: "channel", count: 5 } }]);
 });

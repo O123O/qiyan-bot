@@ -38,6 +38,11 @@ export const ASSISTANT_TOOL_SCHEMAS = {
   send_chat_message: z.object({ content: z.string() }).strict(),
   prepare_chat_attachment: z.object({ owner: z.string().min(1), relative_path: z.string().min(1) }).strict(),
   send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional() }).strict(),
+  get_chat_history: z.object({
+    scope: z.enum(["conversation", "channel"]),
+    count: z.number().int().positive().max(100),
+    before: z.string().min(1).optional(),
+  }).strict(),
 } as const;
 
 export const TOOL_NAMES = Object.freeze(Object.keys(ASSISTANT_TOOL_SCHEMAS)) as readonly (keyof typeof ASSISTANT_TOOL_SCHEMAS)[];
@@ -45,7 +50,7 @@ export type AssistantToolName = keyof typeof ASSISTANT_TOOL_SCHEMAS;
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
 export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
-  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal",
+  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal", "get_chat_history",
 ]);
 
 export function createAssistantTools(

@@ -21,7 +21,7 @@ test("delivery worker routes by adapter and persists opaque binding and receipt"
   const store = new DeliveryStore(db);
   const telegram = new FakeAdapter("telegram", { messageId: 7 });
   const slack = new FakeAdapter("slack", { ts: "1.2" });
-  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([telegram, slack]));
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: telegram }, { delivery: slack }]));
   const binding = { adapterId: "slack", conversationKey: "slack:C1:thread:9", destination: { channel: "C1", threadTs: "9" } } as const;
   const delivery = store.prepare({ id: "d1", kind: "chat", binding, body: "hello", mandatory: true });
   assert.deepEqual(store.get("d1")?.binding, binding);
@@ -43,7 +43,7 @@ test("adapter-specific retry proof overrides generic HTTP status handling", asyn
     },
     isSafeToRetry: (error) => (error as { safeToRetry?: boolean }).safeToRetry === true,
   };
-  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([adapter]));
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: adapter }]));
   await assert.rejects(worker.processOne(safe.id));
   await assert.rejects(worker.processOne(ambiguous.id));
   assert.equal(store.get(safe.id)?.state, "prepared");
@@ -60,7 +60,7 @@ test("a deterministic Slack rejection fails without retrying", async () => {
     sendMessage: async () => { attempts += 1; throw { deterministic: true, safeToRetry: false }; },
     isSafeToRetry: () => false,
   };
-  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([adapter]));
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: adapter }]));
   await assert.rejects(worker.processOne(delivery.id));
   assert.equal(store.get(delivery.id)?.state, "failed");
   assert.equal(attempts, 1);

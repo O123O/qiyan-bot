@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
-import type { ConversationBinding } from "./chat/binding.ts";
+import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
 import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
+import type { ChatHistoryRequest } from "./chat/contracts.ts";
 import { DeliveryWorker } from "./chat/delivery-worker.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
@@ -124,6 +125,7 @@ export async function buildProductionApp(
   let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
   let chat!: ChatAdapter;
+  let chatRegistry!: ChatAdapterRegistry;
   let deliveryWorker!: DeliveryWorker;
   let acceptingReadyEvents = false;
   let schedulerAccepting = false;
@@ -422,7 +424,8 @@ export async function buildProductionApp(
           maxMessageBytes: config.attachmentMaxBytes,
           onMessage: (source, checkpoint) => dispatcher.accept(source, { commitNativeCheckpoint: checkpoint }),
         });
-        deliveryWorker = new DeliveryWorker(deliveries, new ChatAdapterRegistry([chat.delivery]), attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
+        chatRegistry = new ChatAdapterRegistry([chat]);
+        deliveryWorker = new DeliveryWorker(deliveries, chatRegistry, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
       stop: async () => { await deliveryWorker.stop(); await chat.close(); },
@@ -654,6 +657,7 @@ export async function buildProductionApp(
         });
         return { deliveryId: delivery.id };
       },
+      get_chat_history: createChatHistoryAction(() => chatRegistry, assistantAttemptBinding),
     };
   }
 
@@ -1263,6 +1267,13 @@ export async function buildProductionApp(
       throw new Error("worker mappings and lifecycle state are managed by QiYan tools and cannot be edited live");
     }
   }
+}
+
+export function createChatHistoryAction(
+  registry: () => ChatAdapterRegistry,
+  binding: (attemptId: string) => ConversationBinding,
+): (args: ChatHistoryRequest, context: { attemptId: string }) => Promise<JsonValue> {
+  return (args, context) => registry().getHistory(binding(context.attemptId), args);
 }
 
 export function isUncertainAssistantTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {

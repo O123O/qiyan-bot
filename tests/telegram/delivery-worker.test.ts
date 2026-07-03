@@ -15,7 +15,7 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 const binding = { adapterId: "telegram", conversationKey: "telegram:7", destination: { chatId: "7" } } as const;
 
 function adapters(adapter: Omit<ChatDeliveryAdapter, "id">): ChatAdapterRegistry {
-  return new ChatAdapterRegistry([{ id: "telegram", ...adapter }]);
+  return new ChatAdapterRegistry([{ delivery: { id: "telegram", ...adapter } }]);
 }
 
 test("prepared delivery becomes dispatched then atomically confirmed", async () => {

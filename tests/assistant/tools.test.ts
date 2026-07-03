@@ -12,7 +12,7 @@ const expected = [
   "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
   "send_to_session", "read_worker_message", "collect_messages", "interrupt_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
   "update_session_notes",
-  "send_chat_message", "prepare_chat_attachment", "send_chat_attachment",
+  "send_chat_message", "prepare_chat_attachment", "send_chat_attachment", "get_chat_history",
 ].sort();
 
 test("tool catalog is curated and excludes completion and raw RPC", () => {
@@ -26,6 +26,16 @@ test("session nicknames are safe and create_session may use the backend fallback
   for (const nickname of ["Bad", "has space", "../escape", "", "x".repeat(65)]) {
     assert.throws(() => ASSISTANT_TOOL_SCHEMAS.create_session.parse({ nickname }));
   }
+});
+
+test("chat history has one bounded platform-neutral read-only schema", () => {
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.get_chat_history.parse({ scope: "conversation", count: 100, before: "123.4" }), {
+    scope: "conversation", count: 100, before: "123.4",
+  });
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.get_chat_history.parse({ scope: "channel", count: 1 }), { scope: "channel", count: 1 });
+  for (const input of [
+    { scope: "workspace", count: 1 }, { scope: "channel", count: 0 }, { scope: "channel", count: 101 }, { scope: "channel", count: 1, adapter: "slack" },
+  ]) assert.throws(() => ASSISTANT_TOOL_SCHEMAS.get_chat_history.parse(input));
 });
 
 test("adoption uses the native Codex cwd and rejects a caller-supplied project directory", () => {

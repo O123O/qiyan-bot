@@ -28,7 +28,7 @@ test("process restart recovers Telegram ambiguity and assistant effects without 
   deliveries = new DeliveryStore(db);
   deliveries.recoverAfterCrash();
   const sent: string[] = [];
-  await new DeliveryWorker(deliveries, new ChatAdapterRegistry([{ id: "telegram", sendMessage: async (_chat, body) => { sent.push(body); return { messageId: 9 }; } }])).drain();
+  await new DeliveryWorker(deliveries, new ChatAdapterRegistry([{ delivery: { id: "telegram", sendMessage: async (_chat, body) => { sent.push(body); return { messageId: 9 }; } } }])).drain();
   assert.deepEqual(sent, ["[worker · recovery retry d_crash] result"]);
   const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding });
   runtime.beginUserAttempt("ctx", "a", "turn");

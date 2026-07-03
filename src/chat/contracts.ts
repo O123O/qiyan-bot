@@ -1,4 +1,15 @@
 import type { JsonValue } from "./binding.ts";
+import type { ConversationBinding } from "./binding.ts";
+
+export interface ChatHistoryRequest {
+  scope: "conversation" | "channel";
+  count: number;
+  before?: string;
+}
+
+export interface ChatHistoryProvider {
+  getHistory(binding: ConversationBinding, request: ChatHistoryRequest): Promise<JsonValue>;
+}
 
 export interface ChatDeliveryAdapter {
   readonly id: string;
@@ -15,8 +26,12 @@ export interface ChatDeliveryAdapter {
   isSafeToRetry?(error: unknown): boolean;
 }
 
-export interface ChatAdapter {
+export interface ChatAdapterCapabilities {
   readonly delivery: ChatDeliveryAdapter;
+  readonly history?: ChatHistoryProvider;
+}
+
+export interface ChatAdapter extends ChatAdapterCapabilities {
   start(): void;
   stop(): Promise<void>;
   close(): Promise<void>;
