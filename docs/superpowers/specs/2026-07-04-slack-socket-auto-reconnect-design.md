@@ -1,4 +1,4 @@
-# Slack Socket Auto-Reconnect Design
+# Slack Socket Fast-Reconnect Design
 
 ## Problem
 
@@ -6,13 +6,13 @@ The first Slack request after the assistant recovery fix took 15.8 seconds end t
 
 ## Goal
 
-Use the official Slack SDK connection lifecycle so a dead or routinely refreshed Socket Mode connection is detected and replaced promptly, without changing durable ingress, conversation arbitration, or assistant execution.
+Detect and replace a dead or routinely refreshed Socket Mode connection promptly, without changing durable ingress, conversation arbitration, or assistant execution.
 
 ## Architecture
 
-`SlackChatAdapter` will construct one `SocketModeClient` with `autoReconnectEnabled: true`. It will omit custom ping thresholds so the SDK uses its supported defaults: a 5-second client-pong timeout and a 30-second server-ping timeout. The adapter will keep the existing 10-second `apps.connections.open` HTTP timeout, reject rate-limited calls, and disable Web API request retries; the Socket Mode client remains the single owner of reconnect sequencing and backoff.
+`SlackChatAdapter` will construct one `SocketModeClient` with `autoReconnectEnabled: false`. It will omit custom ping thresholds so the SDK uses its supported defaults: a 5-second client-pong timeout and a 30-second server-ping timeout. The adapter will keep the existing 10-second `apps.connections.open` HTTP timeout, reject rate-limited calls, and disable Web API request retries.
 
-QiYan will remove its disconnected listener, reconnect timers, backoff counters, and manual calls to `start()` after initial startup. `start()` will subscribe to Slack events, start the durable ingress worker, and start the SDK client once. `stop()` will unsubscribe, settle accepted events, stop the ingress worker, and call the SDK's `disconnect()`. The SDK's shutdown flag prevents automatic reconnection after that explicit disconnect.
+QiYan will retain its application-owned disconnected listener, reconnect timer, bounded exponential backoff, and lifecycle generation fence. This controller catches every `SocketModeClient.start()` rejection instead of relying on SDK 2.0.7's unsafe automatic reconnect path, which can produce an unhandled rejection for transient URL-open failures and can reconnect past shutdown. `start()` will subscribe to Slack events, start the durable ingress worker, and establish the initial connection. `stop()` will unsubscribe, cancel pending reconnect timers, fence in-flight reconnect settlement, settle accepted events, stop the ingress worker, and call `disconnect()`.
 
 ## Data Flow
 
@@ -28,17 +28,17 @@ No message bodies, attachments, tokens, or credentials will be added to logs. Th
 
 ## Failure Handling
 
-- Missed ping or pong deadlines, Slack-requested refreshes, and unexpected closes are handled by `@slack/socket-mode` automatic reconnection.
-- Failure to obtain a replacement WebSocket URL is retried by the Socket Mode lifecycle, while each individual HTTP attempt remains bounded.
+- Missed ping or pong deadlines, Slack-requested refreshes, and unexpected closes emit `disconnected`; QiYan schedules one replacement attempt.
+- Replacement failures are caught and retried after 1, 2, 4, 8, 16, and at most 30 seconds, while each individual HTTP attempt remains bounded to 10 seconds.
 - Initial startup still fails if the first Socket Mode connection cannot be established.
-- Explicit application shutdown uses `disconnect()` and must not leave a reconnect attempt running.
+- Explicit application shutdown cancels pending reconnect timers. An already-running URL request is generation-fenced and disconnected if it later establishes a socket.
 - Durable inbox recovery remains responsible for events persisted before a crash.
 
 ## Testing
 
-Unit tests will verify that the adapter enables SDK automatic reconnection, preserves the bounded Web API client options, omits custom heartbeat settings, and does not register or schedule an application-owned reconnect. Existing tests will continue to cover event persistence, acknowledgement, draining, and orderly shutdown. The full `npm run check` suite must pass.
+Unit tests will verify that the adapter disables SDK automatic reconnection, preserves the bounded Web API client options, omits custom heartbeat settings, and retains the application-owned reconnect and shutdown fences. Existing tests will continue to cover event persistence, acknowledgement, draining, reconnect failure, and orderly shutdown. The full `npm run check` suite must pass.
 
-After packaging and restarting the local service, a fresh owner DM will be measured using metadata-only timestamps for Slack event time, assistant admission, terminal completion, and confirmed delivery. Success means no application-level reconnect loop remains, the service stays active, and a stable connection delivers the test event without the previous 10-plus-second pre-admission stall. A single transient slow event will be reported rather than hidden; repeated samples are needed before attributing residual delay to the network route.
+After packaging and restarting the local service, a fresh owner DM will be measured using metadata-only timestamps for Slack event time, assistant admission, terminal completion, and confirmed delivery. Success means the service stays active and a stable connection delivers the test event without the previous 10-plus-second pre-admission stall. On a dead connection, the SDK's default heartbeat should initiate close within about 5 seconds; if the peer does not finish the close handshake, the next approximately 1.7-second heartbeat tick force-terminates it before QiYan's 1-second reconnect delay. A single transient slow event will be reported rather than hidden; repeated samples are needed before attributing residual delay to the network route.
 
 ## Non-Goals
 
