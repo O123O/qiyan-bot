@@ -55,6 +55,9 @@ export class ConversationDispatcher {
   private capacityWaiting = false;
   private pumpPaused = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private recoveryGeneration = 0;
+  private nativeSubmissionCount = 0;
   private eventWakeTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
 
@@ -101,6 +104,12 @@ export class ConversationDispatcher {
 
   recover(): Promise<void> {
     return this.post(() => {
+      this.cancelRecovery();
+      if (this.nativeSubmissionCount > 0) {
+        this.scheduleRecovery();
+        return;
+      }
+      const recoveryGeneration = ++this.recoveryGeneration;
       this.pumpPaused = false;
       const lease = this.store.lease();
       if (lease) {
@@ -115,24 +124,34 @@ export class ConversationDispatcher {
           const submission = this.store.submissionFor(lease.attemptId, unresolved.contextId)!;
           this.launch(
             this.runner.readThread(),
-            (thread) => this.reconcileSubmission(submission, submission.submissionKind === "start" ? claim : undefined, thread),
-            () => undefined,
+            (thread) => {
+              if (recoveryGeneration !== this.recoveryGeneration) return;
+              this.reconcileSubmission(submission, submission.submissionKind === "start" ? claim : undefined, thread);
+              const current = this.store.membersForAttempt(lease.attemptId)
+                .find((member) => member.contextId === unresolved.contextId);
+              if (current && new Set(["start_submitting", "steer_submitting", "uncertain"]).has(current.state)) this.scheduleRecovery();
+            },
+            () => { if (recoveryGeneration === this.recoveryGeneration) this.scheduleRecovery(); },
           );
         } else if (lease.phase === "starting" && members.length === 0) {
-          this.launchStart(this.store.reserveStart(lease.primaryContextId), claim);
+          this.launchStart(this.store.reserveStart(lease.primaryContextId), claim, recoveryGeneration);
         } else if (lease.turnId && (lease.phase === "active" || lease.phase === "terminalizing")) {
           this.launch(
             this.runner.readThread(),
             (thread) => {
+              if (recoveryGeneration !== this.recoveryGeneration) return;
               const turn = thread.turns.find((candidate) => candidate.id === lease.turnId);
-              if (!turn || !isTerminal(turn.status)) return;
+              if (!turn || !isTerminal(turn.status)) {
+                if (lease.phase === "terminalizing") this.scheduleRecovery();
+                return;
+              }
               this.noteConversationPeriod();
               this.store.beginTerminalizing(turn.id);
               this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
               this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
               this.options.onDeferredTerminal?.(turn);
             },
-            () => undefined,
+            () => { if (recoveryGeneration === this.recoveryGeneration) this.scheduleRecovery(); },
           );
         }
       }
@@ -157,6 +176,7 @@ export class ConversationDispatcher {
     this.stopped = true;
     this.unsubscribeCapacity();
     this.cancelRetry();
+    this.cancelRecovery();
     if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
     const lease = this.store.lease();
     if (lease) {
@@ -228,15 +248,16 @@ export class ConversationDispatcher {
     if (submission) this.launchSteer(submission, lease);
   }
 
-  private launchStart(submission: ReservedSubmission, claim: TurnCapacityClaim): void {
+  private launchStart(submission: ReservedSubmission, claim: TurnCapacityClaim, recoveryGeneration?: number): void {
     const params: TurnStartParams = {
       threadId: this.options.threadId,
       clientUserMessageId: submission.clientUserMessageId,
       input: this.input(submission),
     };
     this.launch(
-      this.runner.start(params, claim),
+      this.trackNativeSubmission(() => this.runner.start(params, claim)),
       (response) => {
+        if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) return;
         const early = this.earlyTerminals.get(response.turn.id);
         try {
           this.pool.bindTurnCapacityClaim(claim, response.turn.id);
@@ -257,7 +278,11 @@ export class ConversationDispatcher {
         }
         this.pump();
       },
-      (error) => this.handleSubmissionFailure(submission, claim, error),
+      (error) => {
+        if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) return;
+        this.handleSubmissionFailure(submission, claim, error, recoveryGeneration);
+      },
+      () => this.finishNativeSubmission(),
     );
   }
 
@@ -269,7 +294,7 @@ export class ConversationDispatcher {
       input: this.input(submission),
     };
     this.launch(
-      this.runner.steer(params),
+      this.trackNativeSubmission(() => this.runner.steer(params)),
       (response) => {
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turnId);
         this.options.membershipObserver?.notifyMembership(submission.contextId);
@@ -277,21 +302,31 @@ export class ConversationDispatcher {
         this.pump();
       },
       (error) => this.handleSubmissionFailure(submission, undefined, error),
+      () => this.finishNativeSubmission(),
     );
   }
 
-  private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown): void {
+  private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown, recoveryGeneration?: number): void {
     if (this.isKnownNonSteerable(error) && submission.submissionKind === "steer") {
       this.store.restorePending(submission.attemptId, submission.contextId);
       this.options.membershipObserver?.notifyMembership(submission.contextId);
       this.store.pauseSteering(submission.attemptId, "native_turn_not_steerable");
       return;
     }
+    const reconciliationGeneration = recoveryGeneration ?? ++this.recoveryGeneration;
     this.store.markUncertain(submission.attemptId, submission.contextId);
     this.launch(
       this.runner.readThread(),
-      (thread) => this.reconcileSubmission(submission, claim, thread),
-      () => undefined,
+      (thread) => {
+        if (reconciliationGeneration !== this.recoveryGeneration) return;
+        this.reconcileSubmission(submission, claim, thread);
+        const current = this.store.membersForAttempt(submission.attemptId)
+          .find((member) => member.contextId === submission.contextId);
+        if (current && new Set(["start_submitting", "steer_submitting", "uncertain"]).has(current.state)) this.scheduleRecovery();
+      },
+      () => {
+        if (reconciliationGeneration === this.recoveryGeneration) this.scheduleRecovery();
+      },
     );
   }
 
@@ -358,12 +393,13 @@ export class ConversationDispatcher {
     return input;
   }
 
-  private launch<T>(promise: Promise<T>, success: (value: T) => void, failure: (error: unknown) => void): void {
+  private launch<T>(promise: Promise<T>, success: (value: T) => void, failure: (error: unknown) => void, settled?: () => void): void {
     this.networkCount += 1;
     void promise.then(
       (value) => this.post(() => { if (!this.stopped) success(value); }),
       (error) => this.post(() => { if (!this.stopped) failure(error); }),
     ).finally(() => {
+      settled?.();
       this.networkCount -= 1;
       if (this.networkCount === 0) {
         for (const resolve of this.idleWaiters) resolve();
@@ -371,6 +407,16 @@ export class ConversationDispatcher {
         if (!this.stopped) void this.post(() => this.pump());
       }
     });
+  }
+
+  private trackNativeSubmission<T>(start: () => Promise<T>): Promise<T> {
+    this.nativeSubmissionCount += 1;
+    try { return start(); }
+    catch (error) { return Promise.reject(error); }
+  }
+
+  private finishNativeSubmission(): void {
+    this.nativeSubmissionCount = Math.max(0, this.nativeSubmissionCount - 1);
   }
 
   private post(action: () => void): Promise<void> {
@@ -393,6 +439,20 @@ export class ConversationDispatcher {
   private cancelRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+  }
+
+  private scheduleRecovery(): void {
+    if (this.recoveryTimer || this.stopped) return;
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = undefined;
+      if (!this.stopped) void this.recover();
+    }, this.options.retryMs ?? 1_000);
+    this.recoveryTimer.unref?.();
+  }
+
+  private cancelRecovery(): void {
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
   }
 
   private scheduleEventWake(): void {

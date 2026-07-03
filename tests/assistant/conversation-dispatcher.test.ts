@@ -31,9 +31,10 @@ function deferred<T>() {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let index = 0; index < 100; index += 1) {
+  const deadline = Date.now() + 500;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
   }
   assert.fail("condition did not become true");
 }
@@ -42,6 +43,7 @@ class FakeRunner implements AssistantTurnPort {
   starts: Array<{ params: TurnStartParams; claim: TurnCapacityClaim; result: ReturnType<typeof deferred<{ turn: TurnSnapshot }>> }> = [];
   steers: Array<{ params: TurnSteerParams; result: ReturnType<typeof deferred<{ turnId: string }>> }> = [];
   history: ThreadSnapshot = { status: "idle", turns: [] };
+  historyErrors: unknown[] = [];
   historyReads = 0;
 
   start(params: TurnStartParams, claim: TurnCapacityClaim): Promise<{ turn: TurnSnapshot }> {
@@ -56,7 +58,12 @@ class FakeRunner implements AssistantTurnPort {
     return result.promise;
   }
 
-  async readThread(): Promise<ThreadSnapshot> { this.historyReads += 1; return this.history; }
+  async readThread(): Promise<ThreadSnapshot> {
+    this.historyReads += 1;
+    const error = this.historyErrors.shift();
+    if (error) throw error;
+    return this.history;
+  }
 }
 
 const route = (conversationKey: string): ConversationBinding => ({
@@ -146,6 +153,257 @@ test("retrying a restored source uses a new native submission identity", async (
   assert.notEqual(runner.starts[1]?.params.clientUserMessageId, firstClientId);
   runner.starts[1]!.result.resolve({ turn: { id: "retry", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+test("startup recovery retries a terminal lease until authoritative history is available", async () => {
+  const { store, pool, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "terminal", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.terminal({ id: "terminal", status: "interrupted", itemsView: "full", items: [] });
+  await dispatcher.stop();
+
+  const recovered: TurnSnapshot[] = [];
+  const recoveryRunner = new FakeRunner();
+  recoveryRunner.history = {
+    status: "idle",
+    turns: [{ id: "terminal", status: "interrupted", itemsView: "full", items: [] }],
+  };
+  recoveryRunner.readThread = async () => {
+    recoveryRunner.historyReads += 1;
+    if (recoveryRunner.historyReads === 1) return { status: { type: "notLoaded" }, turns: [] };
+    if (recoveryRunner.historyReads === 2) throw new Error("transient thread read failure");
+    return recoveryRunner.history;
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, recoveryRunner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 0,
+    onDeferredTerminal: (turn) => { recovered.push(turn); },
+  });
+
+  await recoveredDispatcher.recover();
+  await waitFor(() => recovered.length === 1);
+  assert.equal(recoveryRunner.historyReads, 3);
+  assert.equal(recovered[0]?.id, "terminal");
+  await recoveredDispatcher.stop();
+});
+
+test("startup recovery retries an uncertain submission after a transient history failure", async () => {
+  const { store, pool, runner, dispatcher } = fixture(1, { stopWaitMs: 0 });
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.stop();
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "uncertain");
+
+  const recoveryRunner = new FakeRunner();
+  recoveryRunner.history = {
+    status: "active",
+    turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] }],
+  };
+  recoveryRunner.readThread = async () => {
+    recoveryRunner.historyReads += 1;
+    if (recoveryRunner.historyReads === 1) {
+      return { status: "active", turns: [{ id: "other", status: "inProgress", itemsView: "summary", items: [] }] };
+    }
+    if (recoveryRunner.historyReads === 2) throw new Error("transient thread read failure");
+    return recoveryRunner.history;
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, recoveryRunner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 0,
+  });
+
+  await recoveredDispatcher.recover();
+  await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
+  assert.equal(recoveryRunner.historyReads, 3);
+  assert.equal(store.lease()?.turnId, "recovered");
+  await recoveredDispatcher.stop();
+});
+
+test("a stale overlapping recovery read cannot overwrite newer authoritative correlation", async () => {
+  const { store, pool, runner, dispatcher } = fixture(1, { stopWaitMs: 0 });
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.stop();
+
+  const older = deferred<ThreadSnapshot>();
+  const newer = deferred<ThreadSnapshot>();
+  const reads = [older, newer];
+  const recoveryRunner = new FakeRunner();
+  recoveryRunner.readThread = () => {
+    recoveryRunner.historyReads += 1;
+    return reads[recoveryRunner.historyReads - 1]!.promise;
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, recoveryRunner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+  });
+
+  await recoveredDispatcher.recover();
+  await waitFor(() => recoveryRunner.historyReads === 1);
+  await recoveredDispatcher.recover();
+  await waitFor(() => recoveryRunner.historyReads === 2);
+  newer.resolve({
+    status: "active",
+    turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] }],
+  });
+  await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
+  older.resolve({ status: "idle", turns: [] });
+  await recoveredDispatcher.idle();
+
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  assert.equal(store.lease()?.turnId, "recovered");
+  await recoveredDispatcher.stop();
+});
+
+test("recovery cannot prove absence while a native start is still in flight", async () => {
+  const { store, pool } = fixture();
+  store.acceptChatSource(chat("first"));
+  const claim = pool.claimTurnCapacity("assistant-local", "assistant", "recovered-start");
+  store.acquireLease({ kind: "chat", contextId: "first" }, claim.id);
+  const recoveryRunner = new FakeRunner();
+  recoveryRunner.history = { status: "idle", turns: [] };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, recoveryRunner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 100,
+  });
+
+  await recoveredDispatcher.recover();
+  assert.equal(recoveryRunner.starts.length, 1);
+  await recoveredDispatcher.recover();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(recoveryRunner.historyReads, 0);
+  recoveryRunner.starts[0]!.result.resolve({ turn: { id: "late-start", status: "inProgress", itemsView: "full", items: [] } });
+  await recoveredDispatcher.idle();
+
+  assert.equal(store.lease()?.phase, "active");
+  assert.equal(store.lease()?.turnId, "late-start");
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  await recoveredDispatcher.stop();
+});
+
+test("recovery waits until an immediate native start response is durably committed", async () => {
+  const { store, pool } = fixture();
+  store.acceptChatSource(chat("first"));
+  const claim = pool.claimTurnCapacity("assistant-local", "assistant", "immediate-recovered-start");
+  store.acquireLease({ kind: "chat", contextId: "first" }, claim.id);
+  let historyReads = 0;
+  const runner: AssistantTurnPort = {
+    start: async () => ({ turn: { id: "immediate-start", status: "inProgress", itemsView: "full", items: [] } }),
+    steer: async () => { throw new Error("unused"); },
+    readThread: async () => { historyReads += 1; return { status: "idle", turns: [] }; },
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 100,
+  });
+
+  await recoveredDispatcher.recover();
+  await recoveredDispatcher.recover();
+  await recoveredDispatcher.idle();
+
+  assert.equal(historyReads, 0);
+  assert.equal(store.lease()?.phase, "active");
+  assert.equal(store.lease()?.turnId, "immediate-start");
+  await recoveredDispatcher.stop();
+});
+
+test("a synchronous native start failure remains fenced until durable reconciliation", async () => {
+  const { store, pool } = fixture();
+  store.acceptChatSource(chat("first"));
+  const claim = pool.claimTurnCapacity("assistant-local", "assistant", "sync-failed-start");
+  const lease = store.acquireLease({ kind: "chat", contextId: "first" }, claim.id);
+  let historyReads = 0;
+  const runner: AssistantTurnPort = {
+    start: () => { throw new Error("synchronous start failure"); },
+    steer: async () => { throw new Error("unused"); },
+    readThread: async () => {
+      historyReads += 1;
+      return {
+        status: "active",
+        turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }] }],
+      };
+    },
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 100,
+  });
+
+  await recoveredDispatcher.recover();
+  await recoveredDispatcher.recover();
+  await recoveredDispatcher.idle();
+
+  assert.equal(historyReads, 1);
+  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "submitted");
+  assert.equal(store.lease()?.turnId, "recovered");
+  await recoveredDispatcher.stop();
+});
+
+test("recovery-launched start keeps reconciling after ambiguous nested history", async () => {
+  const { store, pool } = fixture();
+  store.acceptChatSource(chat("first"));
+  const claim = pool.claimTurnCapacity("assistant-local", "assistant", "recovered-ambiguous-start");
+  const lease = store.acquireLease({ kind: "chat", contextId: "first" }, claim.id);
+  const recoveryRunner = new FakeRunner();
+  recoveryRunner.history = {
+    status: "active",
+    turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }] }],
+  };
+  recoveryRunner.readThread = async () => {
+    recoveryRunner.historyReads += 1;
+    if (recoveryRunner.historyReads === 1) {
+      return { status: "active", turns: [{ id: "other", status: "inProgress", itemsView: "summary", items: [] }] };
+    }
+    return recoveryRunner.history;
+  };
+  const recoveredDispatcher = new ConversationDispatcher(store, pool, recoveryRunner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    retryMs: 0,
+  });
+
+  await recoveredDispatcher.recover();
+  recoveryRunner.starts[0]!.result.reject(new Error("start outcome unknown"));
+  await waitFor(() => store.membersForAttempt(lease.attemptId)[0]?.state === "submitted");
+
+  assert.equal(recoveryRunner.historyReads, 2);
+  assert.equal(store.lease()?.turnId, "recovered");
+  await recoveredDispatcher.stop();
+});
+
+test("ordinary submission reconciliation is fenced from a newer recovery read", async () => {
+  const { store, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  const older = deferred<ThreadSnapshot>();
+  const newer = deferred<ThreadSnapshot>();
+  const reads = [older, newer];
+  runner.readThread = () => {
+    runner.historyReads += 1;
+    return reads[runner.historyReads - 1]!.promise;
+  };
+
+  runner.starts[0]!.result.reject(new Error("start outcome unknown"));
+  await waitFor(() => runner.historyReads === 1);
+  await dispatcher.recover();
+  await waitFor(() => runner.historyReads === 2);
+  newer.resolve({
+    status: "active",
+    turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] }],
+  });
+  await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
+  older.resolve({ status: "idle", turns: [] });
+  await dispatcher.idle();
+
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  assert.equal(store.lease()?.turnId, "recovered");
   await dispatcher.stop();
 });
 
