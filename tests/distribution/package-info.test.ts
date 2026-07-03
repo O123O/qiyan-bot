@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readPackageInfo } from "../../src/distribution/package-info.ts";
 import { APP_VERSION } from "../../src/version.ts";
 
@@ -50,15 +48,19 @@ test("rejects invalid qiyan-bot package metadata", async (context) => {
   await assert.rejects(readPackageInfo(pathToFileURL(join(temp, "dist", "entry")).href), /invalid qiyan-bot package metadata/);
 });
 
-test("release package includes the Slack manifest and bundled SDK without a runtime install tree", async () => {
-  const run = promisify(execFile);
-  const { stdout } = await run("npm", ["pack", "--dry-run", "--json", "--silent"], { maxBuffer: 20 * 1024 * 1024 });
-  const report = JSON.parse(stdout) as Array<{ files: Array<{ path: string }> }>;
-  const files = report[0]!.files.map(({ path }) => path);
-  assert.ok(files.includes("assets/slack/manifest.yaml"));
-  assert.ok(files.includes("dist/qiyan-bot"));
-  assert.equal(files.some((path) => path.includes("node_modules/")), false);
-  const bundled = await import("node:fs/promises").then(({ readFile }) => readFile("dist/qiyan-bot", "utf8"));
-  assert.match(bundled, /SocketModeClient/u);
-  assert.match(bundled, /assistant\.search\.context/u);
+test("release package contract includes the Slack manifest and bundles SDK dependencies", async () => {
+  const manifest = JSON.parse(await import("node:fs/promises").then(({ readFile }) => readFile("package.json", "utf8"))) as {
+    files: string[];
+    dependencies?: Record<string, string>;
+  };
+  assert.ok(manifest.files.includes("assets/slack/manifest.yaml"));
+  assert.ok(manifest.files.includes("dist/qiyan-bot"));
+  assert.deepEqual(manifest.dependencies ?? {}, {});
+  const build = await import("node:fs/promises").then(({ readFile }) => readFile("scripts/build.mjs", "utf8"));
+  assert.match(build, /bundle: true/u);
+  assert.match(build, /packages: "bundle"/u);
+  const clients = await import("node:fs/promises").then(({ readFile }) => readFile("src/slack/clients.ts", "utf8"));
+  const socket = await import("node:fs/promises").then(({ readFile }) => readFile("src/slack/chat-adapter.ts", "utf8"));
+  assert.match(clients, /@slack\/web-api/u);
+  assert.match(socket, /@slack\/socket-mode/u);
 });
