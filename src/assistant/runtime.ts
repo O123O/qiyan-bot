@@ -29,7 +29,7 @@ export class AssistantRuntime {
     private readonly db: Database,
     private readonly operations: OperationStore,
     private readonly deliveries: DeliveryStore,
-    private readonly options: { binding: ConversationBinding },
+    _options: { binding: ConversationBinding | (() => ConversationBinding) },
   ) {}
 
   beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "chat"); }
@@ -281,7 +281,7 @@ export class AssistantRuntime {
     }
     const sourceBinding = this.operations.getSourceContext(String(attempt.context_id))?.binding;
     if (sourceBinding) return sourceBinding;
-    return this.triggerKind(attempt) === "chat" ? this.options.binding : undefined;
+    return undefined;
   }
 
   private parseActive(row: Record<string, unknown>): ActiveAssistantContext {

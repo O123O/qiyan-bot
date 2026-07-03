@@ -11,6 +11,8 @@ import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
+import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
 
 const mappingId = "mapping-1";
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
@@ -33,8 +35,10 @@ async function fixture(onTerminal?: (event: any) => void | Promise<void>) {
   runtime.setSession("local", "worker", mappingId, "managed", "idle");
   runtime.beginEpoch("local", "worker", mappingId, "baseline", 1);
   const deliveries = new DeliveryStore(db);
-  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding, clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
-  return { db, endpoint, registry, runtime, deliveries, relay };
+  const routes = new OwnerRouteStore(db, binding);
+  const conversations = new ConversationStore(db, deliveries);
+  const relay = new EventRelay(db, new AppServerPool([endpoint], { maxConcurrentTurns: 4 }), registry, runtime, new FinalMessageStore(db), deliveries, { binding: () => routes.current(), clock: { now: () => 100 }, ...(onTerminal ? { onTerminal } : {}) });
+  return { db, endpoint, registry, runtime, deliveries, relay, conversations, routes };
 }
 
 function terminal(id = "turn-1", status = "completed", text = "done") {
@@ -70,6 +74,16 @@ test("managed worker finals create automatic delivery and metadata-only assistan
   const events = db.prepare("SELECT payload_json FROM events").all() as Array<{ payload_json: string }>;
   assert.equal(events.length, 1);
   assert.equal(events[0]?.payload_json.includes("done"), false);
+});
+
+test("worker finals and permission warnings freeze the latest accepted owner route", async () => {
+  const { endpoint, deliveries, relay, conversations } = await fixture();
+  const slack = { adapterId: "slack", conversationKey: "slack:T1:thread:C1:1.0", destination: { workspaceId: "T1", channelId: "C1", threadTs: "1.0" }, reply: { messageTs: "2.0" } } as const;
+  conversations.acceptChatSource({ id: "slack-owner", nativeSourceId: "T1:C1:2.0", binding: slack, rawText: "status", attachmentIds: [], receivedAt: 2 });
+  endpoint.turns = [terminal("baseline"), terminal("latest")];
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("latest") });
+  await relay.handlePermissionBlocked("local", { threadId: "worker", turnId: "blocked-latest", method: "approval", params: {} });
+  assert.deepEqual(deliveries.listReady().map((delivery) => delivery.binding), [slack, slack]);
 });
 
 test("failed no-final turns warn, transitional turns are excluded, and permission blocks are deduplicated", async () => {

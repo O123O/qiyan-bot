@@ -7,6 +7,7 @@ import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
 import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
 import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
+import { OwnerRouteStore } from "./chat/owner-route-store.ts";
 import type { ChatHistoryRequest } from "./chat/contracts.ts";
 import { DeliveryWorker } from "./chat/delivery-worker.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
@@ -121,6 +122,7 @@ export async function buildProductionApp(
   let relay!: EventRelay;
   let assistant!: AssistantRuntime;
   let conversations!: ConversationStore;
+  let ownerRoutes!: OwnerRouteStore;
   let attemptScope!: AttemptScope;
   let dispatcher!: ConversationDispatcher;
   let scheduler!: AssistantScheduler;
@@ -184,6 +186,7 @@ export async function buildProductionApp(
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
         dashboardStore = new SessionDashboardStore(db);
         runConversationRoutingBackfill(db, administrativeBinding);
+        ownerRoutes = new OwnerRouteStore(db, administrativeBinding);
       },
       stop: async () => { db.close(); },
     },
@@ -196,17 +199,17 @@ export async function buildProductionApp(
           sessions: {},
         });
         for (const [index, warning] of registry.warnings().entries()) {
-          deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", binding: administrativeBinding, body: `[system] ${warning}`, mandatory: true });
+          deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
         }
         for (const [index, warning] of assistantWarnings.entries()) {
-          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", binding: administrativeBinding, body: `[system] ${warning}`, mandatory: true });
+          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
         }
         const accessWarning = assistantAccessWarning(config.assistantSandboxMode);
         if (accessWarning) {
           deliveries.prepare({
             id: "assistant-full-access-warning",
             kind: "system_warning",
-            binding: administrativeBinding,
+            binding: currentOwnerBinding(),
             body: `[system] ${accessWarning}`,
             mandatory: true,
           });
@@ -234,7 +237,7 @@ export async function buildProductionApp(
       start: async () => {
         conversations = new ConversationStore(db, deliveries, attachments);
         attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
-        assistant = new AssistantRuntime(db, operations, deliveries, { binding: administrativeBinding });
+        assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding });
         const actions = buildActions();
         const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount, attemptScope });
         mcp = new LoopbackMcpServer(tools, assistant, {
@@ -281,7 +284,7 @@ export async function buildProductionApp(
           onError: () => recordBackgroundFailure("session observation"),
         });
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, {
-          binding: administrativeBinding,
+          binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
         }, attachments);
@@ -665,6 +668,8 @@ export async function buildProductionApp(
     };
   }
 
+  function currentOwnerBinding(): ConversationBinding { return ownerRoutes.current(); }
+
   function assistantAttemptBinding(attemptId: string): ConversationBinding {
     const row = db.prepare(`SELECT adapter_id, conversation_key, destination_json, native_reply_json
       FROM assistant_attempts WHERE id = ?`).get(attemptId) as Record<string, unknown> | undefined;
@@ -703,7 +708,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `dashboard-render-warning:${state.failureGeneration}`,
       kind: "system_warning",
-      binding: administrativeBinding,
+      binding: currentOwnerBinding(),
       body: "[system] session dashboard rendering failed; durable state is safe and rendering will retry",
       mandatory: true,
     });
@@ -1124,7 +1129,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `endpoint-unavailable:${target.id}:${endpointIncident}`,
       kind: "system_warning",
-      binding: administrativeBinding,
+      binding: currentOwnerBinding(),
       body: `[system] ${target.id} app-server is unavailable; reconnecting`,
       mandatory: true,
     });
@@ -1164,7 +1169,7 @@ export async function buildProductionApp(
         await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
       } catch (error) {
         if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
-          recordAssistantAuthenticationFailure(deliveries, administrativeBinding, endpointIncident);
+          recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
         }
         throw error;
       }
@@ -1189,7 +1194,7 @@ export async function buildProductionApp(
     deliveries.prepare({
       id: `session-unavailable:${endpointId}:${threadId}:${endpointIncident}`,
       kind: "worker_warning",
-      binding: administrativeBinding,
+      binding: currentOwnerBinding(),
       body: `[${nickname}] unavailable; its registered thread and project directory require verification`,
       mandatory: true,
     });
@@ -1219,7 +1224,7 @@ export async function buildProductionApp(
     try {
       backgroundIncident += 1;
       const id = `background-failure:${backgroundIncident}`;
-      deliveries.prepare({ id, kind: "system_warning", binding: administrativeBinding, body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
+      deliveries.prepare({ id, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
       const identity = registry.snapshot().assistant;
       db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
         VALUES (?, ?, ?, 'background_failure', ?, 'pending', ?)`)
@@ -1252,7 +1257,7 @@ export async function buildProductionApp(
         deliveries.prepare({
           id: `registry-invalid:${Date.now()}`,
           kind: "system_warning",
-          binding: administrativeBinding,
+          binding: currentOwnerBinding(),
           body: "[system] sessions.json replacement was rejected; the last valid registry remains active",
           mandatory: true,
         });
