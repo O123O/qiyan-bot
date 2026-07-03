@@ -43,6 +43,7 @@ test("adapter uses supplied transports without touching real Telegram", async (c
   );
 
   assert.equal(adapter.delivery.id, "telegram");
+  await adapter.initialize();
   await adapter.stop();
   assert.equal(closes, 1);
   await Promise.all([adapter.close(), adapter.close()]);

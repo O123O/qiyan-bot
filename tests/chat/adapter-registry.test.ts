@@ -12,7 +12,7 @@ function adapter(id: string): ChatDeliveryAdapter {
 }
 
 function capabilities(delivery: ChatDeliveryAdapter, history?: ChatAdapter["history"]): ChatAdapter {
-  return { delivery, ...(history ? { history } : {}), start: () => undefined, stop: async () => undefined, close: async () => undefined };
+  return { delivery, ...(history ? { history } : {}), initialize: async () => undefined, start: () => undefined, stop: async () => undefined, close: async () => undefined };
 }
 
 test("adapter registry selects exact IDs and rejects duplicates or unknown IDs", () => {

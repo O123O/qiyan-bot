@@ -33,6 +33,8 @@ export class TelegramChatAdapter implements ChatAdapter {
     });
   }
 
+  async initialize(): Promise<void> { /* Telegram has no separate validation handshake. */ }
+
   start(): void {
     if (this.stopped) throw new Error("Telegram adapter has stopped and cannot restart");
     this.poller.start();

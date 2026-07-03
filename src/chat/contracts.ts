@@ -32,7 +32,8 @@ export interface ChatAdapterCapabilities {
 }
 
 export interface ChatAdapter extends ChatAdapterCapabilities {
-  start(): void;
+  initialize(): Promise<void>;
+  start(): void | Promise<void>;
   stop(): Promise<void>;
   close(): Promise<void>;
 }
