@@ -147,7 +147,10 @@ npm ci
 npm run check
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/app-server.test.ts
 RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-assistant.test.ts
+RUN_SLACK_INTEGRATION=1 npm test -- tests/integration/slack-live.test.ts
 ```
+
+The Slack live test requires dedicated `SLACK_TEST_*` credentials, a designated channel with recent owner fixtures, and an exact `SLACK_TEST_ALLOW_WRITES=TEAM_ID:OWNER_USER_ID` guard. It is skipped by default and writes visible test messages/files.
 
 ## Troubleshooting
 
