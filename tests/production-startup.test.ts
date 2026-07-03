@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { BotConfig } from "../src/config.ts";
 import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
+import type { ChatAdapter } from "../src/chat/contracts.ts";
 
 test("only full-access assistant mode emits the structural startup warning", () => {
   assert.match(assistantAccessWarning("danger-full-access") ?? "", /non-interactively with full filesystem access/);
@@ -67,4 +68,46 @@ test("production prepares the configured assistant workdir before endpoint start
   assert.equal(warnings.length, 1);
   assert.match(String(warnings[0]!.body), /non-interactively with full filesystem access/);
   db.close();
+});
+
+test("production initializes exactly the configured Telegram and Slack adapters and cleans all on later failure", async () => {
+  for (const mode of ["telegram", "slack", "dual"] as const) {
+    const root = await mkdtemp(join(tmpdir(), `qiyan-bot-production-${mode}-`));
+    const initialized: string[] = [];
+    const closed: string[] = [];
+    const fake = (id: "telegram" | "slack"): ChatAdapter => ({
+      delivery: { id, sendMessage: async () => ({ ok: true }) },
+      ...(id === "slack" ? {
+        primaryBinding: { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } },
+      } : {}),
+      initialize: async () => { initialized.push(id); },
+      start: async () => undefined,
+      stop: async () => undefined,
+      close: async () => { closed.push(id); },
+    } as ChatAdapter);
+    const adapters = mode === "telegram" ? [fake("telegram")] : mode === "slack" ? [fake("slack")] : [fake("telegram"), fake("slack")];
+    const telegram = mode === "slack" ? undefined : { token: "test-token", ownerId: 42, destinationChatId: 42 };
+    const slack = mode === "telegram" ? undefined : { appToken: "xapp-test", botToken: "xoxb-test", userToken: "xoxp-test", teamId: "T1", ownerUserId: "U1" };
+    const config: BotConfig = {
+      qiyanHome: join(root, "qiyan-home"),
+      chat: { primary: mode === "telegram" ? "telegram" : "slack", ...(telegram ? { telegram } : {}), ...(slack ? { slack } : {}) },
+      userHome: root,
+      assistantWorkdir: join(root, "workdir"),
+      dataDir: join(root, "data"),
+      sessionRegistryPath: join(root, "data", "sessions.json"),
+      codexBinary: join(root, "missing-codex"),
+      maxConcurrentTurns: 1,
+      maxCollectCount: 20,
+      mcpHost: "127.0.0.1",
+      mcpPort: 0,
+      attachmentMaxBytes: 1024,
+      attachmentStoreMaxBytes: 4096,
+      assistantSandboxMode: "read-only",
+    };
+    await mkdir(config.qiyanHome, { mode: 0o700 });
+    const app = await buildProductionApp(config, { chdir: () => undefined, chatAdapters: adapters });
+    await assert.rejects(app.start());
+    assert.deepEqual(initialized.sort(), adapters.map((adapter) => adapter.delivery.id).sort());
+    assert.deepEqual(closed.sort(), adapters.map((adapter) => adapter.delivery.id).sort());
+  }
 });

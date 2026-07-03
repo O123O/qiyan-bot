@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { openDatabase } from "../../src/storage/database.ts";
 import { AppError } from "../../src/core/errors.ts";
+import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
 
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {
@@ -43,6 +44,26 @@ test("a pre-QiYan database is rejected without mutation or sidecars", async () =
   assert.deepEqual(unchanged.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => row.name), ["legacy_state"]);
   assert.equal(unchanged.prepare("SELECT value FROM legacy_state").get()!.value, "preserve-me");
   unchanged.close();
+});
+
+test("legacy Telegram cutover is rejected read-only when Telegram configuration is absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-telegram-preflight-"));
+  const path = join(root, "bot.sqlite3");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE qiyan_state(product TEXT PRIMARY KEY, state_version INTEGER NOT NULL);
+    INSERT INTO qiyan_state VALUES ('qiyan-bot', 2);
+    CREATE TABLE source_contexts(id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+    INSERT INTO source_contexts VALUES ('one', 'telegram');
+    CREATE TABLE deliveries(id TEXT PRIMARY KEY);
+  `);
+  legacy.close();
+  const bytes = await readFile(path);
+  assert.throws(() => preflightConversationCutover(path, false), (error: unknown) =>
+    error instanceof AppError && error.code === "CONFIGURATION_ERROR" && /Telegram configuration/i.test(error.message));
+  assert.deepEqual(await readFile(path), bytes);
+  await assert.rejects(access(`${path}-wal`));
+  await assert.rejects(access(`${path}-shm`));
 });
 
 test("a QiYan state-version-1 database is rejected read-only without mutation or sidecars", async () => {

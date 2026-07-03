@@ -342,6 +342,8 @@ export class ConversationDispatcher {
 
   private input(submission: ReservedSubmission): unknown[] {
     const input: unknown[] = [];
+    const origin = originHeader(submission.binding);
+    if (origin) input.push({ type: "text", text: origin, text_elements: [] });
     if (submission.rawText) input.push({ type: "text", text: submission.rawText, text_elements: [] });
     for (const failed of submission.failedAttachments) {
       const name = failed.displayName.replace(/[\u0000-\u001f\u007f\]]/gu, "_").trim().slice(0, 180) || "attachment";
@@ -418,6 +420,19 @@ export class ConversationDispatcher {
     const lease = this.store.lease();
     if (lease?.phase !== "terminalizing" && lease?.binding) this.options.scheduler?.noteConversationPeriodCompleted();
   }
+}
+
+function originHeader(binding: ReservedSubmission["binding"]): string | undefined {
+  if (!binding) return undefined;
+  if (binding.adapterId === "telegram") return "[telegram]";
+  if (binding.adapterId !== "slack") return `[${binding.adapterId}]`;
+  const destination = typeof binding.destination === "object" && binding.destination !== null && !Array.isArray(binding.destination)
+    ? binding.destination as Record<string, unknown>
+    : undefined;
+  if (typeof destination?.threadTs === "string") {
+    return typeof destination.channelId === "string" ? `[slack ${destination.channelId} thread]` : "[slack thread]";
+  }
+  return "[slack dm]";
 }
 
 function isTerminal(status: string): boolean {

@@ -1,4 +1,6 @@
 import { AppError } from "../core/errors.ts";
+import { statSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
@@ -10,6 +12,7 @@ const readOnlyOperations = [
   "read_worker_message",
   "list_models",
   "get_goal",
+  "get_chat_history",
 ] as const;
 
 export interface FullAssistantThreadSnapshot {
@@ -22,7 +25,36 @@ export interface FullAssistantThreadSnapshot {
   }>;
 }
 
-export function runConversationRoutingBackfill(db: Database, telegram: ConversationBinding): void {
+export function preflightConversationCutover(path: string, hasLegacyTelegramBinding: boolean): void {
+  if (hasLegacyTelegramBinding) return;
+  try { if (statSync(path).size === 0) return; }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  let inspector: DatabaseSync | undefined;
+  try {
+    inspector = new DatabaseSync(path, { readOnly: true });
+    const tables = new Set((inspector.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(({ name }) => name));
+    if (!tables.has("source_contexts")) return;
+    const sourceColumns = new Set((inspector.prepare("PRAGMA table_info(source_contexts)").all() as Array<{ name: string }>).map(({ name }) => name));
+    const telegramSources = sourceColumns.has("adapter_id")
+      ? Number((inspector.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE kind = 'telegram' AND adapter_id IS NULL").get() as { count: number }).count)
+      : Number((inspector.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE kind = 'telegram'").get() as { count: number }).count);
+    let legacyDeliveries = 0;
+    if (tables.has("deliveries")) {
+      const deliveryColumns = new Set((inspector.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>).map(({ name }) => name));
+      legacyDeliveries = deliveryColumns.has("adapter_id")
+        ? Number((inspector.prepare("SELECT COUNT(*) AS count FROM deliveries WHERE adapter_id IS NULL").get() as { count: number }).count)
+        : Number((inspector.prepare("SELECT COUNT(*) AS count FROM deliveries").get() as { count: number }).count);
+    }
+    if (telegramSources > 0 || legacyDeliveries > 0) throw configuration("legacy Telegram state requires Telegram configuration before conversation routing cutover");
+  } finally {
+    inspector?.close();
+  }
+}
+
+export function runConversationRoutingBackfill(db: Database, telegram?: ConversationBinding): void {
   inTransaction(db, () => {
     const phase = cutoverPhase(db);
     if (phase === "routing_backfilled" || phase === "complete") {
@@ -35,12 +67,21 @@ export function runConversationRoutingBackfill(db: Database, telegram: Conversat
     for (const source of sources) db.prepare("UPDATE source_contexts SET arrival_sequence = ? WHERE id = ?").run(sequence++, source.id);
     db.prepare("UPDATE arrival_sequence SET next_value = ? WHERE singleton = 1").run(sequence);
 
-    const destinationJson = JSON.stringify(telegram.destination);
-    const replyJson = telegram.reply === undefined ? null : JSON.stringify(telegram.reply);
-    db.prepare(`UPDATE source_contexts
-      SET adapter_id = ?, conversation_key = ?, destination_json = ?, native_reply_json = COALESCE(native_reply_json, ?), source_class = 'chat'
-      WHERE kind = 'telegram'`)
-      .run(telegram.adapterId, telegram.conversationKey, destinationJson, replyJson);
+    const legacyTelegramCount = Number((db.prepare(`SELECT COUNT(*) AS count FROM source_contexts
+      WHERE kind = 'telegram' AND (adapter_id IS NULL OR conversation_key IS NULL OR destination_json IS NULL)`).get() as { count: number }).count);
+    const legacyDeliveryCount = Number((db.prepare(`SELECT COUNT(*) AS count FROM deliveries
+      WHERE adapter_id IS NULL OR conversation_key IS NULL OR destination_json IS NULL`).get() as { count: number }).count);
+    if ((legacyTelegramCount > 0 || legacyDeliveryCount > 0) && !telegram) {
+      throw configuration("legacy Telegram state requires Telegram configuration before conversation routing cutover");
+    }
+    const destinationJson = telegram ? JSON.stringify(telegram.destination) : undefined;
+    const replyJson = telegram?.reply === undefined ? null : JSON.stringify(telegram.reply);
+    if (telegram) {
+      db.prepare(`UPDATE source_contexts
+        SET adapter_id = ?, conversation_key = ?, destination_json = ?, native_reply_json = COALESCE(native_reply_json, ?), source_class = 'chat'
+        WHERE kind = 'telegram' AND (adapter_id IS NULL OR conversation_key IS NULL OR destination_json IS NULL)`)
+        .run(telegram.adapterId, telegram.conversationKey, destinationJson!, replyJson);
+    }
 
     const recoveryRows = db.prepare(`SELECT recovery.id AS recovery_id, original.adapter_id, original.conversation_key,
         original.destination_json, original.native_reply_json
@@ -52,7 +93,7 @@ export function runConversationRoutingBackfill(db: Database, telegram: Conversat
         WHERE id = ?`).run(String(row.adapter_id), String(row.conversation_key), String(row.destination_json),
           row.native_reply_json == null ? null : String(row.native_reply_json), String(row.recovery_id));
     }
-    db.prepare("UPDATE source_contexts SET source_class = 'internal' WHERE kind <> 'telegram'").run();
+    db.prepare("UPDATE source_contexts SET source_class = 'internal' WHERE kind NOT IN ('telegram', 'slack')").run();
 
     db.prepare(`UPDATE assistant_attempts
       SET adapter_id = (SELECT adapter_id FROM source_contexts WHERE id = assistant_attempts.context_id),
@@ -60,12 +101,13 @@ export function runConversationRoutingBackfill(db: Database, telegram: Conversat
           destination_json = (SELECT destination_json FROM source_contexts WHERE id = assistant_attempts.context_id),
           native_reply_json = (SELECT native_reply_json FROM source_contexts WHERE id = assistant_attempts.context_id)`).run();
 
-    const deliveries = db.prepare("SELECT id, reply_to, telegram_message_id FROM deliveries").all() as Array<Record<string, unknown>>;
+    const deliveries = db.prepare("SELECT id, reply_to, telegram_message_id, adapter_id FROM deliveries").all() as Array<Record<string, unknown>>;
     for (const delivery of deliveries) {
+      if (delivery.adapter_id != null) continue;
       const nativeReply: JsonValue | undefined = delivery.reply_to == null ? undefined : { messageId: Number(delivery.reply_to) };
       const receipt: JsonValue | undefined = delivery.telegram_message_id == null ? undefined : { messageId: Number(delivery.telegram_message_id) };
       db.prepare(`UPDATE deliveries SET adapter_id = ?, conversation_key = ?, destination_json = ?, reply_json = ?, receipt_json = ? WHERE id = ?`)
-        .run(telegram.adapterId, telegram.conversationKey, destinationJson,
+        .run(telegram!.adapterId, telegram!.conversationKey, destinationJson!,
           nativeReply === undefined ? null : JSON.stringify(nativeReply),
           receipt === undefined ? null : JSON.stringify(receipt), String(delivery.id));
     }

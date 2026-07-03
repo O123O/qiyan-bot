@@ -41,12 +41,13 @@ import { ThreadGate } from "./sessions/thread-gate.ts";
 import { openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { ConversationStore } from "./storage/conversation-store.ts";
-import { finalizeConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
+import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
+import { SlackChatAdapter } from "./slack/chat-adapter.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
@@ -84,16 +85,16 @@ export function registryReloadPreservesWorkerMappings(current: RegistryDocument,
 
 export async function buildProductionApp(
   config: BotConfig,
-  options: { chdir?: (path: string) => void } = {},
+  options: { chdir?: (path: string) => void; chatAdapters?: readonly ChatAdapter[] } = {},
 ): Promise<BotApp> {
   const telegramConfig = config.chat.telegram;
-  if (!telegramConfig) throw new AppError("UNSUPPORTED_CAPABILITY", "Slack production composition is not available yet");
   const token = randomBytes(32).toString("base64url");
-  const administrativeBinding: ConversationBinding = {
+  const telegramBinding: ConversationBinding | undefined = telegramConfig ? {
     adapterId: "telegram",
     conversationKey: `telegram:${telegramConfig.destinationChatId}`,
     destination: { chatId: String(telegramConfig.destinationChatId) },
-  };
+  } : undefined;
+  let administrativeBinding!: ConversationBinding;
 
   let assistantDir = config.assistantWorkdir;
   let dataDir = config.dataDir;
@@ -127,7 +128,7 @@ export async function buildProductionApp(
   let dispatcher!: ConversationDispatcher;
   let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
-  let chat!: ChatAdapter;
+  let chats: ChatAdapter[] = [];
   let chatRegistry!: ChatAdapterRegistry;
   let slackContextService: SlackContextService | undefined;
   let deliveryWorker!: DeliveryWorker;
@@ -182,11 +183,12 @@ export async function buildProductionApp(
     {
       name: "storage",
       start: async () => {
-        db = openDatabase(join(dataDir, "bot.sqlite3"));
+        const databasePath = join(dataDir, "bot.sqlite3");
+        preflightConversationCutover(databasePath, telegramBinding !== undefined);
+        db = openDatabase(databasePath);
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
         dashboardStore = new SessionDashboardStore(db);
-        runConversationRoutingBackfill(db, administrativeBinding);
-        ownerRoutes = new OwnerRouteStore(db, administrativeBinding);
+        runConversationRoutingBackfill(db, telegramBinding);
       },
       stop: async () => { db.close(); },
     },
@@ -198,22 +200,6 @@ export async function buildProductionApp(
           assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: assistantDir },
           sessions: {},
         });
-        for (const [index, warning] of registry.warnings().entries()) {
-          deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
-        }
-        for (const [index, warning] of assistantWarnings.entries()) {
-          deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
-        }
-        const accessWarning = assistantAccessWarning(config.assistantSandboxMode);
-        if (accessWarning) {
-          deliveries.prepare({
-            id: "assistant-full-access-warning",
-            kind: "system_warning",
-            binding: currentOwnerBinding(),
-            body: `[system] ${accessWarning}`,
-            mandatory: true,
-          });
-        }
       }, stop: async () => undefined,
     },
     {
@@ -233,9 +219,49 @@ export async function buildProductionApp(
       }, stop: async () => undefined,
     },
     {
-      name: "mcp",
+      name: "chat-adapters",
       start: async () => {
         conversations = new ConversationStore(db, deliveries, attachments);
+        const configured: ChatAdapter[] = options.chatAdapters ? [...options.chatAdapters] : [];
+        if (!options.chatAdapters && telegramConfig) configured.push(new TelegramChatAdapter(db, attachments, {
+            token: telegramConfig.token,
+            ownerId: telegramConfig.ownerId,
+            maxMessageBytes: config.attachmentMaxBytes,
+            onMessage: (source, commitNativeCheckpoint) => dispatcher.accept(source, { commitNativeCheckpoint }),
+          }));
+        let slack: SlackChatAdapter | undefined;
+        if (!options.chatAdapters && config.chat.slack) {
+          slack = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+            config: config.chat.slack,
+            maxMessageBytes: config.attachmentMaxBytes,
+            onMessage: (source, effects) => dispatcher.accept(source, effects),
+          });
+          configured.push(slack);
+        } else if (options.chatAdapters) {
+          slack = configured.find((adapter) => adapter.delivery.id === "slack") as SlackChatAdapter | undefined;
+        }
+        const expectedAdapters = [telegramConfig ? "telegram" : undefined, config.chat.slack ? "slack" : undefined].filter((id): id is string => Boolean(id)).sort();
+        const actualAdapters = configured.map((adapter) => adapter.delivery.id).sort();
+        if (!isDeepStrictEqual(actualAdapters, expectedAdapters)) throw new AppError("CONFIGURATION_ERROR", "configured chat adapters do not match chat credentials");
+        chats = configured;
+        try { await Promise.all(chats.map((adapter) => adapter.initialize())); }
+        catch (error) {
+          await Promise.allSettled(chats.map(shutdownAdapter));
+          throw error;
+        }
+        administrativeBinding = config.chat.primary === "telegram"
+          ? telegramBinding!
+          : slack?.primaryBinding ?? (() => { throw new AppError("CONFIGURATION_ERROR", "Slack primary direct message is unavailable"); })();
+        ownerRoutes = new OwnerRouteStore(db, administrativeBinding);
+        chatRegistry = new ChatAdapterRegistry(chats);
+        slackContextService = slack?.context;
+        queueStartupWarnings();
+      },
+      stop: async () => { await settleAll(chats.map(shutdownAdapter)); },
+    },
+    {
+      name: "mcp",
+      start: async () => {
         attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
         assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding });
         const actions = buildActions();
@@ -423,22 +449,16 @@ export async function buildProductionApp(
     {
       name: "delivery",
       start: async () => {
-        chat = new TelegramChatAdapter(db, attachments, {
-          token: telegramConfig.token,
-          ownerId: telegramConfig.ownerId,
-          maxMessageBytes: config.attachmentMaxBytes,
-          onMessage: (source, checkpoint) => dispatcher.accept(source, { commitNativeCheckpoint: checkpoint }),
-        });
-        chatRegistry = new ChatAdapterRegistry([chat]);
         deliveryWorker = new DeliveryWorker(deliveries, chatRegistry, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
         deliveryWorker.start();
       },
-      stop: async () => { await deliveryWorker.stop(); await chat.close(); },
+      stop: async () => { await deliveryWorker.stop(); },
     },
     { name: "maintenance", start: async () => undefined, stop: async () => undefined },
     {
-      name: "polling",
-      start: async () => { chat.start(); }, stop: async () => { await chat.stop(); },
+      name: "chat-ingress",
+      start: async () => { await Promise.all(chats.map((adapter) => adapter.start())); },
+      stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
   ];
 
@@ -668,6 +688,23 @@ export async function buildProductionApp(
     };
   }
 
+  function queueStartupWarnings(): void {
+    for (const [index, warning] of registry.warnings().entries()) {
+      deliveries.prepare({ id: `registry-startup-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
+    }
+    for (const [index, warning] of assistantWarnings.entries()) {
+      deliveries.prepare({ id: `assistant-workspace-warning:${index}`, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${warning}`, mandatory: true });
+    }
+    const accessWarning = assistantAccessWarning(config.assistantSandboxMode);
+    if (accessWarning) deliveries.prepare({
+      id: "assistant-full-access-warning",
+      kind: "system_warning",
+      binding: currentOwnerBinding(),
+      body: `[system] ${accessWarning}`,
+      mandatory: true,
+    });
+  }
+
   function currentOwnerBinding(): ConversationBinding { return ownerRoutes.current(); }
 
   function assistantAttemptBinding(attemptId: string): ConversationBinding {
@@ -703,6 +740,7 @@ export async function buildProductionApp(
   }
 
   function queueDashboardWarning(): void {
+    if (!ownerRoutes) return;
     const state = dashboardStore.renderState();
     if (!state.lastError) return;
     deliveries.prepare({
@@ -1309,4 +1347,17 @@ function isProvenSendNoEffect(error: unknown): boolean {
 function normalizeAppServerTime(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.abs(value) < 1_000_000_000_000 ? value * 1_000 : value;
+}
+
+async function settleAll(promises: readonly Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(promises);
+  const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (errors.length > 0) throw new AggregateError(errors, "one or more chat adapters failed to stop");
+}
+
+async function shutdownAdapter(adapter: ChatAdapter): Promise<void> {
+  let first: unknown;
+  try { await adapter.stop(); } catch (error) { first = error; }
+  try { await adapter.close(); } catch (error) { first ??= error; }
+  if (first) throw first;
 }

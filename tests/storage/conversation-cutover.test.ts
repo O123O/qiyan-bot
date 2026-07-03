@@ -81,6 +81,13 @@ test("routing backfill is complete, constrained, and idempotent", async () => {
   db.close();
 });
 
+test("a fresh Slack-only database completes routing backfill without a Telegram binding", () => {
+  const db = openDatabase(":memory:");
+  runConversationRoutingBackfill(db);
+  assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "routing_backfilled");
+  db.close();
+});
+
 test("finalization reconciles one active attempt from full history", async () => {
   const { db } = await legacyDatabase();
   db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)

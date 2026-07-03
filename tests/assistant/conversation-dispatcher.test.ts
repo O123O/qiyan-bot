@@ -108,7 +108,7 @@ test("starts an idle conversation and naturally steers same-conversation follow-
   assert.deepEqual(runner.starts[0]?.params, {
     threadId: "assistant",
     clientUserMessageId: "first",
-    input: [{ type: "text", text: "hello", text_elements: [] }],
+    input: [{ type: "text", text: "[telegram]", text_elements: [] }, { type: "text", text: "hello", text_elements: [] }],
   });
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
@@ -118,11 +118,31 @@ test("starts an idle conversation and naturally steers same-conversation follow-
     threadId: "assistant",
     expectedTurnId: "turn-1",
     clientUserMessageId: "follow-up",
-    input: [{ type: "text", text: "more", text_elements: [] }],
+    input: [{ type: "text", text: "[telegram]", text_elements: [] }, { type: "text", text: "more", text_elements: [] }],
   });
   runner.steers[0]!.result.resolve({ turnId: "turn-1" });
   await dispatcher.idle();
   await dispatcher.stop();
+});
+
+test("Slack origin is a separate derived input item and does not alter immutable owner text", async (context) => {
+  const { db, runner, dispatcher } = fixture();
+  context.after(() => dispatcher.stop());
+  await dispatcher.accept({
+    id: "slack-first",
+    nativeSourceId: "T1:C1:1.1",
+    binding: { adapterId: "slack", conversationKey: "slack:T1:thread:C1:1.0", destination: { workspaceId: "T1", channelId: "C1", threadTs: "1.0" } },
+    rawText: "/pass exact",
+    attachmentIds: [],
+    receivedAt: 1,
+  });
+  assert.deepEqual(runner.starts[0]?.params.input, [
+    { type: "text", text: "[slack C1 thread]", text_elements: [] },
+    { type: "text", text: "/pass exact", text_elements: [] },
+  ]);
+  assert.equal(db.prepare("SELECT raw_text FROM source_contexts WHERE id = 'slack-first'").get()!.raw_text, "/pass exact");
+  runner.starts[0]!.result.resolve({ turn: { id: "turn", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
 });
 
 test("holds one native steer at a time and only queues another conversation", async () => {
@@ -256,6 +276,7 @@ test("submission input preserves text, image, and document source order", async 
   context.after(() => dispatcher.stop());
   await dispatcher.accept(chat("first", "chat-1", [image.id, document.id]));
   assert.deepEqual(runner.starts[0]?.params.input, [
+    { type: "text", text: "[telegram]", text_elements: [] },
     { type: "text", text: "hello", text_elements: [] },
     attachments.toUserInput("first", image.id),
     attachments.toUserInput("first", document.id),
@@ -273,6 +294,7 @@ test("failed attachments are separate model input and never mutate owner text", 
     failedAttachments: [{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }],
   });
   assert.deepEqual(runner.starts[0]?.params.input, [
+    { type: "text", text: "[telegram]", text_elements: [] },
     { type: "text", text: "/pass exact", text_elements: [] },
     { type: "text", text: "[Slack attachment unavailable: missing.txt]", text_elements: [] },
   ]);
