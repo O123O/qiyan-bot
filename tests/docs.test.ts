@@ -9,7 +9,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.ok(readme.indexOf("general-purpose personal assistant") < readme.indexOf("Telegram"));
   assert.match(readme, /handle small filesystem tasks directly/iu);
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
-  assert.match(readme, /Telegram is the first chat adapter/iu);
+  assert.match(readme, /Telegram and Slack can run together/iu);
   assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
@@ -84,6 +84,7 @@ test("full-access and non-interactive worker warnings precede installation and l
     ["README launch", readme, "\nqiyan-bot\n"],
     ["setup launch", setup, "\nqiyan-bot\n"],
     ["Telegram launch", telegram, "\nqiyan-bot\n"],
+    ["Slack launch", await readFile(resolve("docs/chat-apps/slack.md"), "utf8"), "\nqiyan-bot\n"],
   ] as const) {
     const boundary = document.indexOf(marker);
     assert.ok(boundary >= 0, `${name} marker missing`);
@@ -124,17 +125,38 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
   assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
   assert.match(readme, /Before opening a managed thread.*unadopt_session.*adopt it again/isu);
-  assert.match(setup, /config-check.*required Telegram values.*assistant-login.*does not need chat credentials/isu);
+  assert.match(setup, /config-check.*at least one complete adapter group.*assistant-login.*does not need chat credentials/isu);
 });
 
-test("Slack and WeChat pages are explicit roadmap stubs rather than fake setup guides", async () => {
-  for (const path of ["docs/chat-apps/slack.md", "docs/chat-apps/wechat.md"]) {
-    const guide = await readFile(resolve(path), "utf8");
-    assert.match(guide, /Status: Planned/u);
-    assert.match(guide, /not implemented/iu);
-    assert.doesNotMatch(guide, /export\s+\w*(?:TOKEN|SECRET|KEY)=/u);
-    assert.doesNotMatch(guide, /npm install/iu);
-  }
+test("Slack guide covers the implemented single-user Socket Mode setup and limits", async () => {
+  const guide = await readFile(resolve("docs/chat-apps/slack.md"), "utf8");
+  for (const required of [
+    "Status: Implemented", "Socket Mode", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TEAM_ID", "SLACK_OWNER_USER_ID",
+    "PRIMARY_CHAT_APP", "chmod 600", "connections:write", "xapp-", "xoxb-", "xoxp-", "private-search consent", "Copy member ID",
+    "/invite @QiYan", "activated thread", "transient", "3,000", "Activity feed", "ATTACHMENT_MAX_BYTES", "Revoked",
+  ]) assert.equal(guide.includes(required), true, `Slack guide is missing: ${required}`);
+  assert.match(guide, /internal Slack app|workspace-internal app/iu);
+  assert.match(guide, /user token.*code boundary.*read-only.*powerful/isu);
+  assert.match(guide, /search.*cannot exceed.*owner.*permissions.*workspace policy/isu);
+  assert.doesNotMatch(guide, /EnvironmentFile=/u);
+});
+
+test("packaged Slack manifest has the exact reviewed events and scopes", async () => {
+  const manifest = await readFile(resolve("assets/slack/manifest.yaml"), "utf8");
+  assert.match(manifest, /socket_mode_enabled: true/u);
+  assert.match(manifest, /messages_tab_enabled: true/u);
+  const list = (section: string) => [...section.matchAll(/^\s+- ([a-z_.:]+)$/gmu)].map((match) => match[1]!);
+  const bot = manifest.split(/^\s{4}bot:$/mu)[1]!.split(/^\s{4}user:$/mu)[0]!;
+  const user = manifest.split(/^\s{4}user:$/mu)[1]!.split(/^settings:$/mu)[0]!;
+  const events = manifest.split(/^\s{4}bot_events:$/mu)[1]!.split(/^\s{2}org_deploy_enabled:/mu)[0]!;
+  assert.deepEqual(list(bot), ["app_mentions:read", "channels:history", "channels:read", "chat:write", "files:read", "files:write", "groups:history", "groups:read", "im:history", "im:write", "users:read"]);
+  assert.deepEqual(list(user), ["search:read.files", "search:read.im", "search:read.mpim", "search:read.private", "search:read.public", "search:read.users"]);
+  assert.deepEqual(list(events), ["app_mention", "message.channels", "message.groups", "message.im"]);
+  assert.doesNotMatch(manifest, /incoming_webhooks|redirect_urls/u);
+
+  const wechat = await readFile(resolve("docs/chat-apps/wechat.md"), "utf8");
+  assert.match(wechat, /Status: Planned/u);
+  assert.match(wechat, /not implemented/iu);
 });
 
 test("shared docs explain conversation-bound native steering and ordinary safeguards", async () => {

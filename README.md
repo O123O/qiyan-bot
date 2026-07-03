@@ -1,6 +1,6 @@
 # QiYan Bot
 
-QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram is the first chat adapter; Slack and WeChat are planned behind the same transport-neutral backend.
+QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram and Slack can run together behind the same transport-neutral backend; WeChat is planned.
 
 QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
 
@@ -11,6 +11,7 @@ Read this before installing or launching:
 - The assistant defaults to `danger-full-access` with approval policy `never`. It can read, write, and execute as your OS user without an interactive confirmation.
 - Chat approvals are unsupported. Worker sessions receive no QiYan approval, sandbox, or shell override, so your normal Codex configuration must already be suitable for automatic, non-interactive operation. A remaining permission request is reported as blocked.
 - The Telegram adapter accepts only the configured owner and sends only to that owner's private chat. This is not a multi-user service.
+- The Slack adapter accepts only the configured owner. Its `xoxp-` user token is read-only by QiYan's code boundary but remains a powerful credential whose search coverage follows the owner's Slack permissions and workspace policy.
 - The private `.env` is not propagated to assistant or worker child processes, but full filesystem access under the same OS user means QiYan can technically read it. Filesystem isolation requires a dedicated account or container.
 - Use a dedicated OS account or container if other same-account processes are outside your trust boundary.
 
@@ -19,7 +20,7 @@ Read this before installing or launching:
 - Linux
 - Node.js 24 or newer
 - `codex-cli 0.142.4`
-- A Telegram bot token and the numeric user ID of its sole owner
+- At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, or both
 
 ## Install
 
@@ -45,7 +46,7 @@ Setup guides:
 - [Shared Codex and assistant setup](docs/setup.md)
 - [Required fresh cutover for versions before v0.3.0](docs/upgrading-to-v0.3.md)
 - [Telegram — implemented](docs/chat-apps/telegram.md)
-- [Slack — planned](docs/chat-apps/slack.md)
+- [Slack — implemented](docs/chat-apps/slack.md)
 - [WeChat — planned](docs/chat-apps/wechat.md)
 
 ## Configure and run
@@ -63,7 +64,7 @@ EOF
 chmod 600 "$HOME/.qiyan-bot/.env"
 ```
 
-See the [Telegram guide](docs/chat-apps/telegram.md) for safe owner-ID discovery. Validate the complete configuration, then authenticate the isolated assistant profile once:
+This is a Telegram example. Slack-only and dual-adapter dotenv examples are in the [Slack guide](docs/chat-apps/slack.md). At least one complete adapter group is required; dual mode requires `PRIMARY_CHAT_APP`. Validate the complete configuration, then authenticate the isolated assistant profile once:
 
 ```bash
 qiyan-bot config-check
@@ -137,7 +138,7 @@ This is the v0.3 fresh QiYan state format. State created before v0.3.0 is reject
 
 Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.
 
-Telegram delivery and assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash.
+Telegram and Slack delivery plus assistant tool effects are durable. Confirmed effects replay receipts; uncertain effects are reconciled against app-server or outbox state and are never blindly repeated. A visible recovery label identifies a mandatory delivery that must be retried after an ambiguous crash. Slack search bodies are transient, bounded, and never written to durable receipts or report files.
 
 ## Development
 
@@ -157,5 +158,6 @@ RUN_CODEX_INTEGRATION=1 npm test -- tests/integration/mcp-assistant.test.ts
 - `PERMISSION_BLOCKED`: the user's normal worker configuration still requested an approval that chat cannot provide.
 - `OPERATION_UNCERTAIN` or `DELIVERY_UNCERTAIN`: inspect status before deciding whether a human-visible retry is safe.
 - No Telegram input: verify the numeric owner ID and ensure no second process is polling the same bot token.
+- No Slack input: verify owner/workspace IDs, invite QiYan to the channel, mention it once in the thread, and review the [Slack troubleshooting steps](docs/chat-apps/slack.md#troubleshooting-and-revocation).
 
-SSH endpoints, Slack, WeChat, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.
+SSH endpoints, WeChat, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.

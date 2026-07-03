@@ -8,7 +8,8 @@
   "files": [
     "dist/qiyan-bot",
     "assets/assistant/AGENTS.md",
-    "assets/assistant/session-status.example.json"
+    "assets/assistant/session-status.example.json",
+    "assets/slack/manifest.yaml"
   ],
   "engines": {
     "node": ">=24"

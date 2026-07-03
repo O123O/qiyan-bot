@@ -1,6 +1,6 @@
 # Shared setup
 
-This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. Chat credentials are adapter-specific; currently only [Telegram](chat-apps/telegram.md) is implemented.
+This guide prepares QiYan's isolated assistant and the user's ordinary Codex workers. Chat credentials are adapter-specific; [Telegram](chat-apps/telegram.md) and [Slack](chat-apps/slack.md) are implemented and may run together.
 
 ## Understand the execution model
 
@@ -43,7 +43,7 @@ qiyan-bot config-check
 qiyan-bot assistant-login
 ```
 
-`config-check` validates the complete adapter configuration, including required Telegram values. `assistant-login` itself starts no bot and does not need chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
+`config-check` requires at least one complete adapter group and validates every configured group. Dual-adapter setups also require `PRIMARY_CHAT_APP=telegram` or `PRIMARY_CHAT_APP=slack`. `assistant-login` itself starts no bot and does not need chat credentials. The assistant profile is independent; QiYan never copies or symlinks your normal `auth.json`. If authentication later expires, stop the bot, run login again, and restart it yourself.
 
 ## Configure an adapter and launch
 

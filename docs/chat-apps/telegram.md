@@ -48,6 +48,8 @@ chmod 600 "$HOME/.qiyan-bot/.env"
 
 `TELEGRAM_DESTINATION_CHAT_ID` must equal `TELEGRAM_OWNER_ID`; this enforces the single-user private chat. Group, channel, callback, edited, service, and non-owner input is not accepted as an assistant message.
 
+When Slack is also configured, add its complete five-value group and set `PRIMARY_CHAT_APP=telegram` or `PRIMARY_CHAT_APP=slack`. Both adapters run in one process; the primary is only the route used before the first accepted owner message.
+
 For a nondefault QiYan home, create `<QIYAN_HOME>/.env` instead and pass the same absolute `--home` to each command. Home selection is CLI `--home`, process `QIYAN_HOME`, then `$HOME/.qiyan-bot`; `QIYAN_HOME` is not valid inside `.env`.
 
 ## 4. Authenticate and start
