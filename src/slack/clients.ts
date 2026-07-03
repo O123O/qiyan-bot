@@ -152,12 +152,11 @@ export function createSlackClients(config: SlackConfig, dependencies: SlackClien
 export async function validateSlackStartup(config: SlackConfig, clients: SlackClients): Promise<SlackStartupIdentity> {
   let botAuth: SlackResponse;
   let ownerAuth: SlackResponse;
-  let searchInfo: SlackResponse;
   let opened: SlackResponse;
   try {
     botAuth = await clients.bot.authTest();
     ownerAuth = await clients.search.authTest();
-    searchInfo = await clients.search.searchInfo();
+    await clients.search.searchInfo();
     opened = await clients.bot.openOwnerDm(config.ownerUserId);
   } catch {
     throw configuration("Slack startup identity validation failed");
@@ -174,8 +173,6 @@ export async function validateSlackStartup(config: SlackConfig, clients: SlackCl
   if (ownerTeamId !== botTeamId) throw configuration("Slack bot and user token belong to different workspaces");
   if (ownerUserId !== config.ownerUserId) throw configuration("Slack user token does not belong to the configured owner");
   if (botUserId === ownerUserId) throw configuration("Slack owner and bot identity collision");
-  if (searchInfo.is_ai_search_enabled !== true) throw configuration("Slack Real-time Search is unavailable");
-
   const channel = recordField(opened, "channel");
   const ownerDmChannelId = channel ? stringField(channel, "id") : undefined;
   if (!ownerDmChannelId) throw configuration("Slack owner direct message could not be resolved");

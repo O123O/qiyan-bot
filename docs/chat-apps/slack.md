@@ -8,7 +8,7 @@ The Slack adapter is a single-user Socket Mode bridge. It accepts DMs from one c
 
 In [Slack app management](https://api.slack.com/apps), choose **Create New App**, **From an app manifest**, select the target workspace, and paste `assets/slack/manifest.yaml` from the installed package or repository. Review the requested access before creating the app.
 
-The packaged manifest enables Socket Mode, the App Home messages tab, and only these events: `app_mention`, `message.channels`, `message.groups`, and `message.im`. Do not add incoming webhooks or OAuth redirect URLs. This first release is for a workspace-internal app; Slack Real-time Search eligibility depends on the workspace plan, policy, and AI-app access.
+The packaged manifest enables Socket Mode, the App Home messages tab, and only these events: `app_mention`, `message.channels`, `message.groups`, and `message.im`. Do not add incoming webhooks or OAuth redirect URLs. This first release is for a workspace-internal app; Slack Real-time Search access depends on workspace policy and AI-app access.
 
 Under **Basic Information → App-Level Tokens**, generate an `xapp-` token with `connections:write`. Under **Install App**, install the app to the workspace. Record the `xoxb-` Bot User OAuth Token and the installing owner's `xoxp-` User OAuth Token.
 
@@ -24,7 +24,7 @@ Never paste tokens into source, screenshots, issue trackers, or shell history. R
 
 ## 2. Confirm search consent and identities
 
-The manifest requests user scopes for public, private, IM, MPIM, file, and user search. A workspace administrator may need to enable the Real-time Search API or approve the internal AI app. Private search also requires Slack's applicable administrator and user consent. Successful search never proves workspace-wide completeness: results cannot exceed the owner's permissions, consent, retention, or workspace policy.
+The manifest requests user scopes for public, private, IM, MPIM, file, and user search. A workspace administrator may need to approve the internal AI app. Private search also requires Slack's applicable administrator and user consent. Keyword search remains available when Slack AI Search is not enabled; semantic search requires Slack AI Search on an eligible plan. Successful search never proves workspace-wide completeness: results cannot exceed the owner's permissions, consent, retention, or workspace policy.
 
 Copy the owner's member ID (`U…`) from the Slack profile menu (**Copy member ID**). The workspace is derived at startup with `auth.test` from the bot token, and the user token must report the same workspace. QiYan also validates the configured owner identity and ensures that the bot is not the owner identity.
 
@@ -88,7 +88,7 @@ Smoke-test the App Home DM, a channel mention and same-thread follow-up, a small
 
 ## Troubleshooting and revocation
 
-- Startup identity/search failure: verify all token prefixes, the owner ID, that both OAuth tokens belong to the same workspace, app installation, Real-time Search eligibility, scopes, and private-search consent.
+- Startup identity/search failure: verify all token prefixes, the owner ID, that both OAuth tokens belong to the same workspace, app installation, Real-time Search scopes, and private-search consent.
 - Persisted workspace mismatch: restore tokens for the original workspace, or intentionally start with a fresh QiYan home when moving the entire assistant to another workspace.
 - No DM event: enable the App Home messages tab, reinstall after manifest changes, and confirm `message.im` subscription.
 - No channel event: invite QiYan, mention it once in the intended thread, and confirm the four event subscriptions.

@@ -139,6 +139,7 @@ test("Slack guide covers the implemented single-user Socket Mode setup and limit
   assert.match(guide, /user token.*code boundary.*read-only.*powerful/isu);
   assert.match(guide, /search.*cannot exceed.*owner.*permissions.*workspace policy/isu);
   assert.match(guide, /workspace.*deriv.*auth\.test.*bot.*user token.*same workspace/isu);
+  assert.match(guide, /keyword search.*Slack AI Search.*semantic/isu);
   assert.doesNotMatch(guide, /^SLACK_TEAM_ID=/mu);
   const secureCreate = guide.indexOf('install -m 600 /dev/null "$HOME/.qiyan-bot/.env"');
   const privateEdit = guide.indexOf('${EDITOR:-vi} "$HOME/.qiyan-bot/.env"');

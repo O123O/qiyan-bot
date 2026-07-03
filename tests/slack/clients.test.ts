@@ -27,6 +27,7 @@ function harness(overrides: {
   botAuth?: Record<string, unknown>;
   userAuth?: Record<string, unknown>;
   searchInfo?: Record<string, unknown>;
+  searchFailure?: unknown;
   open?: Record<string, unknown>;
   postFailure?: unknown;
   fetch?: typeof fetch;
@@ -41,6 +42,7 @@ function harness(overrides: {
         ? (overrides.botAuth ?? { ok: true, team_id: "T123", user_id: "B123" })
         : (overrides.userAuth ?? { ok: true, team_id: "T123", user_id: "U123" });
       if (method === "conversations.open") return overrides.open ?? { ok: true, channel: { id: "D123" } };
+      if (method === "assistant.search.info" && overrides.searchFailure) throw overrides.searchFailure;
       if (method === "assistant.search.info") return overrides.searchInfo ?? { ok: true, is_ai_search_enabled: true };
       if (method === "chat.postMessage" && overrides.postFailure) throw overrides.postFailure;
       return { ok: true, method, args };
@@ -123,7 +125,6 @@ for (const [name, overrides, match] of [
   ["wrong user workspace", { userAuth: { ok: true, team_id: "T999", user_id: "U123" } }, /workspace/i],
   ["wrong owner identity", { userAuth: { ok: true, team_id: "T123", user_id: "U999" } }, /owner/i],
   ["owner and bot collision", { botAuth: { ok: true, team_id: "T123", user_id: "U123" } }, /collision/i],
-  ["unavailable Real-time Search", { searchInfo: { ok: true, is_ai_search_enabled: false } }, /search.*unavailable/i],
   ["unresolvable owner DM", { open: { ok: true, channel: {} } }, /direct message/i],
 ] as const) {
   test(`startup rejects ${name}`, async () => {
@@ -131,6 +132,25 @@ for (const [name, overrides, match] of [
       error instanceof AppError && error.code === "CONFIGURATION_ERROR" && match.test(error.message));
   });
 }
+
+test("startup keeps keyword search available when Slack AI semantic search is disabled", async () => {
+  const result = await validateSlackStartup(config, harness({
+    searchInfo: { ok: true, is_ai_search_enabled: false },
+  }).clients);
+  assert.equal(result.teamId, "T123");
+  assert.equal(result.coverage.searchAvailable, true);
+});
+
+test("startup still rejects a failed Real-time Search capability request without exposing details", async () => {
+  const secret = config.userToken;
+  await assert.rejects(validateSlackStartup(config, harness({
+    searchFailure: new Error(`search failed with ${secret}`),
+  }).clients), (error: unknown) =>
+    error instanceof AppError
+    && error.code === "CONFIGURATION_ERROR"
+    && /identity validation failed/iu.test(error.message)
+    && !error.message.includes(secret));
+});
 
 test("startup coverage does not infer private consent or unavailable categories from search-info", async () => {
   const { clients } = harness({ searchInfo: { ok: true, is_ai_search_enabled: true, private_search_enabled: false, inaccessible: ["im"] } });
