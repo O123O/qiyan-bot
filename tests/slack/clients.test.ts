@@ -171,6 +171,7 @@ test("SDK errors become sanitized SlackApiError values with conservative retry m
     assert.equal(error.retryAfterMs, 3_000);
     assert.equal(error.deterministic, false);
     assert.equal(error.safeToRetry, true);
+    assert.equal((error as SlackApiError & { category?: string }).category, "rate_limited");
     assert.doesNotMatch(error.message, new RegExp(secret));
     assert.equal("headers" in error, false);
     return true;
@@ -180,4 +181,26 @@ test("SDK errors become sanitized SlackApiError values with conservative retry m
   const ambiguous = harness({ postFailure: transport }).clients;
   await assert.rejects(ambiguous.bot.postMessage({ channel: "D123", text: "hello" }), (error: unknown) =>
     error instanceof SlackApiError && error.safeToRetry === false && error.deterministic === false && !error.message.includes(secret));
+});
+
+test("platform errors distinguish proven rejections from ambiguous service failures", async () => {
+  const platform = (reason: string) => Object.assign(new Error(`Slack rejected with ${reason}`), {
+    code: "slack_webapi_platform_error",
+    data: { ok: false, error: reason },
+  });
+  const unauthorized = harness({ postFailure: platform("invalid_auth") }).clients;
+  await assert.rejects(unauthorized.bot.postMessage({ channel: "D123", text: "hello" }), (error: unknown) => {
+    assert.ok(error instanceof SlackApiError);
+    assert.equal(error.deterministic, true);
+    assert.equal((error as SlackApiError & { category?: string }).category, "authorization");
+    return true;
+  });
+
+  const internal = harness({ postFailure: platform("internal_error") }).clients;
+  await assert.rejects(internal.bot.postMessage({ channel: "D123", text: "hello" }), (error: unknown) => {
+    assert.ok(error instanceof SlackApiError);
+    assert.equal(error.deterministic, false);
+    assert.equal((error as SlackApiError & { category?: string }).category, "service");
+    return true;
+  });
 });

@@ -65,6 +65,8 @@ export interface SlackStartupIdentity {
   coverage: SlackSearchCoverage;
 }
 
+export type SlackFailureCategory = "rate_limited" | "authorization" | "invalid_request" | "service" | "unknown";
+
 export class SlackApiError extends Error {
   constructor(
     message: string,
@@ -72,6 +74,7 @@ export class SlackApiError extends Error {
     readonly retryAfterMs: number | undefined,
     readonly deterministic: boolean,
     readonly safeToRetry: boolean,
+    readonly category: SlackFailureCategory = "unknown",
   ) {
     super(message);
     this.name = "SlackApiError";
@@ -88,6 +91,21 @@ const SEARCH_CATEGORIES = Object.freeze([
   "files",
   "users",
 ] as const);
+const RATE_LIMIT_ERRORS = new Set(["rate_limited", "ratelimited"]);
+const AUTHORIZATION_ERRORS = new Set([
+  "access_denied", "accesslimited", "account_inactive", "ekm_access_denied", "enterprise_is_restricted",
+  "invalid_auth", "missing_scope", "no_permission", "not_allowed_token_type", "not_authed", "org_login_required",
+  "team_access_not_granted", "token_expired", "token_revoked", "two_factor_setup_required",
+]);
+const SERVICE_ERRORS = new Set([
+  "assistant_search_context_disabled", "fatal_error", "internal_error", "request_timeout", "service_unavailable", "team_added_to_org",
+]);
+const INVALID_REQUEST_ERRORS = new Set([
+  "channel_not_found", "context_channel_not_found", "deprecated_endpoint", "feature_not_enabled", "invalid_action_token",
+  "invalid_arg_name", "invalid_arguments", "invalid_array_arg", "invalid_blocks", "invalid_charset", "invalid_cursor",
+  "invalid_form_data", "invalid_post_type", "method_deprecated", "missing_post_type", "missing_query", "msg_too_long",
+  "no_text", "query_too_long",
+]);
 
 interface SlackClientDependencies {
   createWebClient?: (token: string, options: Record<string, unknown>) => SlackWebClientShape;
@@ -195,15 +213,26 @@ function normalizeSlackError(error: unknown, operation: string, rateLimitProvesN
       retryAfter === undefined ? undefined : retryAfter * 1_000,
       false,
       rateLimitProvesNoWrite,
+      "rate_limited",
     );
   }
-  if (code === "slack_webapi_platform_error" || code === "slack_webapi_file_upload_invalid_args_error") {
-    return new SlackApiError(`Slack ${operation} was rejected`, undefined, undefined, true, false);
+  if (code === "slack_webapi_platform_error") {
+    const platformCode = stringField(asRecord(source?.data) ?? {}, "error");
+    const category = platformErrorCategory(platformCode);
+    const deterministic = category === "authorization" || category === "invalid_request";
+    return new SlackApiError(
+      `Slack ${operation} was rejected`, undefined, undefined, deterministic,
+      category === "rate_limited" && rateLimitProvesNoWrite, category,
+    );
+  }
+  if (code === "slack_webapi_file_upload_invalid_args_error") {
+    return new SlackApiError(`Slack ${operation} was rejected`, undefined, undefined, true, false, "invalid_request");
   }
   if (code === "slack_webapi_http_error") {
     const status = finiteNumber(source?.statusCode);
-    const deterministic = status !== undefined && status >= 400 && status < 500 && status !== 429;
-    return new SlackApiError(`Slack ${operation} failed over HTTP`, status, undefined, deterministic, false);
+    const category = httpFailureCategory(status);
+    const deterministic = category === "authorization" || category === "invalid_request";
+    return new SlackApiError(`Slack ${operation} failed over HTTP`, status, undefined, deterministic, false, category);
   }
   return new SlackApiError(`Slack ${operation} transport failed`, undefined, undefined, false, false);
 }
@@ -213,10 +242,10 @@ async function downloadSlackFile(urlValue: string, botToken: string, fetchImpl: 
   try {
     url = new URL(urlValue);
   } catch {
-    throw new SlackApiError("Slack file URL is invalid", undefined, undefined, true, false);
+    throw new SlackApiError("Slack file URL is invalid", undefined, undefined, true, false, "invalid_request");
   }
   if (url.protocol !== "https:" || (url.hostname !== "files.slack.com" && url.hostname !== "files.slack-edge.com")) {
-    throw new SlackApiError("Slack file URL uses an untrusted host", undefined, undefined, true, false);
+    throw new SlackApiError("Slack file URL uses an untrusted host", undefined, undefined, true, false, "invalid_request");
   }
   let response: Response;
   try {
@@ -225,9 +254,10 @@ async function downloadSlackFile(urlValue: string, botToken: string, fetchImpl: 
     throw new SlackApiError("Slack file download transport failed", undefined, undefined, false, false);
   }
   if (!response.ok || !response.body) {
-    const deterministic = response.status >= 400 && response.status < 500 && response.status !== 429;
+    const category = httpFailureCategory(response.status);
+    const deterministic = category === "authorization" || category === "invalid_request";
     const retryAfterMs = response.status === 429 ? retryAfterHeader(response.headers) : undefined;
-    throw new SlackApiError("Slack file download failed", response.status, retryAfterMs, deterministic, response.status === 429);
+    throw new SlackApiError("Slack file download failed", response.status, retryAfterMs, deterministic, response.status === 429, category);
   }
   const size = contentLength(response.headers);
   return {
@@ -264,6 +294,23 @@ function retryAfterHeader(headers: Headers): number | undefined {
   if (raw === null) return undefined;
   const seconds = Number(raw);
   return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1_000 : undefined;
+}
+
+function platformErrorCategory(code: string | undefined): SlackFailureCategory {
+  if (!code) return "unknown";
+  if (RATE_LIMIT_ERRORS.has(code)) return "rate_limited";
+  if (AUTHORIZATION_ERRORS.has(code)) return "authorization";
+  if (SERVICE_ERRORS.has(code)) return "service";
+  if (INVALID_REQUEST_ERRORS.has(code)) return "invalid_request";
+  return "unknown";
+}
+
+function httpFailureCategory(status: number | undefined): SlackFailureCategory {
+  if (status === 429) return "rate_limited";
+  if (status === 401 || status === 403) return "authorization";
+  if (status !== undefined && status >= 400 && status < 500) return "invalid_request";
+  if (status !== undefined && status >= 500) return "service";
+  return "unknown";
 }
 
 function configuration(message: string): AppError {

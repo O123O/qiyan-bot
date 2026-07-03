@@ -1,7 +1,7 @@
 import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { ChatHistoryProvider, ChatHistoryRequest } from "../chat/contracts.ts";
 import { AppError } from "../core/errors.ts";
-import type { SlackBotClient, SlackSearchClient, SlackSearchCoverage } from "./clients.ts";
+import { SlackApiError, type SlackBotClient, type SlackSearchClient, type SlackSearchCoverage } from "./clients.ts";
 import { TransientResultLimiter, type TransientResults } from "./result-limiter.ts";
 
 interface SlackDestination {
@@ -108,11 +108,12 @@ export class SlackContextService implements ChatHistoryProvider {
           before: Math.ceil(toMs / 1_000),
           ...(cursor ? { cursor } : {}),
         });
-      } catch {
+      } catch (error) {
         if (page === 0) throw new AppError("ENDPOINT_UNAVAILABLE", "Slack search is unavailable; verify the read-only user token and search scopes");
         complete = false;
-        warning = "Slack search continuation failed; returned results are partial.";
-        coverage.errors = [...coverage.errors, "pagination_failed"];
+        const failure = continuationFailure(error);
+        warning = failure.warning;
+        coverage.errors = [...coverage.errors, failure.marker];
         break;
       }
       const results = record(response.results);
@@ -333,7 +334,41 @@ function containsUserElement(value: unknown, ownerUserId: string): boolean {
   return Object.values(item).some((child) => containsUserElement(child, ownerUserId));
 }
 
-function renderSearchMatch(item: IndexedSearchMatch): string { return JSON.stringify(item.result); }
+function renderSearchMatch(item: IndexedSearchMatch): string {
+  const rendered: string[] = [];
+  collectRenderedValues(item.result, rendered);
+  return rendered.join(" ");
+}
+
+function collectRenderedValues(value: unknown, output: string[]): void {
+  if (typeof value === "string") {
+    output.push(value);
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    output.push(String(value));
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectRenderedValues(item, output);
+    return;
+  }
+  const item = record(value);
+  if (item) for (const child of Object.values(item)) collectRenderedValues(child, output);
+}
+
+function continuationFailure(error: unknown): { marker: string; warning: string } {
+  if (error instanceof SlackApiError && error.category === "rate_limited") {
+    return { marker: "rate_limited", warning: "Slack search continuation hit a rate limit; returned results are partial." };
+  }
+  if (error instanceof SlackApiError && error.category === "authorization") {
+    return {
+      marker: "authorization_failed",
+      warning: "Slack search continuation failed authorization or scope checks; remaining requested coverage was omitted.",
+    };
+  }
+  return { marker: "pagination_failed", warning: "Slack search continuation failed; returned results are partial." };
+}
 
 function withinDateBounds(item: IndexedSearchMatch, fromMs: number | undefined, toMs: number): boolean {
   const timestamp = slackTimestampMs(item.sortTimestamp);

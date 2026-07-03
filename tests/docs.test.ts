@@ -138,6 +138,11 @@ test("Slack guide covers the implemented single-user Socket Mode setup and limit
   assert.match(guide, /internal Slack app|workspace-internal app/iu);
   assert.match(guide, /user token.*code boundary.*read-only.*powerful/isu);
   assert.match(guide, /search.*cannot exceed.*owner.*permissions.*workspace policy/isu);
+  const secureCreate = guide.indexOf('install -m 600 /dev/null "$HOME/.qiyan-bot/.env"');
+  const privateEdit = guide.indexOf('${EDITOR:-vi} "$HOME/.qiyan-bot/.env"');
+  assert.ok(secureCreate >= 0 && privateEdit > secureCreate, "Slack dotenv must be mode 0600 before credentials are edited");
+  assert.doesNotMatch(guide, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
+  assert.match(guide, /shell history/iu);
   assert.doesNotMatch(guide, /EnvironmentFile=/u);
 });
 

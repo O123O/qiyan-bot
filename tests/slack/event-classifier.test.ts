@@ -123,10 +123,43 @@ test("normalizes only bounded Slack file metadata", () => {
   assert.doesNotMatch(JSON.stringify(result), /action_token|shares|must-not-survive/u);
 });
 
+test("accepts owner file-share messages while still rejecting other message subtypes", () => {
+  const file = {
+    id: "F1",
+    name: "report.txt",
+    mimetype: "text/plain",
+    size: 12,
+    url_private_download: "https://files.slack.com/files-pri/T1-F1/download/report.txt",
+  };
+  const dm = classifySlackEvent(envelope({
+    type: "message", subtype: "file_share", channel_type: "im", channel: "D1", user: "U1", ts: "2.0",
+    text: "report", bot_id: null, app_id: null, files: [file],
+  }), context());
+  assert.equal(dm.kind, "accept");
+  if (dm.kind === "accept") assert.equal(dm.event.files[0]?.slackFileId, "F1");
+
+  const key = "slack:T1:thread:C1:1.0";
+  const thread = classifySlackEvent(envelope({
+    type: "message", subtype: "file_share", channel_type: "channel", channel: "C1", user: "U1", ts: "2.0",
+    thread_ts: "1.0", text: "report", bot_id: null, app_id: null, files: [file],
+  }), context([key]));
+  assert.equal(thread.kind, "accept");
+
+  for (const subtype of ["message_changed", "bot_message", "thread_broadcast"]) {
+    assert.equal(classifySlackEvent(envelope({
+      type: "message", subtype, channel_type: "im", channel: "D1", user: "U1", ts: "2.0", text: "ignore",
+    }), context()).kind, "discard");
+  }
+});
+
 test("overlapping app mention and message events share native source identity", () => {
   const mention = classifySlackEvent(envelope({ type: "app_mention", channel: "C1", user: "U1", ts: "1.0", text: "<@B1> hi" }), context());
   const message = classifySlackEvent(envelope({ type: "message", channel_type: "channel", channel: "C1", user: "U1", ts: "1.0", thread_ts: "1.0", text: "<@B1> hi" }, { event_id: "E2" }), context(["slack:T1:thread:C1:1.0"]));
   assert.equal(mention.kind, "accept");
   assert.equal(message.kind, "accept");
-  if (mention.kind === "accept" && message.kind === "accept") assert.equal(mention.event.nativeSourceId, message.event.nativeSourceId);
+  if (mention.kind === "accept" && message.kind === "accept") {
+    assert.equal(mention.event.nativeSourceId, message.event.nativeSourceId);
+    assert.equal(mention.event.rawText, "hi");
+    assert.equal(message.event.rawText, "hi");
+  }
 });

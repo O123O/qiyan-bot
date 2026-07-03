@@ -33,17 +33,23 @@ Copy the owner's member ID (`U…`) from the Slack profile menu (**Copy member I
 Create the private QiYan dotenv file:
 
 ```bash
-mkdir -p "$HOME/.qiyan-bot"
-chmod 700 "$HOME/.qiyan-bot"
-cat > "$HOME/.qiyan-bot/.env" <<'EOF'
+install -d -m 700 "$HOME/.qiyan-bot"
+install -m 600 /dev/null "$HOME/.qiyan-bot/.env"
+${EDITOR:-vi} "$HOME/.qiyan-bot/.env"
+chmod 600 "$HOME/.qiyan-bot/.env"
+```
+
+Enter the five values in the editor, using this shape:
+
+```dotenv
 SLACK_APP_TOKEN=xapp-replace-with-app-token
 SLACK_BOT_TOKEN=xoxb-replace-with-bot-token
 SLACK_USER_TOKEN=xoxp-replace-with-owner-user-token
 SLACK_TEAM_ID=T01234567
 SLACK_OWNER_USER_ID=U01234567
-EOF
-chmod 600 "$HOME/.qiyan-bot/.env"
 ```
+
+Creating the empty file with mode `0600` before editing prevents a temporary world-readable token file. Editing it directly also keeps literal credentials out of shell history; do not place real tokens in command arguments or an interactive heredoc.
 
 All five values are required together. For a nondefault QiYan home, write `<QIYAN_HOME>/.env` and pass the same absolute `--home` to validation, login, and run. Do not put `QIYAN_HOME` inside `.env`.
 

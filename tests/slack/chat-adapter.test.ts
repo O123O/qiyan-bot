@@ -25,7 +25,7 @@ class FakeSocket extends EventEmitter implements SlackSocketModeClient {
   async disconnect(): Promise<void> { this.disconnects += 1; }
 }
 
-function clients(order: string[]): SlackClients {
+function clients(order: string[], overrides: Partial<SlackBotClient> = {}): SlackClients {
   const bot: SlackBotClient = {
     authTest: async () => { order.push("bot-auth"); return { ok: true, team_id: "T1", user_id: "B1" }; },
     openOwnerDm: async () => { order.push("open-dm"); return { ok: true, channel: { id: "D1" } }; },
@@ -36,6 +36,7 @@ function clients(order: string[]): SlackClients {
     postMessage: async (args) => ({ ok: true, channel: args.channel, ts: "2.0" }),
     uploadFileV2: async () => ({ ok: true, files: [] }),
     downloadFile: async () => ({ stream: Readable.from([]) }),
+    ...overrides,
   };
   const search: SlackSearchClient = {
     authTest: async () => { order.push("user-auth"); return { ok: true, team_id: "T1", user_id: "U1" }; },
@@ -122,4 +123,77 @@ test("Slack start requires successful initialization and never reaches a private
   await assert.rejects(adapter.start(), /initialize/i);
   assert.equal(socket.starts, 0);
   db.close();
+});
+
+test("Slack stop waits for an accepted event and its drain to finish", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-stop-")), { maxFileBytes: 100, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  const socket = new FakeSocket();
+  let releaseAck!: () => void;
+  let ackStarted!: () => void;
+  const ackGate = new Promise<void>((resolve) => { releaseAck = resolve; });
+  const acking = new Promise<void>((resolve) => { ackStarted = resolve; });
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config, maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, { clients: clients([]), createSocketModeClient: () => socket });
+  await adapter.initialize();
+  await adapter.start();
+  socket.emit("slack_event", {
+    body: { type: "event_callback", team_id: "T1", event_id: "E-stop", event_time: 2, event: { type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "2.0", text: "finish me" } },
+    ack: async () => { ackStarted(); await ackGate; },
+  });
+  await acking;
+
+  let stopped = false;
+  const stopping = adapter.stop().then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  try { assert.equal(stopped, false); }
+  finally { releaseAck(); await stopping; }
+  assert.equal(new SlackInboxStore(db).get("E-stop")?.state, "processed");
+});
+
+test("an oversized Slack file becomes unavailable without blocking the next message", async (context) => {
+  const db = createTestDatabase();
+  context.after(() => db.close());
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "qiyan-slack-adapter-limit-")), { maxFileBytes: 2, maxStoreBytes: 1_000 });
+  await attachments.initialize();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries, attachments);
+  const socket = new FakeSocket();
+  const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
+    config, maxMessageBytes: 100,
+    onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+  }, {
+    clients: clients([], { downloadFile: async () => ({ stream: Readable.from(["big"]), size: 3 }) }),
+    createSocketModeClient: () => socket,
+  });
+  await adapter.initialize();
+  await adapter.start();
+  let acknowledgements = 0;
+  const ack = async () => { acknowledgements += 1; };
+  socket.emit("slack_event", {
+    body: { type: "event_callback", team_id: "T1", event_id: "E-large", event_time: 2, event: {
+      type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "2.0", text: "large",
+      files: [{ id: "F1", name: "large.txt", mimetype: "text/plain", size: 3, url_private_download: "https://files.slack.com/F1" }],
+    } },
+    ack,
+  });
+  socket.emit("slack_event", {
+    body: { type: "event_callback", team_id: "T1", event_id: "E-next", event_time: 3, event: { type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "3.0", text: "next" } },
+    ack,
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  try {
+    assert.equal(acknowledgements, 2);
+    assert.equal(new SlackInboxStore(db).get("E-large")?.state, "processed");
+    assert.equal(new SlackInboxStore(db).get("E-next")?.state, "processed");
+    const failed = db.prepare("SELECT failed_attachments_json FROM source_contexts WHERE id = 'slack:T1:D1:2.0'").get() as { failed_attachments_json: string };
+    assert.deepEqual(JSON.parse(failed.failed_attachments_json), [{ nativeId: "F1", displayName: "large.txt", reasonCode: "download_failed" }]);
+  } finally { await adapter.stop(); }
 });

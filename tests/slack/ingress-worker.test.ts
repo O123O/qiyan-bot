@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
+import { parseDirective } from "../../src/directives/parser.ts";
+import { classifySlackEvent } from "../../src/slack/event-classifier.ts";
 import { SlackInboxStore } from "../../src/slack/inbox-store.ts";
 import { SlackIngressWorker } from "../../src/slack/ingress-worker.ts";
 import type { NormalizedSlackEvent } from "../../src/slack/types.ts";
@@ -76,6 +78,36 @@ test("overlapping events reuse one successful download and accepted source", asy
   assert.equal(value.db.prepare("SELECT ref_count FROM attachments").get()!.ref_count, 1);
   assert.equal(value.db.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE adapter_id = 'slack'").get()!.count, 1);
   assert.equal(value.db.prepare("SELECT COUNT(*) AS count FROM deliveries WHERE kind = 'attachment_warning'").get()!.count, 0);
+});
+
+test("message-first overlap preserves canonical mention stripping for directive safeguards", async () => {
+  const value = await fixture(async () => ({ stream: Readable.from([]), size: 0 }));
+  value.inbox.accept({ ...event("E-root", "1.0", "activate"), files: [] });
+  assert.equal(await value.worker.processOne(), true);
+
+  const classify = (eventId: string, slackEvent: Record<string, unknown>) => classifySlackEvent({
+    type: "event_callback", team_id: "T1", event_id: eventId, event_time: 2, event: slackEvent,
+  }, {
+    teamId: "T1", ownerUserId: "U1", botUserId: "B1", now: () => 2_000,
+    isActivated: (conversationKey) => value.inbox.isActivated(conversationKey),
+  });
+  const message = classify("E-message", {
+    type: "message", channel_type: "channel", channel: "C1", user: "U1", ts: "2.0", thread_ts: "1.0", text: "<@B1> /pass exact",
+  });
+  const mention = classify("E-mention", {
+    type: "app_mention", channel: "C1", user: "U1", ts: "2.0", thread_ts: "1.0", text: "<@B1> /pass exact",
+  });
+  assert.equal(message.kind, "accept");
+  assert.equal(mention.kind, "accept");
+  if (message.kind !== "accept" || mention.kind !== "accept") return;
+  value.inbox.accept(message.event);
+  value.inbox.accept(mention.event);
+  assert.equal(await value.worker.processOne(), true);
+  assert.equal(await value.worker.processOne(), true);
+
+  const source = value.db.prepare("SELECT raw_text FROM source_contexts WHERE id = 'slack:T1:C1:2.0'").get() as { raw_text: string };
+  assert.equal(source.raw_text, "/pass exact");
+  assert.deepEqual(parseDirective(source.raw_text, [], 10), { kind: "pass", prefix: "", payload: "exact" });
 });
 
 test("overlapping permanent failure creates one descriptor and warning without an attachment row", async () => {

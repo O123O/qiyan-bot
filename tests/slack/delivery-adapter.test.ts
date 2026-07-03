@@ -17,7 +17,10 @@ function client(overrides: Partial<SlackBotClient> = {}) {
     userInfo: async () => ({ ok: true }),
     downloadFile: async () => ({ stream: Readable.from([]) }),
     postMessage: async (args) => { messages.push(args); return { ok: true, channel: args.channel, ts: "10.200" }; },
-    uploadFileV2: async (args) => { uploads.push(args); return { ok: true, files: [{ id: "F1" }, { id: "F2" }] }; },
+    uploadFileV2: async (args) => {
+      uploads.push(args);
+      return { ok: true, files: [{ ok: true, files: [{ id: "F1" }, { id: "F2" }] }] };
+    },
     ...overrides,
   };
   return { value, messages, uploads };
@@ -74,6 +77,16 @@ test("Slack documents use upload-v2 with the frozen channel thread and return op
   }]);
   const source = await readFile(new URL("../../src/slack/delivery-adapter.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /files\.upload(?:\W|$)/u);
+});
+
+test("a successful upload without a Slack file identity remains uncertain", async () => {
+  const adapter = new SlackDeliveryAdapter("T123", client({
+    uploadFileV2: async () => ({ ok: true, files: [{ ok: true, files: [] }] }),
+  }).value);
+  await assert.rejects(adapter.sendDocument!(
+    { workspaceId: "T123", channelId: "D123" },
+    { stream: Readable.from(["payload"]), size: 7, displayName: "report.txt", mediaType: "text/plain", deliveryId: "delivery-file" },
+  ), (error: unknown) => error instanceof SlackApiError && error.deterministic === false && error.safeToRetry === false);
 });
 
 test("Slack delivery rejects destinations outside the configured workspace", async () => {

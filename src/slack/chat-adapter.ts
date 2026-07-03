@@ -3,6 +3,7 @@ import type { AttachmentStore } from "../attachments/store.ts";
 import type { ConversationBinding } from "../chat/binding.ts";
 import type { ChatAdapter, ChatHistoryProvider } from "../chat/contracts.ts";
 import type { SlackConfig } from "../config.ts";
+import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { ConversationStore, ChatAcceptanceEffects } from "../storage/conversation-store.ts";
 import type { Database } from "../storage/database.ts";
@@ -45,15 +46,18 @@ export class SlackChatAdapter implements ChatAdapter {
   private stopping: Promise<void> | undefined;
   private socketStarted = false;
   private subscribed = false;
+  private readonly eventTasks = new Set<Promise<void>>();
 
   private readonly socketListener = (value: unknown): void => {
     const event = record(value);
     const ack = event?.ack;
     if (!this.handler || typeof ack !== "function") return;
     const body = reduceEnvelopeBody(event?.body);
-    void this.handler.handle({ body, ack: () => Promise.resolve(ack()) })
+    const task = this.handler.handle({ body, ack: () => Promise.resolve(ack()) })
       .then(() => this.worker.drain())
       .catch(() => undefined);
+    this.eventTasks.add(task);
+    void task.finally(() => { this.eventTasks.delete(task); });
   };
 
   constructor(
@@ -126,6 +130,7 @@ export class SlackChatAdapter implements ChatAdapter {
         await this.socket.start();
       } catch (error) {
         this.unsubscribe();
+        await this.settleEventTasks();
         await this.worker.stop();
         if (this.socketStarted) await this.socket.disconnect().catch(() => undefined);
         this.socketStarted = false;
@@ -138,6 +143,7 @@ export class SlackChatAdapter implements ChatAdapter {
   stop(): Promise<void> {
     return this.stopping ??= (async () => {
       this.unsubscribe();
+      await this.settleEventTasks();
       await this.worker.stop();
       if (this.socketStarted) await this.socket.disconnect();
       this.socketStarted = false;
@@ -151,9 +157,14 @@ export class SlackChatAdapter implements ChatAdapter {
     this.socket.off("slack_event", this.socketListener);
     this.subscribed = false;
   }
+
+  private async settleEventTasks(): Promise<void> {
+    while (this.eventTasks.size > 0) await Promise.all([...this.eventTasks]);
+  }
 }
 
 function transientSlackFailure(error: unknown): boolean {
+  if (error instanceof AppError && error.code === "ATTACHMENT_INVALID") return false;
   if (!(error instanceof SlackApiError)) return true;
   return !error.deterministic || error.status === 429 || (error.status !== undefined && error.status >= 500);
 }

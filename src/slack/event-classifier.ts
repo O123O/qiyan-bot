@@ -20,7 +20,9 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
   const userId = string(event.user);
   const messageTs = string(event.ts);
   if (!eventId || !channelId || !userId || !messageTs || userId !== context.ownerUserId) return discard();
-  if (event.bot_id !== undefined || event.app_id !== undefined || event.subtype !== undefined || event.hidden === true) return discard();
+  const subtype = string(event.subtype);
+  if (event.bot_id != null || event.app_id != null || event.hidden === true) return discard();
+  if (subtype && !(type === "message" && subtype === "file_share")) return discard();
 
   const threadTs = string(event.thread_ts);
   let eventType: NormalizedSlackEvent["eventType"];
@@ -46,6 +48,7 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
     if (!context.isActivated(conversationKey)) return discard();
     eventType = event.channel_type === "channel" ? "message.channels" : "message.groups";
     destination = { workspaceId: context.teamId, channelId, threadTs };
+    rawText = stripLeadingMention(rawText, context.botUserId);
   } else return discard();
 
   const files = normalizeFiles(event.files);

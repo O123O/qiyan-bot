@@ -172,6 +172,22 @@ test("owner mention search uses the exact token and post-filters text and rich-t
   assert.deepEqual((result.coverage as any).limitedTo, { channelTypes: ["public_channel", "private_channel", "mpim", "im"], contentTypes: ["messages"] });
 });
 
+test("search enforces the word limit against Unicode whitespace inside result fields", async () => {
+  const content = Array.from({ length: 3_001 }, (_, index) => `word${index}`).join("\n");
+  const fake = searchHarness(() => ({ ok: true, results: {
+    messages: [{ channel_id: "C1", message_ts: "20.0", content }],
+    response_metadata: { next_cursor: "" },
+  } }));
+  const service = new SlackContextService(bot({}).client, "T123", {
+    search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.now(),
+  });
+  const result = await service.search("large result");
+  assert.equal(result.count, 1);
+  assert.equal(result.returned_count, 0);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.results, []);
+});
+
 test("search fails actionably on page one and returns explicit partial coverage after a later page failure", async () => {
   const failure = new SlackApiError("Slack assistant.search.context was rejected", undefined, undefined, true, false);
   const first = searchHarness(() => { throw failure; });
@@ -189,4 +205,30 @@ test("search fails actionably on page one and returns explicit partial coverage 
   assert.match(result.warning ?? "", /continuation/i);
   assert.deepEqual(result.coverage.errors, ["pagination_failed"]);
   assert.equal(JSON.stringify(result).includes("next"), false);
+});
+
+test("search identifies rate-limited and authorization-limited continuations", async () => {
+  for (const [category, marker, warning] of [
+    ["rate_limited", "rate_limited", /rate limit/i],
+    ["authorization", "authorization_failed", /authorization|scope/i],
+  ] as const) {
+    const failure = Object.assign(
+      new SlackApiError("sanitized Slack continuation failure", category === "rate_limited" ? 429 : undefined, undefined, false, false),
+      { category },
+    );
+    const fake = searchHarness((_args, call) => {
+      if (call > 1) throw failure;
+      return { ok: true, results: {
+        messages: [{ channel_id: "C1", message_ts: "20.0", content: "one" }],
+        response_metadata: { next_cursor: "next" },
+      } };
+    });
+    const service = new SlackContextService(bot({}).client, "T123", {
+      search: fake.search, ownerUserId: "U123", coverage: searchCoverage, now: () => Date.now(),
+    });
+    const result = await service.search("launch");
+    assert.equal(result.complete, false);
+    assert.deepEqual(result.coverage.errors, [marker]);
+    assert.match(result.warning ?? "", warning);
+  }
 });

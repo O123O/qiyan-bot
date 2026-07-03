@@ -54,12 +54,12 @@ export class SlackDeliveryAdapter implements ChatDeliveryAdapter {
       ...(file.caption === undefined ? {} : { initial_comment: file.caption }),
     });
     const fileIds = Array.isArray(result.files)
-      ? result.files.flatMap((value) => {
-        const item = record(value);
-        return item && typeof item.id === "string" ? [item.id] : [];
-      })
+      ? [...new Set(result.files.flatMap((value) => completionFileIds(value)))]
       : [];
-    return { channelId: target.channelId, ...(fileIds.length > 0 ? { fileIds } : {}) };
+    if (fileIds.length === 0) {
+      throw new SlackApiError("Slack filesUploadV2 returned no file identity", undefined, undefined, false, false);
+    }
+    return { channelId: target.channelId, fileIds };
   }
 
   isSafeToRetry(error: unknown): boolean {
@@ -95,4 +95,18 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function stringField(value: Record<string, unknown>, key: string): string | undefined {
   return typeof value[key] === "string" && value[key].length > 0 ? value[key] : undefined;
+}
+
+function completionFileIds(value: unknown): string[] {
+  const completion = record(value);
+  if (!completion) return [];
+  const direct = stringField(completion, "id");
+  const nested = Array.isArray(completion.files)
+    ? completion.files.flatMap((file) => {
+      const item = record(file);
+      const id = item && stringField(item, "id");
+      return id ? [id] : [];
+    })
+    : [];
+  return direct ? [direct, ...nested] : nested;
 }

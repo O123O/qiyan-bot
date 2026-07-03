@@ -50,6 +50,31 @@ test("enforces per-message and total quotas before retaining partial files", asy
   assert.equal(store.totalBytes(), 5);
 });
 
+test("concurrent ingests cannot commit bytes beyond the shared store quota", async () => {
+  const { store } = await fixture({ maxFileBytes: 10, maxStoreBytes: 10 });
+  let entered = 0;
+  let release!: () => void;
+  let bothEntered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { bothEntered = resolve; });
+  const stream = async function* () {
+    entered += 1;
+    if (entered === 2) bothEntered();
+    await gate;
+    yield Buffer.alloc(6);
+  };
+
+  const first = store.ingest("one", stream(), { displayName: "one", mediaType: "x" });
+  const second = store.ingest("two", stream(), { displayName: "two", mediaType: "x" });
+  await ready;
+  release();
+  const outcomes = await Promise.allSettled([first, second]);
+
+  assert.equal(outcomes.filter(({ status }) => status === "fulfilled").length, 1);
+  assert.equal(outcomes.filter(({ status }) => status === "rejected").length, 1);
+  assert.equal(store.totalBytes(), 6);
+});
+
 test("opaque handles are scope-bound and materialize as app-server inputs", async () => {
   const { store } = await fixture();
   const image = await store.ingest("ctx", Readable.from(["img"]), { displayName: "x.png", mediaType: "image/png" });

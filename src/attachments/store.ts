@@ -68,10 +68,13 @@ export class AttachmentStore {
     const displayName = this.sanitizeName(meta.displayName);
     const sha256 = hash.digest("hex");
     try {
-      this.db.prepare(`INSERT INTO attachments
+      const inserted = this.db.prepare(`INSERT INTO attachments
         (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-        .run(id, scopeId, displayName, meta.mediaType || "application/octet-stream", path, size, sha256, this.clock.now() + this.ttlMs, this.clock.now());
+        SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?
+        WHERE (SELECT COALESCE(SUM(size), 0) FROM attachments) + ? <= ?`)
+        .run(id, scopeId, displayName, meta.mediaType || "application/octet-stream", path, size, sha256,
+          this.clock.now() + this.ttlMs, this.clock.now(), size, this.options.maxStoreBytes).changes;
+      if (inserted !== 1) this.invalid("attachment store quota exceeded");
     } catch (error) {
       await unlink(path).catch(() => undefined);
       throw error;
