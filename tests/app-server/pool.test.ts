@@ -63,6 +63,74 @@ test("a terminal notification that arrives before turn/start responds does not l
   assert.equal(pool.activeTurnCount, 0);
 });
 
+test("an exact caller claim can be rebound after its turn terminal races the start response", async () => {
+  for (const terminalTiming of ["before-response", "after-response"] as const) {
+    let resolveStart!: (value: any) => void;
+    const endpoint: AppServerEndpoint = {
+      id: "local", state: "ready",
+      request: async <T>() => new Promise<T>((resolve) => { resolveStart = resolve; }),
+    };
+    const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+    const claim = pool.claimTurnCapacity("local", "assistant", `claim-${terminalTiming}`);
+    const starting = pool.startTurn("local", { threadId: "assistant", input: [] }, claim);
+    if (terminalTiming === "before-response") pool.markTurnTerminal("local", "assistant", "turn-raced");
+    resolveStart({ turn: { id: "turn-raced", status: "completed" } });
+    const response = await starting;
+    if (terminalTiming === "after-response") pool.markTurnTerminal("local", "assistant", "turn-raced");
+
+    assert.doesNotThrow(() => pool.bindTurnCapacityClaim(claim, response.turn.id));
+    assert.throws(() => pool.bindTurnCapacityClaim(claim, "turn-other"), /unknown capacity claim/iu);
+    assert.equal(pool.activeTurnCount, 0);
+  }
+});
+
+test("a stale terminal claim cannot bind or release a reused claim ID", () => {
+  const endpoint = new FakeEndpoint();
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const stale = pool.claimTurnCapacity("local", "assistant", "reused-claim");
+  pool.bindTurnCapacityClaim(stale, "turn-old");
+  pool.markTurnTerminal("local", "assistant", "turn-old");
+
+  const current = pool.claimTurnCapacity("local", "assistant", "reused-claim");
+  assert.notEqual(current.generation, stale.generation);
+  assert.doesNotThrow(() => pool.bindTurnCapacityClaim(stale, "turn-old"));
+  pool.markTurnTerminal("local", "assistant", "turn-old");
+  assert.equal(pool.activeTurnCount, 1);
+
+  pool.bindTurnCapacityClaim(current, "turn-new");
+  assert.equal(pool.activeTurnCount, 1);
+  pool.markTurnTerminal("local", "assistant", "turn-new");
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("restoring a terminal claim never reserves capacity again", () => {
+  const terminalFixture = () => {
+    const pool = new AppServerPool([new FakeEndpoint()], { maxConcurrentTurns: 1 });
+    const claim = pool.claimTurnCapacity("local", "assistant", "terminal-claim");
+    pool.bindTurnCapacityClaim(claim, "turn-terminal");
+    pool.markTurnTerminal("local", "assistant", "turn-terminal");
+    return { pool, claim };
+  };
+
+  const exact = terminalFixture();
+  assert.deepEqual(exact.pool.restoreTurnCapacityClaim("local", "assistant", "terminal-claim", {
+    phase: "active", turnId: "turn-terminal",
+  }), exact.claim);
+  assert.equal(exact.pool.activeTurnCount, 0);
+
+  const mismatched = terminalFixture();
+  assert.throws(() => mismatched.pool.restoreTurnCapacityClaim("local", "assistant", "terminal-claim", {
+    phase: "active", turnId: "turn-other",
+  }), /terminal capacity claim/iu);
+  assert.equal(mismatched.pool.activeTurnCount, 0);
+
+  const provisional = terminalFixture();
+  assert.deepEqual(provisional.pool.restoreTurnCapacityClaim("local", "assistant", "terminal-claim", {
+    phase: "provisional",
+  }), provisional.claim);
+  assert.equal(provisional.pool.activeTurnCount, 0);
+});
+
 test("a lost turn/start response is proven from history instead of retransmitted", async () => {
   let starts = 0;
   const endpoint: AppServerEndpoint = {
@@ -112,7 +180,19 @@ test("caller-owned capacity claims restore, bind, and release on exact terminal 
   assert.deepEqual(pool.restoreTurnCapacityClaim("local", "assistant", "claim-1", { phase: "provisional" }), claim);
   assert.equal(pool.activeTurnCount, 1);
   pool.bindTurnCapacityClaim(claim, "turn-1");
+  assert.throws(() => pool.restoreTurnCapacityClaim("local", "assistant", "claim-1", {
+    phase: "active", turnId: "turn-other",
+  }), /already bound|changed turn/iu);
+  assert.equal(pool.activeTurnCount, 1);
   pool.markTurnTerminal("local", "assistant", "turn-1");
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("an invalid active restore cannot reserve capacity", () => {
+  const pool = new AppServerPool([new FakeEndpoint()], { maxConcurrentTurns: 1 });
+  assert.throws(() => pool.restoreTurnCapacityClaim("local", "assistant", "claim-invalid", {
+    phase: "active",
+  }), /no turn ID/iu);
   assert.equal(pool.activeTurnCount, 0);
 });
 

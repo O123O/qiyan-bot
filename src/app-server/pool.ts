@@ -10,6 +10,7 @@ export interface TurnCapacityClaim {
   id: string;
   endpointId: string;
   threadId: string;
+  generation: number;
 }
 
 export interface ThreadHistory {
@@ -29,14 +30,18 @@ interface ClaimState extends TurnCapacityClaim {
   selfOwned: boolean;
 }
 
+interface TerminalClaim extends TurnCapacityClaim { turnId: string }
+
 class StartProvenAbsentError extends Error {}
 
 export class AppServerPool {
   private readonly endpoints = new Map<string, AppServerEndpoint>();
   private readonly claims = new Map<string, ClaimState>();
   private readonly terminalBeforeStart = new Set<string>();
+  private readonly terminalClaims = new Map<string, TerminalClaim>();
   private readonly capacityListeners = new Set<() => void>();
   private capacitySignalPending = false;
+  private nextClaimGeneration = 1;
 
   constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void> }) {
     for (const endpoint of endpoints) this.endpoints.set(endpoint.id, endpoint);
@@ -57,28 +62,44 @@ export class AppServerPool {
   }
 
   restoreTurnCapacityClaim(endpointId: string, threadId: string, claimId: string, state: { phase: "provisional" | "active"; turnId?: string }): TurnCapacityClaim {
+    if (state.phase === "active" && !state.turnId) this.conflict(`active capacity claim ${claimId} has no turn ID`);
     const existing = this.claims.get(claimId);
     if (existing) {
       if (existing.endpointId !== endpointId || existing.threadId !== threadId) this.conflict(`capacity claim ${claimId} changed identity`);
-      if (state.phase === "active" && state.turnId && existing.phase === "provisional") this.bindTurnCapacityClaim(existing, state.turnId);
+      if (state.phase === "active") {
+        if (existing.phase === "active" && existing.turnId !== state.turnId) this.conflict(`active capacity claim ${claimId} changed turn`);
+        if (existing.phase === "provisional") this.bindTurnCapacityClaim(existing, state.turnId!);
+      }
       return this.publicClaim(existing);
+    }
+    const terminal = this.terminalClaims.get(claimId);
+    if (terminal) {
+      if (terminal.endpointId !== endpointId || terminal.threadId !== threadId) this.conflict(`terminal capacity claim ${claimId} changed identity`);
+      if (state.phase === "active" && state.turnId !== terminal.turnId) this.conflict(`terminal capacity claim ${claimId} changed turn`);
+      return this.publicClaim(terminal);
     }
     const claim = this.createClaim(endpointId, threadId, claimId, false);
     if (state.phase === "active") {
-      if (!state.turnId) this.conflict(`active capacity claim ${claimId} has no turn ID`);
-      this.bindTurnCapacityClaim(claim, state.turnId);
+      this.bindTurnCapacityClaim(claim, state.turnId!);
     }
     return claim;
   }
 
   bindTurnCapacityClaim(claim: TurnCapacityClaim, turnId: string): void {
-    const state = this.requiredClaim(claim);
+    const state = this.claims.get(claim.id);
+    if (!state || state.endpointId !== claim.endpointId || state.threadId !== claim.threadId || state.generation !== claim.generation) {
+      const terminal = this.terminalClaims.get(claim.id);
+      if (terminal?.endpointId === claim.endpointId && terminal.threadId === claim.threadId
+        && terminal.generation === claim.generation && terminal.turnId === turnId) return;
+      this.conflict(`unknown capacity claim ${claim.id}`);
+    }
     if (state.phase === "active") {
       if (state.turnId !== turnId) this.conflict(`capacity claim ${claim.id} is already bound to another turn`);
       return;
     }
     const terminalKey = this.turnKey(claim.endpointId, claim.threadId, turnId);
     if (this.terminalBeforeStart.delete(terminalKey)) {
+      this.recordTerminalClaim(state, turnId);
       this.releaseClaimState(state);
       return;
     }
@@ -89,7 +110,9 @@ export class AppServerPool {
   releaseTurnCapacityClaim(claim: TurnCapacityClaim): void {
     const state = this.claims.get(claim.id);
     if (!state) return;
-    if (state.endpointId !== claim.endpointId || state.threadId !== claim.threadId) this.conflict(`capacity claim ${claim.id} changed identity`);
+    if (state.endpointId !== claim.endpointId || state.threadId !== claim.threadId || state.generation !== claim.generation) {
+      this.conflict(`capacity claim ${claim.id} changed identity`);
+    }
     this.releaseClaimState(state);
   }
 
@@ -185,6 +208,7 @@ export class AppServerPool {
       candidate.endpointId === endpointId && candidate.threadId === threadId
       && candidate.phase === "active" && candidate.turnId === turnId);
     if (state) {
+      this.recordTerminalClaim(state, turnId);
       this.releaseClaimState(state);
       return;
     }
@@ -211,14 +235,16 @@ export class AppServerPool {
     if (this.claims.size >= this.options.maxConcurrentTurns) {
       throw new AppError("CAPACITY_EXCEEDED", `at most ${this.options.maxConcurrentTurns} turns may run concurrently`);
     }
-    const state: ClaimState = { id: claimId, endpointId, threadId, phase: "provisional", selfOwned };
+    const state: ClaimState = { id: claimId, endpointId, threadId, generation: this.nextClaimGeneration++, phase: "provisional", selfOwned };
     this.claims.set(claimId, state);
     return this.publicClaim(state);
   }
 
   private requiredClaim(claim: TurnCapacityClaim): ClaimState {
     const state = this.claims.get(claim.id);
-    if (!state || state.endpointId !== claim.endpointId || state.threadId !== claim.threadId) this.conflict(`unknown capacity claim ${claim.id}`);
+    if (!state || state.endpointId !== claim.endpointId || state.threadId !== claim.threadId || state.generation !== claim.generation) {
+      this.conflict(`unknown capacity claim ${claim.id}`);
+    }
     return state;
   }
 
@@ -226,6 +252,18 @@ export class AppServerPool {
     const wasFull = this.claims.size >= this.options.maxConcurrentTurns;
     if (!this.claims.delete(state.id)) return;
     if (wasFull && this.claims.size < this.options.maxConcurrentTurns) this.scheduleCapacitySignal();
+  }
+
+  private recordTerminalClaim(state: TurnCapacityClaim, turnId: string): void {
+    this.terminalClaims.delete(state.id);
+    this.terminalClaims.set(state.id, {
+      id: state.id,
+      endpointId: state.endpointId,
+      threadId: state.threadId,
+      generation: state.generation,
+      turnId,
+    });
+    if (this.terminalClaims.size > 1_000) this.terminalClaims.delete(this.terminalClaims.keys().next().value!);
   }
 
   private scheduleCapacitySignal(): void {
@@ -259,8 +297,8 @@ export class AppServerPool {
     } while (true);
   }
 
-  private publicClaim(state: ClaimState): TurnCapacityClaim {
-    return { id: state.id, endpointId: state.endpointId, threadId: state.threadId };
+  private publicClaim(state: TurnCapacityClaim): TurnCapacityClaim {
+    return { id: state.id, endpointId: state.endpointId, threadId: state.threadId, generation: state.generation };
   }
 
   private turnKey(endpointId: string, threadId: string, turnId: string): string {
