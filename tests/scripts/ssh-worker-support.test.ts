@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../../src/core/process-identity.ts";
 import {
   DEFAULT_CODEX_VERSION,
   DEFAULT_SSH_PORT,
@@ -86,6 +87,42 @@ async function assertNoStagingDirectories(stateDir: string): Promise<void> {
 async function prepareEmptyState(paths: FixturePaths): Promise<void> {
   await mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
   await chmod(paths.stateDir, 0o700);
+}
+
+function operationLeasePath(paths: FixturePaths): string {
+  return join(paths.stateDir, ".operation-lease");
+}
+
+async function installOperationLease(paths: FixturePaths, owner: LinuxProcessIdentity | string): Promise<string> {
+  await prepareEmptyState(paths);
+  const lease = operationLeasePath(paths);
+  await mkdir(lease, { mode: 0o700 });
+  await writeFile(join(lease, "owner.json"), typeof owner === "string" ? owner : `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+  return lease;
+}
+
+function gate(): { wait: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  return { wait, release };
+}
+
+function gatedStagingRunner(): { runner: CommandRunner; entered: Promise<void>; release: () => void } {
+  const blocker = gate();
+  let enter!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const base = stagingRunner([]);
+  let blocked = false;
+  const runner: CommandRunner = async (command, args, options) => {
+    const result = await base(command, args, options);
+    if (!blocked && command === "ssh-keygen" && !args.includes("-y")) {
+      blocked = true;
+      enter();
+      await blocker.wait;
+    }
+    return result;
+  };
+  return { runner, entered, release: blocker.release };
 }
 
 test("resolves every fixture path beneath a canonical repository root", async (t) => {
@@ -375,6 +412,12 @@ test("removes a safe stale key staging directory before generating a complete pa
   const stale = join(paths.stateDir, ".keygen-Ab12z9");
   await mkdir(stale, { mode: 0o700 });
   await writeFile(join(stale, "partial"), "not-secret", { mode: 0o600 });
+  const restrictiveStale = join(paths.stateDir, ".keygen-Cd34x8");
+  await mkdir(restrictiveStale, { mode: 0o700 });
+  await chmod(restrictiveStale, 0o500);
+  const abandonedLeaseTemporary = join(paths.stateDir, ".operation-lease-Ef56w7");
+  await mkdir(abandonedLeaseTemporary, { mode: 0o700 });
+  await chmod(abandonedLeaseTemporary, 0o500);
 
   await ensureFixtureState(paths, stagingRunner([]));
 
@@ -406,6 +449,91 @@ test("rejects suspicious stale key staging entries without following or removing
   await chmod(staleWrongMode, 0o755);
   await assert.rejects(ensureFixtureState(modePaths, stagingRunner([])), /stale SSH key staging entry must have mode 0700/u);
   assert.equal((await lstat(staleWrongMode)).isDirectory(), true);
+});
+
+test("serializes concurrent fixture preparation without deleting the live staging directory", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  const gated = gatedStagingRunner();
+  const first = ensureFixtureState(paths, gated.runner);
+  await gated.entered;
+  const liveStages = (await readdir(paths.stateDir)).filter((name) => /^\.keygen-[A-Za-z0-9]{6}$/u.test(name));
+  assert.equal(liveStages.length, 1);
+
+  let overlapError: unknown;
+  try {
+    await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /SSH fixture operation already running/u);
+    assert.deepEqual(
+      (await readdir(paths.stateDir)).filter((name) => /^\.keygen-[A-Za-z0-9]{6}$/u.test(name)),
+      liveStages,
+    );
+  } catch (error) {
+    overlapError = error;
+  } finally {
+    gated.release();
+    await first.catch(() => undefined);
+  }
+  if (overlapError !== undefined) throw overlapError;
+  await first;
+  await assert.rejects(lstat(operationLeasePath(paths)));
+});
+
+test("serializes SSH config writing behind active fixture preparation", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  const gated = gatedStagingRunner();
+  const first = ensureFixtureState(paths, gated.runner);
+  await gated.entered;
+
+  let overlapError: unknown;
+  try {
+    await assert.rejects(writeSshConfig(paths), /SSH fixture operation already running/u);
+    await assert.rejects(lstat(paths.sshConfig));
+  } catch (error) {
+    overlapError = error;
+  } finally {
+    gated.release();
+    await first.catch(() => undefined);
+  }
+  if (overlapError !== undefined) throw overlapError;
+  await first;
+});
+
+test("reclaims a verifiably stale operation lease and removes abandoned lease temporaries", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installOperationLease(paths, { pid: 2_147_483_647, startTime: "1" });
+  const abandoned = join(paths.stateDir, ".operation-lease-Ab12z9");
+  await mkdir(abandoned, { mode: 0o700 });
+  await chmod(abandoned, 0o500);
+
+  await ensureFixtureState(paths, stagingRunner([]));
+
+  await assert.rejects(lstat(operationLeasePath(paths)));
+  assert.equal((await readdir(paths.stateDir)).some((name) => name.startsWith(".operation-lease-")), false);
+});
+
+test("does not remove an operation lease owned by the current process identity", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  const owner = await readLinuxProcessIdentity(process.pid);
+  const lease = await installOperationLease(paths, owner);
+  const originalOwner = await readFile(join(lease, "owner.json"), "utf8");
+
+  await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /SSH fixture operation already running/u);
+
+  assert.equal(await readFile(join(lease, "owner.json"), "utf8"), originalOwner);
+});
+
+test("fails closed for malformed or replaced operation leases", async (t) => {
+  const malformedPaths = resolveFixturePaths(await temporaryRepository(t));
+  const malformedLease = await installOperationLease(malformedPaths, "{not-json}\n");
+  await assert.rejects(ensureFixtureState(malformedPaths, stagingRunner([])), /SSH fixture operation lease is invalid/u);
+  assert.equal((await lstat(malformedLease)).isDirectory(), true);
+
+  const replacedPaths = resolveFixturePaths(await temporaryRepository(t));
+  await prepareEmptyState(replacedPaths);
+  const external = await mkdtemp(join(tmpdir(), "qiyan-operation-lease-"));
+  t.after(() => rm(external, { recursive: true, force: true }));
+  await symlink(external, operationLeasePath(replacedPaths), "dir");
+  await assert.rejects(ensureFixtureState(replacedPaths, stagingRunner([])), /operation lease must not be a symbolic link/u);
+  assert.equal((await lstat(operationLeasePath(replacedPaths))).isSymbolicLink(), true);
 });
 
 for (const runnerFailure of ["throw", "nonzero"] as const) {
@@ -446,6 +574,32 @@ test("fails closed when the state directory is replaced during key generation", 
   await assert.rejects(lstat(paths.privateKey));
   await assert.rejects(lstat(paths.publicKey));
   await assert.rejects(lstat(paths.sshConfig));
+});
+
+test("fails before installation when the acquired operation lease is replaced", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  const displacedLease = join(paths.stateDir, ".operation-lease-displaced");
+  const currentOwner = await readLinuxProcessIdentity(process.pid);
+  const baseRunner = stagingRunner([]);
+  let replaced = false;
+  const runner: CommandRunner = async (command, args, options) => {
+    const result = await baseRunner(command, args, options);
+    if (!replaced && command === "ssh-keygen" && !args.includes("-y")) {
+      replaced = true;
+      await rename(operationLeasePath(paths), displacedLease);
+      await mkdir(operationLeasePath(paths), { mode: 0o700 });
+      await writeFile(
+        join(operationLeasePath(paths), "owner.json"),
+        `${JSON.stringify(currentOwner)}\n`,
+        { mode: 0o600 },
+      );
+    }
+    return result;
+  };
+
+  await assert.rejects(ensureFixtureState(paths, runner), /operation lease was replaced/u);
+  await assert.rejects(lstat(paths.privateKey));
+  await assert.rejects(lstat(paths.publicKey));
 });
 
 test("requires an existing atomic client key directory to remain private", async (t) => {

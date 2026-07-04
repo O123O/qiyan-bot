@@ -12,6 +12,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../src/core/process-identity.ts";
 
 export interface FixturePaths {
   repositoryRoot: string;
@@ -55,6 +56,10 @@ const CONFIG_UNSAFE = /[\u0000-\u0020\u007f#$"'\\%]/u;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const KEY_STAGING_NAME = /^\.keygen-[A-Za-z0-9]{6}$/u;
+const OPERATION_LEASE_NAME = ".operation-lease";
+const OPERATION_LEASE_TEMPORARY_NAME = /^\.operation-lease-[A-Za-z0-9]{6}$/u;
+const OPERATION_LEASE_OWNER = "owner.json";
+const MAX_OPERATION_LEASE_OWNER_BYTES = 512;
 
 interface DirectoryIdentity {
   path: string;
@@ -66,6 +71,12 @@ interface FixtureTrust {
   uid: number;
   parent: DirectoryIdentity;
   state: DirectoryIdentity;
+}
+
+interface OperationLease {
+  directory: DirectoryIdentity;
+  ownerFile: DirectoryIdentity;
+  owner: LinuxProcessIdentity;
 }
 
 function fixturePaths(repositoryRoot: string): FixturePaths {
@@ -254,37 +265,319 @@ function assertStagingDirectory(metadata: Stats, uid: number): void {
     throw new Error(`${label} must be a regular directory`);
   }
   assertOwned(metadata, uid, label);
-  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error(`${label} must have mode 0700`);
+  if (((metadata.mode & 0o777) & ~PRIVATE_DIRECTORY_MODE) !== 0) {
+    throw new Error(`${label} must have mode 0700 or a restrictive subset`);
+  }
 }
 
 async function removeStagingDirectory(
   trust: FixtureTrust,
   stagingDirectory: string,
   expected?: DirectoryIdentity,
+  heldLease?: OperationLease,
 ): Promise<void> {
   if (dirname(stagingDirectory) !== trust.state.path || !KEY_STAGING_NAME.test(basename(stagingDirectory))) {
     throw new Error("SSH key staging path is invalid");
   }
   await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
   const metadata = await optionalMetadata(stagingDirectory);
   if (metadata === undefined) return;
   assertStagingDirectory(metadata, trust.uid);
   if (expected !== undefined && (metadata.dev !== expected.device || metadata.ino !== expected.inode)) {
     throw new Error("SSH key staging directory was replaced");
   }
+  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
+    await chmod(stagingDirectory, PRIVATE_DIRECTORY_MODE);
+    const normalized = await lstat(stagingDirectory);
+    assertPrivateDirectory(normalized, trust.uid, "stale SSH key staging entry");
+    if (normalized.dev !== metadata.dev || normalized.ino !== metadata.ino) {
+      throw new Error("SSH key staging directory was replaced");
+    }
+  }
   await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
   await rm(stagingDirectory, { recursive: true, force: false });
   await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
 }
 
-async function cleanStaleStagingDirectories(trust: FixtureTrust): Promise<void> {
+async function cleanStaleStagingDirectories(trust: FixtureTrust, heldLease: OperationLease): Promise<void> {
   const names = await readdir(trust.state.path);
   for (const name of names) {
     if (!KEY_STAGING_NAME.test(name)) continue;
     const stagingDirectory = join(trust.state.path, name);
     const metadata = await lstat(stagingDirectory);
-    assertStagingDirectory(metadata, trust.uid);
-    await removeStagingDirectory(trust, stagingDirectory, identity(stagingDirectory, metadata));
+    await removeStagingDirectory(trust, stagingDirectory, identity(stagingDirectory, metadata), heldLease);
+  }
+}
+
+function fixedOperationLeasePath(trust: FixtureTrust): string {
+  return join(trust.state.path, OPERATION_LEASE_NAME);
+}
+
+function assertOperationLeaseDirectory(metadata: Stats, uid: number): void {
+  const label = "SSH fixture operation lease";
+  if (metadata.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!metadata.isDirectory()) throw new Error(`${label} must be a directory`);
+  assertOwned(metadata, uid, label);
+  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error(`${label} must have mode 0700`);
+}
+
+function assertOperationLeaseOwner(metadata: Stats, uid: number): void {
+  const label = "SSH fixture operation lease owner file";
+  assertOwnedRegularSingleLink(metadata, uid, label);
+  if ((metadata.mode & 0o777) !== OWNER_ONLY_FILE_MODE) throw new Error(`${label} must have mode 0600`);
+  if (metadata.size <= 0 || metadata.size > MAX_OPERATION_LEASE_OWNER_BYTES) {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+}
+
+function parseOperationLeaseOwner(value: string): LinuxProcessIdentity {
+  if (Buffer.byteLength(value, "utf8") > MAX_OPERATION_LEASE_OWNER_BYTES) {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  const record = parsed as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 2 || keys[0] !== "pid" || keys[1] !== "startTime") {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  if (!Number.isSafeInteger(record.pid) || (record.pid as number) <= 1) {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  if (typeof record.startTime !== "string" || !/^\d+$/u.test(record.startTime)) {
+    throw new Error("SSH fixture operation lease is invalid");
+  }
+  return { pid: record.pid as number, startTime: record.startTime };
+}
+
+async function inspectOperationLease(trust: FixtureTrust, leasePath: string): Promise<OperationLease> {
+  await revalidateFixtureTrust(trust);
+  const directoryMetadata = await optionalMetadata(leasePath);
+  if (directoryMetadata === undefined) throw new Error("SSH fixture operation lease was replaced or removed");
+  assertOperationLeaseDirectory(directoryMetadata, trust.uid);
+  const directory = identity(leasePath, directoryMetadata);
+  const ownerPath = join(leasePath, OPERATION_LEASE_OWNER);
+  const ownerMetadata = await optionalMetadata(ownerPath);
+  if (ownerMetadata === undefined) throw new Error("SSH fixture operation lease is invalid");
+  assertOperationLeaseOwner(ownerMetadata, trust.uid);
+  const ownerFile = identity(ownerPath, ownerMetadata);
+  let ownerBytes: string;
+  try {
+    ownerBytes = await readFile(ownerPath, "utf8");
+  } catch {
+    throw new Error("SSH fixture operation lease could not be verified");
+  }
+  const owner = parseOperationLeaseOwner(ownerBytes);
+  const [currentDirectory, currentOwner] = await Promise.all([
+    lstat(leasePath),
+    lstat(ownerPath),
+  ]);
+  assertOperationLeaseDirectory(currentDirectory, trust.uid);
+  assertOperationLeaseOwner(currentOwner, trust.uid);
+  if (
+    currentDirectory.dev !== directory.device
+    || currentDirectory.ino !== directory.inode
+    || currentOwner.dev !== ownerFile.device
+    || currentOwner.ino !== ownerFile.inode
+  ) {
+    throw new Error("SSH fixture operation lease was replaced");
+  }
+  await revalidateFixtureTrust(trust);
+  return { directory, ownerFile, owner };
+}
+
+function sameProcess(left: LinuxProcessIdentity, right: LinuxProcessIdentity): boolean {
+  return left.pid === right.pid && left.startTime === right.startTime;
+}
+
+function sameOperationLease(left: OperationLease, right: OperationLease): boolean {
+  return left.directory.device === right.directory.device
+    && left.directory.inode === right.directory.inode
+    && left.ownerFile.device === right.ownerFile.device
+    && left.ownerFile.inode === right.ownerFile.inode
+    && sameProcess(left.owner, right.owner);
+}
+
+async function revalidateOperationLease(trust: FixtureTrust, expected: OperationLease): Promise<void> {
+  const current = await inspectOperationLease(trust, expected.directory.path);
+  if (!sameOperationLease(current, expected)) throw new Error("SSH fixture operation lease was replaced");
+}
+
+function assertRemovableLeaseTemporary(metadata: Stats, uid: number): void {
+  const label = "abandoned SSH fixture operation lease temporary";
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`${label} must be a regular directory`);
+  assertOwned(metadata, uid, label);
+  if (((metadata.mode & 0o777) & ~PRIVATE_DIRECTORY_MODE) !== 0) {
+    throw new Error(`${label} must have mode 0700 or a restrictive subset`);
+  }
+}
+
+async function removeLeaseTemporary(
+  trust: FixtureTrust,
+  temporaryPath: string,
+  expected: DirectoryIdentity | undefined,
+  heldLease?: OperationLease,
+): Promise<void> {
+  if (dirname(temporaryPath) !== trust.state.path || !OPERATION_LEASE_TEMPORARY_NAME.test(basename(temporaryPath))) {
+    throw new Error("SSH fixture operation lease temporary path is invalid");
+  }
+  await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+  const metadata = await optionalMetadata(temporaryPath);
+  if (metadata === undefined) return;
+  assertRemovableLeaseTemporary(metadata, trust.uid);
+  if (expected !== undefined && (metadata.dev !== expected.device || metadata.ino !== expected.inode)) {
+    throw new Error("SSH fixture operation lease temporary was replaced");
+  }
+  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
+    await chmod(temporaryPath, PRIVATE_DIRECTORY_MODE);
+    const normalized = await lstat(temporaryPath);
+    assertOperationLeaseDirectory(normalized, trust.uid);
+    if (normalized.dev !== metadata.dev || normalized.ino !== metadata.ino) {
+      throw new Error("SSH fixture operation lease temporary was replaced");
+    }
+  }
+  await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+  await rm(temporaryPath, { recursive: true, force: false });
+  await revalidateFixtureTrust(trust);
+  if (heldLease !== undefined) await revalidateOperationLease(trust, heldLease);
+}
+
+async function createOperationLeaseCandidate(trust: FixtureTrust): Promise<OperationLease> {
+  let owner: LinuxProcessIdentity;
+  try {
+    owner = await readLinuxProcessIdentity(process.pid);
+  } catch {
+    throw new Error("SSH fixture operation owner could not be identified");
+  }
+  let temporaryPath: string | undefined;
+  let directoryIdentity: DirectoryIdentity | undefined;
+  let ownerHandle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    temporaryPath = await mkdtemp(join(trust.state.path, `${OPERATION_LEASE_NAME}-`));
+    await chmod(temporaryPath, PRIVATE_DIRECTORY_MODE);
+    const directoryMetadata = await lstat(temporaryPath);
+    assertOperationLeaseDirectory(directoryMetadata, trust.uid);
+    directoryIdentity = identity(temporaryPath, directoryMetadata);
+    const ownerPath = join(temporaryPath, OPERATION_LEASE_OWNER);
+    ownerHandle = await open(ownerPath, "wx", OWNER_ONLY_FILE_MODE);
+    await ownerHandle.chmod(OWNER_ONLY_FILE_MODE);
+    await ownerHandle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+    await ownerHandle.sync();
+    await ownerHandle.close();
+    ownerHandle = undefined;
+    const directoryHandle = await open(temporaryPath, "r");
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+    const candidate = await inspectOperationLease(trust, temporaryPath);
+    if (!sameProcess(candidate.owner, owner)) throw new Error("SSH fixture operation lease is invalid");
+    return candidate;
+  } catch (error) {
+    await ownerHandle?.close();
+    if (temporaryPath !== undefined) {
+      await removeLeaseTemporary(trust, temporaryPath, directoryIdentity);
+    }
+    throw error;
+  }
+}
+
+async function operationLeaseIsStale(owner: LinuxProcessIdentity): Promise<boolean> {
+  try {
+    return !sameProcess(await readLinuxProcessIdentity(owner.pid), owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw new Error("SSH fixture operation lease could not be verified");
+  }
+}
+
+async function removeFixedOperationLease(trust: FixtureTrust, expected: OperationLease): Promise<void> {
+  await revalidateOperationLease(trust, expected);
+  await revalidateFixtureTrust(trust);
+  await rm(expected.directory.path, { recursive: true, force: false });
+  await revalidateFixtureTrust(trust);
+}
+
+async function installOperationLeaseCandidate(
+  trust: FixtureTrust,
+  candidate: OperationLease,
+): Promise<OperationLease | undefined> {
+  const fixedPath = fixedOperationLeasePath(trust);
+  await revalidateFixtureTrust(trust);
+  if (await optionalMetadata(fixedPath) !== undefined) return undefined;
+  try {
+    await rename(candidate.directory.path, fixedPath);
+  } catch {
+    await revalidateFixtureTrust(trust);
+    if (await optionalMetadata(fixedPath) !== undefined) return undefined;
+    throw new Error("SSH fixture operation lease could not be acquired");
+  }
+  const installed = await inspectOperationLease(trust, fixedPath);
+  const relocatedCandidate: OperationLease = {
+    directory: { ...candidate.directory, path: fixedPath },
+    ownerFile: { ...candidate.ownerFile, path: join(fixedPath, OPERATION_LEASE_OWNER) },
+    owner: candidate.owner,
+  };
+  if (!sameOperationLease(installed, relocatedCandidate)) {
+    throw new Error("SSH fixture operation lease was replaced during acquisition");
+  }
+  return installed;
+}
+
+async function acquireOperationLease(trust: FixtureTrust): Promise<OperationLease> {
+  const candidate = await createOperationLeaseCandidate(trust);
+  let installed: OperationLease | undefined;
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      installed = await installOperationLeaseCandidate(trust, candidate);
+      if (installed !== undefined) return installed;
+
+      const existing = await inspectOperationLease(trust, fixedOperationLeasePath(trust));
+      if (!await operationLeaseIsStale(existing.owner)) {
+        throw new Error("SSH fixture operation already running");
+      }
+      if (attempt !== 0) throw new Error("SSH fixture operation lease could not be acquired");
+      await removeFixedOperationLease(trust, existing);
+    }
+    throw new Error("SSH fixture operation lease could not be acquired");
+  } finally {
+    if (installed === undefined) {
+      await removeLeaseTemporary(trust, candidate.directory.path, candidate.directory);
+    }
+  }
+}
+
+async function cleanAbandonedLeaseTemporaries(trust: FixtureTrust, heldLease: OperationLease): Promise<void> {
+  const names = await readdir(trust.state.path);
+  for (const name of names) {
+    if (!OPERATION_LEASE_TEMPORARY_NAME.test(name)) continue;
+    const temporaryPath = join(trust.state.path, name);
+    const metadata = await lstat(temporaryPath);
+    await removeLeaseTemporary(trust, temporaryPath, identity(temporaryPath, metadata), heldLease);
+  }
+}
+
+async function withOperationLease<T>(trust: FixtureTrust, operation: (lease: OperationLease) => Promise<T>): Promise<T> {
+  const lease = await acquireOperationLease(trust);
+  try {
+    await cleanAbandonedLeaseTemporaries(trust, lease);
+    await revalidateOperationLease(trust, lease);
+    return await operation(lease);
+  } finally {
+    await removeFixedOperationLease(trust, lease);
   }
 }
 
@@ -388,7 +681,12 @@ async function validateKeyPair(
   }
 }
 
-async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, trust: FixtureTrust): Promise<void> {
+async function generateKeyPair(
+  paths: FixturePaths,
+  runner: CommandRunner,
+  trust: FixtureTrust,
+  heldLease: OperationLease,
+): Promise<void> {
   let stagingDirectory: string | undefined;
   let stagingIdentity: DirectoryIdentity | undefined;
   try {
@@ -401,6 +699,7 @@ async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, trust
     const stagedPublicKey = `${stagedPrivateKey}.pub`;
     const revalidateStaging = async (): Promise<void> => {
       await revalidateFixtureTrust(trust);
+      await revalidateOperationLease(trust, heldLease);
       if (stagingIdentity === undefined) throw new Error("SSH key staging directory was not pinned");
       await revalidateDirectory(
         stagingIdentity,
@@ -453,7 +752,7 @@ async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, trust
     await validateKeyFiles(paths.privateKey, paths.publicKey, trust.uid, false);
   } finally {
     if (stagingDirectory !== undefined) {
-      await removeStagingDirectory(trust, stagingDirectory, stagingIdentity);
+      await removeStagingDirectory(trust, stagingDirectory, stagingIdentity, heldLease);
     }
   }
 }
@@ -466,27 +765,31 @@ export async function ensureFixtureState(
   validateFixturePaths(paths);
   const uid = currentUid(options);
   const trust = await establishFixtureTrust(paths, uid);
-  await cleanStaleStagingDirectories(trust);
-  await validateOptionalFixtureFiles(paths, uid);
+  await withOperationLease(trust, async (heldLease) => {
+    await cleanStaleStagingDirectories(trust, heldLease);
+    await revalidateOperationLease(trust, heldLease);
+    await validateOptionalFixtureFiles(paths, uid);
 
-  const clientKeyDirectory = dirname(paths.privateKey);
-  const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
-  if (clientKeyMetadata === undefined) {
-    await generateKeyPair(paths, runner, trust);
-    return;
-  }
-  assertPrivateDirectory(clientKeyMetadata, uid, "SSH client key directory");
-  const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
-  const revalidateKeyState = async (): Promise<void> => {
-    await revalidateFixtureTrust(trust);
-    await revalidateDirectory(
-      clientKeyIdentity,
-      uid,
-      "SSH client key directory",
-      (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
-    );
-  };
-  await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false, revalidateKeyState);
+    const clientKeyDirectory = dirname(paths.privateKey);
+    const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
+    if (clientKeyMetadata === undefined) {
+      await generateKeyPair(paths, runner, trust, heldLease);
+      return;
+    }
+    assertPrivateDirectory(clientKeyMetadata, uid, "SSH client key directory");
+    const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
+    const revalidateKeyState = async (): Promise<void> => {
+      await revalidateFixtureTrust(trust);
+      await revalidateOperationLease(trust, heldLease);
+      await revalidateDirectory(
+        clientKeyIdentity,
+        uid,
+        "SSH client key directory",
+        (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
+      );
+    };
+    await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false, revalidateKeyState);
+  });
 }
 
 export function formatSshConfig(paths: FixturePaths, port = DEFAULT_SSH_PORT): string {
@@ -540,45 +843,49 @@ export async function writeSshConfig(
   validatePort(port);
   const uid = currentUid(options);
   const trust = await establishFixtureTrust(paths, uid);
-  const existing = await optionalMetadata(paths.sshConfig);
-  if (existing !== undefined) assertConfigFile(existing, uid);
-  const existingIdentity = existing === undefined ? undefined : identity(paths.sshConfig, existing);
+  await withOperationLease(trust, async (heldLease) => {
+    const existing = await optionalMetadata(paths.sshConfig);
+    if (existing !== undefined) assertConfigFile(existing, uid);
+    const existingIdentity = existing === undefined ? undefined : identity(paths.sshConfig, existing);
 
-  const temporaryPath = join(paths.stateDir, `.config-${randomUUID()}.tmp`);
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let temporaryIdentity: DirectoryIdentity | undefined;
-  try {
-    handle = await open(temporaryPath, "wx", OWNER_ONLY_FILE_MODE);
-    temporaryIdentity = identity(temporaryPath, await handle.stat());
-    await handle.chmod(OWNER_ONLY_FILE_MODE);
-    await handle.writeFile(formatSshConfig(paths, port), "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    const temporaryMetadata = await lstat(temporaryPath);
-    assertConfigFile(temporaryMetadata, uid);
-    if (temporaryMetadata.dev !== temporaryIdentity.device || temporaryMetadata.ino !== temporaryIdentity.inode) {
-      throw new Error("SSH config temporary file was replaced");
-    }
-
-    const currentConfig = await optionalMetadata(paths.sshConfig);
-    if (existingIdentity === undefined) {
-      if (currentConfig !== undefined) throw new Error("SSH config appeared during replacement");
-    } else {
-      if (currentConfig === undefined) throw new Error("SSH config was replaced or removed");
-      assertConfigFile(currentConfig, uid);
-      if (currentConfig.dev !== existingIdentity.device || currentConfig.ino !== existingIdentity.inode) {
-        throw new Error("SSH config was replaced");
+    const temporaryPath = join(paths.stateDir, `.config-${randomUUID()}.tmp`);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    let temporaryIdentity: DirectoryIdentity | undefined;
+    try {
+      handle = await open(temporaryPath, "wx", OWNER_ONLY_FILE_MODE);
+      temporaryIdentity = identity(temporaryPath, await handle.stat());
+      await handle.chmod(OWNER_ONLY_FILE_MODE);
+      await handle.writeFile(formatSshConfig(paths, port), "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      const temporaryMetadata = await lstat(temporaryPath);
+      assertConfigFile(temporaryMetadata, uid);
+      if (temporaryMetadata.dev !== temporaryIdentity.device || temporaryMetadata.ino !== temporaryIdentity.inode) {
+        throw new Error("SSH config temporary file was replaced");
       }
+
+      const currentConfig = await optionalMetadata(paths.sshConfig);
+      if (existingIdentity === undefined) {
+        if (currentConfig !== undefined) throw new Error("SSH config appeared during replacement");
+      } else {
+        if (currentConfig === undefined) throw new Error("SSH config was replaced or removed");
+        assertConfigFile(currentConfig, uid);
+        if (currentConfig.dev !== existingIdentity.device || currentConfig.ino !== existingIdentity.inode) {
+          throw new Error("SSH config was replaced");
+        }
+      }
+      await revalidateFixtureTrust(trust);
+      await revalidateOperationLease(trust, heldLease);
+      await rename(temporaryPath, paths.sshConfig);
+      await revalidateFixtureTrust(trust);
+      await revalidateOperationLease(trust, heldLease);
+      assertConfigFile(await lstat(paths.sshConfig), uid);
+    } finally {
+      await handle?.close();
+      await removeConfigTemporaryFile(trust, temporaryPath, temporaryIdentity);
     }
-    await revalidateFixtureTrust(trust);
-    await rename(temporaryPath, paths.sshConfig);
-    await revalidateFixtureTrust(trust);
-    assertConfigFile(await lstat(paths.sshConfig), uid);
-  } finally {
-    await handle?.close();
-    await removeConfigTemporaryFile(trust, temporaryPath, temporaryIdentity);
-  }
+  });
 }
 
 export function buildSshArgs(paths: FixturePaths, remoteCommand: readonly string[]): string[] {
