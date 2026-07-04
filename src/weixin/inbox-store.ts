@@ -14,7 +14,12 @@ export interface WeixinInboxRecord {
   items: readonly WeixinClassifiedItem[];
   routeTokenId?: string;
   attemptCount: number;
+  receivedAt: number;
 }
+
+export type WeixinMediaCheckpoint =
+  | { state: "completed"; itemOrdinal: number; scopeId: string; attachmentId: FileHandleId; descriptor: unknown }
+  | { state: "failed"; itemOrdinal: number; descriptor: unknown };
 
 export interface WeixinPollCommit {
   inserted: number;
@@ -37,6 +42,7 @@ interface InboxRow {
   normalized_json: string;
   route_token_id: string | null;
   attempt_count: number;
+  created_at: number;
 }
 
 export class WeixinInboxStore {
@@ -180,6 +186,65 @@ export class WeixinInboxStore {
       .get(inboxHoldId(generationId, identity)) as { count: number }).count);
   }
 
+  mediaCheckpoint(generationId: string, identity: WeixinMessageIdentity, itemOrdinal: number): WeixinMediaCheckpoint | undefined {
+    const row = this.db.prepare(`SELECT state, descriptor_json, attachment_id, attachment_scope_id
+      FROM weixin_inbox_media WHERE generation_id = ? AND identity_kind = ? AND identity_value = ? AND item_ordinal = ?`)
+      .get(generationId, identity.kind, identity.value, itemOrdinal) as {
+        state: "completed" | "failed"; descriptor_json: string; attachment_id: FileHandleId | null; attachment_scope_id: string | null;
+      } | undefined;
+    if (!row) return undefined;
+    const descriptor: unknown = JSON.parse(row.descriptor_json);
+    if (row.state === "failed") return { state: "failed", itemOrdinal, descriptor };
+    if (!row.attachment_id || !row.attachment_scope_id) throw new Error("WeChat media checkpoint is inconsistent");
+    return { state: "completed", itemOrdinal, scopeId: row.attachment_scope_id, attachmentId: row.attachment_id, descriptor };
+  }
+
+  markMediaFailed(
+    generationId: string,
+    identity: WeixinMessageIdentity,
+    itemOrdinal: number,
+    descriptor: unknown,
+  ): void {
+    inTransaction(this.db, () => {
+      const row = this.get(generationId, identity);
+      if (!row || row.state !== "processing") throw new Error("WeChat inbox row is not processing");
+      const encoded = JSON.stringify(descriptor);
+      const existing = this.mediaCheckpoint(generationId, identity, itemOrdinal);
+      if (existing) {
+        if (existing.state !== "failed" || JSON.stringify(existing.descriptor) !== encoded) throw new Error("WeChat media checkpoint is inconsistent");
+        return;
+      }
+      this.db.prepare(`INSERT INTO weixin_inbox_media
+        (generation_id, identity_kind, identity_value, item_ordinal, hold_id, state, descriptor_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'failed', ?, ?)`)
+        .run(generationId, identity.kind, identity.value, itemOrdinal, inboxHoldId(generationId, identity), encoded, this.now());
+    });
+  }
+
+  retry(generationId: string, identity: WeixinMessageIdentity, category: string): void {
+    const changed = this.db.prepare(`UPDATE weixin_inbox SET state = 'retry', last_error_category = ?, updated_at = ?
+      WHERE generation_id = ? AND identity_kind = ? AND identity_value = ? AND state = 'processing'`)
+      .run(category, this.now(), generationId, identity.kind, identity.value).changes;
+    if (changed !== 1) throw new Error("WeChat inbox row cannot retry");
+  }
+
+  completeAndTransferHoldsInTransaction(
+    generationId: string,
+    identity: WeixinMessageIdentity,
+    sourceScopeId: string,
+    attachmentIds: readonly FileHandleId[],
+  ): void {
+    if (!this.options.attachments) throw new Error("WeChat attachment store is unavailable");
+    const changed = this.db.prepare(`UPDATE weixin_inbox SET state = 'processed', route_token_id = NULL,
+        last_error_category = NULL, updated_at = ?
+      WHERE generation_id = ? AND identity_kind = ? AND identity_value = ? AND state = 'processing'`)
+      .run(this.now(), generationId, identity.kind, identity.value).changes;
+    if (changed !== 1) throw new Error("WeChat inbox row cannot complete");
+    this.options.attachments.transferInboxAttachmentsToAcceptedSourceInTransaction(
+      inboxHoldId(generationId, identity), sourceScopeId, attachmentIds,
+    );
+  }
+
   resolveRouteToken(generationId: string, routeTokenId?: string): string | undefined {
     const row = routeTokenId === undefined
       ? this.db.prepare(`SELECT token FROM weixin_route_tokens
@@ -254,5 +319,6 @@ function toRecord(row: InboxRow): WeixinInboxRecord {
     items: normalized.items,
     ...(row.route_token_id === null ? {} : { routeTokenId: row.route_token_id }),
     attemptCount: row.attempt_count,
+    receivedAt: row.created_at,
   };
 }
