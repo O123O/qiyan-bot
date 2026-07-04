@@ -121,6 +121,7 @@ function requireEffectiveSshdConfig(value: string): void {
     "pubkeyauthentication yes",
     "authenticationmethods publickey",
     "disableforwarding yes",
+    "setenv codex_home=/home/codex/.codex",
     "permitrootlogin no",
     "passwordauthentication no",
     "kbdinteractiveauthentication no",

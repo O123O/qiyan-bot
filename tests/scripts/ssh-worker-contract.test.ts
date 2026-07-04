@@ -83,6 +83,7 @@ test("SSH daemon accepts only the codex user's public key", async () => {
     "PermitEmptyPasswords no",
     "AllowUsers codex",
     "DisableForwarding yes",
+    "SetEnv CODEX_HOME=/home/codex/.codex",
     "UsePAM no",
   ]) {
     assert.match(config, new RegExp(`^${directive.replaceAll("/", "\\/")}$`, "mu"), `missing ${directive}`);

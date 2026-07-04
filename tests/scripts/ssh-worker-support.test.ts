@@ -85,6 +85,50 @@ async function installExistingPair(paths: FixturePaths, publicKey = PUBLIC_KEY):
   await writeFile(paths.publicKey, `${publicKey} a comment that is ignored\n`, { mode: 0o600 });
 }
 
+async function installConnectionState(paths: FixturePaths): Promise<void> {
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+}
+
+function probeRunner(): CommandRunner {
+  return async (command, args) => {
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+}
+
+function fakeStreamingChild(
+  stdout: AsyncIterable<Uint8Array>,
+  options: {
+    exit?: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+    writeStdin?: (value: string) => Promise<void>;
+    closeOn?: "SIGTERM" | "SIGKILL";
+  } = {},
+): { child: StreamingChild; signals: NodeJS.Signals[] } {
+  const signals: NodeJS.Signals[] = [];
+  let close!: () => void;
+  const closed = new Promise<void>((resolve) => { close = resolve; });
+  const closeOn = options.closeOn ?? "SIGTERM";
+  return {
+    signals,
+    child: {
+      started: Promise.resolve(),
+      stdout,
+      exit: options.exit ?? new Promise(() => {}),
+      close: closed,
+      writeStdin: options.writeStdin ?? (async () => {}),
+      endStdin: async () => {},
+      kill: (signal) => {
+        signals.push(signal);
+        if (signal === closeOn) close();
+      },
+    },
+  };
+}
+
 async function assertNoStagingDirectories(stateDir: string): Promise<void> {
   assert.equal((await readdir(stateDir)).some((name) => /^\.keygen-[A-Za-z0-9]{6}$/u.test(name)), false);
 }
@@ -260,7 +304,10 @@ test("checks the fixed remote environment and authenticated App Server without c
     while (writes.length < 3) await new Promise((resolve) => setImmediate(resolve));
     yield Buffer.from(`${JSON.stringify({
       id: 2,
-      result: { account: { type: "chatgpt" }, requiresOpenaiAuth: false },
+      result: {
+        account: { type: "chatgpt", email: null, planType: "plus" },
+        requiresOpenaiAuth: false,
+      },
     })}\n`);
   }
   const child: StreamingChild = {
@@ -380,6 +427,53 @@ test("returns only an unauthenticated verdict when App Server has no account", a
   }), { authenticated: false });
 });
 
+test("rejects a malformed non-null App Server account instead of reporting authenticated", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+  async function* stdout(): AsyncGenerator<Uint8Array> {
+    yield Buffer.from(`${JSON.stringify({
+      id: 1,
+      result: {
+        userAgent: "codex_app_server/0.142.5",
+        codexHome: "/home/codex/.codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+    })}\n`);
+    yield Buffer.from(`${JSON.stringify({
+      id: 2,
+      result: { account: { type: "chatgpt" }, requiresOpenaiAuth: false },
+    })}\n`);
+  }
+  let close!: () => void;
+  const child: StreamingChild = {
+    started: Promise.resolve(),
+    stdout: stdout(),
+    exit: new Promise(() => {}),
+    close: new Promise<void>((resolve) => { close = resolve; }),
+    writeStdin: async () => {},
+    endStdin: async () => {},
+    kill: () => { close(); },
+  };
+
+  await assert.rejects(
+    checkFixture(paths, {
+      runner,
+      spawn: () => child,
+      wait: async () => new Promise(() => {}),
+    }),
+    /App Server account response is invalid/u,
+  );
+});
+
 test("kills an SSH child whose App Server process never reaches the startup boundary", async (t) => {
   const paths = resolveFixturePaths(await temporaryRepository(t));
   await installExistingPair(paths);
@@ -408,6 +502,89 @@ test("kills an SSH child whose App Server process never reaches the startup boun
     /App Server process startup timed out/u,
   );
   assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("rejects oversized, mismatched, notification-flooded, and errored protocol streams", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installConnectionState(paths);
+  const cases: Array<readonly [AsyncIterable<Uint8Array>, RegExp]> = [
+    [(async function* () { yield Buffer.alloc(1024 * 1024 + 1, 0x78); })(), /response is too large/u],
+    [(async function* () { yield Buffer.from('{"id":99,"result":{}}\n'); })(), /response ID is invalid/u],
+    [(async function* () {
+      for (let index = 0; index < 1_000; index += 1) yield Buffer.from('{"method":"notice"}\n');
+    })(), /response limit exceeded/u],
+    [(async function* () { throw new Error("sensitive stream detail"); })(), /protocol stream failed/u],
+  ];
+
+  for (const [stdout, expected] of cases) {
+    const { child, signals } = fakeStreamingChild(stdout);
+    await assert.rejects(checkFixture(paths, {
+      runner: probeRunner(),
+      spawn: () => child,
+      wait: async () => new Promise(() => {}),
+    }), expected);
+    assert.deepEqual(signals, ["SIGTERM"]);
+  }
+});
+
+test("bounds protocol writes, reads, and unexpected exits and escalates shutdown", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installConnectionState(paths);
+
+  const writeTimeout = fakeStreamingChild((async function* () {})(), {
+    writeStdin: async () => new Promise(() => {}),
+  });
+  await assert.rejects(checkFixture(paths, {
+    runner: probeRunner(),
+    spawn: () => writeTimeout.child,
+    wait: async () => {},
+  }), /protocol write timed out/u);
+  assert.deepEqual(writeTimeout.signals, ["SIGTERM"]);
+
+  const exited = fakeStreamingChild((async function* () { await new Promise(() => {}); })(), {
+    exit: Promise.resolve({ code: 1, signal: null }),
+  });
+  await assert.rejects(checkFixture(paths, {
+    runner: probeRunner(),
+    spawn: () => exited.child,
+    wait: async () => new Promise(() => {}),
+  }), /App Server exited during the protocol check/u);
+  assert.deepEqual(exited.signals, ["SIGTERM"]);
+
+  async function* initializedOnly(): AsyncGenerator<Uint8Array> {
+    yield Buffer.from(`${JSON.stringify({
+      id: 1,
+      result: {
+        userAgent: "codex_app_server/0.142.5",
+        codexHome: "/home/codex/.codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+    })}\n`);
+    await new Promise(() => {});
+  }
+  const readTimeout = fakeStreamingChild(initializedOnly());
+  let waits = 0;
+  await assert.rejects(checkFixture(paths, {
+    runner: probeRunner(),
+    spawn: () => readTimeout.child,
+    wait: async () => {
+      waits += 1;
+      if (waits === 6) return;
+      await new Promise(() => {});
+    },
+  }), /protocol check timed out/u);
+  assert.deepEqual(readTimeout.signals, ["SIGTERM"]);
+
+  const escalated = fakeStreamingChild((async function* () { yield Buffer.from("not-json\n"); })(), {
+    closeOn: "SIGKILL",
+  });
+  await assert.rejects(checkFixture(paths, {
+    runner: probeRunner(),
+    spawn: () => escalated.child,
+    wait: async () => {},
+  }), /protocol check timed out/u);
+  assert.deepEqual(escalated.signals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("runs device login with an inherited terminal and dispatches the exact CLI surface", async (t) => {
@@ -462,6 +639,16 @@ test("runs device login with an inherited terminal and dispatches the exact CLI 
     stderr: (value) => { output.push(value); },
   }), 1);
   assert.deepEqual(dispatched, ["up", "login", "check", "down", "reset"]);
+
+  assert.equal(await runCli(["check"], {
+    ...operations,
+    check: async () => ({ authenticated: false }),
+  }, {
+    readLine: async () => "",
+    stdout: (value) => { output.push(value); },
+    stderr: (value) => { output.push(value); },
+  }), 2);
+  assert.equal(output.at(-1), "SSH worker: authentication required\n");
 });
 
 test("stages, validates, and installs a new owner-only keypair", async (t) => {

@@ -36,6 +36,9 @@ export const nodeCommandRunner: CommandRunner = async (command, args, options = 
   const stdoutSize = { value: 0 };
   const stderrSize = { value: 0 };
   let outputFailure: Error | undefined;
+  let timeout: NodeJS.Timeout | undefined;
+  let forceKill: NodeJS.Timeout | undefined;
+  let timedOut = false;
   if (!inherited) {
     child.stdout?.on("data", (chunk: Buffer) => {
       if (outputFailure !== undefined) return;
@@ -59,10 +62,9 @@ export const nodeCommandRunner: CommandRunner = async (command, args, options = 
     });
   }
 
-  let timeout: NodeJS.Timeout | undefined;
-  let forceKill: NodeJS.Timeout | undefined;
   if (options.timeoutMs !== undefined) {
     timeout = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGTERM");
       forceKill = setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
     }, options.timeoutMs);
@@ -73,6 +75,7 @@ export const nodeCommandRunner: CommandRunner = async (command, args, options = 
       child.once("close", (closeCode, closeSignal) => resolve([closeCode, closeSignal]));
     });
     if (outputFailure !== undefined) throw outputFailure;
+    if (timedOut) throw new Error("SSH worker command timed out");
     return {
       code,
       signal,
@@ -111,17 +114,35 @@ export const nodeStreamingChildFactory: StreamingChildFactory = (command, args, 
   });
   if (child.stdin === null || child.stdout === null) throw new Error("SSH App Server streams are unavailable");
   const stdin = child.stdin;
+  let stdinFailure: Error | undefined;
+  const stdinRejectors = new Set<(error: Error) => void>();
+  stdin.on("error", (error: Error) => {
+    stdinFailure = error;
+    for (const reject of stdinRejectors) reject(error);
+    stdinRejectors.clear();
+  });
+  const useStdin = (operation: (done: (error?: Error | null) => void) => void): Promise<void> => (
+    new Promise<void>((resolve, reject) => {
+      if (stdinFailure !== undefined) {
+        reject(stdinFailure);
+        return;
+      }
+      const rejectPending = (error: Error): void => { reject(error); };
+      stdinRejectors.add(rejectPending);
+      operation((error) => {
+        stdinRejectors.delete(rejectPending);
+        if (error === null || error === undefined) resolve();
+        else reject(error);
+      });
+    })
+  );
   const streaming: StreamingChild = {
     started,
     stdout: readableBytes(child.stdout),
     exit,
     close,
-    writeStdin: (value) => new Promise<void>((resolve, reject) => {
-      stdin.write(value, "utf8", (error) => error === null || error === undefined ? resolve() : reject(error));
-    }),
-    endStdin: () => new Promise<void>((resolve, reject) => {
-      stdin.end((error?: Error | null) => error === null || error === undefined ? resolve() : reject(error));
-    }),
+    writeStdin: (value) => useStdin((done) => { stdin.write(value, "utf8", done); }),
+    endStdin: () => useStdin((done) => { stdin.end(done); }),
     kill: (signal) => { child.kill(signal); },
   };
   return streaming;

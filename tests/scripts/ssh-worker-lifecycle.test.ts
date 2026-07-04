@@ -43,6 +43,7 @@ const EFFECTIVE_SSHD_CONFIG = [
   "pubkeyauthentication yes",
   "authenticationmethods publickey",
   "disableforwarding yes",
+  "setenv CODEX_HOME=/home/codex/.codex",
   "permitrootlogin no",
   "passwordauthentication no",
   "kbdinteractiveauthentication no",

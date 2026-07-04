@@ -9,5 +9,6 @@ KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 AllowUsers codex
 DisableForwarding yes
+SetEnv CODEX_HOME=/home/codex/.codex
 UsePAM no
 PidFile /run/sshd/sshd.pid

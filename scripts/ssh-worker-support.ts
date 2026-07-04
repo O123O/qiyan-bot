@@ -1606,7 +1606,12 @@ class BoundedJsonlReader {
       if (this.pending.length > MAX_JSONL_LINE_BYTES) {
         throw new Error("App Server protocol response is too large");
       }
-      const item = await this.iterator.next();
+      let item: IteratorResult<Uint8Array>;
+      try {
+        item = await this.iterator.next();
+      } catch {
+        throw new Error("App Server protocol stream failed");
+      }
       if (item.done) throw new Error("App Server closed before completing the protocol check");
       const chunk = Buffer.from(item.value);
       this.pending = this.pending.length === 0 ? chunk : Buffer.concat([this.pending, chunk]);
@@ -1677,13 +1682,31 @@ function validateInitializeResponse(value: unknown, codexVersion: string): Initi
   return value as unknown as InitializeResponse;
 }
 
-function validateAccountResponse(value: unknown): GetAccountResponse {
+function accountIsAuthenticated(value: unknown): boolean {
   if (!isRecord(value)
     || typeof value.requiresOpenaiAuth !== "boolean"
-    || !(value.account === null || isRecord(value.account))) {
+    || !(value.account === null || isValidAccount(value.account))) {
     throw new Error("App Server account response is invalid");
   }
-  return value as unknown as GetAccountResponse;
+  const response = value as unknown as GetAccountResponse;
+  return !response.requiresOpenaiAuth && response.account !== null;
+}
+
+const PLAN_TYPES = new Set([
+  "free", "go", "plus", "pro", "prolite", "team", "self_serve_business_usage_based",
+  "business", "enterprise_cbp_usage_based", "enterprise", "edu", "unknown",
+]);
+
+function isValidAccount(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  if (value.type === "apiKey") return true;
+  if (value.type === "chatgpt") {
+    return (value.email === null || typeof value.email === "string")
+      && typeof value.planType === "string"
+      && PLAN_TYPES.has(value.planType);
+  }
+  return value.type === "amazonBedrock"
+    && (value.credentialSource === "codexManaged" || value.credentialSource === "awsManaged");
 }
 
 async function writeProtocolMessage(
@@ -1824,10 +1847,10 @@ export async function checkFixture(
       options.wait,
     );
     options.onPhase?.("account");
-    const account = validateAccountResponse(
+    const authenticated = accountIsAuthenticated(
       await readProtocolResponse(reader, child, 2, ACCOUNT_TIMEOUT_MS, options.wait),
     );
-    return { authenticated: !account.requiresOpenaiAuth && account.account !== null };
+    return { authenticated };
   } catch (error) {
     primaryFailure = error;
     throw error;
@@ -1867,6 +1890,7 @@ export async function runCli(
     else if (command === "check") {
       const result = await operations.check();
       io.stdout(result.authenticated ? "SSH worker: authenticated\n" : "SSH worker: authentication required\n");
+      if (!result.authenticated) return 2;
     } else if (command === "down") await operations.down();
     else {
       const confirmed = args[1] === "--yes"
