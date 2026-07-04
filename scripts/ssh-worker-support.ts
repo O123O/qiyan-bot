@@ -2,17 +2,16 @@ import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, type Stats } from "node:fs";
 import {
   chmod,
-  link,
   lstat,
   mkdir,
   mkdtemp,
   open,
   readFile,
+  readdir,
   rename,
   rm,
-  unlink,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 export interface FixturePaths {
   repositoryRoot: string;
@@ -52,12 +51,26 @@ export const DEFAULT_SSH_PORT = 2222;
 export const DEFAULT_CODEX_VERSION = "0.142.5";
 export const SSH_ALIAS = "qiyan-ssh-worker";
 
-const CONFIG_UNSAFE = /[\u0000-\u0020\u007f#"'\\%]/u;
+const CONFIG_UNSAFE = /[\u0000-\u0020\u007f#$"'\\%]/u;
 const OWNER_ONLY_FILE_MODE = 0o600;
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const KEY_STAGING_NAME = /^\.keygen-[A-Za-z0-9]{6}$/u;
+
+interface DirectoryIdentity {
+  path: string;
+  device: number;
+  inode: number;
+}
+
+interface FixtureTrust {
+  uid: number;
+  parent: DirectoryIdentity;
+  state: DirectoryIdentity;
+}
 
 function fixturePaths(repositoryRoot: string): FixturePaths {
   const stateDir = join(repositoryRoot, ".tmp", "ssh-worker");
-  const privateKey = join(stateDir, "id_ed25519");
+  const privateKey = join(stateDir, "client-key", "id_ed25519");
   return {
     repositoryRoot,
     composeFile: join(repositoryRoot, "docker", "ssh-worker", "compose.yaml"),
@@ -146,7 +159,26 @@ function assertConfigFile(metadata: Stats, uid: number): void {
   if ((metadata.mode & 0o777) !== OWNER_ONLY_FILE_MODE) throw new Error(`${label} must have mode 0600`);
 }
 
-async function ensureStateParent(paths: FixturePaths): Promise<void> {
+function identity(path: string, metadata: Stats): DirectoryIdentity {
+  return { path, device: metadata.dev, inode: metadata.ino };
+}
+
+function assertStateParent(metadata: Stats, uid: number): void {
+  const label = "SSH fixture state parent";
+  if (metadata.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!metadata.isDirectory()) throw new Error(`${label} must be a directory`);
+  assertOwned(metadata, uid, label);
+  if ((metadata.mode & 0o022) !== 0) throw new Error(`${label} must not be group- or world-writable`);
+}
+
+function assertPrivateDirectory(metadata: Stats, uid: number, label: string): void {
+  if (metadata.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!metadata.isDirectory()) throw new Error(`${label} must be a directory`);
+  assertOwned(metadata, uid, label);
+  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error(`${label} must have mode 0700`);
+}
+
+async function ensureStateParent(paths: FixturePaths, uid: number): Promise<Stats> {
   const parent = dirname(paths.stateDir);
   let metadata = await optionalMetadata(parent);
   if (metadata === undefined) {
@@ -157,26 +189,103 @@ async function ensureStateParent(paths: FixturePaths): Promise<void> {
     }
     metadata = await optionalMetadata(parent);
   }
-  if (metadata?.isSymbolicLink()) throw new Error("SSH fixture state parent must not be a symbolic link");
-  if (metadata === undefined || !metadata.isDirectory()) throw new Error("SSH fixture state parent must be a directory");
+  if (metadata === undefined) throw new Error("SSH fixture state parent must be a directory");
+  assertStateParent(metadata, uid);
+  return metadata;
 }
 
-async function ensureStateDirectory(paths: FixturePaths, uid: number): Promise<void> {
-  await ensureStateParent(paths);
+async function ensureStateDirectory(paths: FixturePaths, uid: number): Promise<Stats> {
   let metadata = await optionalMetadata(paths.stateDir);
   if (metadata === undefined) {
     try {
-      await mkdir(paths.stateDir, { mode: 0o700 });
-      await chmod(paths.stateDir, 0o700);
+      await mkdir(paths.stateDir, { mode: PRIVATE_DIRECTORY_MODE });
+      await chmod(paths.stateDir, PRIVATE_DIRECTORY_MODE);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     metadata = await optionalMetadata(paths.stateDir);
   }
-  if (metadata?.isSymbolicLink()) throw new Error("SSH fixture state directory must not be a symbolic link");
-  if (metadata === undefined || !metadata.isDirectory()) throw new Error("SSH fixture state directory must be a directory");
-  assertOwned(metadata, uid, "SSH fixture state directory");
-  if ((metadata.mode & 0o777) !== 0o700) throw new Error("SSH fixture state directory must have mode 0700");
+  if (metadata === undefined) throw new Error("SSH fixture state directory must be a directory");
+  assertPrivateDirectory(metadata, uid, "SSH fixture state directory");
+  return metadata;
+}
+
+async function revalidateDirectory(
+  expected: DirectoryIdentity,
+  uid: number,
+  label: string,
+  validate: (metadata: Stats, uid: number) => void,
+): Promise<Stats> {
+  const metadata = await optionalMetadata(expected.path);
+  if (metadata === undefined) throw new Error(`${label} was replaced or removed`);
+  validate(metadata, uid);
+  if (metadata.dev !== expected.device || metadata.ino !== expected.inode) {
+    throw new Error(`${label} was replaced`);
+  }
+  return metadata;
+}
+
+async function establishFixtureTrust(paths: FixturePaths, uid: number): Promise<FixtureTrust> {
+  const parentPath = dirname(paths.stateDir);
+  const parentMetadata = await ensureStateParent(paths, uid);
+  const stateMetadata = await ensureStateDirectory(paths, uid);
+  const trust = {
+    uid,
+    parent: identity(parentPath, parentMetadata),
+    state: identity(paths.stateDir, stateMetadata),
+  };
+  await revalidateDirectory(trust.parent, uid, "SSH fixture state parent", assertStateParent);
+  return trust;
+}
+
+async function revalidateFixtureTrust(trust: FixtureTrust): Promise<void> {
+  await revalidateDirectory(trust.parent, trust.uid, "SSH fixture state parent", assertStateParent);
+  await revalidateDirectory(
+    trust.state,
+    trust.uid,
+    "SSH fixture state directory",
+    (metadata, uid) => assertPrivateDirectory(metadata, uid, "SSH fixture state directory"),
+  );
+}
+
+function assertStagingDirectory(metadata: Stats, uid: number): void {
+  const label = "stale SSH key staging entry";
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`${label} must be a regular directory`);
+  }
+  assertOwned(metadata, uid, label);
+  if ((metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error(`${label} must have mode 0700`);
+}
+
+async function removeStagingDirectory(
+  trust: FixtureTrust,
+  stagingDirectory: string,
+  expected?: DirectoryIdentity,
+): Promise<void> {
+  if (dirname(stagingDirectory) !== trust.state.path || !KEY_STAGING_NAME.test(basename(stagingDirectory))) {
+    throw new Error("SSH key staging path is invalid");
+  }
+  await revalidateFixtureTrust(trust);
+  const metadata = await optionalMetadata(stagingDirectory);
+  if (metadata === undefined) return;
+  assertStagingDirectory(metadata, trust.uid);
+  if (expected !== undefined && (metadata.dev !== expected.device || metadata.ino !== expected.inode)) {
+    throw new Error("SSH key staging directory was replaced");
+  }
+  await revalidateFixtureTrust(trust);
+  await rm(stagingDirectory, { recursive: true, force: false });
+  await revalidateFixtureTrust(trust);
+}
+
+async function cleanStaleStagingDirectories(trust: FixtureTrust): Promise<void> {
+  const names = await readdir(trust.state.path);
+  for (const name of names) {
+    if (!KEY_STAGING_NAME.test(name)) continue;
+    const stagingDirectory = join(trust.state.path, name);
+    const metadata = await lstat(stagingDirectory);
+    assertStagingDirectory(metadata, trust.uid);
+    await removeStagingDirectory(trust, stagingDirectory, identity(stagingDirectory, metadata));
+  }
 }
 
 async function validateOptionalFixtureFiles(paths: FixturePaths, uid: number): Promise<void> {
@@ -205,20 +314,43 @@ function parsePublicKey(value: string, label: string): readonly [string, string]
   return [fields[0], fields[1]];
 }
 
-async function derivePublicKey(privateKey: string, runner: CommandRunner): Promise<readonly [string, string]> {
-  let result: CommandResult;
+async function runSshKeygen(
+  runner: CommandRunner,
+  args: readonly string[],
+  afterCommand: () => Promise<void>,
+  failureMessage: string,
+): Promise<CommandResult> {
+  let result: CommandResult | undefined;
+  let runnerFailed = false;
   try {
-    result = await runner("ssh-keygen", ["-y", "-f", privateKey]);
+    result = await runner("ssh-keygen", args);
   } catch {
-    throw new Error("SSH private key validation failed");
+    runnerFailed = true;
   }
-  if (result.code !== 0 || result.signal !== null) throw new Error("SSH private key validation failed");
+  await afterCommand();
+  if (runnerFailed || result === undefined || result.code !== 0 || result.signal !== null) {
+    throw new Error(failureMessage);
+  }
+  return result;
+}
+
+async function derivePublicKey(
+  privateKey: string,
+  runner: CommandRunner,
+  afterCommand: () => Promise<void>,
+): Promise<readonly [string, string]> {
+  const result = await runSshKeygen(
+    runner,
+    ["-y", "-f", privateKey],
+    afterCommand,
+    "SSH private key validation failed",
+  );
   const fields = result.stdout.trim().split(/\s+/u);
   if (fields.length !== 2) throw new Error("SSH private key validation produced an invalid public key");
   return parsePublicKey(result.stdout, "derived SSH public key");
 }
 
-async function validateKeyPair(privateKey: string, publicKey: string, runner: CommandRunner, uid: number, generated: boolean): Promise<void> {
+async function validateKeyFiles(privateKey: string, publicKey: string, uid: number, generated: boolean): Promise<void> {
   const [privateMetadata, publicMetadata] = await Promise.all([
     optionalMetadata(privateKey),
     optionalMetadata(publicKey),
@@ -229,8 +361,21 @@ async function validateKeyPair(privateKey: string, publicKey: string, runner: Co
   }
   assertPrivateKey(privateMetadata, uid, `${prefix}private key`);
   assertOwnerOnlyFile(publicMetadata, uid, `${prefix}public key`);
+}
 
-  const derived = await derivePublicKey(privateKey, runner);
+async function validateKeyPair(
+  privateKey: string,
+  publicKey: string,
+  runner: CommandRunner,
+  uid: number,
+  generated: boolean,
+  afterCommand: () => Promise<void>,
+): Promise<void> {
+  await validateKeyFiles(privateKey, publicKey, uid, generated);
+
+  const derived = await derivePublicKey(privateKey, runner, afterCommand);
+  await validateKeyFiles(privateKey, publicKey, uid, generated);
+  const prefix = generated ? "generated " : "";
   let stored: readonly [string, string];
   try {
     stored = parsePublicKey(await readFile(publicKey, "utf8"), `${prefix}public key`);
@@ -243,22 +388,31 @@ async function validateKeyPair(privateKey: string, publicKey: string, runner: Co
   }
 }
 
-async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, uid: number): Promise<void> {
-  const stagingDirectory = await mkdtemp(join(paths.stateDir, ".keygen-"));
-  await chmod(stagingDirectory, 0o700);
-  const stagingMetadata = await lstat(stagingDirectory);
-  assertOwned(stagingMetadata, uid, "SSH key staging directory");
-  if (!stagingMetadata.isDirectory() || (stagingMetadata.mode & 0o777) !== 0o700) {
-    throw new Error("SSH key staging directory must have mode 0700");
-  }
-  const stagedPrivateKey = join(stagingDirectory, "id_ed25519");
-  const stagedPublicKey = `${stagedPrivateKey}.pub`;
-  let installedPublicKey = false;
-  let installedPrivateKey = false;
+async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, trust: FixtureTrust): Promise<void> {
+  let stagingDirectory: string | undefined;
+  let stagingIdentity: DirectoryIdentity | undefined;
   try {
-    let result: CommandResult;
-    try {
-      result = await runner("ssh-keygen", [
+    stagingDirectory = await mkdtemp(join(paths.stateDir, ".keygen-"));
+    await chmod(stagingDirectory, PRIVATE_DIRECTORY_MODE);
+    const stagingMetadata = await lstat(stagingDirectory);
+    assertPrivateDirectory(stagingMetadata, trust.uid, "SSH key staging directory");
+    stagingIdentity = identity(stagingDirectory, stagingMetadata);
+    const stagedPrivateKey = join(stagingDirectory, "id_ed25519");
+    const stagedPublicKey = `${stagedPrivateKey}.pub`;
+    const revalidateStaging = async (): Promise<void> => {
+      await revalidateFixtureTrust(trust);
+      if (stagingIdentity === undefined) throw new Error("SSH key staging directory was not pinned");
+      await revalidateDirectory(
+        stagingIdentity,
+        trust.uid,
+        "SSH key staging directory",
+        (metadata, uid) => assertPrivateDirectory(metadata, uid, "SSH key staging directory"),
+      );
+    };
+
+    await runSshKeygen(
+      runner,
+      [
         "-q",
         "-t",
         "ed25519",
@@ -268,43 +422,39 @@ async function generateKeyPair(paths: FixturePaths, runner: CommandRunner, uid: 
         SSH_ALIAS,
         "-f",
         stagedPrivateKey,
-      ]);
-    } catch {
-      throw new Error("SSH key generation failed");
-    }
-    if (result.code !== 0 || result.signal !== null) throw new Error("SSH key generation failed");
+      ],
+      revalidateStaging,
+      "SSH key generation failed",
+    );
 
     const stagedPublicMetadata = await optionalMetadata(stagedPublicKey);
     if (stagedPublicMetadata === undefined) throw new Error("generated SSH keypair is incomplete");
-    assertOwnedRegularSingleLink(stagedPublicMetadata, uid, "generated public key");
+    assertOwnedRegularSingleLink(stagedPublicMetadata, trust.uid, "generated public key");
     const stagedPublicMode = stagedPublicMetadata.mode & 0o777;
     if ((stagedPublicMode & ~0o644) !== 0) {
       throw new Error("generated public key mode must not contain permission bits outside 0644");
     }
     await chmod(stagedPublicKey, OWNER_ONLY_FILE_MODE);
-    await validateKeyPair(stagedPrivateKey, stagedPublicKey, runner, uid, true);
+    await validateKeyPair(stagedPrivateKey, stagedPublicKey, runner, trust.uid, true, revalidateStaging);
 
-    try {
-      await link(stagedPublicKey, paths.publicKey);
-      installedPublicKey = true;
-      await unlink(stagedPublicKey);
-      await link(stagedPrivateKey, paths.privateKey);
-      installedPrivateKey = true;
-      await unlink(stagedPrivateKey);
-    } catch {
-      if (installedPrivateKey) await rm(paths.privateKey, { force: true });
-      if (installedPublicKey) await rm(paths.publicKey, { force: true });
-      throw new Error("SSH keypair could not be installed safely");
+    const clientKeyDirectory = dirname(paths.privateKey);
+    if (await optionalMetadata(clientKeyDirectory) !== undefined) {
+      throw new Error("SSH client key directory already exists");
     }
+    await revalidateStaging();
+    await rename(stagingDirectory, clientKeyDirectory);
 
-    const [privateMetadata, publicMetadata] = await Promise.all([
-      lstat(paths.privateKey),
-      lstat(paths.publicKey),
-    ]);
-    assertPrivateKey(privateMetadata, uid, "private key");
-    assertOwnerOnlyFile(publicMetadata, uid, "public key");
+    const clientKeyMetadata = await lstat(clientKeyDirectory);
+    assertPrivateDirectory(clientKeyMetadata, trust.uid, "SSH client key directory");
+    if (clientKeyMetadata.dev !== stagingIdentity.device || clientKeyMetadata.ino !== stagingIdentity.inode) {
+      throw new Error("SSH client key directory was replaced during installation");
+    }
+    await revalidateFixtureTrust(trust);
+    await validateKeyFiles(paths.privateKey, paths.publicKey, trust.uid, false);
   } finally {
-    await rm(stagingDirectory, { recursive: true, force: true });
+    if (stagingDirectory !== undefined) {
+      await removeStagingDirectory(trust, stagingDirectory, stagingIdentity);
+    }
   }
 }
 
@@ -315,21 +465,28 @@ export async function ensureFixtureState(
 ): Promise<void> {
   validateFixturePaths(paths);
   const uid = currentUid(options);
-  await ensureStateDirectory(paths, uid);
+  const trust = await establishFixtureTrust(paths, uid);
+  await cleanStaleStagingDirectories(trust);
   await validateOptionalFixtureFiles(paths, uid);
 
-  const [privateMetadata, publicMetadata] = await Promise.all([
-    optionalMetadata(paths.privateKey),
-    optionalMetadata(paths.publicKey),
-  ]);
-  if ((privateMetadata === undefined) !== (publicMetadata === undefined)) {
-    throw new Error("SSH keypair is incomplete");
-  }
-  if (privateMetadata === undefined) {
-    await generateKeyPair(paths, runner, uid);
+  const clientKeyDirectory = dirname(paths.privateKey);
+  const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
+  if (clientKeyMetadata === undefined) {
+    await generateKeyPair(paths, runner, trust);
     return;
   }
-  await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false);
+  assertPrivateDirectory(clientKeyMetadata, uid, "SSH client key directory");
+  const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
+  const revalidateKeyState = async (): Promise<void> => {
+    await revalidateFixtureTrust(trust);
+    await revalidateDirectory(
+      clientKeyIdentity,
+      uid,
+      "SSH client key directory",
+      (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
+    );
+  };
+  await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false, revalidateKeyState);
 }
 
 export function formatSshConfig(paths: FixturePaths, port = DEFAULT_SSH_PORT): string {
@@ -353,6 +510,27 @@ export function formatSshConfig(paths: FixturePaths, port = DEFAULT_SSH_PORT): s
   ].join("\n");
 }
 
+async function removeConfigTemporaryFile(
+  trust: FixtureTrust,
+  temporaryPath: string,
+  expected: DirectoryIdentity | undefined,
+): Promise<void> {
+  if (expected === undefined) return;
+  try {
+    await revalidateFixtureTrust(trust);
+  } catch {
+    return;
+  }
+  const metadata = await optionalMetadata(temporaryPath);
+  if (metadata === undefined) return;
+  assertConfigFile(metadata, trust.uid);
+  if (metadata.dev !== expected.device || metadata.ino !== expected.inode) {
+    throw new Error("SSH config temporary file was replaced");
+  }
+  await revalidateFixtureTrust(trust);
+  await rm(temporaryPath, { force: true });
+}
+
 export async function writeSshConfig(
   paths: FixturePaths,
   port = DEFAULT_SSH_PORT,
@@ -361,25 +539,45 @@ export async function writeSshConfig(
   validateFixturePaths(paths);
   validatePort(port);
   const uid = currentUid(options);
-  await ensureStateDirectory(paths, uid);
+  const trust = await establishFixtureTrust(paths, uid);
   const existing = await optionalMetadata(paths.sshConfig);
   if (existing !== undefined) assertConfigFile(existing, uid);
+  const existingIdentity = existing === undefined ? undefined : identity(paths.sshConfig, existing);
 
   const temporaryPath = join(paths.stateDir, `.config-${randomUUID()}.tmp`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let temporaryIdentity: DirectoryIdentity | undefined;
   try {
     handle = await open(temporaryPath, "wx", OWNER_ONLY_FILE_MODE);
+    temporaryIdentity = identity(temporaryPath, await handle.stat());
     await handle.chmod(OWNER_ONLY_FILE_MODE);
     await handle.writeFile(formatSshConfig(paths, port), "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
-    assertConfigFile(await lstat(temporaryPath), uid);
+    const temporaryMetadata = await lstat(temporaryPath);
+    assertConfigFile(temporaryMetadata, uid);
+    if (temporaryMetadata.dev !== temporaryIdentity.device || temporaryMetadata.ino !== temporaryIdentity.inode) {
+      throw new Error("SSH config temporary file was replaced");
+    }
+
+    const currentConfig = await optionalMetadata(paths.sshConfig);
+    if (existingIdentity === undefined) {
+      if (currentConfig !== undefined) throw new Error("SSH config appeared during replacement");
+    } else {
+      if (currentConfig === undefined) throw new Error("SSH config was replaced or removed");
+      assertConfigFile(currentConfig, uid);
+      if (currentConfig.dev !== existingIdentity.device || currentConfig.ino !== existingIdentity.inode) {
+        throw new Error("SSH config was replaced");
+      }
+    }
+    await revalidateFixtureTrust(trust);
     await rename(temporaryPath, paths.sshConfig);
+    await revalidateFixtureTrust(trust);
     assertConfigFile(await lstat(paths.sshConfig), uid);
   } finally {
     await handle?.close();
-    await rm(temporaryPath, { force: true });
+    await removeConfigTemporaryFile(trust, temporaryPath, temporaryIdentity);
   }
 }
 

@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -69,10 +70,20 @@ function stagingRunner(calls: Array<{ command: string; args: readonly string[] }
 }
 
 async function installExistingPair(paths: FixturePaths, publicKey = PUBLIC_KEY): Promise<void> {
-  await mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
+  await mkdir(dirname(paths.privateKey), { recursive: true, mode: 0o700 });
   await chmod(paths.stateDir, 0o700);
+  await chmod(dirname(paths.privateKey), 0o700);
   await writeFile(paths.privateKey, "opaque-test-private-key", { mode: 0o600 });
   await writeFile(paths.publicKey, `${publicKey} a comment that is ignored\n`, { mode: 0o600 });
+}
+
+async function assertNoStagingDirectories(stateDir: string): Promise<void> {
+  assert.equal((await readdir(stateDir)).some((name) => /^\.keygen-[A-Za-z0-9]{6}$/u.test(name)), false);
+}
+
+async function prepareEmptyState(paths: FixturePaths): Promise<void> {
+  await mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
+  await chmod(paths.stateDir, 0o700);
 }
 
 test("resolves every fixture path beneath a canonical repository root", async (t) => {
@@ -86,8 +97,8 @@ test("resolves every fixture path beneath a canonical repository root", async (t
     repositoryRoot: root,
     composeFile: join(root, "docker", "ssh-worker", "compose.yaml"),
     stateDir,
-    privateKey: join(stateDir, "id_ed25519"),
-    publicKey: join(stateDir, "id_ed25519.pub"),
+    privateKey: join(stateDir, "client-key", "id_ed25519"),
+    publicKey: join(stateDir, "client-key", "id_ed25519.pub"),
     trustedHostKey: join(stateDir, "trusted-host-key.pub"),
     knownHosts: join(stateDir, "known_hosts"),
     sshConfig: join(stateDir, "config"),
@@ -108,6 +119,11 @@ test("rejects relative, non-normalized, aliased, and config-hostile repository r
   await mkdir(hostile);
   t.after(() => rm(hostile, { recursive: true, force: true }));
   assert.throws(() => resolveFixturePaths(hostile), /SSH configuration characters/u);
+
+  const expansionHostile = await mkdtemp(join(tmpdir(), "qiyan-${HOME}-"));
+  t.after(() => rm(expansionHostile, { recursive: true, force: true }));
+  const canonicalExpansionHostile = await realpath(expansionHostile);
+  assert.throws(() => resolveFixturePaths(canonicalExpansionHostile), /SSH configuration characters/u);
 });
 
 test("formats one strict alias without ambient configuration or identities", async (t) => {
@@ -170,6 +186,7 @@ test("stages, validates, and installs a new owner-only keypair", async (t) => {
   await ensureFixtureState(paths, inspectingRunner);
 
   assert.equal((await lstat(paths.stateDir)).mode & 0o777, 0o700);
+  assert.equal((await lstat(dirname(paths.privateKey))).mode & 0o777, 0o700);
   for (const keyPath of [paths.privateKey, paths.publicKey]) {
     const metadata = await lstat(keyPath);
     assert.equal(metadata.isFile(), true);
@@ -188,8 +205,7 @@ test("stages, validates, and installs a new owner-only keypair", async (t) => {
   ]);
   assert.equal((await readFile(paths.publicKey, "utf8")).trim(), `${PUBLIC_KEY} qiyan-ssh-worker`);
   assert.deepEqual(await readdir(paths.stateDir), [
-    "id_ed25519",
-    "id_ed25519.pub",
+    "client-key",
   ]);
 });
 
@@ -210,6 +226,7 @@ for (const generatedPublicMode of [0o664, 0o645]) {
     );
     await assert.rejects(lstat(paths.privateKey));
     await assert.rejects(lstat(paths.publicKey));
+    await assertNoStagingDirectories(paths.stateDir);
   });
 }
 
@@ -228,7 +245,9 @@ test("validates an existing pair by algorithm and blob while ignoring its commen
 
 test("fails closed for missing or mismatched public keys without returning key material", async (t) => {
   const missing = resolveFixturePaths(await temporaryRepository(t));
-  await mkdir(missing.stateDir, { recursive: true, mode: 0o700 });
+  await mkdir(dirname(missing.privateKey), { recursive: true, mode: 0o700 });
+  await chmod(missing.stateDir, 0o700);
+  await chmod(dirname(missing.privateKey), 0o700);
   await writeFile(missing.privateKey, "opaque-test-private-key", { mode: 0o600 });
   await assert.rejects(ensureFixtureState(missing, stagingRunner([])), /keypair is incomplete/u);
 
@@ -239,6 +258,7 @@ test("fails closed for missing or mismatched public keys without returning key m
   );
   await assert.rejects(lstat(generatedMissing.privateKey));
   await assert.rejects(lstat(generatedMissing.publicKey));
+  await assertNoStagingDirectories(generatedMissing.stateDir);
 
   const mismatched = resolveFixturePaths(await temporaryRepository(t));
   await installExistingPair(mismatched);
@@ -269,11 +289,13 @@ test("rejects symlinked, incorrectly owned, accessible, special, and hard-linked
   const actualUid = (await lstat(uidPaths.stateDir)).uid;
   await assert.rejects(
     ensureFixtureState(uidPaths, stagingRunner([]), { currentUid: actualUid + 1 }),
-    /state directory must be owned by the current user/u,
+    /must be owned by the current user/u,
   );
 
   const specialPaths = resolveFixturePaths(await temporaryRepository(t));
-  await mkdir(specialPaths.stateDir, { recursive: true, mode: 0o700 });
+  await mkdir(dirname(specialPaths.privateKey), { recursive: true, mode: 0o700 });
+  await chmod(specialPaths.stateDir, 0o700);
+  await chmod(dirname(specialPaths.privateKey), 0o700);
   await mkdir(specialPaths.privateKey, { mode: 0o700 });
   await writeFile(specialPaths.publicKey, `${PUBLIC_KEY}\n`, { mode: 0o600 });
   await assert.rejects(ensureFixtureState(specialPaths, stagingRunner([])), /private key must be a regular file/u);
@@ -297,6 +319,114 @@ test("rejects a symlink in the state directory parent", async (t) => {
   await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /state parent must not be a symbolic link/u);
 });
 
+test("requires an existing state parent to be owned and not group- or world-writable", async (t) => {
+  const wrongOwnerPaths = resolveFixturePaths(await temporaryRepository(t));
+  const wrongOwnerParent = dirname(wrongOwnerPaths.stateDir);
+  await mkdir(wrongOwnerParent, { mode: 0o700 });
+  const actualUid = (await lstat(wrongOwnerParent)).uid;
+  await assert.rejects(
+    ensureFixtureState(wrongOwnerPaths, stagingRunner([]), { currentUid: actualUid + 1 }),
+    /state parent must be owned by the current user/u,
+  );
+
+  for (const mode of [0o770, 0o702]) {
+    const writablePaths = resolveFixturePaths(await temporaryRepository(t));
+    const writableParent = dirname(writablePaths.stateDir);
+    await mkdir(writableParent, { mode });
+    await chmod(writableParent, mode);
+    await assert.rejects(
+      ensureFixtureState(writablePaths, stagingRunner([])),
+      /state parent must not be group- or world-writable/u,
+    );
+  }
+});
+
+test("removes a safe stale key staging directory before generating a complete pair", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await prepareEmptyState(paths);
+  const stale = join(paths.stateDir, ".keygen-Ab12z9");
+  await mkdir(stale, { mode: 0o700 });
+  await writeFile(join(stale, "partial"), "not-secret", { mode: 0o600 });
+
+  await ensureFixtureState(paths, stagingRunner([]));
+
+  await assertNoStagingDirectories(paths.stateDir);
+  assert.deepEqual(await readdir(paths.stateDir), ["client-key"]);
+});
+
+test("rejects suspicious stale key staging entries without following or removing them", async (t) => {
+  const symlinkPaths = resolveFixturePaths(await temporaryRepository(t));
+  await prepareEmptyState(symlinkPaths);
+  const external = await mkdtemp(join(tmpdir(), "qiyan-stale-stage-"));
+  t.after(() => rm(external, { recursive: true, force: true }));
+  const staleSymlink = join(symlinkPaths.stateDir, ".keygen-Ab12z9");
+  await symlink(external, staleSymlink, "dir");
+  await assert.rejects(ensureFixtureState(symlinkPaths, stagingRunner([])), /stale SSH key staging entry must be a regular directory/u);
+  assert.equal((await lstat(staleSymlink)).isSymbolicLink(), true);
+
+  const specialPaths = resolveFixturePaths(await temporaryRepository(t));
+  await prepareEmptyState(specialPaths);
+  const staleSpecial = join(specialPaths.stateDir, ".keygen-Cd34x8");
+  await writeFile(staleSpecial, "not-secret", { mode: 0o600 });
+  await assert.rejects(ensureFixtureState(specialPaths, stagingRunner([])), /stale SSH key staging entry must be a regular directory/u);
+  assert.equal((await lstat(staleSpecial)).isFile(), true);
+
+  const modePaths = resolveFixturePaths(await temporaryRepository(t));
+  await prepareEmptyState(modePaths);
+  const staleWrongMode = join(modePaths.stateDir, ".keygen-Ef56w7");
+  await mkdir(staleWrongMode, { mode: 0o755 });
+  await chmod(staleWrongMode, 0o755);
+  await assert.rejects(ensureFixtureState(modePaths, stagingRunner([])), /stale SSH key staging entry must have mode 0700/u);
+  assert.equal((await lstat(staleWrongMode)).isDirectory(), true);
+});
+
+for (const runnerFailure of ["throw", "nonzero"] as const) {
+  test(`cleans key staging state when ssh-keygen returns ${runnerFailure}`, async (t) => {
+    const paths = resolveFixturePaths(await temporaryRepository(t));
+    const runner: CommandRunner = async () => {
+      if (runnerFailure === "throw") throw new Error("runner failure with no secret");
+      return { code: 1, signal: null, stdout: "", stderr: "ignored" };
+    };
+
+    await assert.rejects(ensureFixtureState(paths, runner), /SSH key generation failed/u);
+    await assertNoStagingDirectories(paths.stateDir);
+    await assert.rejects(lstat(paths.privateKey));
+    await assert.rejects(lstat(paths.publicKey));
+  });
+}
+
+test("fails closed when the state directory is replaced during key generation", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  const displacedState = `${paths.stateDir}-displaced`;
+  const baseRunner = stagingRunner([]);
+  let replaced = false;
+  const runner: CommandRunner = async (command, args, options) => {
+    const result = await baseRunner(command, args, options);
+    if (!replaced && command === "ssh-keygen" && !args.includes("-y")) {
+      replaced = true;
+      await rename(paths.stateDir, displacedState);
+      await mkdir(paths.stateDir, { mode: 0o700 });
+      const stagedPrivateKey = args[args.indexOf("-f") + 1];
+      assert.ok(stagedPrivateKey);
+      await mkdir(dirname(stagedPrivateKey), { mode: 0o700 });
+      await baseRunner(command, args, options);
+    }
+    return result;
+  };
+
+  await assert.rejects(ensureFixtureState(paths, runner), /state directory.*replaced/u);
+  await assert.rejects(lstat(paths.privateKey));
+  await assert.rejects(lstat(paths.publicKey));
+  await assert.rejects(lstat(paths.sshConfig));
+});
+
+test("requires an existing atomic client key directory to remain private", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await chmod(dirname(paths.privateKey), 0o755);
+  await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /client key directory must have mode 0700/u);
+});
+
 test("writes and replaces the SSH config atomically as an owner-only regular file", async (t) => {
   const paths = resolveFixturePaths(await temporaryRepository(t));
   await ensureFixtureState(paths, stagingRunner([]));
@@ -313,9 +443,8 @@ test("writes and replaces the SSH config atomically as an owner-only regular fil
   metadata = await lstat(paths.sshConfig);
   assert.equal(metadata.mode & 0o777, 0o600);
   assert.deepEqual(await readdir(paths.stateDir), [
+    "client-key",
     "config",
-    "id_ed25519",
-    "id_ed25519.pub",
   ]);
 });
 
