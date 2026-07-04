@@ -240,9 +240,13 @@ test("compares existing and derived keys by algorithm and blob while ignoring on
   await ensureFixtureState(paths, stagingRunner(calls));
 
   assert.deepEqual(calls, [{ command: "ssh-keygen", args: ["-y", "-f", paths.privateKey] }]);
+  await ensureFixtureState(paths, stagingRunner([], { derivedPublicKey: `${PUBLIC_KEY} qiyan-ssh-worker\r` }));
 
   for (const derivedPublicKey of [
     `${PUBLIC_KEY} first comment\n${PUBLIC_KEY} second key`,
+    `\n${PUBLIC_KEY} leading blank line`,
+    `${PUBLIC_KEY} doubled terminal LF\n`,
+    `${PUBLIC_KEY} doubled terminal CRLF\r\n\r`,
     "not-an-ssh-public-key",
   ]) {
     await assert.rejects(
@@ -254,8 +258,17 @@ test("compares existing and derived keys by algorithm and blob while ignoring on
     );
   }
 
-  await writeFile(paths.publicKey, `${PUBLIC_KEY} first comment\n${PUBLIC_KEY} second key\n`, { mode: 0o600 });
-  await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /not a valid Ed25519 public key/u);
+  await writeFile(paths.publicKey, `${PUBLIC_KEY} stored CRLF comment\r\n`, { mode: 0o600 });
+  await ensureFixtureState(paths, stagingRunner([]));
+  for (const storedPublicKey of [
+    `${PUBLIC_KEY} first comment\n${PUBLIC_KEY} second key\n`,
+    `\n${PUBLIC_KEY} leading blank line\n`,
+    `${PUBLIC_KEY} doubled terminal LF\n\n`,
+    `${PUBLIC_KEY} doubled terminal CRLF\r\n\r\n`,
+  ]) {
+    await writeFile(paths.publicKey, storedPublicKey, { mode: 0o600 });
+    await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /not a valid Ed25519 public key/u);
+  }
 });
 
 test("fails closed for missing or mismatched public keys without returning key material", async (t) => {

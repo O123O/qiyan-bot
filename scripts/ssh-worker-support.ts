@@ -303,12 +303,14 @@ async function validateOptionalFixtureFiles(paths: FixturePaths, uid: number): P
 }
 
 function parsePublicKey(value: string, label: string): readonly [string, string] {
-  const publicKeyLine = value.trim();
-  const fields = publicKeyLine.split(/[\t ]+/u);
-  if (fields.length < 2 || fields[0] !== "ssh-ed25519" || fields[1] === undefined || fields[1].length === 0) {
+  let publicKeyLine = value;
+  if (publicKeyLine.endsWith("\r\n")) publicKeyLine = publicKeyLine.slice(0, -2);
+  else if (publicKeyLine.endsWith("\n")) publicKeyLine = publicKeyLine.slice(0, -1);
+  if (publicKeyLine.includes("\n") || publicKeyLine.includes("\r")) {
     throw new Error(`${label} is not a valid Ed25519 public key`);
   }
-  if (publicKeyLine.includes("\n") || publicKeyLine.includes("\r")) {
+  const fields = publicKeyLine.trim().split(/[\t ]+/u);
+  if (fields.length < 2 || fields[0] !== "ssh-ed25519" || fields[1] === undefined || fields[1].length === 0) {
     throw new Error(`${label} is not a valid Ed25519 public key`);
   }
   return [fields[0], fields[1]];
