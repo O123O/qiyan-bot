@@ -87,6 +87,24 @@ export function safeWeixinFileName(value: string | undefined): string {
   return clean || "attachment";
 }
 
+export function classifyWeixinOutboundMedia(
+  bytes: Uint8Array,
+  displayName: string,
+  mediaType: string,
+): "image" | "file" {
+  const normalizedType = mediaType.trim().toLowerCase().split(";", 1)[0] ?? "";
+  const extension = basename(displayName).toLowerCase().match(/\.[a-z0-9]+$/u)?.[0];
+  if (isSupportedImage(Buffer.from(bytes))) return "image";
+  if (normalizedType.startsWith("audio/") || normalizedType.startsWith("video/")
+    || AUDIO_EXTENSIONS.has(extension ?? "") || VIDEO_EXTENSIONS.has(extension ?? "")) {
+    throw new TypeError("WeChat audio and video delivery is unsupported");
+  }
+  if (normalizedType.startsWith("image/") || IMAGE_EXTENSIONS.has(extension ?? "")) {
+    throw new TypeError("WeChat image format is invalid");
+  }
+  return "file";
+}
+
 async function collect(source: AsyncIterable<Uint8Array | string>, maxBytes: number, label: string): Promise<Buffer> {
   validateLimit(maxBytes);
   const chunks: Buffer[] = [];
@@ -116,3 +134,7 @@ function isSupportedImage(bytes: Buffer): boolean {
     || bytes.subarray(0, 6).toString("ascii") === "GIF89a"
     || (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP");
 }
+
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+const AUDIO_EXTENSIONS = new Set([".aac", ".amr", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"]);
+const VIDEO_EXTENSIONS = new Set([".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"]);

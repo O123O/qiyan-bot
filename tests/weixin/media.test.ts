@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  classifyWeixinOutboundMedia,
   decodeWeixinAesKey,
   decryptWeixinMedia,
   deterministicWeixinAttachmentId,
@@ -57,4 +58,14 @@ test("verifies digest, declared sizes, image signatures, names, and deterministi
   assert.match(id, /^file_weixin_[a-f0-9]{64}$/u);
   assert.equal(id, deterministicWeixinAttachmentId("generation", { kind: "message", value: "7" }, 2));
   assert.notEqual(id, deterministicWeixinAttachmentId("generation", { kind: "client", value: "7" }, 2));
+});
+
+test("classifies outbound media from validated bytes and rejects disguised audio or video", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+  assert.equal(classifyWeixinOutboundMedia(png, "picture.png", "application/octet-stream"), "image");
+  assert.equal(classifyWeixinOutboundMedia(png, "stale-name.MP3", "Video/MP4"), "image");
+  assert.equal(classifyWeixinOutboundMedia(Buffer.from("notes"), "notes.txt", "APPLICATION/OCTET-STREAM"), "file");
+  assert.throws(() => classifyWeixinOutboundMedia(Buffer.from("audio"), "recording.MP3", "application/octet-stream"), /unsupported/u);
+  assert.throws(() => classifyWeixinOutboundMedia(Buffer.from("video"), "movie.bin", "Video/MP4; codecs=x"), /unsupported/u);
+  assert.throws(() => classifyWeixinOutboundMedia(Buffer.from("invalid"), "picture.PNG", "application/octet-stream"), /image format/u);
 });

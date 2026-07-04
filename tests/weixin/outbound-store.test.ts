@@ -6,6 +6,7 @@ import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
 import {
   splitWeixinText,
   WeixinOutboundStore,
+  type WeixinAttachmentPlan,
   type WeixinFrozenDestination,
 } from "../../src/weixin/outbound-store.ts";
 
@@ -114,5 +115,92 @@ test("selects and freezes the current route token when the destination omits one
   db.prepare(`INSERT INTO weixin_route_tokens(id, generation_id, token, is_current, created_at)
     VALUES ('new-route', 'generation', 'new-secret', 1, 2)`).run();
   assert.deepEqual(outbound.prepareText(delivery, destination), plan);
+  db.close();
+});
+
+test("persists a fresh immutable attachment key and deterministic upload identities before dispatch", () => {
+  const { db, deliveries, outbound } = setup();
+  db.prepare(`INSERT INTO attachments
+    (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+    VALUES ('file_attachment', 'scope', 'picture.png', 'image/png', '/tmp/picture', 16, 'sha', 0, 999, 1)`).run();
+  const input = {
+    kind: "image" as const,
+    displayName: "picture.png",
+    mediaType: "image/png",
+    plaintextSize: 16,
+    plaintextMd5: "0123456789abcdef0123456789abcdef",
+  };
+  const firstDelivery = deliveries.prepareAttachment({
+    id: "image-one", kind: "file", binding: {
+      adapterId: "weixin", conversationKey: "weixin:generation:owner", destination: { ...target },
+    }, body: "caption", mandatory: true, attachmentId: "file_attachment", attachmentScopeId: "scope",
+  });
+  const first = outbound.prepareAttachment(firstDelivery, target, input);
+  const reloaded = new WeixinOutboundStore(db).attachmentPlan(firstDelivery.id);
+  assert.deepEqual(reloaded, first);
+  assert.equal(/^[a-f0-9]{32}$/u.test(first.aesKeyHex), true);
+  assert.equal(/^[a-f0-9]{32}$/u.test(first.fileKey), true);
+  assert.equal(first.ciphertextSize, 32);
+  assert.deepEqual(first.steps.map((step) => step.kind), ["upload_parameters", "upload", "caption", "image"]);
+  for (const [ordinal, step] of first.steps.entries()) {
+    outbound.begin(step.id);
+    assert.deepEqual(outbound.reconcile(firstDelivery.id), { outcome: "unresolved" });
+    outbound.succeed(step.id, { checkpoint: step.kind });
+    assert.deepEqual(outbound.reconcile(firstDelivery.id), ordinal === first.steps.length - 1
+      ? { outcome: "confirmed", receipt: { kind: "weixin", stepCount: first.steps.length } }
+      : { outcome: "resume_safe" });
+  }
+
+  const secondDelivery = deliveries.prepareAttachment({
+    id: "image-two", kind: "file", binding: {
+      adapterId: "weixin", conversationKey: "weixin:generation:owner", destination: { ...target },
+    }, body: "", mandatory: true, attachmentId: "file_attachment", attachmentScopeId: "scope",
+  });
+  const second: WeixinAttachmentPlan = outbound.prepareAttachment(secondDelivery, target, input);
+  assert.notEqual(second.aesKeyHex, first.aesKeyHex);
+  assert.notEqual(second.fileKey, first.fileKey);
+  assert.deepEqual(second.steps.map((step) => step.kind), ["upload_parameters", "upload", "image"]);
+  assert.throws(() => outbound.prepareAttachment(firstDelivery, target, { ...input, plaintextSize: 15 }), /immutable|inconsistent/u);
+  db.close();
+});
+
+test("startup recovery makes every in-flight attachment phase durably non-redispatchable", () => {
+  const { db, deliveries, outbound } = setup();
+  db.prepare(`INSERT INTO attachments
+    (id, scope_id, display_name, media_type, local_path, size, sha256, ref_count, expires_at, created_at)
+    VALUES ('crash_attachment', 'scope', 'notes.txt', 'text/plain', '/tmp/notes', 5, 'sha', 0, 999, 1)`).run();
+  const input = {
+    kind: "file" as const,
+    displayName: "notes.txt",
+    mediaType: "text/plain",
+    plaintextSize: 5,
+    plaintextMd5: "0123456789abcdef0123456789abcdef",
+  };
+
+  for (let crashOrdinal = 0; crashOrdinal < 4; crashOrdinal += 1) {
+    const delivery = deliveries.prepareAttachment({
+      id: `crash-${crashOrdinal}`,
+      kind: "file",
+      binding: { adapterId: "weixin", conversationKey: "weixin:generation:owner", destination: { ...target } },
+      body: "caption",
+      mandatory: true,
+      attachmentId: "crash_attachment",
+      attachmentScopeId: "scope",
+    });
+    const plan = outbound.prepareAttachment(delivery, target, input);
+    assert.deepEqual(plan.steps.map((step) => step.kind), ["upload_parameters", "upload", "caption", "file"]);
+    for (const step of plan.steps.slice(0, crashOrdinal)) {
+      outbound.begin(step.id);
+      outbound.succeed(step.id, { checkpoint: step.kind });
+    }
+    deliveries.markDispatched(delivery.id);
+    outbound.begin(plan.steps[crashOrdinal]!.id);
+
+    assert.equal(outbound.markDispatchingUncertain(), 1);
+    deliveries.recoverAfterCrash();
+    assert.equal(deliveries.get(delivery.id)?.state, "uncertain");
+    assert.equal(outbound.get(plan.steps[crashOrdinal]!.id)?.state, "uncertain");
+    assert.deepEqual(outbound.reconcile(delivery.id), { outcome: "unresolved" });
+  }
   db.close();
 });
