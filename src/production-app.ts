@@ -10,6 +10,12 @@ import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
 import { OwnerRouteCatalog, OwnerRouteStore } from "./chat/owner-route-store.ts";
 import type { ChatHistoryRequest } from "./chat/contracts.ts";
 import { DeliveryWorker } from "./chat/delivery-worker.ts";
+import {
+  chatAttachmentDeliveryId,
+  chatAttachmentFileHandle,
+  chatMessageDeliveryId,
+  createChatOutputActions,
+} from "./chat/output-actions.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import { SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
@@ -747,22 +753,13 @@ export async function buildProductionApp(
         await renderDashboardSafely();
         return result;
       },
-      send_chat_message: async (args, context) => ({ deliveryId: deliveries.prepare({ id: `chat:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`, kind: "chat", binding: assistantAttemptBinding(context.attemptId), body: args.content, mandatory: false }).id }),
-      prepare_chat_attachment: async (args, context) => {
-        const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
-        const prepared = await attachments.prepareOutbound(context.effectiveSourceContextId, ownerRoot, args.relative_path, undefined, undefined, operationFileHandle(context.effectiveSourceContextId, context.attemptId, context.callId));
-        return { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 };
-      },
-      send_chat_attachment: async (args, context) => {
-        const attachment = attachments.toUserInput(context.effectiveSourceContextId, args.file_handle);
-        void attachment;
-        const delivery = deliveries.prepareAttachment({
-          id: `chat-attachment:${context.effectiveSourceContextId}:${context.attemptId}:${context.callId}`,
-          kind: "attachment", binding: assistantAttemptBinding(context.attemptId), body: args.caption ?? "", mandatory: false,
-          attachmentId: args.file_handle, attachmentScopeId: context.effectiveSourceContextId,
-        });
-        return { deliveryId: delivery.id };
-      },
+      ...createChatOutputActions({
+        deliveries,
+        attachments,
+        assistantDir,
+        managedProjectRoot: (owner) => sessions.managedProjectRoot(owner),
+        binding: assistantAttemptBinding,
+      }),
       get_chat_history: createChatHistoryAction(() => chatRegistry, assistantAttemptBinding),
       search_slack: async (args) => requireSlackContext().search(args.query, args.date_from, args.date_to),
       get_slack_mentions: async (args) => requireSlackContext().mentions(args.date_from),
@@ -1000,15 +997,15 @@ export async function buildProductionApp(
           if (result) await succeedRecovered(operation, result);
           else failRecoveredNoEffect(operation.id, "manager note mutation was not committed");
         } else if (operation.kind === "send_chat_message") {
-          const id = `chat:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
+          const id = chatMessageDeliveryId(operation.contextId, operation.attemptId, operation.callId);
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
           else failRecoveredNoEffect(operation.id, "chat delivery intent was not committed");
         } else if (operation.kind === "send_chat_attachment") {
-          const id = `chat-attachment:${operation.contextId}:${operation.attemptId}:${operation.callId}`;
+          const id = chatAttachmentDeliveryId(operation.contextId, operation.attemptId, operation.callId);
           if (deliveries.get(id)) operations.succeed(operation.id, { deliveryId: id });
           else failRecoveredNoEffect(operation.id, "attachment delivery intent was not committed");
         } else if (operation.kind === "prepare_chat_attachment") {
-          const id = operationFileHandle(operation.contextId, operation.attemptId, operation.callId);
+          const id = chatAttachmentFileHandle(operation.contextId, operation.attemptId, operation.callId);
           let prepared = attachments.get(operation.contextId, id);
           if (!prepared) {
             const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
@@ -1411,10 +1408,6 @@ export function createChatHistoryAction(
 
 export function isUncertainAssistantTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
   return endpointState !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
-}
-
-function operationFileHandle(contextId: string, attemptId: string, callId: string): FileHandleId {
-  return `file_${createHash("sha256").update(`${contextId}\0${attemptId}\0${callId}`).digest("hex")}`;
 }
 
 function workerAttachmentHoldId(contextId: string, attemptId: string, callId: string): string {

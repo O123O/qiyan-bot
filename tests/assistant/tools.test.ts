@@ -19,6 +19,7 @@ test("tool catalog is curated and excludes completion and raw RPC", () => {
   assert.deepEqual([...TOOL_NAMES].sort(), expected);
   assert.equal(TOOL_NAMES.includes("complete_goal" as any), false);
   assert.equal(TOOL_NAMES.includes("raw_rpc" as any), false);
+  assert.equal(TOOL_NAMES.some((name) => name.includes("weixin") || name.includes("wechat")), false);
 });
 
 test("session nicknames are safe and create_session may use the backend fallback", () => {
