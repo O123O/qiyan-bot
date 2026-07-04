@@ -3,7 +3,6 @@ import {
   DEFAULT_CODEX_VERSION,
   DEFAULT_SSH_PORT,
   buildSshArgs,
-  ensureFixtureState,
   formatSshConfig,
   resolveFixturePaths,
   withFixtureStateTransaction,
@@ -172,7 +171,7 @@ function composeExecSshdArgs(paths: FixturePaths): string[] {
 function composeExecHostKeyAbsenceArgs(paths: FixturePaths): string[] {
   return composeArgs(paths, [
     "exec", "--no-TTY", "--user", "root", "ssh-worker",
-    "find", "/etc/ssh", "-maxdepth", "1", "-type", "f",
+    "find", "/etc/ssh", "-maxdepth", "1",
     "-name", "ssh_host_*", "-print", "-quit",
   ]);
 }
@@ -233,12 +232,11 @@ export async function upFixture(paths: FixturePaths, options: FixtureLifecycleOp
     { env, timeoutMs: COMPOSE_TIMEOUT_MS },
     "Docker Compose is not available",
   );
-  await ensureFixtureState(paths, async (command, args, runnerOptions) => options.runner(command, args, {
-    ...runnerOptions,
-    timeoutMs: runnerOptions?.timeoutMs ?? HOST_KEY_VALIDATION_TIMEOUT_MS,
-  }));
-
   await withFixtureStateTransaction(paths, async (transaction) => {
+    await transaction.ensureClientKey(async (command, args, runnerOptions) => options.runner(command, args, {
+      ...runnerOptions,
+      timeoutMs: runnerOptions?.timeoutMs ?? HOST_KEY_VALIDATION_TIMEOUT_MS,
+    }));
     let startup: CommandResult;
     try {
       startup = await options.runner(
@@ -328,6 +326,8 @@ export async function resetFixture(paths: FixturePaths, options: FixtureResetOpt
   if (!options.confirmed) return { reset: false, stateDirectoryRetained: true };
   const env = fixtureEnvironment(paths, options.env ?? process.env, port, codexVersion);
   await withFixtureStateTransaction(paths, async (transaction) => {
+    await transaction.preflightGeneratedStateRemoval();
+    await transaction.beginReset();
     await runStable(
       options.runner,
       "docker",

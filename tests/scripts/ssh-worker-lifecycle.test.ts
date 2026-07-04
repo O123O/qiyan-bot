@@ -206,8 +206,6 @@ function composeExecHostKeyAbsenceArgs(paths: FixturePaths): string[] {
     "/etc/ssh",
     "-maxdepth",
     "1",
-    "-type",
-    "f",
     "-name",
     "ssh_host_*",
     "-print",
@@ -277,6 +275,25 @@ test("starts the fixture with exact bounded commands, private trust state, and s
     assert.equal((await lstat(path)).mode & 0o777, 0o600);
   }
   assert.equal((await readdir(paths.stateDir)).some((name) => name.startsWith(".host-key-candidate-")), false);
+});
+
+test("holds one state lease from client-key validation through Compose startup", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingClientKey(paths);
+  const leasePath = join(paths.stateDir, ".operation-lease");
+  const observedInodes: number[] = [];
+  const runner = lifecycleRunner([], {
+    beforeResult: async ({ command, args }) => {
+      if ((command === "ssh-keygen" && args.includes("-y")) || (command === "docker" && args.includes("up"))) {
+        observedInodes.push((await lstat(leasePath)).ino);
+      }
+    },
+  });
+
+  await upFixture(paths, { runner, now: () => 0, sleep: async () => {} });
+
+  assert.equal(observedInodes.length, 2);
+  assert.equal(observedInodes[0], observedInodes[1]);
 });
 
 test("validates the port and exact three-component Codex version before dispatch", async (t) => {
@@ -498,6 +515,52 @@ test("reset requires confirmation, uses only the checkout project, and leaves a 
   assert.deepEqual(await readdir(paths.stateDir), []);
   assert.equal((await lstat(paths.stateDir)).mode & 0o777, 0o700);
   assert.ok((await lstat(otherPaths.privateKey)).isFile());
+});
+
+test("reset validates the complete local state before deleting Docker volumes", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingClientKey(paths);
+  await writeFile(join(paths.stateDir, "unexpected-state"), "do-not-delete", { mode: 0o600 });
+  const calls: RunnerCall[] = [];
+
+  await assert.rejects(
+    resetFixture(paths, { runner: lifecycleRunner(calls), confirmed: true }),
+    /unexpected files/u,
+  );
+
+  assert.equal(calls.some(({ args }) => args.includes("--volumes")), false);
+  assert.equal(await readFile(join(paths.stateDir, "unexpected-state"), "utf8"), "do-not-delete");
+});
+
+test("an interrupted reset leaves a durable intent that blocks startup and resumes safely", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingClientKey(paths);
+  const interruption = join(paths.stateDir, "unexpected-after-docker-reset");
+  const resetIntent = join(paths.stateDir, ".reset-intent.json");
+  const failingRunner = lifecycleRunner([], {
+    beforeResult: async ({ command, args }) => {
+      if (command === "docker" && args.includes("--volumes")) {
+        await writeFile(interruption, "simulated crash boundary", { mode: 0o600 });
+      }
+    },
+  });
+
+  await assert.rejects(
+    resetFixture(paths, { runner: failingRunner, confirmed: true }),
+    /unexpected files/u,
+  );
+  assert.equal(await readFile(resetIntent, "utf8"), '{"version":1}\n');
+  await assert.rejects(
+    upFixture(paths, { runner: lifecycleRunner([]), now: () => 0, sleep: async () => {} }),
+    /reset is incomplete/u,
+  );
+
+  await rm(interruption);
+  assert.deepEqual(await resetFixture(paths, {
+    runner: lifecycleRunner([]),
+    confirmed: true,
+  }), { reset: true, stateDirectoryRetained: true });
+  assert.deepEqual(await readdir(paths.stateDir), []);
 });
 
 test("reset fails instead of racing an active lifecycle trust transaction", async (t) => {

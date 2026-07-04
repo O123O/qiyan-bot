@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { constants as fsConstants, lstatSync, realpathSync, type Stats } from "node:fs";
 import {
   chmod,
   lstat,
@@ -52,9 +52,12 @@ export interface FixtureOwnershipOptions {
 export type FixtureManagedStateFile = "trustedHostKey" | "knownHosts" | "sshConfig";
 
 export interface FixtureStateTransaction {
+  ensureClientKey(runner: CommandRunner): Promise<void>;
   readOwnerOnlyFile(file: FixtureManagedStateFile): Promise<string | undefined>;
   replaceOwnerOnlyFile(file: FixtureManagedStateFile, contents: string): Promise<void>;
   withOwnerOnlyTemporaryFile<T>(contents: string, operation: (path: string) => Promise<T>): Promise<T>;
+  preflightGeneratedStateRemoval(): Promise<void>;
+  beginReset(): Promise<void>;
   removeGeneratedState(): Promise<void>;
 }
 
@@ -74,6 +77,9 @@ const MAX_OPERATION_LEASE_OWNER_BYTES = 512;
 const HOST_KEY_CANDIDATE_NAME = /^\.host-key-candidate-[a-f0-9]{32}\.tmp$/u;
 const CONFIG_TEMPORARY_NAME = /^\.config-[a-f0-9-]{36}\.tmp$/u;
 const STATE_FILE_TEMPORARY_NAME = /^\.state-file-[a-f0-9-]{36}\.tmp$/u;
+const RESET_INTENT_NAME = ".reset-intent.json";
+const RESET_INTENT_CONTENTS = '{"version":1}\n';
+const MAX_MANAGED_STATE_BYTES = 1024 * 1024;
 
 interface DirectoryIdentity {
   path: string;
@@ -878,6 +884,42 @@ async function generateKeyPair(
   }
 }
 
+async function ensureFixtureStateLocked(
+  paths: FixturePaths,
+  runner: CommandRunner,
+  trust: FixtureTrust,
+  heldLease: OperationLease,
+): Promise<void> {
+  await cleanStaleStagingDirectories(trust, heldLease);
+  await revalidateOperationLease(trust, heldLease);
+  await validateOptionalFixtureFiles(paths, trust.uid);
+  const resetIntent = await optionalMetadata(join(paths.stateDir, RESET_INTENT_NAME));
+  if (resetIntent !== undefined) {
+    assertManagedStateFile(resetIntent, trust.uid, "SSH fixture reset intent");
+    throw new Error("SSH worker reset is incomplete; run reset again");
+  }
+
+  const clientKeyDirectory = dirname(paths.privateKey);
+  const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
+  if (clientKeyMetadata === undefined) {
+    await generateKeyPair(paths, runner, trust, heldLease);
+    return;
+  }
+  assertPrivateDirectory(clientKeyMetadata, trust.uid, "SSH client key directory");
+  const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
+  const revalidateKeyState = async (): Promise<void> => {
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, heldLease);
+    await revalidateDirectory(
+      clientKeyIdentity,
+      trust.uid,
+      "SSH client key directory",
+      (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
+    );
+  };
+  await validateKeyPair(paths.privateKey, paths.publicKey, runner, trust.uid, false, revalidateKeyState);
+}
+
 export async function ensureFixtureState(
   paths: FixturePaths,
   runner: CommandRunner,
@@ -886,31 +928,11 @@ export async function ensureFixtureState(
   validateFixturePaths(paths);
   const uid = currentUid(options);
   const trust = await establishFixtureTrust(paths, uid);
-  await withOperationLease(trust, async (heldLease) => {
-    await cleanStaleStagingDirectories(trust, heldLease);
-    await revalidateOperationLease(trust, heldLease);
-    await validateOptionalFixtureFiles(paths, uid);
-
-    const clientKeyDirectory = dirname(paths.privateKey);
-    const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
-    if (clientKeyMetadata === undefined) {
-      await generateKeyPair(paths, runner, trust, heldLease);
-      return;
-    }
-    assertPrivateDirectory(clientKeyMetadata, uid, "SSH client key directory");
-    const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
-    const revalidateKeyState = async (): Promise<void> => {
-      await revalidateFixtureTrust(trust);
-      await revalidateOperationLease(trust, heldLease);
-      await revalidateDirectory(
-        clientKeyIdentity,
-        uid,
-        "SSH client key directory",
-        (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
-      );
-    };
-    await validateKeyPair(paths.privateKey, paths.publicKey, runner, uid, false, revalidateKeyState);
-  }, options.beforeStaleLeaseClaim);
+  await withOperationLease(
+    trust,
+    (heldLease) => ensureFixtureStateLocked(paths, runner, trust, heldLease),
+    options.beforeStaleLeaseClaim,
+  );
 }
 
 export function formatSshConfig(paths: FixturePaths, port = DEFAULT_SSH_PORT): string {
@@ -1018,6 +1040,68 @@ function assertManagedStateFile(metadata: Stats, uid: number, label: string): vo
   if ((metadata.mode & 0o777) !== OWNER_ONLY_FILE_MODE) {
     throw new Error(`${label} must have mode 0600`);
   }
+  if (metadata.size < 0 || metadata.size > MAX_MANAGED_STATE_BYTES) {
+    throw new Error(`${label} is too large`);
+  }
+}
+
+async function readManagedStateFile(
+  trust: FixtureTrust,
+  lease: OperationLease,
+  path: string,
+  label: string,
+): Promise<string | undefined> {
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+  const pathMetadata = await optionalMetadata(path);
+  if (pathMetadata === undefined) return undefined;
+  assertManagedStateFile(pathMetadata, trust.uid, label);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    assertManagedStateFile(opened, trust.uid, label);
+    if (opened.dev !== pathMetadata.dev || opened.ino !== pathMetadata.ino) {
+      throw new Error(`${label} was replaced`);
+    }
+    const contents = await handle.readFile("utf8");
+    const [afterHandle, afterPath] = await Promise.all([handle.stat(), lstat(path)]);
+    assertManagedStateFile(afterHandle, trust.uid, label);
+    assertManagedStateFile(afterPath, trust.uid, label);
+    if (
+      afterHandle.dev !== pathMetadata.dev
+      || afterHandle.ino !== pathMetadata.ino
+      || afterPath.dev !== pathMetadata.dev
+      || afterPath.ino !== pathMetadata.ino
+    ) throw new Error(`${label} was replaced`);
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    return contents;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function syncFixtureStateDirectory(trust: FixtureTrust, lease: OperationLease): Promise<void> {
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      trust.state.path,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    const metadata = await handle.stat();
+    assertPrivateDirectory(metadata, trust.uid, "SSH fixture state directory");
+    if (metadata.dev !== trust.state.device || metadata.ino !== trust.state.inode) {
+      throw new Error("SSH fixture state directory was replaced");
+    }
+    await handle.sync();
+  } finally {
+    await handle?.close();
+  }
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
 }
 
 async function removeManagedTemporary(
@@ -1040,16 +1124,16 @@ async function removeManagedTemporary(
   await revalidateOperationLease(trust, lease);
 }
 
-async function replaceManagedStateFile(
+async function replaceOwnerOnlyStatePath(
   paths: FixturePaths,
   trust: FixtureTrust,
   lease: OperationLease,
-  file: FixtureManagedStateFile,
+  target: string,
+  label: string,
   contents: string,
 ): Promise<void> {
-  const target = managedStatePath(paths, file);
   const existing = await optionalMetadata(target);
-  if (existing !== undefined) assertManagedStateFile(existing, trust.uid, `SSH fixture ${file}`);
+  if (existing !== undefined) assertManagedStateFile(existing, trust.uid, label);
   const existingIdentity = existing === undefined ? undefined : identity(target, existing);
   const temporaryPath = join(paths.stateDir, `.state-file-${randomUUID()}.tmp`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -1062,28 +1146,61 @@ async function replaceManagedStateFile(
     await handle.sync();
     await handle.close();
     handle = undefined;
-    assertManagedStateFile(await lstat(temporaryPath), trust.uid, "SSH fixture temporary state file");
+    const closedTemporary = await lstat(temporaryPath);
+    assertManagedStateFile(closedTemporary, trust.uid, "SSH fixture temporary state file");
+    if (
+      temporaryIdentity === undefined
+      || closedTemporary.dev !== temporaryIdentity.device
+      || closedTemporary.ino !== temporaryIdentity.inode
+    ) throw new Error("SSH fixture temporary state file was replaced");
 
     const current = await optionalMetadata(target);
     if (existingIdentity === undefined) {
-      if (current !== undefined) throw new Error(`SSH fixture ${file} appeared during replacement`);
+      if (current !== undefined) throw new Error(`${label} appeared during replacement`);
     } else {
-      if (current === undefined) throw new Error(`SSH fixture ${file} was replaced or removed`);
-      assertManagedStateFile(current, trust.uid, `SSH fixture ${file}`);
+      if (current === undefined) throw new Error(`${label} was replaced or removed`);
+      assertManagedStateFile(current, trust.uid, label);
       if (current.dev !== existingIdentity.device || current.ino !== existingIdentity.inode) {
-        throw new Error(`SSH fixture ${file} was replaced`);
+        throw new Error(`${label} was replaced`);
       }
     }
     await revalidateFixtureTrust(trust);
     await revalidateOperationLease(trust, lease);
+    const beforeRename = await lstat(temporaryPath);
+    assertManagedStateFile(beforeRename, trust.uid, "SSH fixture temporary state file");
+    if (beforeRename.dev !== temporaryIdentity.device || beforeRename.ino !== temporaryIdentity.inode) {
+      throw new Error("SSH fixture temporary state file was replaced");
+    }
     await rename(temporaryPath, target);
+    await syncFixtureStateDirectory(trust, lease);
     await revalidateFixtureTrust(trust);
     await revalidateOperationLease(trust, lease);
-    assertManagedStateFile(await lstat(target), trust.uid, `SSH fixture ${file}`);
+    const installed = await lstat(target);
+    assertManagedStateFile(installed, trust.uid, label);
+    if (installed.dev !== temporaryIdentity.device || installed.ino !== temporaryIdentity.inode) {
+      throw new Error(`${label} was replaced during installation`);
+    }
   } finally {
     await handle?.close();
     await removeManagedTemporary(trust, lease, temporaryPath, temporaryIdentity);
   }
+}
+
+async function replaceManagedStateFile(
+  paths: FixturePaths,
+  trust: FixtureTrust,
+  lease: OperationLease,
+  file: FixtureManagedStateFile,
+  contents: string,
+): Promise<void> {
+  return replaceOwnerOnlyStatePath(
+    paths,
+    trust,
+    lease,
+    managedStatePath(paths, file),
+    `SSH fixture ${file}`,
+    contents,
+  );
 }
 
 async function cleanupManagedTemporaries(trust: FixtureTrust, lease: OperationLease): Promise<void> {
@@ -1097,13 +1214,68 @@ async function cleanupManagedTemporaries(trust: FixtureTrust, lease: OperationLe
   }
 }
 
-async function removeGeneratedState(
+async function preflightGeneratedStateRemoval(
   paths: FixturePaths,
   trust: FixtureTrust,
   lease: OperationLease,
 ): Promise<void> {
   await cleanStaleStagingDirectories(trust, lease);
   await cleanupManagedTemporaries(trust, lease);
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+  const allowed = new Set([
+    OPERATION_LEASE_NAME,
+    RESET_INTENT_NAME,
+    basename(paths.trustedHostKey),
+    basename(paths.knownHosts),
+    basename(paths.sshConfig),
+    basename(dirname(paths.privateKey)),
+  ]);
+  const unexpected = (await readdir(paths.stateDir)).filter((name) => !allowed.has(name));
+  if (unexpected.length !== 0) throw new Error("SSH fixture state contains unexpected files");
+
+  await validateOptionalFixtureFiles(paths, trust.uid);
+  const resetIntentPath = join(paths.stateDir, RESET_INTENT_NAME);
+  const resetIntent = await readManagedStateFile(trust, lease, resetIntentPath, "SSH fixture reset intent");
+  if (resetIntent !== undefined && resetIntent !== RESET_INTENT_CONTENTS) {
+    throw new Error("SSH fixture reset intent is invalid");
+  }
+
+  const keyDirectory = dirname(paths.privateKey);
+  const keyDirectoryMetadata = await optionalMetadata(keyDirectory);
+  if (keyDirectoryMetadata !== undefined) {
+    assertPrivateDirectory(keyDirectoryMetadata, trust.uid, "SSH client key directory");
+    const names = (await readdir(keyDirectory)).sort();
+    if (names.length !== 2 || names[0] !== "id_ed25519" || names[1] !== "id_ed25519.pub") {
+      throw new Error("SSH client key directory contains unexpected state");
+    }
+    await validateKeyFiles(paths.privateKey, paths.publicKey, trust.uid, false);
+  }
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, lease);
+}
+
+async function beginReset(paths: FixturePaths, trust: FixtureTrust, lease: OperationLease): Promise<void> {
+  await preflightGeneratedStateRemoval(paths, trust, lease);
+  const resetIntentPath = join(paths.stateDir, RESET_INTENT_NAME);
+  const existing = await readManagedStateFile(trust, lease, resetIntentPath, "SSH fixture reset intent");
+  if (existing === RESET_INTENT_CONTENTS) return;
+  await replaceOwnerOnlyStatePath(
+    paths,
+    trust,
+    lease,
+    resetIntentPath,
+    "SSH fixture reset intent",
+    RESET_INTENT_CONTENTS,
+  );
+}
+
+async function removeGeneratedState(
+  paths: FixturePaths,
+  trust: FixtureTrust,
+  lease: OperationLease,
+): Promise<void> {
+  await preflightGeneratedStateRemoval(paths, trust, lease);
   for (const [file, label] of [
     [paths.trustedHostKey, "trusted host key"],
     [paths.knownHosts, "known hosts file"],
@@ -1120,15 +1292,19 @@ async function removeGeneratedState(
   const keyDirectory = dirname(paths.privateKey);
   const keyDirectoryMetadata = await optionalMetadata(keyDirectory);
   if (keyDirectoryMetadata !== undefined) {
-    assertPrivateDirectory(keyDirectoryMetadata, trust.uid, "SSH client key directory");
-    const names = (await readdir(keyDirectory)).sort();
-    if (names.length !== 2 || names[0] !== "id_ed25519" || names[1] !== "id_ed25519.pub") {
-      throw new Error("SSH client key directory contains unexpected state");
-    }
-    await validateKeyFiles(paths.privateKey, paths.publicKey, trust.uid, false);
     await revalidateFixtureTrust(trust);
     await revalidateOperationLease(trust, lease);
     await rm(keyDirectory, { recursive: true, force: false });
+  }
+
+  const resetIntentPath = join(paths.stateDir, RESET_INTENT_NAME);
+  const resetIntent = await optionalMetadata(resetIntentPath);
+  if (resetIntent !== undefined) {
+    assertManagedStateFile(resetIntent, trust.uid, "SSH fixture reset intent");
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, lease);
+    await rm(resetIntentPath, { force: false });
+    await syncFixtureStateDirectory(trust, lease);
   }
 
   const remaining = (await readdir(paths.stateDir)).filter((name) => name !== OPERATION_LEASE_NAME);
@@ -1148,15 +1324,13 @@ export async function withFixtureStateTransaction<T>(
     await cleanupManagedTemporaries(trust, lease);
     await validateOptionalFixtureFiles(paths, uid);
     const transaction: FixtureStateTransaction = {
-      readOwnerOnlyFile: async (file) => {
-        await revalidateFixtureTrust(trust);
-        await revalidateOperationLease(trust, lease);
-        const path = managedStatePath(paths, file);
-        const metadata = await optionalMetadata(path);
-        if (metadata === undefined) return undefined;
-        assertManagedStateFile(metadata, uid, `SSH fixture ${file}`);
-        return readFile(path, "utf8");
-      },
+      ensureClientKey: (runner) => ensureFixtureStateLocked(paths, runner, trust, lease),
+      readOwnerOnlyFile: (file) => readManagedStateFile(
+        trust,
+        lease,
+        managedStatePath(paths, file),
+        `SSH fixture ${file}`,
+      ),
       replaceOwnerOnlyFile: (file, contents) => replaceManagedStateFile(paths, trust, lease, file, contents),
       withOwnerOnlyTemporaryFile: async (contents, temporaryOperation) => {
         const temporaryPath = join(
@@ -1175,13 +1349,29 @@ export async function withFixtureStateTransaction<T>(
           handle = undefined;
           await revalidateFixtureTrust(trust);
           await revalidateOperationLease(trust, lease);
-          assertManagedStateFile(await lstat(temporaryPath), uid, "SSH host key candidate");
-          return await temporaryOperation(temporaryPath);
+          const beforeOperation = await lstat(temporaryPath);
+          assertManagedStateFile(beforeOperation, uid, "SSH host key candidate");
+          if (
+            temporaryIdentity === undefined
+            || beforeOperation.dev !== temporaryIdentity.device
+            || beforeOperation.ino !== temporaryIdentity.inode
+          ) throw new Error("SSH host key candidate was replaced");
+          const result = await temporaryOperation(temporaryPath);
+          const afterOperation = await lstat(temporaryPath);
+          assertManagedStateFile(afterOperation, uid, "SSH host key candidate");
+          if (afterOperation.dev !== temporaryIdentity.device || afterOperation.ino !== temporaryIdentity.inode) {
+            throw new Error("SSH host key candidate was replaced");
+          }
+          await revalidateFixtureTrust(trust);
+          await revalidateOperationLease(trust, lease);
+          return result;
         } finally {
           await handle?.close();
           await removeManagedTemporary(trust, lease, temporaryPath, temporaryIdentity);
         }
       },
+      preflightGeneratedStateRemoval: () => preflightGeneratedStateRemoval(paths, trust, lease),
+      beginReset: () => beginReset(paths, trust, lease),
       removeGeneratedState: () => removeGeneratedState(paths, trust, lease),
     };
     return operation(transaction);
