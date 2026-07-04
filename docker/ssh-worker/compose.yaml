@@ -1,8 +1,8 @@
 services:
   ssh-worker:
     build:
-      context: ../..
-      dockerfile: docker/ssh-worker/Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
         CODEX_VERSION: ${QIYAN_SSH_WORKER_CODEX_VERSION:-0.142.5}
     ports:

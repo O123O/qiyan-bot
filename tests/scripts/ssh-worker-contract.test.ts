@@ -26,8 +26,11 @@ test("SSH worker image pins its base, packages, account, and copied inputs", asy
 
   const copies = dockerfile.match(/^COPY .+$/gmu) ?? [];
   assert.equal(copies.length, 2);
-  assert.match(copies[0] ?? "", /docker\/ssh-worker\/sshd_config/u);
-  assert.match(copies[1] ?? "", /--chmod=0755 docker\/ssh-worker\/entrypoint\.sh/u);
+  assert.equal(copies[0], "COPY sshd_config /etc/ssh/sshd_config");
+  assert.equal(
+    copies[1],
+    "COPY --chmod=0755 entrypoint.sh /usr/local/bin/ssh-worker-entrypoint",
+  );
   assert.doesNotMatch(copies.join("\n"), /auth\.json|\.codex|QIYAN_HOME/u);
   assert.match(dockerfile, /^ENTRYPOINT \["\/usr\/local\/bin\/ssh-worker-entrypoint"\]$/mu);
 });
@@ -38,8 +41,8 @@ test("SSH worker Compose service is isolated and localhost-only", async () => {
 
   assert.equal((services.match(/^  [a-z0-9-]+:\s*$/gmu) ?? []).join("\n"), "  ssh-worker:");
   assert.doesNotMatch(compose, /^name:/mu);
-  assert.match(compose, /^\s{6}context: \.\.\/\.\.$/mu);
-  assert.match(compose, /^\s{6}dockerfile: docker\/ssh-worker\/Dockerfile$/mu);
+  assert.match(compose, /^\s{6}context: \.$/mu);
+  assert.match(compose, /^\s{6}dockerfile: Dockerfile$/mu);
   assert.match(compose, /^\s{8}CODEX_VERSION: \$\{QIYAN_SSH_WORKER_CODEX_VERSION:-0\.142\.5\}$/mu);
   assert.match(
     compose,
@@ -107,9 +110,13 @@ test("SSH worker entrypoint provisions only fixture-owned SSH state", async () =
   assert.match(entrypoint, /exec \/usr\/sbin\/sshd -D -e -f \/etc\/ssh\/sshd_config\n$/u);
 });
 
-test("Docker build context is a deny-all allowlist", async () => {
+test("Docker context root has a conventional deny-all allowlist", async () => {
+  await assert.rejects(
+    readFixture("Dockerfile.dockerignore"),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+  );
   assert.equal(
-    await readFixture("Dockerfile.dockerignore"),
-    "**\n!docker/ssh-worker/entrypoint.sh\n!docker/ssh-worker/sshd_config\n",
+    await readFixture(".dockerignore"),
+    "**\n!entrypoint.sh\n!sshd_config\n",
   );
 });

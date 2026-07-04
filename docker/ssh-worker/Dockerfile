@@ -16,8 +16,8 @@ RUN apt-get update \
  && install -d -m 0700 -o root -g root /var/lib/ssh-host-keys \
  && rm -rf /var/lib/apt/lists/*
 
-COPY docker/ssh-worker/sshd_config /etc/ssh/sshd_config
-COPY --chmod=0755 docker/ssh-worker/entrypoint.sh /usr/local/bin/ssh-worker-entrypoint
+COPY sshd_config /etc/ssh/sshd_config
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/ssh-worker-entrypoint
 
 EXPOSE 22
 
