@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
   checkFixture,
+  fixtureRuntimeOptions,
   loginFixture,
   resolveFixturePaths,
   runCli,
@@ -129,17 +130,20 @@ export const nodeStreamingChildFactory: StreamingChildFactory = (command, args, 
 async function main(): Promise<number> {
   const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
   const paths = resolveFixturePaths(repositoryRoot);
+  const { port, codexVersion } = fixtureRuntimeOptions(process.env);
   return runCli(process.argv.slice(2), {
-    up: () => upFixture(paths, { runner: nodeCommandRunner }),
-    login: () => loginFixture(paths, nodeCommandRunner),
+    up: () => upFixture(paths, { runner: nodeCommandRunner, port, codexVersion }),
+    login: () => loginFixture(paths, nodeCommandRunner, { port }),
     check: () => checkFixture(paths, {
       runner: nodeCommandRunner,
       spawn: nodeStreamingChildFactory,
+      port,
+      codexVersion,
       onPhase: (phase) => { process.stdout.write(`SSH worker check: ${phase}\n`); },
     }),
-    down: () => downFixture(paths, { runner: nodeCommandRunner }),
+    down: () => downFixture(paths, { runner: nodeCommandRunner, port, codexVersion }),
     reset: async () => {
-      await resetFixture(paths, { runner: nodeCommandRunner, confirmed: true });
+      await resetFixture(paths, { runner: nodeCommandRunner, port, codexVersion, confirmed: true });
     },
   }, {
     readLine: async (prompt) => {

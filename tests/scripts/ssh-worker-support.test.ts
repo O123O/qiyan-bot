@@ -24,6 +24,7 @@ import {
   buildSshArgs,
   checkFixture,
   ensureFixtureState,
+  fixtureRuntimeOptions,
   formatSshConfig,
   loginFixture,
   resolveFixturePaths,
@@ -208,6 +209,20 @@ test("builds SSH arguments with only the dedicated config before the fixed alias
   assert.deepEqual(buildSshArgs(paths, ["printf", "%s", "-oProxyCommand=attacker"]), [
     "-F", paths.sshConfig, "qiyan-ssh-worker", "printf", "%s", "-oProxyCommand=attacker",
   ]);
+});
+
+test("parses one validated port and Codex version consistently for every fixture command", () => {
+  assert.deepEqual(fixtureRuntimeOptions({}), { port: 2222, codexVersion: "0.142.5" });
+  assert.deepEqual(fixtureRuntimeOptions({
+    QIYAN_SSH_WORKER_PORT: "2201",
+    QIYAN_SSH_WORKER_CODEX_VERSION: "1.2.3",
+  }), { port: 2201, codexVersion: "1.2.3" });
+  for (const value of ["", "0", "65536", "22.5", " 2222", "02222", "not-a-port"]) {
+    assert.throws(() => fixtureRuntimeOptions({ QIYAN_SSH_WORKER_PORT: value }), /SSH port/u);
+  }
+  for (const value of ["", "1", "1.2", "1.2.3.4", "v1.2.3", "1.2.x"]) {
+    assert.throws(() => fixtureRuntimeOptions({ QIYAN_SSH_WORKER_CODEX_VERSION: value }), /Codex version/u);
+  }
 });
 
 test("checks the fixed remote environment and authenticated App Server without creating a thread", async (t) => {

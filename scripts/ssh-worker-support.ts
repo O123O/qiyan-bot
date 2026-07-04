@@ -125,6 +125,18 @@ export const DEFAULT_SSH_PORT = 2222;
 export const DEFAULT_CODEX_VERSION = "0.142.5";
 export const SSH_ALIAS = "qiyan-ssh-worker";
 
+export function fixtureRuntimeOptions(env: NodeJS.ProcessEnv): { port: number; codexVersion: string } {
+  const rawPort = env.QIYAN_SSH_WORKER_PORT;
+  if (rawPort !== undefined && !/^[1-9][0-9]*$/u.test(rawPort)) {
+    throw new Error("SSH port must be an integer from 1 through 65535");
+  }
+  const port = rawPort === undefined ? DEFAULT_SSH_PORT : Number(rawPort);
+  validatePort(port);
+  const codexVersion = env.QIYAN_SSH_WORKER_CODEX_VERSION ?? DEFAULT_CODEX_VERSION;
+  validateSelectedCodexVersion(codexVersion);
+  return { port, codexVersion };
+}
+
 const CONFIG_UNSAFE = /[\u0000-\u0020\u007f#$"'\\%]/u;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const PRIVATE_DIRECTORY_MODE = 0o700;
