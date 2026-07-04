@@ -54,7 +54,9 @@ function stagingRunner(calls: Array<{ command: string; args: readonly string[] }
     assert.notEqual(outputPathIndex, -1);
     const keyPath = args[outputPathIndex + 1];
     assert.ok(keyPath);
-    if (args.includes("-y")) return successfulResult(`${options.derivedPublicKey ?? PUBLIC_KEY}\n`);
+    if (args.includes("-y")) {
+      return successfulResult(`${options.derivedPublicKey ?? `${PUBLIC_KEY} qiyan-ssh-worker`}\n`);
+    }
 
     await writeFile(keyPath, "opaque-test-private-key", { mode: 0o600 });
     if (options.createPublicKey !== false) {
@@ -230,7 +232,7 @@ for (const generatedPublicMode of [0o664, 0o645]) {
   });
 }
 
-test("validates an existing pair by algorithm and blob while ignoring its comment", async (t) => {
+test("compares existing and derived keys by algorithm and blob while ignoring one-line comments", async (t) => {
   const paths = resolveFixturePaths(await temporaryRepository(t));
   await installExistingPair(paths);
   const calls: Array<{ command: string; args: readonly string[] }> = [];
@@ -238,6 +240,19 @@ test("validates an existing pair by algorithm and blob while ignoring its commen
   await ensureFixtureState(paths, stagingRunner(calls));
 
   assert.deepEqual(calls, [{ command: "ssh-keygen", args: ["-y", "-f", paths.privateKey] }]);
+
+  for (const derivedPublicKey of [
+    `${PUBLIC_KEY} first comment\n${PUBLIC_KEY} second key`,
+    "not-an-ssh-public-key",
+  ]) {
+    await assert.rejects(
+      ensureFixtureState(paths, stagingRunner([], { derivedPublicKey })),
+      (error: unknown) => {
+        assert.doesNotMatch(String(error), /AAAAC3Nza|not-an-ssh-public-key/u);
+        return /not a valid Ed25519 public key/u.test(String(error));
+      },
+    );
+  }
 
   await writeFile(paths.publicKey, `${PUBLIC_KEY} first comment\n${PUBLIC_KEY} second key\n`, { mode: 0o600 });
   await assert.rejects(ensureFixtureState(paths, stagingRunner([])), /not a valid Ed25519 public key/u);

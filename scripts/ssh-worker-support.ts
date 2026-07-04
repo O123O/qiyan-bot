@@ -345,8 +345,6 @@ async function derivePublicKey(
     afterCommand,
     "SSH private key validation failed",
   );
-  const fields = result.stdout.trim().split(/\s+/u);
-  if (fields.length !== 2) throw new Error("SSH private key validation produced an invalid public key");
   return parsePublicKey(result.stdout, "derived SSH public key");
 }
 
