@@ -154,6 +154,8 @@ QIYAN_WEIXIN_LIVE=1 npm test -- tests/integration/weixin-live.test.ts
 
 The Slack live test requires dedicated `SLACK_TEST_*` credentials, a designated channel with recent owner fixtures, and an exact `SLACK_TEST_ALLOW_WRITES=TEAM_ID:OWNER_USER_ID` guard. It is skipped by default and writes visible test messages/files.
 
+For future remote-worker development, source checkouts include a secret-free, localhost-only [SSH worker development fixture](https://github.com/O123O/qiyan-bot/blob/main/docs/development/ssh-worker-fixture.md). It validates a separate Codex App Server over SSH but is not wired into QiYan's session routing.
+
 ## Troubleshooting
 
 - Assistant authentication required: stop QiYan, run `qiyan-bot assistant-login`, complete the device flow, and restart. Do not copy the normal profile's `auth.json`.

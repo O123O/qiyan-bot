@@ -121,3 +121,13 @@ test("Docker context root has a conventional deny-all allowlist", async () => {
     "**\n!entrypoint.sh\n!sshd_config\n",
   );
 });
+
+test("release package allowlist excludes development fixture and generated SSH state", async () => {
+  const manifest = JSON.parse(await readFile("package.json", "utf8")) as { files?: unknown };
+  assert.ok(Array.isArray(manifest.files));
+  const files = manifest.files as unknown[];
+  assert.equal(files.every((value) => typeof value === "string"), true);
+  assert.equal(files.some((value) => (value as string).startsWith("scripts")), false);
+  assert.equal(files.some((value) => (value as string).startsWith("docker")), false);
+  assert.equal(files.some((value) => (value as string).includes(".tmp")), false);
+});

@@ -30,6 +30,19 @@ test("README links to all focused guides and every local guide target exists", a
   await Promise.all(links.map((link) => access(resolve(link))));
 });
 
+test("SSH worker development guide documents the source-checkout-only remote fixture", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const absoluteGuide = "https://github.com/O123O/qiyan-bot/blob/main/docs/development/ssh-worker-fixture.md";
+  assert.equal(readme.includes(absoluteGuide), true, "README does not link the SSH worker development guide");
+  const guide = await readFile(resolve("docs/development/ssh-worker-fixture.md"), "utf8");
+  for (const required of [
+    "Development fixture", "Docker Compose", "127.0.0.1", "ssh-worker:up",
+    "ssh-worker:login", "ssh-worker:check", "ssh-worker:down", "ssh-worker:reset",
+    "device authentication", ".tmp/ssh-worker", "StrictHostKeyChecking",
+    "source checkout only", "does not implement QiYan remote-worker routing",
+  ]) assert.equal(guide.includes(required), true, `SSH worker guide is missing: ${required}`);
+});
+
 test("installation guide covers Release install, no-Git source build, version, and update", async () => {
   const guide = await readFile(resolve("docs/installation.md"), "utf8");
   for (const required of [
