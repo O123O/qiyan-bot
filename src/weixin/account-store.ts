@@ -67,8 +67,15 @@ export class WeixinAccountStore {
           throw new Error("WeChat account generation identity changed unexpectedly");
         }
         if (existing.credential_revision_id === identity.credentialRevisionId) {
+          if (existing.authorization_state !== "active") {
+            this.retireAuthorizationWarningsInTransaction(identity.accountGenerationId);
+            this.db.prepare(`UPDATE weixin_account_generations
+              SET authorization_state = 'active', active = 1, retired_at = NULL WHERE generation_id = ?`)
+              .run(identity.accountGenerationId);
+          }
           return { kind: "unchanged", generationId: identity.accountGenerationId };
         }
+        this.retireAuthorizationWarningsInTransaction(identity.accountGenerationId);
         this.db.prepare(`UPDATE weixin_account_generations
           SET credential_revision_id = ?, api_base_url = ?, authorization_state = 'active', active = 1, retired_at = NULL
           WHERE generation_id = ?`)
@@ -83,6 +90,7 @@ export class WeixinAccountStore {
         const placeholders = oldIds.map(() => "?").join(", ");
         const deliveryRows = this.db.prepare(`SELECT DISTINCT delivery_id FROM weixin_outbound_steps
           WHERE generation_id IN (${placeholders}) ORDER BY delivery_id`).all(...oldIds) as Array<{ delivery_id: string }>;
+        for (const oldId of oldIds) this.retireAuthorizationWarningsInTransaction(oldId);
         this.db.prepare(`UPDATE weixin_account_generations SET active = 0, retired_at = ?
           WHERE generation_id IN (${placeholders})`).run(this.now(), ...oldIds);
         this.db.prepare(`UPDATE weixin_inbox SET state = 'fenced', updated_at = ?
@@ -103,6 +111,18 @@ export class WeixinAccountStore {
       this.db.prepare("INSERT INTO weixin_sync_state(generation_id, cursor) VALUES (?, '')").run(identity.accountGenerationId);
       return { kind: "new-generation", generationId: identity.accountGenerationId };
     });
+  }
+
+  prepareAuthenticatedProbe(identity: WeixinCredentialPublic): void {
+    const existing = this.db.prepare("SELECT * FROM weixin_account_generations WHERE generation_id = ?")
+      .get(identity.accountGenerationId) as AccountRow | undefined;
+    if (!existing) {
+      this.activate(identity);
+      return;
+    }
+    if (existing.bot_id !== identity.botId || existing.owner_user_id !== identity.ownerUserId) {
+      throw new Error("WeChat account generation identity changed unexpectedly");
+    }
   }
 
   authorization(generationId: string): WeixinAuthorizationState {
@@ -130,6 +150,7 @@ export class WeixinAccountStore {
     generationId: string,
     state: WeixinInactiveAuthorizationState,
     incidentId: string,
+    category: string = state,
   ): WeixinAuthTransition {
     const changed = this.db.prepare(`UPDATE weixin_account_generations SET authorization_state = ?
       WHERE generation_id = ? AND active = 1 AND authorization_state = 'active'`).run(state, generationId).changes;
@@ -137,7 +158,7 @@ export class WeixinAccountStore {
     this.db.prepare(`INSERT INTO weixin_auth_incidents
       (incident_id, generation_id, authorization_state, category, created_at)
       VALUES (?, ?, ?, ?, ?)`)
-      .run(incidentId, generationId, state, state, this.now());
+      .run(incidentId, generationId, state, category, this.now());
     return { changed: true, incidentId };
   }
 
@@ -154,9 +175,12 @@ export class WeixinAccountStore {
   }
 
   listUnwarnedIncidents(): readonly WeixinAuthIncident[] {
-    const rows = this.db.prepare(`SELECT incident_id, generation_id, authorization_state, category, no_route, created_at
-      FROM weixin_auth_incidents WHERE warning_delivery_id IS NULL
-      ORDER BY created_at, incident_id`).all() as Array<{
+    const rows = this.db.prepare(`SELECT incident.incident_id, incident.generation_id, incident.authorization_state,
+        incident.category, incident.no_route, incident.created_at
+      FROM weixin_auth_incidents AS incident
+      JOIN weixin_account_generations AS account ON account.generation_id = incident.generation_id AND account.active = 1
+      WHERE incident.warning_delivery_id IS NULL
+      ORDER BY incident.created_at, incident.incident_id`).all() as Array<{
         incident_id: string;
         generation_id: string;
         authorization_state: WeixinInactiveAuthorizationState;
@@ -172,5 +196,12 @@ export class WeixinAccountStore {
       noRoute: row.no_route === 1,
       createdAt: row.created_at,
     }));
+  }
+
+  private retireAuthorizationWarningsInTransaction(generationId: string): void {
+    const warnings = this.db.prepare(`SELECT warning_delivery_id FROM weixin_auth_incidents
+      WHERE generation_id = ? AND warning_delivery_id IS NOT NULL`).all(generationId) as Array<{ warning_delivery_id: string }>;
+    for (const warning of warnings) this.deliveries.failInTransaction(warning.warning_delivery_id);
+    this.db.prepare("DELETE FROM weixin_auth_incidents WHERE generation_id = ?").run(generationId);
   }
 }

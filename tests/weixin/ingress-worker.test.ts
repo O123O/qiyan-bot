@@ -10,6 +10,7 @@ import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
+import { WeixinApiError } from "../../src/weixin/api-client.ts";
 import { WeixinInboxStore } from "../../src/weixin/inbox-store.ts";
 import { WeixinIngressWorker } from "../../src/weixin/ingress-worker.ts";
 import { parseUpdates } from "../../src/weixin/protocol.ts";
@@ -92,6 +93,27 @@ test("a transient media failure retries the head without allowing a later row to
   assert.equal(await value.worker.processOne(), true);
   assert.equal(value.inbox.list("generation")[0]?.state, "processed");
   assert.equal(value.inbox.list("generation")[1]?.state, "pending");
+});
+
+test("an authorization-blocked media download stays retryable without a permanent failure checkpoint", async (context) => {
+  const value = await fixture(context, async () => { throw new WeixinApiError("authorization", "inactive"); });
+  value.inbox.commitPoll("generation", "", parseUpdates(JSON.stringify({ ret: 0, msgs: [{
+    message_id: 1,
+    from_user_id: "owner",
+    to_user_id: "bot",
+    item_list: [{ type: 2, image_item: { url: "https://weixin.qq.com/c2c/download?kind=image" } }],
+  }] })));
+  const worker = new WeixinIngressWorker(value.inbox, value.attachments, value.conversations, {
+    generationId: "generation", botId: "bot", ownerUserId: "owner", maxMediaBytes: 100,
+    download: async () => { throw new WeixinApiError("authorization", "inactive"); },
+    isTransient: (error) => error instanceof WeixinApiError && error.category === "authorization",
+    onMessage: async (source, effects) => { value.conversations.acceptChatSource(source, effects); },
+  });
+
+  assert.equal(await worker.processOne(), false);
+  assert.equal(value.inbox.list("generation")[0]?.state, "retry");
+  assert.equal(value.inbox.mediaCheckpoint("generation", { kind: "message", value: "1" }, 0), undefined);
+  assert.deepEqual(value.accepted, []);
 });
 
 test("rejects base64 image-item hex keys and reconciles an exception after committed acceptance", async (context) => {

@@ -28,8 +28,13 @@ test("preserves same-generation state, changes revisions, and durably deduplicat
   ]);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM weixin_auth_incidents").get()!.count, 1);
 
+  deliveries.prepare({ id: "stale-warning", kind: "warning", binding, body: "warning", mandatory: true });
+  inTransaction(db, () => store.markIncidentRouteInTransaction("incident-1", { warningDeliveryId: "stale-warning" }));
+
   assert.equal(store.activate(identity("generation", "revision-2")).kind, "new-revision");
   assert.equal(store.authorization("generation"), "active");
+  assert.equal(deliveries.get("stale-warning")?.state, "failed");
+  assert.deepEqual(store.listUnwarnedIncidents(), []);
   assert.equal(db.prepare("SELECT cursor FROM weixin_sync_state WHERE generation_id = 'generation'").get()!.cursor, "opaque");
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM weixin_route_tokens WHERE generation_id = 'generation'").get()!.count, 1);
   db.close();
@@ -112,5 +117,23 @@ test("in-transaction incidents remain routable until their route result is recor
   deliveries.prepare({ id: "warning-id", kind: "warning", binding, body: "warning", mandatory: true });
   inTransaction(db, () => store.markIncidentRouteInTransaction("incident-routed", { warningDeliveryId: "warning-id" }));
   assert.deepEqual(store.listUnwarnedIncidents(), []);
+  db.close();
+});
+
+test("an authenticated activation of the unchanged revision clears an inactive latch", () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new WeixinAccountStore(db, deliveries);
+  store.activate(identity("generation", "revision"));
+  assert.equal(store.latchInactive("generation", "relogin_required", "incident"), true);
+
+  store.prepareAuthenticatedProbe(identity("generation", "revision"));
+  assert.equal(store.authorization("generation"), "relogin_required");
+
+  assert.equal(store.activate(identity("generation", "revision")).kind, "unchanged");
+
+  assert.equal(store.authorization("generation"), "active");
+  assert.deepEqual(store.listUnwarnedIncidents(), []);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM weixin_auth_incidents").get()!.count, 0);
   db.close();
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
+import { OwnerRouteCatalog, OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
@@ -51,4 +51,15 @@ test("a duplicate native source cannot replace its accepted route", () => {
   });
   assert.deepEqual(routes.current(), slack);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE adapter_id = 'slack'").get()!.count, 1);
+});
+
+test("warning route catalog prefers a usable current route, then primary, and never the failed adapter", () => {
+  const weixin = { adapterId: "weixin", conversationKey: "weixin:g:o", destination: { generationId: "g" } } as const;
+  const catalog = new OwnerRouteCatalog([primary, slack, weixin], "telegram");
+  assert.deepEqual(catalog.warningRoute({ failedAdapterId: "weixin", current: slack }), slack);
+  assert.deepEqual(catalog.warningRoute({ failedAdapterId: "weixin", current: weixin }), primary);
+  assert.deepEqual(new OwnerRouteCatalog([weixin], "weixin").warningRoute({ failedAdapterId: "weixin" }), undefined);
+  const copy = catalog.warningRoute({ failedAdapterId: "weixin", current: slack }) as typeof slack;
+  (copy.destination as { channelId: string }).channelId = "mutated";
+  assert.deepEqual(catalog.warningRoute({ failedAdapterId: "weixin", current: slack }), slack);
 });

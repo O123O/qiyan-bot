@@ -70,27 +70,39 @@ test("production prepares the configured assistant workdir before endpoint start
   db.close();
 });
 
-test("production initializes exactly the configured Telegram and Slack adapters and cleans all on later failure", async () => {
-  for (const mode of ["telegram", "slack", "dual"] as const) {
+test("production initializes exactly the configured Telegram, Slack, and WeChat adapters and cleans all on later failure", async () => {
+  for (const mode of ["telegram", "slack", "dual", "weixin", "triple"] as const) {
     const root = await mkdtemp(join(tmpdir(), `qiyan-bot-production-${mode}-`));
     const initialized: string[] = [];
     const closed: string[] = [];
-    const fake = (id: "telegram" | "slack"): ChatAdapter => ({
+    const fake = (id: "telegram" | "slack" | "weixin"): ChatAdapter => ({
       delivery: { id, sendMessage: async () => ({ ok: true }) },
       ...(id === "slack" ? {
         primaryBinding: { adapterId: "slack", conversationKey: "slack:T1:dm:D1", destination: { workspaceId: "T1", channelId: "D1" } },
+      } : id === "weixin" ? {
+        primaryBinding: { adapterId: "weixin", conversationKey: "weixin:g:owner", destination: { generationId: "g", botId: "bot", ownerUserId: "owner" } },
       } : {}),
       initialize: async () => { initialized.push(id); },
       start: async () => undefined,
       stop: async () => undefined,
       close: async () => { closed.push(id); },
     } as ChatAdapter);
-    const adapters = mode === "telegram" ? [fake("telegram")] : mode === "slack" ? [fake("slack")] : [fake("telegram"), fake("slack")];
-    const telegram = mode === "slack" ? undefined : { token: "test-token", ownerId: 42, destinationChatId: 42 };
-    const slack = mode === "telegram" ? undefined : { appToken: "xapp-test", botToken: "xoxb-test", userToken: "xoxp-test", ownerUserId: "U1" };
+    const adapters = mode === "telegram" ? [fake("telegram")]
+      : mode === "slack" ? [fake("slack")]
+        : mode === "weixin" ? [fake("weixin")]
+          : mode === "dual" ? [fake("telegram"), fake("slack")]
+            : [fake("telegram"), fake("slack"), fake("weixin")];
+    const telegram = mode === "telegram" || mode === "dual" || mode === "triple"
+      ? { token: "test-token", ownerId: 42, destinationChatId: 42 } : undefined;
+    const slack = mode === "slack" || mode === "dual" || mode === "triple"
+      ? { appToken: "xapp-test", botToken: "xoxb-test", userToken: "xoxp-test", ownerUserId: "U1" } : undefined;
+    const weixin = mode === "weixin" || mode === "triple" ? { configured: true as const } : undefined;
     const config: BotConfig = {
       qiyanHome: join(root, "qiyan-home"),
-      chat: { primary: mode === "telegram" ? "telegram" : "slack", ...(telegram ? { telegram } : {}), ...(slack ? { slack } : {}) },
+      chat: {
+        primary: mode === "telegram" || mode === "dual" || mode === "triple" ? "telegram" : mode,
+        ...(telegram ? { telegram } : {}), ...(slack ? { slack } : {}), ...(weixin ? { weixin } : {}),
+      },
       userHome: root,
       assistantWorkdir: join(root, "workdir"),
       dataDir: join(root, "data"),

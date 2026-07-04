@@ -98,12 +98,14 @@ export class WeixinIngressWorker {
     while (await this.processOne()) { /* committed FIFO */ }
   }
 
+  scheduleDrain(): void {
+    if (this.draining) return;
+    this.draining = this.drain().finally(() => { this.draining = undefined; });
+  }
+
   start(intervalMs = 250): void {
     if (this.timer) return;
-    this.timer = setInterval(() => {
-      if (this.draining) return;
-      this.draining = this.drain().finally(() => { this.draining = undefined; });
-    }, intervalMs);
+    this.timer = setInterval(() => { this.scheduleDrain(); }, intervalMs);
   }
 
   async stop(): Promise<void> {

@@ -78,11 +78,11 @@ export class WeixinApiClient {
     this.longPollTimeoutMs = options.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
   }
 
-  getUpdates(cursor: string, signal: AbortSignal): Promise<ParsedUpdates> {
+  getUpdates(cursor: string, signal: AbortSignal, serverTimeoutMs?: number): Promise<ParsedUpdates> {
     return this.authenticatedJson("get-updates", {
       get_updates_buf: cursor,
       base_info: baseInfo(),
-    }, this.longPollTimeoutMs, signal, (raw) => parseUpdates(raw));
+    }, requestLongPollTimeout(this.longPollTimeoutMs, serverTimeoutMs), signal, (raw) => parseUpdates(raw));
   }
 
   async getConfig(signal?: AbortSignal): Promise<{ typingTicket?: string }> {
@@ -254,6 +254,14 @@ export class WeixinApiClient {
       }
     })();
   }
+}
+
+function requestLongPollTimeout(defaultTimeoutMs: number, serverTimeoutMs: number | undefined): number {
+  if (serverTimeoutMs === undefined) return defaultTimeoutMs;
+  if (!Number.isSafeInteger(serverTimeoutMs) || serverTimeoutMs < 1 || serverTimeoutMs > 600_000) {
+    throw new TypeError("WeChat long-poll timeout is invalid");
+  }
+  return Math.min(605_000, serverTimeoutMs + 5_000);
 }
 
 export function commonHeaders(): Record<string, string> {

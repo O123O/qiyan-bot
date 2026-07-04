@@ -59,6 +59,25 @@ test("sends exact authenticated getupdates headers and base info", async () => {
   assert.equal(headers.get("iLink-App-ClientVersion"), "1024");
 });
 
+test("bounds the next long poll by Tencent's parsed server timeout plus response overhead", async () => {
+  const fake = harness([]);
+  const transport: WeixinHttpTransport = {
+    async fetch(_url, init) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 10);
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+      return Response.json({ ret: 0, msgs: [] });
+    },
+  };
+  const client = new WeixinApiClient(fake.handle, transport, { longPollTimeoutMs: 1 });
+  assert.equal((await client.getUpdates("", new AbortController().signal, 50)).ret, 0);
+  assert.throws(() => client.getUpdates("", new AbortController().signal, 600_001), /timeout is invalid/u);
+});
+
 test("revalidates credentials and generates a fresh UIN before every authenticated dispatch", async () => {
   const fake = harness([Response.json({ ret: 0 }), Response.json({ ret: 0 }), Response.json({ ret: 0 })]);
   let uin = 0;

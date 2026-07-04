@@ -7,7 +7,7 @@ import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
 import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
 import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
-import { OwnerRouteStore } from "./chat/owner-route-store.ts";
+import { OwnerRouteCatalog, OwnerRouteStore } from "./chat/owner-route-store.ts";
 import type { ChatHistoryRequest } from "./chat/contracts.ts";
 import { DeliveryWorker } from "./chat/delivery-worker.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
@@ -49,6 +49,14 @@ import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
 import { SlackChatAdapter } from "./slack/chat-adapter.ts";
 import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
+import { WeixinApiClient, WeixinApiError } from "./weixin/api-client.ts";
+import { WeixinAccountStore } from "./weixin/account-store.ts";
+import { WeixinInboxStore } from "./weixin/inbox-store.ts";
+import { WeixinIngressWorker } from "./weixin/ingress-worker.ts";
+import { WeixinOutboundStore } from "./weixin/outbound-store.ts";
+import { WeixinDeliveryAdapter } from "./weixin/delivery-adapter.ts";
+import { authorizationIncident, WeixinChatAdapter } from "./weixin/chat-adapter.ts";
+import { WeixinIncidentRouter } from "./weixin/incident-router.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
@@ -88,7 +96,6 @@ export async function buildProductionApp(
   config: BotConfig,
   options: { chdir?: (path: string) => void; chatAdapters?: readonly ChatAdapter[]; weixinCredential?: WeixinCredentialHandle } = {},
 ): Promise<BotApp> {
-  void options.weixinCredential;
   const telegramConfig = config.chat.telegram;
   const token = randomBytes(32).toString("base64url");
   const telegramBinding: ConversationBinding | undefined = telegramConfig ? {
@@ -126,6 +133,8 @@ export async function buildProductionApp(
   let assistant!: AssistantRuntime;
   let conversations!: ConversationStore;
   let ownerRoutes!: OwnerRouteStore;
+  let ownerRouteCatalog: OwnerRouteCatalog | undefined;
+  let weixinIncidents: WeixinIncidentRouter | undefined;
   let attemptScope!: AttemptScope;
   let dispatcher!: ConversationDispatcher;
   let scheduler!: AssistantScheduler;
@@ -242,7 +251,70 @@ export async function buildProductionApp(
         } else if (options.chatAdapters) {
           slack = configured.find((adapter) => adapter.delivery.id === "slack") as SlackChatAdapter | undefined;
         }
-        const expectedAdapters = [telegramConfig ? "telegram" : undefined, config.chat.slack ? "slack" : undefined].filter((id): id is string => Boolean(id)).sort();
+        let weixin: WeixinChatAdapter | undefined;
+        if (!options.chatAdapters && config.chat.weixin) {
+          const credential = options.weixinCredential;
+          if (!credential) throw new AppError("CONFIGURATION_ERROR", "configured WeChat credentials are unavailable");
+          const accounts = new WeixinAccountStore(db, deliveries);
+          const inbox = new WeixinInboxStore(db, {
+            botId: credential.public.botId,
+            ownerUserId: credential.public.ownerUserId,
+          }, { attachments });
+          const outbound = new WeixinOutboundStore(db);
+          const api = new WeixinApiClient(credential);
+          const generationId = credential.public.accountGenerationId;
+          weixinIncidents = new WeixinIncidentRouter(db, accounts, deliveries, {
+            warningRoute: () => ownerRouteCatalog?.warningRoute({
+              failedAdapterId: "weixin",
+              ...(ownerRoutes ? { current: ownerRoutes.current() } : {}),
+            }),
+          });
+          const ingress = new WeixinIngressWorker(inbox, attachments, conversations, {
+            generationId,
+            botId: credential.public.botId,
+            ownerUserId: credential.public.ownerUserId,
+            download: async (url) => {
+              try {
+                try { accounts.requireActive(generationId); }
+                catch { throw new WeixinApiError("authorization", "WeChat account authorization is inactive"); }
+                return await api.download(url) as AsyncIterable<Uint8Array | string>;
+              }
+              catch (error) {
+                const incident = authorizationIncident(error);
+                if (incident) await weixinIncidents!.transition({ generationId, ...incident });
+                throw error;
+              }
+            },
+            isTransient: isRetryableWeixinIngressFailure,
+            onMessage: (source, effects) => dispatcher.accept(source, effects),
+            maxMediaBytes: config.attachmentMaxBytes,
+          });
+          const delivery = new WeixinDeliveryAdapter({
+            api,
+            outbound,
+            deliveries,
+            accounts,
+            incidentSink: weixinIncidents,
+          });
+          weixin = new WeixinChatAdapter({
+            credential: credential.public,
+            api,
+            accounts,
+            inbox,
+            outbound,
+            ingress,
+            delivery,
+            incidentSink: weixinIncidents,
+          });
+          configured.push(weixin);
+        } else if (options.chatAdapters) {
+          weixin = configured.find((adapter) => adapter.delivery.id === "weixin") as WeixinChatAdapter | undefined;
+        }
+        const expectedAdapters = [
+          telegramConfig ? "telegram" : undefined,
+          config.chat.slack ? "slack" : undefined,
+          config.chat.weixin ? "weixin" : undefined,
+        ].filter((id): id is string => Boolean(id)).sort();
         const actualAdapters = configured.map((adapter) => adapter.delivery.id).sort();
         if (!isDeepStrictEqual(actualAdapters, expectedAdapters)) throw new AppError("CONFIGURATION_ERROR", "configured chat adapters do not match chat credentials");
         chats = configured;
@@ -251,10 +323,17 @@ export async function buildProductionApp(
           await Promise.allSettled(chats.map(shutdownAdapter));
           throw error;
         }
-        administrativeBinding = config.chat.primary === "telegram"
-          ? telegramBinding!
-          : slack?.primaryBinding ?? (() => { throw new AppError("CONFIGURATION_ERROR", "Slack primary direct message is unavailable"); })();
+        const slackBinding = adapterPrimaryBinding(slack, "slack");
+        const weixinBinding = adapterPrimaryBinding(weixin, "weixin");
+        administrativeBinding = config.chat.primary === "telegram" ? telegramBinding!
+          : config.chat.primary === "slack" ? slackBinding ?? unavailablePrimary("Slack")
+            : weixinBinding ?? unavailablePrimary("WeChat");
         ownerRoutes = new OwnerRouteStore(db, administrativeBinding);
+        ownerRouteCatalog = new OwnerRouteCatalog(
+          [telegramBinding, slackBinding, weixinBinding].filter((binding): binding is ConversationBinding => binding !== undefined),
+          config.chat.primary,
+        );
+        await weixinIncidents?.reconcileUnwarned();
         chatRegistry = new ChatAdapterRegistry(chats);
         slackContextService = slack?.context;
         queueStartupWarnings();
@@ -1362,4 +1441,20 @@ async function shutdownAdapter(adapter: ChatAdapter): Promise<void> {
   try { await adapter.stop(); } catch (error) { first = error; }
   try { await adapter.close(); } catch (error) { first ??= error; }
   if (first) throw first;
+}
+
+function adapterPrimaryBinding(adapter: ChatAdapter | undefined, expectedId: string): ConversationBinding | undefined {
+  if (!adapter) return undefined;
+  const binding = (adapter as ChatAdapter & { primaryBinding?: ConversationBinding }).primaryBinding;
+  if (!binding || binding.adapterId !== expectedId) throw new AppError("CONFIGURATION_ERROR", `${expectedId} primary binding is unavailable`);
+  return binding;
+}
+
+function unavailablePrimary(label: string): never {
+  throw new AppError("CONFIGURATION_ERROR", `${label} primary direct message is unavailable`);
+}
+
+function isRetryableWeixinIngressFailure(error: unknown): boolean {
+  return authorizationIncident(error) !== undefined || (error instanceof WeixinApiError
+    && new Set(["authorization", "rate_limit", "service", "unknown"]).has(error.category));
 }
