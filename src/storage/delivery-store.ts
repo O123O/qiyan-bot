@@ -85,7 +85,7 @@ export class DeliveryStore {
       if (!prior || prior.state === "confirmed" || prior.state === "failed") return;
       const changed = this.db.prepare("UPDATE deliveries SET state = 'confirmed', receipt_json = ?, updated_at = ? WHERE id = ? AND state <> 'confirmed'")
         .run(JSON.stringify(receipt), Date.now(), id).changes;
-      if (changed && !(prior.state === "uncertain" && prior.mandatory === 0)) this.releaseAttachment(id);
+      if (changed) this.releaseAttachmentOnce(id);
     });
   }
 
@@ -100,7 +100,7 @@ export class DeliveryStore {
     const changed = this.db.prepare("UPDATE deliveries SET state = 'failed', updated_at = ? WHERE id = ? AND state = ?")
       .run(Date.now(), id, prior.state).changes;
     if (changed !== 1) return false;
-    if (!(prior.state === "uncertain" && prior.mandatory === 0)) this.releaseAttachment(id);
+    this.releaseAttachmentOnce(id);
     return true;
   }
 
@@ -109,7 +109,18 @@ export class DeliveryStore {
       const row = this.db.prepare("SELECT state, mandatory FROM deliveries WHERE id = ?").get(id) as { state: string; mandatory: number } | undefined;
       if (!row || row.state === "uncertain") return;
       this.db.prepare("UPDATE deliveries SET state = 'uncertain', updated_at = ? WHERE id = ?").run(Date.now(), id);
-      if (row.mandatory === 0) this.releaseAttachment(id);
+    });
+  }
+
+  resumeUncertain(id: string): boolean {
+    return this.db.prepare("UPDATE deliveries SET state = 'prepared', updated_at = ? WHERE id = ? AND state = 'uncertain'")
+      .run(Date.now(), id).changes === 1;
+  }
+
+  abandonUncertain(id: string): void {
+    inTransaction(this.db, () => {
+      const row = this.db.prepare("SELECT state FROM deliveries WHERE id = ?").get(id) as { state: string } | undefined;
+      if (row?.state === "uncertain") this.releaseAttachmentOnce(id);
     });
   }
 
@@ -119,20 +130,8 @@ export class DeliveryStore {
 
   recoverAfterCrash(): DeliveryRecord[] {
     return inTransaction(this.db, () => {
-      const optional = this.db.prepare("SELECT id FROM deliveries WHERE state = 'dispatched' AND mandatory = 0").all() as Array<{ id: string }>;
       const recovered = this.db.prepare("SELECT id FROM deliveries WHERE state = 'dispatched' ORDER BY created_at, id").all() as Array<{ id: string }>;
       this.db.prepare("UPDATE deliveries SET state = 'uncertain', updated_at = ? WHERE state = 'dispatched'").run(Date.now());
-      for (const delivery of optional) {
-        this.releaseAttachment(delivery.id);
-        const original = this.get(delivery.id)!;
-        this.prepare({
-          id: `delivery-warning:${delivery.id}`,
-          kind: "delivery_warning",
-          binding: original.binding,
-          body: `[system] delivery ${delivery.id} could not be confirmed and was not automatically retried`,
-          mandatory: true,
-        });
-      }
       return recovered.map(({ id }) => this.get(id)!).filter(Boolean);
     });
   }
@@ -145,5 +144,15 @@ export class DeliveryStore {
   private releaseAttachment(deliveryId: string): void {
     this.db.prepare(`UPDATE attachments SET ref_count = MAX(ref_count - 1, 0)
       WHERE id = (SELECT attachment_id FROM deliveries WHERE id = ?)`).run(deliveryId);
+  }
+
+
+  private releaseAttachmentOnce(deliveryId: string): void {
+    const row = this.db.prepare("SELECT attachment_id FROM deliveries WHERE id = ?").get(deliveryId) as
+      { attachment_id: string | null } | undefined;
+    if (!row?.attachment_id) return;
+    const inserted = this.db.prepare(`INSERT OR IGNORE INTO delivery_attachment_releases(delivery_id, released_at)
+      VALUES (?, ?)`).run(deliveryId, Date.now()).changes;
+    if (inserted) this.releaseAttachment(deliveryId);
   }
 }

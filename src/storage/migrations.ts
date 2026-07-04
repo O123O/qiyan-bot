@@ -533,4 +533,14 @@ export const migrations: readonly Migration[] = [
   CREATE INDEX weixin_outbound_generation_idx
     ON weixin_outbound_steps(generation_id, delivery_id, ordinal);
   `,
+  `
+  CREATE TABLE delivery_attachment_releases (
+    delivery_id TEXT PRIMARY KEY REFERENCES deliveries(id),
+    released_at INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO delivery_attachment_releases(delivery_id, released_at)
+    SELECT id, updated_at FROM deliveries
+    WHERE attachment_id IS NOT NULL
+      AND (state IN ('confirmed', 'failed') OR (state = 'uncertain' AND mandatory = 0));
+  `,
 ];

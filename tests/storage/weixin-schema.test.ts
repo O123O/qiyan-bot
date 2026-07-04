@@ -71,6 +71,7 @@ test("appends the WeChat migration to completed state-version 2 and 3 databases"
     const old = new DatabaseSync(path);
     old.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE delivery_attachment_releases;
       DROP TABLE weixin_outbound_steps;
       DROP TABLE weixin_inbox_attachment_refs;
       DROP TABLE weixin_inbox_media;
@@ -80,7 +81,7 @@ test("appends the WeChat migration to completed state-version 2 and 3 databases"
       DROP TABLE weixin_sync_state;
       DROP TABLE weixin_auth_incidents;
       DROP TABLE weixin_account_generations;
-      DELETE FROM schema_migrations WHERE version = ${migrations.length};
+      DELETE FROM schema_migrations WHERE version >= ${migrations.length - 1};
       UPDATE qiyan_state SET state_version = ${stateVersion};
       UPDATE conversation_cutover SET phase = 'complete' WHERE singleton = 1;
     `);

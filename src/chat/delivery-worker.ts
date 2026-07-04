@@ -20,9 +20,32 @@ export class DeliveryWorker {
   async processOne(id: string): Promise<void> {
     const delivery = this.store.get(id);
     if (!delivery || delivery.state === "confirmed") return;
-    if (delivery.state === "uncertain" && !delivery.mandatory) throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
-    const body = delivery.state === "uncertain" ? this.recoveryEnvelope(delivery.body, delivery.id) : delivery.body;
     const adapter = this.adapters.delivery(delivery.binding.adapterId);
+    if (delivery.state === "uncertain" && adapter.reconcileUncertain) {
+      const resolution = await adapter.reconcileUncertain({
+        id: delivery.id,
+        binding: delivery.binding,
+        mandatory: delivery.mandatory,
+        hasAttachment: delivery.attachmentId !== undefined,
+      });
+      if (resolution.outcome === "confirmed") {
+        this.store.confirm(id, resolution.receipt);
+        await this.notify(this.store.get(id)!);
+        return;
+      }
+      if (resolution.outcome === "resume_safe") {
+        if (!this.store.resumeUncertain(id)) throw new AppError("DELIVERY_UNCERTAIN", `delivery ${id} reconciliation changed concurrently`);
+        await this.notify(this.store.get(id)!);
+        return;
+      }
+      throw new AppError("DELIVERY_UNCERTAIN", `delivery ${id} may already have been sent`);
+    }
+    if (delivery.state === "uncertain" && !delivery.mandatory) {
+      this.store.abandonUncertain(id);
+      this.prepareUncertainWarning(delivery);
+      throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
+    }
+    const body = delivery.state === "uncertain" ? this.recoveryEnvelope(delivery.body, delivery.id) : delivery.body;
     try {
       this.store.markDispatched(id);
       const receipt = delivery.attachmentId
@@ -35,14 +58,9 @@ export class DeliveryWorker {
       if (safeToRetry) this.store.markPrepared(id);
       else if (isDeterministicDeliveryError(error)) this.store.fail(id);
       else this.store.markUncertain(id);
-      if (!delivery.mandatory && !safeToRetry) {
-        this.store.prepare({
-          id: `delivery-warning:${id}`,
-          kind: "delivery_warning",
-          binding: delivery.binding,
-          body: `[system] delivery ${id} could not be confirmed and was not automatically retried`,
-          mandatory: true,
-        });
+      if (!delivery.mandatory && !safeToRetry && !adapter.reconcileUncertain) {
+        this.store.abandonUncertain(id);
+        this.prepareUncertainWarning(delivery);
       }
       if (!safeToRetry) await this.notify(this.store.get(id)!, error);
       throw error;
@@ -52,7 +70,11 @@ export class DeliveryWorker {
   async drain(): Promise<void> {
     for (const delivery of this.store.listReady()) {
       try { await this.processOne(delivery.id); }
-      catch (error) { if (!(error instanceof AppError && error.code === "DELIVERY_UNCERTAIN")) throw error; }
+      catch (error) {
+        if (!(error instanceof AppError && error.code === "DELIVERY_UNCERTAIN")) throw error;
+        const warning = this.store.get(`delivery-warning:${delivery.id}`);
+        if (warning?.state === "prepared") await this.processOne(warning.id);
+      }
     }
   }
 
@@ -73,6 +95,16 @@ export class DeliveryWorker {
   private recoveryEnvelope(body: string, id: string): string {
     const match = /^\[([^\]]+)\]\s?(.*)$/su.exec(body);
     return match ? `[${match[1]} · recovery retry ${id}] ${match[2]}` : `[recovery retry ${id}] ${body}`;
+  }
+
+  private prepareUncertainWarning(delivery: DeliveryRecord): void {
+    this.store.prepare({
+      id: `delivery-warning:${delivery.id}`,
+      kind: "delivery_warning",
+      binding: delivery.binding,
+      body: `[system] delivery ${delivery.id} could not be confirmed and was not automatically retried`,
+      mandatory: true,
+    });
   }
 
   private async notify(delivery: DeliveryRecord, error?: unknown): Promise<void> {

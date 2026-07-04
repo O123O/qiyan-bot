@@ -11,8 +11,21 @@ export interface ChatHistoryProvider {
   getHistory(binding: ConversationBinding, request: ChatHistoryRequest): Promise<JsonValue>;
 }
 
+export type UncertainDeliveryResolution =
+  | { outcome: "confirmed"; receipt: JsonValue }
+  | { outcome: "resume_safe" }
+  | { outcome: "unresolved" };
+
+export interface UncertainDeliveryContext {
+  id: string;
+  binding: ConversationBinding;
+  mandatory: boolean;
+  hasAttachment: boolean;
+}
+
 export interface ChatDeliveryAdapter {
   readonly id: string;
+  reconcileUncertain?(delivery: UncertainDeliveryContext): Promise<UncertainDeliveryResolution>;
   sendMessage(destination: JsonValue, body: string, reply?: JsonValue, options?: { deliveryId: string }): Promise<JsonValue>;
   sendDocument?(destination: JsonValue, file: {
     stream: AsyncIterable<Uint8Array | string>;
