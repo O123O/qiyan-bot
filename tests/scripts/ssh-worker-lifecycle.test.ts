@@ -532,6 +532,22 @@ test("reset validates the complete local state before deleting Docker volumes", 
   assert.equal(await readFile(join(paths.stateDir, "unexpected-state"), "utf8"), "do-not-delete");
 });
 
+test("reset rejects incorrectly permissioned managed state before deleting Docker volumes", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingClientKey(paths);
+  await writeFile(paths.trustedHostKey, `ssh-ed25519 ${HOST_KEY_A}\n`, { mode: 0o600 });
+  await chmod(paths.trustedHostKey, 0o400);
+  const calls: RunnerCall[] = [];
+
+  await assert.rejects(
+    resetFixture(paths, { runner: lifecycleRunner(calls), confirmed: true }),
+    /trusted host key.*mode 0600/u,
+  );
+
+  assert.equal(calls.some(({ args }) => args.includes("--volumes")), false);
+  assert.equal(await readFile(paths.trustedHostKey, "utf8"), `ssh-ed25519 ${HOST_KEY_A}\n`);
+});
+
 test("an interrupted reset leaves a durable intent that blocks startup and resumes safely", async (t) => {
   const paths = resolveFixturePaths(await temporaryRepository(t));
   await installExistingClientKey(paths);

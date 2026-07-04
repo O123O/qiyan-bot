@@ -892,7 +892,14 @@ async function ensureFixtureStateLocked(
 ): Promise<void> {
   await cleanStaleStagingDirectories(trust, heldLease);
   await revalidateOperationLease(trust, heldLease);
-  await validateOptionalFixtureFiles(paths, trust.uid);
+  for (const [file, label] of [
+    [paths.trustedHostKey, "trusted host key"],
+    [paths.knownHosts, "known hosts file"],
+    [paths.sshConfig, "SSH config"],
+  ] as const) {
+    const metadata = await optionalMetadata(file);
+    if (metadata !== undefined) assertManagedStateFile(metadata, trust.uid, label);
+  }
   const resetIntent = await optionalMetadata(join(paths.stateDir, RESET_INTENT_NAME));
   if (resetIntent !== undefined) {
     assertManagedStateFile(resetIntent, trust.uid, "SSH fixture reset intent");
@@ -1234,7 +1241,14 @@ async function preflightGeneratedStateRemoval(
   const unexpected = (await readdir(paths.stateDir)).filter((name) => !allowed.has(name));
   if (unexpected.length !== 0) throw new Error("SSH fixture state contains unexpected files");
 
-  await validateOptionalFixtureFiles(paths, trust.uid);
+  for (const [file, label] of [
+    [paths.trustedHostKey, "trusted host key"],
+    [paths.knownHosts, "known hosts file"],
+    [paths.sshConfig, "SSH config"],
+  ] as const) {
+    const metadata = await optionalMetadata(file);
+    if (metadata !== undefined) assertManagedStateFile(metadata, trust.uid, label);
+  }
   const resetIntentPath = join(paths.stateDir, RESET_INTENT_NAME);
   const resetIntent = await readManagedStateFile(trust, lease, resetIntentPath, "SSH fixture reset intent");
   if (resetIntent !== undefined && resetIntent !== RESET_INTENT_CONTENTS) {
@@ -1296,6 +1310,9 @@ async function removeGeneratedState(
     await revalidateOperationLease(trust, lease);
     await rm(keyDirectory, { recursive: true, force: false });
   }
+
+  // Persist every generated-state deletion while the reset intent still exists.
+  await syncFixtureStateDirectory(trust, lease);
 
   const resetIntentPath = join(paths.stateDir, RESET_INTENT_NAME);
   const resetIntent = await optionalMetadata(resetIntentPath);
