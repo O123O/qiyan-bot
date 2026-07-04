@@ -48,10 +48,11 @@ test("rejects invalid qiyan-bot package metadata", async (context) => {
   await assert.rejects(readPackageInfo(pathToFileURL(join(temp, "dist", "entry")).href), /invalid qiyan-bot package metadata/);
 });
 
-test("release package contract includes the Slack manifest and bundles SDK dependencies", async () => {
+test("release package contract includes chat assets and bundles SDK dependencies", async () => {
   const manifest = JSON.parse(await import("node:fs/promises").then(({ readFile }) => readFile("package.json", "utf8"))) as {
     files: string[];
     dependencies?: Record<string, string>;
+    devDependencies: Record<string, string>;
   };
   assert.ok(manifest.files.includes("assets/slack/manifest.yaml"));
   assert.ok(manifest.files.includes("dist/qiyan-bot"));
@@ -63,4 +64,7 @@ test("release package contract includes the Slack manifest and bundles SDK depen
   const socket = await import("node:fs/promises").then(({ readFile }) => readFile("src/slack/chat-adapter.ts", "utf8"));
   assert.match(clients, /@slack\/web-api/u);
   assert.match(socket, /@slack\/socket-mode/u);
+  assert.equal(manifest.devDependencies["lossless-json"], "4.3.0");
+  assert.equal(manifest.devDependencies["qrcode-terminal"], "0.12.0");
+  assert.equal(Object.keys(manifest.devDependencies).some((name) => name.toLowerCase().includes("openclaw")), false);
 });
