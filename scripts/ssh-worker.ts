@@ -1,0 +1,160 @@
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
+import { createInterface } from "node:readline/promises";
+import {
+  checkFixture,
+  loginFixture,
+  resolveFixturePaths,
+  runCli,
+  type CommandResult,
+  type CommandRunner,
+  type StreamingChild,
+  type StreamingChildFactory,
+} from "./ssh-worker-support.ts";
+import { downFixture, resetFixture, upFixture } from "./ssh-worker-lifecycle.ts";
+
+const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
+const COMMAND_KILL_GRACE_MS = 1_000;
+
+function appendBounded(chunks: Buffer[], value: Buffer, size: { value: number }): void {
+  size.value += value.length;
+  if (size.value > MAX_COMMAND_OUTPUT_BYTES) throw new Error("SSH worker command output limit exceeded");
+  chunks.push(value);
+}
+
+export const nodeCommandRunner: CommandRunner = async (command, args, options = {}): Promise<CommandResult> => {
+  const inherited = options.inherit === true;
+  const child = spawn(command, [...args], {
+    env: options.env,
+    shell: false,
+    stdio: inherited ? "inherit" : ["ignore", "pipe", "pipe"],
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  const stdoutSize = { value: 0 };
+  const stderrSize = { value: 0 };
+  let outputFailure: Error | undefined;
+  if (!inherited) {
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (outputFailure !== undefined) return;
+      try {
+        appendBounded(stdout, chunk, stdoutSize);
+      } catch (error) {
+        outputFailure = error as Error;
+        child.kill("SIGTERM");
+        forceKill ??= setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (outputFailure !== undefined) return;
+      try {
+        appendBounded(stderr, chunk, stderrSize);
+      } catch (error) {
+        outputFailure = error as Error;
+        child.kill("SIGTERM");
+        forceKill ??= setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
+      }
+    });
+  }
+
+  let timeout: NodeJS.Timeout | undefined;
+  let forceKill: NodeJS.Timeout | undefined;
+  if (options.timeoutMs !== undefined) {
+    timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      forceKill = setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
+    }, options.timeoutMs);
+  }
+  try {
+    const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (closeCode, closeSignal) => resolve([closeCode, closeSignal]));
+    });
+    if (outputFailure !== undefined) throw outputFailure;
+    return {
+      code,
+      signal,
+      stdout: inherited ? "" : Buffer.concat(stdout).toString("utf8"),
+      stderr: inherited ? "" : Buffer.concat(stderr).toString("utf8"),
+    };
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (forceKill !== undefined) clearTimeout(forceKill);
+  }
+};
+
+function readableBytes(stream: NodeJS.ReadableStream): AsyncIterable<Uint8Array> {
+  return (async function* () {
+    for await (const chunk of stream) {
+      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+    }
+  })();
+}
+
+export const nodeStreamingChildFactory: StreamingChildFactory = (command, args, options = {}) => {
+  const child = spawn(command, [...args], {
+    env: options.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const close = new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+  });
+  const started = new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  if (child.stdin === null || child.stdout === null) throw new Error("SSH App Server streams are unavailable");
+  const stdin = child.stdin;
+  const streaming: StreamingChild = {
+    started,
+    stdout: readableBytes(child.stdout),
+    exit,
+    close,
+    writeStdin: (value) => new Promise<void>((resolve, reject) => {
+      stdin.write(value, "utf8", (error) => error === null || error === undefined ? resolve() : reject(error));
+    }),
+    endStdin: () => new Promise<void>((resolve, reject) => {
+      stdin.end((error?: Error | null) => error === null || error === undefined ? resolve() : reject(error));
+    }),
+    kill: (signal) => { child.kill(signal); },
+  };
+  return streaming;
+};
+
+async function main(): Promise<number> {
+  const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  const paths = resolveFixturePaths(repositoryRoot);
+  return runCli(process.argv.slice(2), {
+    up: () => upFixture(paths, { runner: nodeCommandRunner }),
+    login: () => loginFixture(paths, nodeCommandRunner),
+    check: () => checkFixture(paths, {
+      runner: nodeCommandRunner,
+      spawn: nodeStreamingChildFactory,
+      onPhase: (phase) => { process.stdout.write(`SSH worker check: ${phase}\n`); },
+    }),
+    down: () => downFixture(paths, { runner: nodeCommandRunner }),
+    reset: async () => {
+      await resetFixture(paths, { runner: nodeCommandRunner, confirmed: true });
+    },
+  }, {
+    readLine: async (prompt) => {
+      const readline = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        return await readline.question(prompt);
+      } finally {
+        readline.close();
+      }
+    },
+    stdout: (value) => { process.stdout.write(value); },
+    stderr: (value) => { process.stderr.write(value); },
+  });
+}
+
+if (import.meta.main) {
+  process.exitCode = await main();
+}

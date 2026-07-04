@@ -22,7 +22,12 @@
     "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "generate:codex-schema": "node scripts/generate-app-server-schema.mjs"
+    "generate:codex-schema": "node scripts/generate-app-server-schema.mjs",
+    "ssh-worker:up": "node --import tsx scripts/ssh-worker.ts up",
+    "ssh-worker:login": "node --import tsx scripts/ssh-worker.ts login",
+    "ssh-worker:check": "node --import tsx scripts/ssh-worker.ts check",
+    "ssh-worker:down": "node --import tsx scripts/ssh-worker.ts down",
+    "ssh-worker:reset": "node --import tsx scripts/ssh-worker.ts reset"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

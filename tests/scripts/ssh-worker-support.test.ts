@@ -22,11 +22,15 @@ import {
   DEFAULT_SSH_PORT,
   SSH_ALIAS,
   buildSshArgs,
+  checkFixture,
   ensureFixtureState,
   formatSshConfig,
+  loginFixture,
   resolveFixturePaths,
+  runCli,
   writeSshConfig,
   type CommandRunner,
+  type StreamingChild,
   type FixturePaths,
 } from "../../scripts/ssh-worker-support.ts";
 
@@ -204,6 +208,245 @@ test("builds SSH arguments with only the dedicated config before the fixed alias
   assert.deepEqual(buildSshArgs(paths, ["printf", "%s", "-oProxyCommand=attacker"]), [
     "-F", paths.sshConfig, "qiyan-ssh-worker", "printf", "%s", "-oProxyCommand=attacker",
   ]);
+});
+
+test("checks the fixed remote environment and authenticated App Server without creating a thread", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const calls: Array<{ command: string; args: readonly string[]; inherit?: boolean; timeoutMs?: number }> = [];
+  const runner: CommandRunner = async (command, args, options) => {
+    calls.push({
+      command,
+      args: [...args],
+      ...(options?.inherit === undefined ? {} : { inherit: options.inherit }),
+      ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    });
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+  const writes: string[] = [];
+  let close!: () => void;
+  const closed = new Promise<void>((resolve) => { close = resolve; });
+  async function* stdout(): AsyncGenerator<Uint8Array> {
+    while (writes.length === 0) await new Promise((resolve) => setImmediate(resolve));
+    yield Buffer.from(`${JSON.stringify({
+      id: 1,
+      result: {
+        userAgent: "codex_app_server/0.142.5",
+        codexHome: "/home/codex/.codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+    })}\n`);
+    while (writes.length < 3) await new Promise((resolve) => setImmediate(resolve));
+    yield Buffer.from(`${JSON.stringify({
+      id: 2,
+      result: { account: { type: "chatgpt" }, requiresOpenaiAuth: false },
+    })}\n`);
+  }
+  const child: StreamingChild = {
+    started: Promise.resolve(),
+    stdout: stdout(),
+    exit: new Promise(() => {}),
+    close: closed,
+    writeStdin: async (value) => { writes.push(value); },
+    endStdin: async () => {},
+    kill: () => { close(); },
+  };
+
+  assert.deepEqual(await checkFixture(paths, {
+    runner,
+    spawn: (command, args) => {
+      calls.push({ command, args: [...args] });
+      return child;
+    },
+    wait: async () => new Promise(() => {}),
+  }), { authenticated: true });
+
+  assert.equal(calls.some(({ args }) => args.includes("codex --version")), false);
+  assert.equal(calls.some(({ args }) => args.includes("--version")), true);
+  assert.ok((calls.find(({ command }) => command === "ssh-keygen")?.timeoutMs ?? 0) > 0);
+  const appServer = calls.find(({ args }) => args.includes("app-server"));
+  assert.ok(appServer);
+  assert.deepEqual(appServer.args.slice(0, 3), ["-T", "-F", paths.sshConfig]);
+  assert.equal(writes.length, 3);
+  const initialize = JSON.parse(writes[0] ?? "null") as Record<string, unknown>;
+  assert.deepEqual(initialize, {
+    id: 1,
+    method: "initialize",
+    params: {
+      clientInfo: { name: "qiyan_ssh_worker_check", title: "QiYan SSH Worker Check", version: "0.4.0" },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    },
+  });
+  assert.deepEqual(JSON.parse(writes[1] ?? "null"), { method: "initialized" });
+  assert.deepEqual(JSON.parse(writes[2] ?? "null"), {
+    id: 2,
+    method: "account/read",
+    params: { refreshToken: false },
+  });
+  assert.equal(calls.some(({ args }) => args.includes("thread/start")), false);
+});
+
+test("terminates malformed App Server probes without exposing response data", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+  const signals: NodeJS.Signals[] = [];
+  let close!: () => void;
+  const child: StreamingChild = {
+    started: Promise.resolve(),
+    stdout: (async function* () { yield Buffer.from("not-json\n"); })(),
+    exit: new Promise(() => {}),
+    close: new Promise<void>((resolve) => { close = resolve; }),
+    writeStdin: async () => {},
+    endStdin: async () => {},
+    kill: (signal) => { signals.push(signal); close(); },
+  };
+  await assert.rejects(
+    checkFixture(paths, { runner, spawn: () => child, wait: async () => new Promise(() => {}) }),
+    /App Server protocol response is invalid/u,
+  );
+  assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("returns only an unauthenticated verdict when App Server has no account", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+  async function* stdout(): AsyncGenerator<Uint8Array> {
+    yield Buffer.from(`${JSON.stringify({
+      id: 1,
+      result: {
+        userAgent: "codex_app_server/0.142.5",
+        codexHome: "/home/codex/.codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+    })}\n`);
+    yield Buffer.from(`${JSON.stringify({
+      id: 2,
+      result: { account: null, requiresOpenaiAuth: true },
+    })}\n`);
+  }
+  let close!: () => void;
+  const child: StreamingChild = {
+    started: Promise.resolve(),
+    stdout: stdout(),
+    exit: new Promise(() => {}),
+    close: new Promise<void>((resolve) => { close = resolve; }),
+    writeStdin: async () => {},
+    endStdin: async () => {},
+    kill: () => { close(); },
+  };
+
+  assert.deepEqual(await checkFixture(paths, {
+    runner,
+    spawn: () => child,
+    wait: async () => new Promise(() => {}),
+  }), { authenticated: false });
+});
+
+test("kills an SSH child whose App Server process never reaches the startup boundary", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    if (args.includes("--version")) return successfulResult("codex-cli 0.142.5\n");
+    return successfulResult();
+  };
+  const signals: NodeJS.Signals[] = [];
+  let close!: () => void;
+  const child: StreamingChild = {
+    started: new Promise(() => {}),
+    stdout: (async function* () {})(),
+    exit: new Promise(() => {}),
+    close: new Promise<void>((resolve) => { close = resolve; }),
+    writeStdin: async () => {},
+    endStdin: async () => {},
+    kill: (signal) => { signals.push(signal); close(); },
+  };
+
+  await assert.rejects(
+    checkFixture(paths, { runner, spawn: () => child, wait: async () => {} }),
+    /App Server process startup timed out/u,
+  );
+  assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("runs device login with an inherited terminal and dispatches the exact CLI surface", async (t) => {
+  const paths = resolveFixturePaths(await temporaryRepository(t));
+  await installExistingPair(paths);
+  await writeFile(paths.trustedHostKey, "ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.knownHosts, "[127.0.0.1]:2222 ssh-ed25519 AAAAhost\n", { mode: 0o600 });
+  await writeFile(paths.sshConfig, formatSshConfig(paths), { mode: 0o600 });
+  const loginCalls: Array<{ args: readonly string[]; inherit?: boolean }> = [];
+  await loginFixture(paths, async (command, args, options) => {
+    loginCalls.push({
+      args: [...args],
+      ...(options?.inherit === undefined ? {} : { inherit: options.inherit }),
+    });
+    if (command === "ssh-keygen") return successfulResult(`${PUBLIC_KEY}\n`);
+    return successfulResult();
+  });
+  assert.deepEqual(loginCalls.at(-1), {
+    args: ["-tt", "-F", paths.sshConfig, SSH_ALIAS, "codex", "login", "--device-auth"],
+    inherit: true,
+  });
+
+  const dispatched: string[] = [];
+  const output: string[] = [];
+  const operations = {
+    up: async () => { dispatched.push("up"); },
+    login: async () => { dispatched.push("login"); },
+    check: async () => { dispatched.push("check"); return { authenticated: true }; },
+    down: async () => { dispatched.push("down"); },
+    reset: async () => { dispatched.push("reset"); },
+  };
+  for (const command of ["up", "login", "check", "down"] as const) {
+    assert.equal(await runCli([command], operations, {
+      readLine: async () => "",
+      stdout: (value) => { output.push(value); },
+      stderr: (value) => { output.push(value); },
+    }), 0);
+  }
+  assert.equal(await runCli(["reset"], operations, {
+    readLine: async () => "not reset",
+    stdout: (value) => { output.push(value); },
+    stderr: (value) => { output.push(value); },
+  }), 1);
+  assert.equal(await runCli(["reset", "--yes"], operations, {
+    readLine: async () => "",
+    stdout: (value) => { output.push(value); },
+    stderr: (value) => { output.push(value); },
+  }), 0);
+  assert.equal(await runCli(["unknown"], operations, {
+    readLine: async () => "",
+    stdout: (value) => { output.push(value); },
+    stderr: (value) => { output.push(value); },
+  }), 1);
+  assert.deepEqual(dispatched, ["up", "login", "check", "down", "reset"]);
 });
 
 test("stages, validates, and installs a new owner-only keypair", async (t) => {

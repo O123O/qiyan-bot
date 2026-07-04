@@ -10,6 +10,7 @@ test("SSH worker image pins its base, packages, account, and copied inputs", asy
 
   assert.match(dockerfile, /^FROM node:24-bookworm-slim\n/u);
   assert.match(dockerfile, /^ARG CODEX_VERSION=0\.142\.5$/mu);
+  assert.match(dockerfile, /^ENV CODEX_HOME=\/home\/codex\/\.codex$/mu);
   assert.match(
     dockerfile,
     /^RUN apt-get update \\\n && apt-get install -y --no-install-recommends \\\n\s+ca-certificates \\\n\s+git \\\n\s+openssh-client \\\n\s+openssh-server \\\n && rm -f \/etc\/ssh\/ssh_host_\* \\\n && npm install --global "@openai\/codex@\$\{CODEX_VERSION\}" \\/mu,

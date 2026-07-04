@@ -1,6 +1,7 @@
 FROM node:24-bookworm-slim
 
 ARG CODEX_VERSION=0.142.5
+ENV CODEX_HOME=/home/codex/.codex
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

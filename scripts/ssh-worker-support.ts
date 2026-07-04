@@ -13,6 +13,16 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../src/core/process-identity.ts";
+import type {
+  ClientNotification,
+  InitializeParams,
+  InitializeResponse,
+} from "../src/app-server/generated/index.ts";
+import type {
+  GetAccountParams,
+  GetAccountResponse,
+} from "../src/app-server/generated/v2/index.ts";
+import { APP_VERSION } from "../src/version.ts";
 
 export interface FixturePaths {
   repositoryRoot: string;
@@ -53,12 +63,62 @@ export type FixtureManagedStateFile = "trustedHostKey" | "knownHosts" | "sshConf
 
 export interface FixtureStateTransaction {
   ensureClientKey(runner: CommandRunner): Promise<void>;
+  requireConnectionState(runner: CommandRunner, port: number): Promise<void>;
   readOwnerOnlyFile(file: FixtureManagedStateFile): Promise<string | undefined>;
   replaceOwnerOnlyFile(file: FixtureManagedStateFile, contents: string): Promise<void>;
   withOwnerOnlyTemporaryFile<T>(contents: string, operation: (path: string) => Promise<T>): Promise<T>;
   preflightGeneratedStateRemoval(): Promise<void>;
   beginReset(): Promise<void>;
   removeGeneratedState(): Promise<void>;
+}
+
+export interface StreamingChildExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+export interface StreamingChild {
+  started: Promise<void>;
+  stdout: AsyncIterable<Uint8Array>;
+  exit: Promise<StreamingChildExit>;
+  close: Promise<void>;
+  writeStdin(value: string): Promise<void>;
+  endStdin(): Promise<void>;
+  kill(signal: "SIGTERM" | "SIGKILL"): void;
+}
+
+export type StreamingChildFactory = (
+  command: string,
+  args: readonly string[],
+  options?: { env?: NodeJS.ProcessEnv },
+) => StreamingChild;
+
+export interface FixtureCheckOptions {
+  runner: CommandRunner;
+  spawn: StreamingChildFactory;
+  env?: NodeJS.ProcessEnv;
+  port?: number;
+  codexVersion?: string;
+  wait?: (milliseconds: number) => Promise<void>;
+  onPhase?: (phase: "environment" | "codex" | "app-server" | "account") => void;
+}
+
+export interface FixtureCheckResult {
+  authenticated: boolean;
+}
+
+export interface SshWorkerCliOperations {
+  up(): Promise<void>;
+  login(): Promise<void>;
+  check(): Promise<FixtureCheckResult>;
+  down(): Promise<void>;
+  reset(): Promise<void>;
+}
+
+export interface SshWorkerCliIo {
+  readLine(prompt: string): Promise<string>;
+  stdout(value: string): void;
+  stderr(value: string): void;
 }
 
 export const DEFAULT_SSH_PORT = 2222;
@@ -927,6 +987,55 @@ async function ensureFixtureStateLocked(
   await validateKeyPair(paths.privateKey, paths.publicKey, runner, trust.uid, false, revalidateKeyState);
 }
 
+async function requireConnectionStateLocked(
+  paths: FixturePaths,
+  runner: CommandRunner,
+  port: number,
+  trust: FixtureTrust,
+  heldLease: OperationLease,
+): Promise<void> {
+  validatePort(port);
+  await cleanStaleStagingDirectories(trust, heldLease);
+  await cleanupManagedTemporaries(trust, heldLease);
+  await revalidateOperationLease(trust, heldLease);
+  const resetIntent = await optionalMetadata(join(paths.stateDir, RESET_INTENT_NAME));
+  if (resetIntent !== undefined) {
+    assertManagedStateFile(resetIntent, trust.uid, "SSH fixture reset intent");
+    throw new Error("SSH worker reset is incomplete; run reset again");
+  }
+
+  const clientKeyDirectory = dirname(paths.privateKey);
+  const clientKeyMetadata = await optionalMetadata(clientKeyDirectory);
+  if (clientKeyMetadata === undefined) throw new Error("SSH worker is not initialized; run ssh-worker:up first");
+  assertPrivateDirectory(clientKeyMetadata, trust.uid, "SSH client key directory");
+  const clientKeyIdentity = identity(clientKeyDirectory, clientKeyMetadata);
+  const revalidateKeyState = async (): Promise<void> => {
+    await revalidateFixtureTrust(trust);
+    await revalidateOperationLease(trust, heldLease);
+    await revalidateDirectory(
+      clientKeyIdentity,
+      trust.uid,
+      "SSH client key directory",
+      (metadata, currentUser) => assertPrivateDirectory(metadata, currentUser, "SSH client key directory"),
+    );
+  };
+  await validateKeyPair(paths.privateKey, paths.publicKey, runner, trust.uid, false, revalidateKeyState);
+
+  const [trustedHostKey, knownHosts, sshConfig] = await Promise.all([
+    readManagedStateFile(trust, heldLease, paths.trustedHostKey, "SSH fixture trusted host key"),
+    readManagedStateFile(trust, heldLease, paths.knownHosts, "SSH fixture known hosts file"),
+    readManagedStateFile(trust, heldLease, paths.sshConfig, "SSH fixture SSH config"),
+  ]);
+  if (trustedHostKey === undefined || knownHosts === undefined || sshConfig === undefined) {
+    throw new Error("SSH worker connection state is incomplete; run ssh-worker:up first");
+  }
+  if (sshConfig !== formatSshConfig(paths, port)) {
+    throw new Error("SSH worker connection state does not match the selected port; run ssh-worker:up first");
+  }
+  await revalidateFixtureTrust(trust);
+  await revalidateOperationLease(trust, heldLease);
+}
+
 export async function ensureFixtureState(
   paths: FixturePaths,
   runner: CommandRunner,
@@ -1342,6 +1451,7 @@ export async function withFixtureStateTransaction<T>(
     await validateOptionalFixtureFiles(paths, uid);
     const transaction: FixtureStateTransaction = {
       ensureClientKey: (runner) => ensureFixtureStateLocked(paths, runner, trust, lease),
+      requireConnectionState: (runner, port) => requireConnectionStateLocked(paths, runner, port, trust, lease),
       readOwnerOnlyFile: (file) => readManagedStateFile(
         trust,
         lease,
@@ -1398,4 +1508,366 @@ export async function withFixtureStateTransaction<T>(
 export function buildSshArgs(paths: FixturePaths, remoteCommand: readonly string[]): string[] {
   validateFixturePaths(paths);
   return ["-F", paths.sshConfig, SSH_ALIAS, ...remoteCommand];
+}
+
+const REMOTE_PROBE_COMMAND = [
+  "test \"$HOME\" = /home/codex",
+  "test \"${CODEX_HOME:-}\" = /home/codex/.codex",
+  "test -d /home/codex/.codex",
+  "test -d /home/codex/projects",
+  "command -v codex >/dev/null 2>&1",
+].join(" && ");
+const CODEX_VERSION_PATTERN = /^\d+\.\d+\.\d+$/u;
+const SHORT_COMMAND_TIMEOUT_MS = 10_000;
+const PROCESS_START_TIMEOUT_MS = 10_000;
+const INITIALIZE_TIMEOUT_MS = 10_000;
+const ACCOUNT_TIMEOUT_MS = 10_000;
+const TERMINATE_TIMEOUT_MS = 2_000;
+const MAX_JSONL_LINE_BYTES = 1024 * 1024;
+const MAX_INTERLEAVED_MESSAGES = 1_000;
+
+function validateSelectedCodexVersion(version: string): void {
+  if (!CODEX_VERSION_PATTERN.test(version)) {
+    throw new Error("Codex version must contain exactly three decimal components");
+  }
+}
+
+async function runFixedCommand(
+  runner: CommandRunner,
+  command: string,
+  args: readonly string[],
+  options: CommandRunnerOptions,
+  failure: string,
+): Promise<void> {
+  let result: CommandResult;
+  try {
+    result = await runner(command, args, options);
+  } catch {
+    throw new Error(failure);
+  }
+  if (result.code !== 0 || result.signal !== null) throw new Error(failure);
+}
+
+async function withProbeDeadline<T>(
+  operation: Promise<T>,
+  milliseconds: number,
+  failure: string,
+  wait?: (milliseconds: number) => Promise<void>,
+): Promise<T> {
+  if (wait !== undefined) {
+    return Promise.race([
+      operation,
+      wait(milliseconds).then(() => { throw new Error(failure); }),
+    ]);
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(failure)), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+class BoundedJsonlReader {
+  private readonly iterator: AsyncIterator<Uint8Array>;
+  private pending = Buffer.alloc(0);
+
+  constructor(stdout: AsyncIterable<Uint8Array>) {
+    this.iterator = stdout[Symbol.asyncIterator]();
+  }
+
+  async nextLine(): Promise<string> {
+    while (true) {
+      const newline = this.pending.indexOf(0x0a);
+      if (newline !== -1) {
+        if (newline > MAX_JSONL_LINE_BYTES) throw new Error("App Server protocol response is too large");
+        const line = this.pending.subarray(0, newline);
+        this.pending = this.pending.subarray(newline + 1);
+        if (line.length > 0 && line.at(-1) === 0x0d) return line.subarray(0, -1).toString("utf8");
+        return line.toString("utf8");
+      }
+      if (this.pending.length > MAX_JSONL_LINE_BYTES) {
+        throw new Error("App Server protocol response is too large");
+      }
+      const item = await this.iterator.next();
+      if (item.done) throw new Error("App Server closed before completing the protocol check");
+      const chunk = Buffer.from(item.value);
+      this.pending = this.pending.length === 0 ? chunk : Buffer.concat([this.pending, chunk]);
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseProtocolLine(line: string): Record<string, unknown> {
+  if (line.length === 0) throw new Error("App Server protocol response is invalid");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
+  } catch {
+    throw new Error("App Server protocol response is invalid");
+  }
+  if (!isRecord(parsed)) throw new Error("App Server protocol response is invalid");
+  return parsed;
+}
+
+async function readProtocolResponse(
+  reader: BoundedJsonlReader,
+  child: StreamingChild,
+  expectedId: number,
+  timeoutMs: number,
+  wait?: (milliseconds: number) => Promise<void>,
+): Promise<unknown> {
+  const operation = (async (): Promise<unknown> => {
+    for (let seen = 0; seen < MAX_INTERLEAVED_MESSAGES; seen += 1) {
+      const line = await Promise.race([
+        reader.nextLine(),
+        child.exit.then(() => { throw new Error("App Server exited during the protocol check"); }),
+      ]);
+      const response = parseProtocolLine(line);
+      if (!("id" in response)) {
+        if (typeof response.method !== "string") throw new Error("App Server protocol response is invalid");
+        continue;
+      }
+      if (response.id !== expectedId) throw new Error("App Server protocol response ID is invalid");
+      if ("error" in response) throw new Error("App Server rejected the protocol check");
+      if (!("result" in response)) throw new Error("App Server protocol response is invalid");
+      return response.result;
+    }
+    throw new Error("App Server protocol response limit exceeded");
+  })();
+  return withProbeDeadline(operation, timeoutMs, "App Server protocol check timed out", wait);
+}
+
+function validateInitializeResponse(value: unknown, codexVersion: string): InitializeResponse {
+  if (!isRecord(value)
+    || typeof value.userAgent !== "string"
+    || typeof value.codexHome !== "string"
+    || typeof value.platformFamily !== "string"
+    || typeof value.platformOs !== "string") {
+    throw new Error("App Server initialize response is invalid");
+  }
+  const escapedVersion = codexVersion.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const versionToken = new RegExp(`(?:^|[/ ])${escapedVersion}(?:$|[ ;])`, "u");
+  if (!versionToken.test(value.userAgent)
+    || value.codexHome !== "/home/codex/.codex"
+    || value.platformFamily !== "unix"
+    || value.platformOs !== "linux") {
+    throw new Error("App Server identity does not match the SSH worker fixture");
+  }
+  return value as unknown as InitializeResponse;
+}
+
+function validateAccountResponse(value: unknown): GetAccountResponse {
+  if (!isRecord(value)
+    || typeof value.requiresOpenaiAuth !== "boolean"
+    || !(value.account === null || isRecord(value.account))) {
+    throw new Error("App Server account response is invalid");
+  }
+  return value as unknown as GetAccountResponse;
+}
+
+async function writeProtocolMessage(
+  child: StreamingChild,
+  value: unknown,
+  timeoutMs: number,
+  wait?: (milliseconds: number) => Promise<void>,
+): Promise<void> {
+  await withProbeDeadline(
+    Promise.race([
+      child.writeStdin(`${JSON.stringify(value)}\n`),
+      child.exit.then(() => { throw new Error("App Server exited during the protocol check"); }),
+    ]),
+    timeoutMs,
+    "App Server protocol write timed out",
+    wait,
+  );
+}
+
+async function terminateStreamingChild(
+  child: StreamingChild,
+  wait?: (milliseconds: number) => Promise<void>,
+): Promise<void> {
+  try {
+    await withProbeDeadline(child.endStdin(), TERMINATE_TIMEOUT_MS, "App Server input shutdown timed out", wait);
+  } catch {
+    // A closed input stream is expected when SSH or App Server has already exited.
+  }
+  child.kill("SIGTERM");
+  try {
+    await withProbeDeadline(child.close, TERMINATE_TIMEOUT_MS, "App Server shutdown timed out", wait);
+    return;
+  } catch {
+    child.kill("SIGKILL");
+  }
+  await withProbeDeadline(child.close, TERMINATE_TIMEOUT_MS, "App Server did not terminate", wait);
+}
+
+async function requireConnectionState(
+  paths: FixturePaths,
+  runner: CommandRunner,
+  port: number,
+): Promise<void> {
+  const boundedRunner: CommandRunner = (command, args, options) => runner(command, args, {
+    ...options,
+    timeoutMs: options?.timeoutMs ?? SHORT_COMMAND_TIMEOUT_MS,
+  });
+  await withFixtureStateTransaction(paths, (transaction) => transaction.requireConnectionState(boundedRunner, port));
+}
+
+export async function loginFixture(
+  paths: FixturePaths,
+  runner: CommandRunner,
+  options: { env?: NodeJS.ProcessEnv; port?: number } = {},
+): Promise<void> {
+  const port = options.port ?? DEFAULT_SSH_PORT;
+  await requireConnectionState(paths, runner, port);
+  await runFixedCommand(
+    runner,
+    "ssh",
+    ["-tt", "-F", paths.sshConfig, SSH_ALIAS, "codex", "login", "--device-auth"],
+    { env: options.env ?? process.env, inherit: true },
+    "Codex device authentication failed",
+  );
+}
+
+export async function checkFixture(
+  paths: FixturePaths,
+  options: FixtureCheckOptions,
+): Promise<FixtureCheckResult> {
+  const port = options.port ?? DEFAULT_SSH_PORT;
+  const codexVersion = options.codexVersion ?? DEFAULT_CODEX_VERSION;
+  validatePort(port);
+  validateSelectedCodexVersion(codexVersion);
+  await requireConnectionState(paths, options.runner, port);
+  const env = options.env ?? process.env;
+  options.onPhase?.("environment");
+  await runFixedCommand(
+    options.runner,
+    "ssh",
+    buildSshArgs(paths, [REMOTE_PROBE_COMMAND]),
+    { env, timeoutMs: SHORT_COMMAND_TIMEOUT_MS },
+    "SSH worker environment check failed",
+  );
+  options.onPhase?.("codex");
+  let versionResult: CommandResult;
+  try {
+    versionResult = await options.runner(
+      "ssh",
+      buildSshArgs(paths, ["codex", "--version"]),
+      { env, timeoutMs: SHORT_COMMAND_TIMEOUT_MS },
+    );
+  } catch {
+    throw new Error("Codex version check failed");
+  }
+  if (versionResult.code !== 0
+    || versionResult.signal !== null
+    || versionResult.stdout.trim() !== `codex-cli ${codexVersion}`) {
+    throw new Error("Codex version does not match the SSH worker fixture");
+  }
+
+  options.onPhase?.("app-server");
+  let child: StreamingChild | undefined;
+  let primaryFailure: unknown;
+  try {
+    child = options.spawn(
+      "ssh",
+      ["-T", ...buildSshArgs(paths, ["codex", "app-server", "--listen", "stdio://"])],
+      { env },
+    );
+    await withProbeDeadline(
+      child.started,
+      PROCESS_START_TIMEOUT_MS,
+      "App Server process startup timed out",
+      options.wait,
+    );
+    const reader = new BoundedJsonlReader(child.stdout);
+    const initializeParams = {
+      clientInfo: {
+        name: "qiyan_ssh_worker_check",
+        title: "QiYan SSH Worker Check",
+        version: APP_VERSION,
+      },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    } satisfies InitializeParams;
+    await writeProtocolMessage(child, { id: 1, method: "initialize", params: initializeParams }, INITIALIZE_TIMEOUT_MS, options.wait);
+    validateInitializeResponse(
+      await readProtocolResponse(reader, child, 1, INITIALIZE_TIMEOUT_MS, options.wait),
+      codexVersion,
+    );
+    const initialized = { method: "initialized" } satisfies ClientNotification;
+    await writeProtocolMessage(child, initialized, INITIALIZE_TIMEOUT_MS, options.wait);
+    const accountParams = { refreshToken: false } satisfies GetAccountParams;
+    await writeProtocolMessage(
+      child,
+      { id: 2, method: "account/read", params: accountParams },
+      ACCOUNT_TIMEOUT_MS,
+      options.wait,
+    );
+    options.onPhase?.("account");
+    const account = validateAccountResponse(
+      await readProtocolResponse(reader, child, 2, ACCOUNT_TIMEOUT_MS, options.wait),
+    );
+    return { authenticated: !account.requiresOpenaiAuth && account.account !== null };
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    if (child !== undefined) {
+      try {
+        await terminateStreamingChild(child, options.wait);
+      } catch (cleanupError) {
+        if (primaryFailure === undefined) throw cleanupError;
+      }
+    }
+  }
+}
+
+const SSH_WORKER_USAGE = "Usage: ssh-worker <up|login|check|down|reset [--yes]>\n";
+
+export async function runCli(
+  args: readonly string[],
+  operations: SshWorkerCliOperations,
+  io: SshWorkerCliIo,
+): Promise<number> {
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+    io.stdout(SSH_WORKER_USAGE);
+    return 0;
+  }
+  const command = args[0];
+  const validNoArgument = command === "up" || command === "login" || command === "check" || command === "down";
+  const validReset = command === "reset" && (args.length === 1 || (args.length === 2 && args[1] === "--yes"));
+  if ((!validNoArgument || args.length !== 1) && !validReset) {
+    io.stderr(SSH_WORKER_USAGE);
+    return 1;
+  }
+
+  try {
+    if (command === "up") await operations.up();
+    else if (command === "login") await operations.login();
+    else if (command === "check") {
+      const result = await operations.check();
+      io.stdout(result.authenticated ? "SSH worker: authenticated\n" : "SSH worker: authentication required\n");
+    } else if (command === "down") await operations.down();
+    else {
+      const confirmed = args[1] === "--yes"
+        || (await io.readLine("Type reset to delete the SSH worker container, volumes, credentials, projects, and host state: ")) === "reset";
+      if (!confirmed) {
+        io.stderr("SSH worker reset cancelled.\n");
+        return 1;
+      }
+      await operations.reset();
+    }
+    return 0;
+  } catch {
+    io.stderr("SSH worker operation failed.\n");
+    return 1;
+  }
 }
