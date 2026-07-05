@@ -87,9 +87,9 @@ The catalog is read and validated whenever an inactive SSH endpoint is requested
 
 ### Destination binding
 
-On successful SSH activation, the backend normalizes the effective destination returned by `ssh -G`: host name, remote user, and port. It stores a hash of that tuple in backend-owned endpoint state under `QIYAN_HOME`, using atomic mode-0600 persistence.
+On successful SSH activation, the backend normalizes the effective destination returned by `ssh -G`: host name, remote user, and port. It stores a hash of that tuple in backend-owned endpoint state under `QIYAN_HOME`, using atomic mode-0600 persistence. Failed first activation does not create or replace a binding.
 
-If managed sessions reference the endpoint, a changed destination hash is rejected. This prevents an SSH-config edit from silently redirecting existing native thread IDs to another machine. If no managed sessions reference the endpoint, the binding may be replaced on the next successful activation. Changes to routes such as `ProxyJump` or identity-file selection do not by themselves change endpoint identity.
+If managed sessions reference the endpoint, a changed destination hash is rejected. This prevents an SSH-config edit from silently redirecting existing native thread IDs to another machine. If no managed sessions reference the endpoint, the binding may be replaced on the next successful activation. Every new SSH connection generation reruns `ssh -G`, compares the result with the binding, and pins the resolved host, user, and port in the actual OpenSSH invocation; the alias still selects other user configuration. Changes to routes such as `ProxyJump` or identity-file selection do not by themselves change endpoint identity.
 
 Renaming a catalog key creates a new endpoint identity. Removing or renaming an entry that still has managed sessions leaves those mappings intact but unavailable; the backend does not silently migrate them.
 
@@ -103,7 +103,7 @@ Higher-level services resolve an `EndpointRuntime` composed of three narrow capa
 
 Session lifecycle, session registry, goals, status, model selection, notification routing, and chat adapters depend on these interfaces rather than on endpoint type. They must not contain scattered `local` versus `ssh` behavior.
 
-The endpoint pool gains a resolver/factory. It preserves the current global turn-capacity policy and endpoint-scoped session identities. The built-in local runtime is created as it is today. SSH runtimes are created lazily, except that startup recovery activates SSH endpoints referenced by managed sessions.
+The endpoint pool gains a resolver/factory and an endpoint-scoped admission gate. It preserves the current global turn-capacity policy and endpoint-scoped session identities. The built-in local runtime is created as it is today. SSH runtimes are created lazily, except that startup recovery activates SSH endpoints referenced by managed sessions. Turn starts, steers, session lifecycle requests, and worker file transfers acquire an endpoint admission lease so explicit lifecycle operations can quiesce one endpoint without stopping unrelated endpoints.
 
 ### Local implementation
 
@@ -125,7 +125,7 @@ An SSH runtime contains separately testable components:
 - a remote App Server supervisor implemented with a private `tmux` socket;
 - an SSH Unix-socket tunnel;
 - an App Server WebSocket transport over the locally forwarded Unix socket;
-- fixed remote Linux filesystem operations; and
+- a packaged, digest-verified Node.js helper for fixed remote Linux filesystem and process operations; and
 - streaming remote worker-file transfer operations.
 
 Codex documents Unix-socket App Server listeners through `codex app-server --listen unix:///absolute/path.sock`. The socket uses the App Server's WebSocket framing without opening a network listener. The SSH implementation converts those frames to the same request and notification abstractions used by the local JSONL transport.
@@ -138,12 +138,15 @@ The first release is connect-only. A usable remote host has:
 - a trusted host key already accepted by the user;
 - noninteractive key or agent authentication;
 - Linux;
+- Node.js available from the remote login environment for QiYan's fixed helper;
 - `codex` available from the remote login environment;
 - Codex already authenticated under the remote user's own `~/.codex` or `CODEX_HOME`;
 - `tmux`; and
 - the bounded Linux filesystem utilities required by the remote host implementation.
 
 The backend uses batch mode, no PTY for control and transfer channels, strict host-key checking, and bounded connection timeouts. It never uses `accept-new`, edits `~/.ssh/config`, writes `known_hosts`, initiates login, or copies credentials. The user may perform those actions directly or ask QiYan to do them with normal shell tools outside backend policy.
+
+QiYan stages only its versioned helper in the endpoint's private runtime directory and verifies its SHA-256 before use. Remote operations invoke that helper with a fixed operation name and bounded base64url data arguments. Endpoint hashes, numeric IDs, and other command tokens use strict allowlists. User paths, project names, attachment names, and shell fragments never enter an SSH remote-command or tmux shell-command string. The helper decodes data and uses Node.js filesystem and child-process APIs without a shell.
 
 The checked-in App Server types remain generated reproducibly from Codex `0.142.5`, but runtime compatibility is not an exact package pin. Codex `0.142.5` is the minimum supported version for both local and SSH worker App Servers. Initialization accepts the same numeric release or any newer numeric release, including a newer release with a prerelease/build suffix, and rejects an older or unparseable version with a clear compatibility error. Required App Server behavior is still validated through initialization and capability calls. This lets users update Codex normally without forcing a matching QiYan release while preserving a defined lower compatibility boundary.
 
@@ -172,9 +175,9 @@ tmux -L qiyan-bot list-sessions
 
 Normal `tmux ls` uses the user's default socket and cannot see or modify QiYan's alternate server. The user can deliberately inspect it with `tmux -L qiyan-bot list-sessions`. QiYan stops only its endpoint session and never issues `kill-server` against the user's default tmux server.
 
-Each endpoint uses a deterministic, safely encoded session name and a short private App Server runtime path. The App Server runtime directory is mode 0700 and its socket is owner-only. The first release assumes one QiYan deployment manages the `qiyan-bot` tmux server for a given remote operating-system account.
+Each endpoint uses a deterministic, safely encoded session name and a short private App Server runtime path. The App Server runtime directory is mode 0700 and its socket is owner-only. Every App Server launch also creates a cryptographically random incarnation token and records the supervisor PID plus Linux process start time atomically in a mode-0600 metadata file. Reconnecting the tunnel reads the same attested incarnation; a restart, reboot, or replacement process necessarily has a different identity even though the tmux session and socket names are deterministic. The first release assumes one QiYan deployment manages the `qiyan-bot` tmux server for a given remote operating-system account.
 
-The tmux session launches the remote login environment and then:
+The tmux session launches the fixed QiYan helper, which starts the resolved `codex` executable without a shell:
 
 ```text
 codex app-server --listen unix://<private-runtime>/app-server.sock
@@ -186,14 +189,15 @@ The App Server exposes no TCP port. The tmux pane is not used as a protocol chan
 
 When activating an SSH endpoint, the backend:
 
-1. validates the catalog entry and resolved destination binding;
+1. reloads the catalog, resolves `ssh -G`, validates an existing destination binding, and constructs a connection pinned to that host, user, and port;
 2. completes the SSH, Linux, command, Codex, auth, and `tmux` preflight;
 3. checks the endpoint session through `tmux -L qiyan-bot`;
 4. removes an owned stale App Server socket only when the private tmux session is proven absent;
 5. starts the detached App Server if absent;
 6. creates a private local Unix socket forwarded to the remote App Server socket;
 7. completes the WebSocket upgrade and normal App Server initialization; and
-8. restores managed subscriptions and reconciles session state.
+8. restores managed subscriptions and reconciles session state; and
+9. records or replaces the destination binding only after successful activation and only when registry references permit it.
 
 If the dedicated tmux session exists but its App Server socket remains unhealthy after a bounded startup grace period, QiYan reports the runtime as unhealthy. It does not automatically kill a process that may still contain active work.
 
@@ -201,7 +205,9 @@ If the dedicated tmux session exists but its App Server socket remains unhealthy
 
 SSH keepalives detect a dead tunnel. Tunnel loss increments the local runtime generation and makes endpoint operations temporarily unavailable, but it does not stop the remote tmux session or active Codex turn.
 
-While managed sessions reference the endpoint, QiYan reconnects with bounded exponential backoff. After SSH returns, it recreates the tunnel, connects to the existing App Server, initializes a new client connection, restores subscriptions, reads managed threads, and reconciles messages completed while disconnected. Stale callbacks and notifications from earlier connection generations are ignored.
+While managed sessions reference the endpoint and the endpoint is in the automatic state, QiYan reconnects with bounded exponential backoff. Every attempt re-resolves and revalidates the pinned destination. After SSH returns, it recreates the tunnel, connects to the existing App Server, initializes a new client connection, restores subscriptions, reads managed threads, and reconciles messages completed while disconnected. Stale callbacks and notifications from earlier connection generations are ignored.
+
+An explicit disconnect first changes the desired state to disconnected and cancels any scheduled reconnect before stopping the runtime. A stale timer or callback cannot recreate it. The disconnected state ends only when a later endpoint operation explicitly requests readiness or startup recovery activates a still-managed endpoint.
 
 Ordinary QiYan shutdown closes local tunnels but leaves remote App Servers running. On the next QiYan start, every SSH endpoint referenced by a managed session is reconnected automatically. Unused catalog endpoints remain dormant.
 
@@ -214,7 +220,7 @@ Worker tools accept an optional endpoint and normalize an omitted value to `loca
 ### `disconnect_endpoint(endpoint?)`
 
 - Defaults to `local`.
-- Proves all managed turns on the endpoint are idle. If the endpoint is unreachable and idleness cannot be proven, it refuses rather than risking active work.
+- Atomically closes the endpoint admission gate, rejects new starts/steers/session mutations/file transfers, waits for already-admitted operations to drain, then proves all managed turns on the endpoint are idle. If the endpoint is unreachable and idleness cannot be proven, it reopens the gate and refuses rather than risking active work.
 - For `local`, shuts down the existing worker App Server.
 - For SSH, closes the tunnel and stops the endpoint session through `tmux -L qiyan-bot`.
 - Preserves native Codex threads, catalog data, endpoint bindings, and managed session mappings.
@@ -223,7 +229,7 @@ Worker tools accept an optional endpoint and normalize an omitted value to `loca
 ### `restart_endpoint(endpoint?)`
 
 - Defaults to `local`.
-- Refuses unless every managed turn on the endpoint is proven idle.
+- Uses the same endpoint-wide drain and refuses unless every managed turn is proven idle after already-admitted operations finish.
 - Validates the endpoint definition and reachable prerequisites before stopping the current runtime.
 - Performs a generation-fenced stop and start.
 - Reinitializes the App Server, restores subscriptions, and reconciles all managed sessions.
@@ -245,7 +251,7 @@ The same workspace policy applies to local and SSH endpoints through `WorkspaceH
 
 If the user does not provide a suitable remote project location, QiYan uses that endpoint's `projects_root`, defaulting to `~/qiyan-projects/<semantic-project-name>`. The local endpoint retains its existing semantic placement and fallback behavior.
 
-The first SSH implementation supports Linux hosts only. Remote filesystem operations are fixed and audited. Paths and operation parameters are transported as data and are never interpolated into arbitrary user-controlled shell commands.
+The first SSH implementation supports Linux hosts only. Remote filesystem operations are fixed and audited. Paths and operation parameters are bounded base64url data decoded by the verified helper and are never interpolated into arbitrary user-controlled shell commands.
 
 ## Explicit QiYan-managed worker file transfers
 
@@ -287,7 +293,7 @@ When QiYan wants to send a project file to the user, it explicitly calls:
 
 `owner` is either `assistant` or a managed worker nickname. The backend resolves a worker owner to that session's endpoint and project root. It accepts only a regular file canonically contained by the project, rejects traversal and symlink escapes, and enforces existing file-size limits.
 
-For the assistant or a local worker, QiYan snapshots the local file as it does today. For an SSH worker, `WorkerFileBridge` streams that one selected remote file into a temporary object in QiYan's local attachment store, verifies its size, and atomically promotes it. The existing `send_chat_attachment({"file_handle":"file_def456","caption":"Here is the report."})` operation then delivers the ordinary retained local handle and requires no endpoint-specific behavior.
+For the assistant or a local worker, QiYan snapshots the local file as it does today. For an SSH worker, the fixed helper opens the selected file with no-follow semantics, verifies a regular file with `fstat` on that same descriptor, and streams from that descriptor while reporting and verifying size, SHA-256, device, and inode. QiYan promotes the local temporary object only if those checks and the captured session mapping, project identity, and endpoint generation still match. A path swap, symlink replacement, mapping replacement, or reconnect during transfer cannot promote bytes from another object. The existing `send_chat_attachment({"file_handle":"file_def456","caption":"Here is the report."})` operation then delivers the ordinary retained local handle and requires no endpoint-specific behavior.
 
 The reverse flow is:
 
@@ -349,7 +355,7 @@ Errors remain typed and endpoint-scoped. Important categories include:
 - inability to prove idle state for disconnect or restart; and
 - recovery failure.
 
-Errors expose the endpoint ID, failed stage, and actionable next step without returning arbitrary remote output. Logs never contain Telegram or other chat message bodies, attachment contents, bot tokens, Codex credentials, complete SSH configuration, or authentication payloads. Child-process environments are never logged.
+Errors expose the endpoint ID, failed stage, and actionable next step without returning arbitrary remote output. Version errors contain only the parsed numeric version or `unknown`, never the complete App Server user agent. Logs never contain Telegram or other chat message bodies, attachment contents, bot tokens, Codex credentials, complete SSH configuration, complete App Server user agents, or authentication payloads. Child-process environments are never logged.
 
 ## Testing strategy
 
@@ -359,20 +365,21 @@ The ordinary repository suite remains offline and credential-free.
 
 - Strict endpoint-catalog parsing, defaults, unknown fields, and actionable paths.
 - Endpoint normalization with omitted arguments defaulting to `local`.
-- Resolved SSH destination binding and safe rebinding only without managed sessions.
-- SSH argument construction, batch/host-key policy, timeouts, and shell-injection resistance.
+- Resolved SSH destination binding, pinned connection arguments, revalidation on every generation, no binding after failed first activation, and safe rebinding only without managed sessions.
+- SSH argument construction, batch/host-key policy, timeouts, and hostile-path shell-injection resistance including newlines, quotes, substitutions, backticks, leading hyphens, and Unicode.
 - User-configured versus QiYan-owned ControlMaster behavior without SSH-config writes.
 - Consistent `tmux -L qiyan-bot` command construction and proof that no command touches the default tmux server.
 - Local and SSH `WorkspaceHost` contract suites covering canonical identity, safe creation, symlinks, protected roots, and reservation races.
-- Explicit `send_to_session` upload and `prepare_chat_attachment` download, including content reuse, checksum mismatch, interruption cleanup, bounds, traversal, and symlink rejection.
+- Explicit `send_to_session` upload and `prepare_chat_attachment` download, including content reuse, checksum mismatch, interruption cleanup, bounds, traversal, same-descriptor no-follow reads, swap races, generation fencing, and symlink rejection.
 - Lazy endpoint creation, startup activation for managed sessions, generation fencing, backoff, and failure isolation.
-- `disconnect_endpoint` and `restart_endpoint` local/SSH behavior, including active and unprovable-idle rejection.
+- `disconnect_endpoint` and `restart_endpoint` local/SSH behavior, including endpoint-wide admission draining, concurrent-send/transfer rejection, pending reconnect cancellation, active rejection, and unprovable-idle rejection.
+- Local and SSH minimum-version parity, newer-version acceptance, older/malformed rejection, and complete-user-agent redaction.
 - Delivery reconciliation and deduplication across repeated reconnects.
 - Sanitized errors and logs.
 
 ### Docker SSH integration
 
-The existing reusable SSH worker fixture is extended to include `tmux` while keeping authentication external to the image and repository. Deterministic integration tests use a protocol fixture where model execution is unnecessary; opt-in live acceptance uses the authenticated Codex installation.
+The existing reusable SSH worker fixture is extended to include `tmux` while keeping authentication external to the image and repository. Ordinary unit/contract tests remain self-contained and offline. Docker SSH integration is explicitly skipped unless its opt-in environment flag is set and the fixture has been started; opt-in deterministic integration uses a protocol fixture where model execution is unnecessary, and opt-in live acceptance uses the authenticated Codex installation.
 
 Integration coverage proves:
 
@@ -398,7 +405,7 @@ Before implementation is considered complete, `npm run check` must pass and the 
 
 The distributable package adds the endpoint example and remote-worker documentation to its published files. Documentation covers:
 
-- Linux, OpenSSH, Codex auth, and `tmux` prerequisites;
+- Linux, OpenSSH, Node.js, Codex auth, and `tmux` prerequisites;
 - SSH alias and host-trust setup;
 - endpoint catalog format;
 - local-default behavior;
