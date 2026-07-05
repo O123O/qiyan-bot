@@ -18,7 +18,7 @@ import {
 } from "./chat/output-actions.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
-import { SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
+import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
@@ -366,14 +366,14 @@ export async function buildProductionApp(
     {
       name: "subscriptions",
       start: async () => {
-        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), expectedVersion: SUPPORTED_CODEX_VERSION });
+        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION });
         assistantEndpoint = new LocalEndpoint({
           id: "assistant-local",
           codexBinary: config.codexBinary,
           env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
           expectedCodexHome: assistantProfile.codexHome,
           validateEnvironment: () => assistantProfile.assertIntact(),
-          expectedVersion: SUPPORTED_CODEX_VERSION,
+          minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
         pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
         const durableLease = conversations.lease();

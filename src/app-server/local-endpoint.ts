@@ -6,6 +6,7 @@ import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/pro
 import { JsonRpcClient } from "./json-rpc-client.ts";
 import type { RpcRequest } from "./protocol.ts";
 import { APP_VERSION } from "../version.ts";
+import { requireMinimumCodexVersion } from "./version-compat.ts";
 
 export interface PermissionBlockedEvent {
   method: string;
@@ -50,7 +51,7 @@ export class LocalEndpoint {
   private protocolIdentity?: LinuxProcessIdentity;
   private readonly events = new EventEmitter();
 
-  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; expectedVersion?: string; expectedCodexHome?: string; validateEnvironment?: () => Promise<void>; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
+  constructor(private readonly options: { id?: string; codexBinary: string; spawn?: Spawn; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; minimumVersion?: string; expectedCodexHome?: string; validateEnvironment?: () => Promise<void>; resolveMcpClientIdentity?: ResolveMcpClientIdentity }) {
     this.id = options.id ?? "local";
   }
 
@@ -100,10 +101,7 @@ export class LocalEndpoint {
         clientInfo: { name: "qiyan_bot", title: "QiYan Bot", version: APP_VERSION },
         capabilities: { experimentalApi: true },
       });
-      if (this.options.expectedVersion) {
-        const actual = /\/(\d+\.\d+\.\d+)(?:\s|\()/u.exec(initialized.userAgent ?? "")?.[1];
-        if (actual !== this.options.expectedVersion) throw new AppError("UNSUPPORTED_CAPABILITY", `expected Codex app-server ${this.options.expectedVersion}, received ${actual ?? "unknown"}`);
-      }
+      if (this.options.minimumVersion) requireMinimumCodexVersion(initialized.userAgent, this.options.minimumVersion);
       if (this.options.expectedCodexHome) {
         const matches = initialized.codexHome !== undefined
           && await realpath(initialized.codexHome).catch(() => undefined) === this.options.expectedCodexHome;

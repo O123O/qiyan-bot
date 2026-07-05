@@ -57,14 +57,27 @@ test("declines approval requests and emits a blocked event", async () => {
   assert.equal(blocked.length, 1);
 });
 
-test("rejects an app-server version outside the generated protocol pin", async () => {
+test("accepts newer app-server versions and rejects older versions", async () => {
+  const newer = new FakeChild();
+  newer.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+    if (request.method === "initialize") newer.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "codex_app_server/0.143.0-alpha.36" } })}\n`);
+  });
+  const accepted = new LocalEndpoint({ codexBinary: "codex", spawn: () => newer as never, minimumVersion: "0.142.5" });
+  await accepted.start();
+  assert.equal(accepted.state, "ready");
+  await accepted.stop();
+
   const child = new FakeChild();
   child.stdin.on("data", (chunk) => {
     const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
-    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "qiyan_bot/9.9.9 (test)" } })}\n`);
+    if (request.method === "initialize") child.stdout.write(`${JSON.stringify({ id: request.id, result: { userAgent: "codex_app_server/0.142.4 (DO_NOT_LEAK)" } })}\n`);
   });
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, expectedVersion: "0.142.4" });
-  await assert.rejects(endpoint.start(), /expected Codex app-server 0\.142\.4/);
+  const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never, minimumVersion: "0.142.5" });
+  let thrown: unknown;
+  try { await endpoint.start(); } catch (error) { thrown = error; }
+  assert.match(String(thrown), /0\.142\.5 or newer/u);
+  assert.doesNotMatch(String(thrown), /DO_NOT_LEAK/u);
   assert.equal(endpoint.state, "unavailable");
 });
 
