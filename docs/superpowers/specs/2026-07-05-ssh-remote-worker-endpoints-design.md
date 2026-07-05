@@ -125,7 +125,7 @@ An SSH runtime contains separately testable components:
 - a remote App Server supervisor implemented with a private `tmux` socket;
 - an SSH Unix-socket tunnel;
 - an App Server WebSocket transport over the locally forwarded Unix socket;
-- a packaged, digest-verified Node.js helper for fixed remote Linux filesystem and process operations; and
+- packaged, digest-verified helper and App Server launcher assets for fixed remote Linux filesystem and process operations; and
 - streaming remote worker-file transfer operations.
 
 Codex documents Unix-socket App Server listeners through `codex app-server --listen unix:///absolute/path.sock`. The socket uses the App Server's WebSocket framing without opening a network listener. The SSH implementation converts those frames to the same request and notification abstractions used by the local JSONL transport.
@@ -146,7 +146,7 @@ The first release is connect-only. A usable remote host has:
 
 The backend uses batch mode, no PTY for control and transfer channels, strict host-key checking, and bounded connection timeouts. It never uses `accept-new`, edits `~/.ssh/config`, writes `known_hosts`, initiates login, or copies credentials. The user may perform those actions directly or ask QiYan to do them with normal shell tools outside backend policy.
 
-QiYan stages only its versioned helper in the endpoint's private runtime directory and verifies its SHA-256 before use. Remote operations invoke that helper with a fixed operation name and bounded base64url data arguments. Endpoint hashes, numeric IDs, and other command tokens use strict allowlists. User paths, project names, attachment names, and shell fragments never enter an SSH remote-command or tmux shell-command string. The helper decodes data and uses Node.js filesystem and child-process APIs without a shell.
+QiYan stages only its versioned helper and fixed App Server launcher in the endpoint's private runtime directory and verifies their SHA-256 before use. Remote operations invoke the helper with a fixed operation name and bounded base64url data arguments. Endpoint hashes, numeric IDs, and other command tokens use strict allowlists. User paths, project names, attachment names, and shell fragments never enter an SSH remote-command or tmux shell-command string. The helper decodes data and uses Node.js filesystem and child-process APIs without a shell.
 
 The checked-in App Server types remain generated reproducibly from Codex `0.142.5`, but runtime compatibility is not an exact package pin. Codex `0.142.5` is the minimum supported version for both local and SSH worker App Servers. Initialization accepts the same numeric release or any newer numeric release, including a newer release with a prerelease/build suffix, and rejects an older or unparseable version with a clear compatibility error. Required App Server behavior is still validated through initialization and capability calls. This lets users update Codex normally without forcing a matching QiYan release while preserving a defined lower compatibility boundary.
 
@@ -175,9 +175,9 @@ tmux -L qiyan-bot -f /dev/null list-sessions
 
 Normal `tmux ls` uses the user's default socket and cannot see or modify QiYan's alternate server. The user can deliberately inspect it with `tmux -L qiyan-bot -f /dev/null list-sessions`. Every backend tmux command uses both the alternate socket label and `-f /dev/null`, so user tmux options, hooks, and `destroy-unattached` cannot alter the persistent runtime. QiYan stops only its endpoint session and never issues `kill-server` against the user's default tmux server.
 
-Each endpoint uses a deterministic, safely encoded session name and a short private App Server runtime path. The App Server runtime directory is mode 0700 and its socket is owner-only. Every App Server launch also creates a cryptographically random incarnation token and records the supervisor PID plus Linux process start time atomically in a mode-0600 metadata file. Reconnecting the tunnel reads the same attested incarnation; a restart, reboot, or replacement process necessarily has a different identity even though the tmux session and socket names are deterministic. The first release assumes one QiYan deployment manages the `qiyan-bot` tmux server for a given remote operating-system account.
+Each endpoint uses a deterministic, safely encoded session name and a short private App Server runtime path. The App Server runtime directory is mode 0700 and its socket is owner-only. Every launch receives a cryptographically random incarnation token. The fixed launcher atomically records the launcher's PID, Linux process start time, and process-group ID in a mode-0600 metadata file, then `exec`s the resolved Codex executable so that PID becomes the actual App Server process. Reconnecting the tunnel reads the same attested incarnation; a restart, reboot, or replacement process necessarily has a different identity even though the tmux session and socket names are deterministic. The first release assumes one QiYan deployment manages the `qiyan-bot` tmux server for a given remote operating-system account.
 
-The tmux session starts the user's validated absolute login shell with `-lc` and a fully fixed command containing only allowlisted runtime paths and encoded data. The login shell supplies login-only `PATH`, `CODEX_HOME`, and provider configuration, then `exec`s the fixed QiYan helper. The helper starts `codex` without a shell:
+The tmux session starts the user's validated absolute login shell with `-lc` and a fully fixed command containing only allowlisted runtime paths and encoded data. The login shell supplies login-only `PATH`, `CODEX_HOME`, and provider configuration, then `exec`s the fixed launcher. The launcher resolves and validates `codex`, writes the incarnation metadata, and `exec`s it:
 
 ```text
 codex app-server --listen unix://<private-runtime>/app-server.sock
@@ -199,7 +199,7 @@ When activating an SSH endpoint, the backend:
 8. restores managed subscriptions and reconciles session state; and
 9. records or replaces the destination binding only after successful activation and only when registry references permit it.
 
-If the dedicated tmux session exists but its App Server socket remains unhealthy after a bounded startup grace period, QiYan reports the runtime as unhealthy. It does not automatically kill a process that may still contain active work.
+If the dedicated tmux session exists but its App Server socket remains unhealthy after a bounded startup grace period, QiYan reports the runtime as unhealthy. It does not automatically kill a process that may still contain active work. A missing tmux session or launcher PID is also insufficient to prove runtime loss if the recorded process group still contains a live process. QiYan emits `runtime-lost`, removes a stale socket, or releases turn capacity only after the attested PID/start-time and process group prove no App Server descendant remains. Explicit idle-proven shutdown signals the owned process group, waits for bounded exit, escalates to `SIGKILL`, and verifies it is empty.
 
 ### Connection loss
 
@@ -210,6 +210,8 @@ While managed sessions reference the endpoint and the endpoint is in the automat
 An explicit disconnect first changes the desired state to disconnected and cancels any scheduled reconnect before stopping the runtime. A stale timer or callback cannot recreate it. The disconnected state ends only when a later endpoint operation explicitly requests readiness or startup recovery activates a still-managed endpoint.
 
 Ordinary QiYan shutdown closes local tunnels but leaves remote App Servers running. On the next QiYan start, every SSH endpoint referenced by a managed session is reconnected automatically. Unused catalog endpoints remain dormant.
+
+Before chat adapters accept new work on startup, QiYan reads every managed thread on reconnected endpoints and rebuilds global turn-capacity claims for all authoritative nonterminal turns, including turns started outside the new process. Restored claims deduplicate by endpoint/thread/turn and may conservatively exceed a newly lowered configured limit; they block new starts until terminal history releases enough capacity. This cold-start reconstruction is separate from in-process connection-loss reconciliation.
 
 If the remote host rebooted or the private tmux session genuinely disappeared, QiYan starts a new App Server and resumes persisted native threads from the remote Codex store. It never replays an uncertain user operation automatically.
 

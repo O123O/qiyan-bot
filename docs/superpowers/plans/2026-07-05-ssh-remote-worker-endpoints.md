@@ -29,6 +29,7 @@ New focused units:
 - `src/endpoints/workspace-router.ts` — endpoint-aware routing into the shared project workspace policy.
 - `src/endpoints/worker-file-bridge.ts` — explicit `send_to_session` upload and `prepare_chat_attachment` download only.
 - `assets/remote/qiyan-ssh-helper.mjs` — fixed digest-verified remote helper for no-shell process/filesystem operations and descriptor-safe transfers.
+- `assets/remote/qiyan-app-server-launcher.sh` — fixed digest-verified login-environment launcher that records and then execs the actual App Server process.
 - `src/app-server/rpc-client.ts` — transport-neutral JSON-RPC peer.
 - `src/app-server/jsonl-wire.ts` — current JSONL stream framing.
 - `src/app-server/websocket-wire.ts` — WebSocket framing over a Unix socket.
@@ -380,6 +381,15 @@ test("connection loss retains active and provisional capacity until authoritativ
   pool.markTurnTerminal(active.endpointId, active.threadId, "turn-a");
   assert.equal(pool.activeTurnCount, 0);
 });
+
+test("cold recovery restores observed active turns even above the configured limit", () => {
+  const pool = fixturePool({ maxConcurrentTurns: 1 });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
+  pool.restoreObservedActiveTurn("devbox", "thread-b", "turn-b");
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
+  assert.equal(pool.activeTurnCount, 2);
+  assert.throws(() => pool.claimTurnCapacity("local", "thread-c", "new"), /at most 1 turn/u);
+});
 ```
 
 - [ ] **Step 2: Run pool tests and verify RED**
@@ -393,7 +403,7 @@ Expected: FAIL because the endpoint lifecycle contract and resolver are absent.
 ```ts
 export type RuntimeIdentity =
   | { kind: "local"; pid: number; startTime: string }
-  | { kind: "ssh"; token: string; pid: number; linuxStartTime: string };
+  | { kind: "ssh"; token: string; pid: number; linuxStartTime: string; processGroupId: number };
 
 export type EndpointLossKind = "connection-lost" | "runtime-lost";
 
@@ -424,6 +434,7 @@ Make `AppServerPool.request()` await a deduplicated resolver/start promise. Exis
 - `connection-lost` retains every active and provisional claim plus terminal-before-start evidence;
 - provisional claims retain their exact `clientUserMessageId` correlation; `startTurn` generates and sends an opaque capacity-correlation ID when a caller did not supply one, so no dispatched start is unreconcilable;
 - `reconcileEndpointClaims(endpointId)` reads full authoritative histories after reconnect, binds matching provisional starts, retains active/incomplete claims, and releases a claim exactly once only for a terminal turn or a full-idle proof that its client message is absent.
+- `restoreObservedActiveTurn(endpointId, threadId, turnId)` rebuilds a deterministic active claim from cold-start history, deduplicates by endpoint/thread/turn, and deliberately bypasses the admission ceiling for already-running work; `claims.size >= maxConcurrentTurns` still rejects every new claim until enough recovered turns finish.
 
 Test active and provisional claims across tunnel loss, incomplete reconnect history, later terminal/absent proof, repeated reconciliation, and one capacity-available signal.
 
@@ -507,6 +518,7 @@ git commit -m "feat: add strict SSH connection planning"
 ## Task 6: Detached tmux runtime, Unix-socket tunnel, and SSH endpoint
 
 **Files:**
+- Create: `assets/remote/qiyan-app-server-launcher.sh`
 - Create: `assets/remote/qiyan-ssh-helper.mjs`
 - Create: `src/endpoints/ssh-runtime.ts`
 - Create: `src/endpoints/ssh-endpoint.ts`
@@ -568,7 +580,7 @@ Expected: FAIL because the supervisor does not exist.
 
 - [ ] **Step 3: Write failing helper and command-safety tests**
 
-Test the packaged helper digest, owner-only staging, fixed operation allowlist, bounded base64url argument codec, and commands containing only fixed ASCII tokens. Exercise paths containing newline, single/double quotes, `$()`, backticks, a leading `-`, spaces, and Unicode. Assert each value round-trips only after helper decoding and that none appears literally in any SSH remote-command or tmux shell-command string.
+Test both packaged asset digests, owner-only staging, fixed operation allowlist, bounded base64url argument codec, and commands containing only fixed ASCII tokens. Exercise paths containing newline, single/double quotes, `$()`, backticks, a leading `-`, spaces, and Unicode. Assert each value round-trips only after helper decoding and that none appears literally in any SSH remote-command or tmux shell-command string.
 
 For the download operation, inject a path replacement after initial containment validation and before helper open. Prove the helper uses `O_NOFOLLOW`, `fstat`s and streams the same descriptor, reports device/inode/size/SHA-256, and refuses symlinks, non-regular files, or a changed object.
 
@@ -588,11 +600,11 @@ tmux -L qiyan-bot -f /dev/null new-session -d -s <encoded-session> <fixed-login-
 tmux -L qiyan-bot -f /dev/null kill-session -t <encoded-session>
 ```
 
-Preflight proves Linux, Node.js, required core utilities, `tmux`, remote login-shell `codex`, normalized home/uid, and an absolute executable login shell whose path matches a strict safe-token allowlist. Bootstrap `assets/remote/qiyan-ssh-helper.mjs` into the private runtime directory with mode 0700 and verify the packaged SHA-256 before each new runtime generation. The only remote command form is a fixed helper/bootstrap operation plus strictly validated ASCII operation names, hex/decimal IDs, or bounded base64url arguments. The helper decodes paths as data and uses Node filesystem/child-process APIs with `shell: false`.
+Preflight proves Linux, Node.js, required core utilities, `tmux`, remote login-shell `codex`, normalized home/uid, and an absolute executable login shell whose path matches a strict safe-token allowlist. Bootstrap `assets/remote/qiyan-ssh-helper.mjs` and `assets/remote/qiyan-app-server-launcher.sh` into the private runtime directory with mode 0700 and verify their packaged SHA-256 values before each new runtime generation. The only remote command form is a fixed helper/bootstrap operation plus strictly validated ASCII operation names, hex/decimal IDs, or bounded base64url arguments. The helper decodes paths as data and uses Node filesystem/child-process APIs with `shell: false`.
 
-Make `<fixed-login-shell-launcher>` concrete: the validated login-shell path runs with `-lc`; its fixed command contains only `exec node`, the allowlisted private helper path, the `run-app-server` operation, and encoded arguments. The login shell therefore loads login-only `PATH`, `CODEX_HOME`, provider settings, and Codex configuration before the helper uses `spawn("codex", args, {shell:false, env:process.env})`. No decoded value or profile-derived environment value is inserted into the shell command.
+Make `<fixed-login-shell-launcher>` concrete: the validated login-shell path runs with `-lc`; its fixed command contains only `exec`, the allowlisted private launcher path, a locally generated 128-bit hex token, and encoded runtime paths. The login shell therefore loads login-only `PATH`, `CODEX_HOME`, provider settings, and Codex configuration. The fixed launcher resolves `command -v codex`, requires an absolute executable safe path, atomically writes `{kind:"ssh",token,pid:$$,linuxStartTime,processGroupId}` as mode 0600, and then `exec`s that exact Codex path with fixed App Server arguments. The PID/start time in the identity therefore belongs to the actual App Server, not a parent helper. No decoded value or profile-derived environment value is inserted into the tmux shell command.
 
-At launch, the helper creates a random 128-bit incarnation token, records `{kind:"ssh",token,pid,linuxStartTime}` atomically as mode 0600, starts the resolved Codex executable without a shell, and remains the tmux-supervised parent. `runtimeIdentity()` validates the metadata against `/proc/<pid>/stat`; deterministic tmux/socket names are never treated as incarnation identity. Never use the tmux pane for RPC. Remove an App Server socket or stale metadata only after `has-session` proves the owned session absent.
+`runtimeIdentity()` validates the launcher metadata against `/proc/<pid>/stat` and the recorded process group; deterministic tmux/socket names are never treated as incarnation identity. A missing tmux session or leader with any live member in the attested group is `connection-lost`/unhealthy, never `runtime-lost`. Explicit shutdown signals the exact owned process group, waits a bounded grace period, escalates to `SIGKILL`, and proves no matching descendant remains. Only that empty-group proof permits `runtime-lost`, stale socket/metadata removal, or capacity release. Never use the tmux pane for RPC.
 
 - [ ] **Step 6: Write failing endpoint reconnect tests**
 
@@ -601,8 +613,10 @@ Use a fake WebSocket wire and tunnel process to prove:
 - first start launches tmux then tunnel;
 - tunnel loss marks only the connection unavailable;
 - unexpected tunnel/WebSocket loss emits `connection-lost`, while an attested missing supervisor emits `runtime-lost`;
-- reconnect uses the same attested `{kind:"ssh",token,pid,linuxStartTime}` identity;
+- reconnect uses the same attested `{kind:"ssh",token,pid,linuxStartTime,processGroupId}` identity;
 - runtime restart or simulated reboot returns a different identity despite identical tmux/socket names;
+- killing the tmux session performs bounded process-group termination and leaves no App Server descendant;
+- killing only the recorded leader while an attested group member remains never emits `runtime-lost`, removes the socket, or releases capacity;
 - `closeConnection()` leaves tmux alive;
 - `shutdownRuntime()` kills only the endpoint session;
 - an existing but unhealthy session is never killed automatically;
@@ -630,7 +644,7 @@ Run: `npm test -- tests/endpoints/ssh-helper.test.ts tests/endpoints/ssh-runtime
 Expected: PASS.
 
 ```bash
-git add assets/remote/qiyan-ssh-helper.mjs src/endpoints/ssh-runtime.ts src/endpoints/ssh-endpoint.ts tests/endpoints/ssh-helper.test.ts tests/endpoints/ssh-runtime.test.ts tests/endpoints/ssh-endpoint.test.ts
+git add assets/remote/qiyan-app-server-launcher.sh assets/remote/qiyan-ssh-helper.mjs src/endpoints/ssh-runtime.ts src/endpoints/ssh-endpoint.ts tests/endpoints/ssh-helper.test.ts tests/endpoints/ssh-runtime.test.ts tests/endpoints/ssh-endpoint.test.ts
 git commit -m "feat: run persistent SSH app servers"
 ```
 
@@ -780,7 +794,7 @@ Add concrete `SessionService` and `SessionLifecycle` races: pause an already-adm
 
 - [ ] **Step 2: Run workspace tests and verify RED**
 
-Run: `npm test -- tests/sessions/project-workspace.test.ts tests/endpoints/ssh-host.test.ts`
+Run: `npm test -- tests/sessions/project-workspace.test.ts tests/endpoints/ssh-host.test.ts tests/sessions/lifecycle.test.ts tests/sessions/service.test.ts`
 
 Expected: FAIL because workspace effects are still hard-coded to Node filesystem APIs.
 
@@ -980,6 +994,8 @@ Test these exact behaviors with fake local and SSH endpoints:
 - local and assistant start remain mandatory;
 - catalog-only remote entries are not started;
 - referenced remote endpoints start before managed-session reconciliation;
+- a cold process start with an empty pool rebuilds claims for every authoritative nonterminal managed turn before chat adapters accept work;
+- recovered active turns deduplicate and may exceed a newly lowered configured limit, blocking new claims until enough turns become terminal;
 - one remote failure leaves QiYan/local/other remotes healthy and marks only its sessions unavailable;
 - dynamic remote notifications use the correct endpoint ID and generation;
 - SSH `connection-lost` retains active and provisional capacity claims while local/proven `runtime-lost` preserves current cleanup behavior;
@@ -996,6 +1012,14 @@ test("startup isolates an unavailable referenced SSH endpoint", async () => {
   assert.equal(app.remote("healthy").state, "ready");
   assert.equal(app.runtimeSession("offline-worker").managementState, "unavailable");
 });
+
+test("cold startup restores surviving remote capacity before accepting input", async () => {
+  const app = fixtureProduction({ maxConcurrentTurns: 1, remoteHistory: activeTurns(2) });
+  await app.start();
+  assert.equal(app.pool.activeTurnCount, 2);
+  assert.equal(app.chatAdapters.startedAfterCapacityRecovery, true);
+  assert.throws(() => app.pool.claimTurnCapacity("local", "thread-new", "new"), /at most 1 turn/u);
+});
 ```
 
 - [ ] **Step 2: Run production tests and verify RED**
@@ -1010,7 +1034,7 @@ Replace the single project `endpoint` variable with `localEndpoint` plus `Endpoi
 
 Generalize unavailable/reconnect handlers to `ManagedAppServerEndpoint` and pass their typed `EndpointLossKind` into the pool; keep assistant recovery separate. Remove the `session.endpoint === local` filter from managed-session recovery. Group registry sessions by endpoint, activate each endpoint, reconcile successes, and warn failures without throwing application startup.
 
-After a connection returns, call `AppServerPool.reconcileEndpointClaims` before normal capacity wakeup and then use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
+On cold startup, keep chat adapters stopped until referenced endpoint activation and managed-session reconciliation have returned authoritative histories. For every nonterminal turn in those histories, call `restoreObservedActiveTurn`; this rebuild is idempotent and may place the pool above its configured maximum. Then start input adapters. After an in-process connection returns, call `AppServerPool.reconcileEndpointClaims` before normal capacity wakeup. In both paths, use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
 
 - [ ] **Step 4: Run production tests and commit**
 
@@ -1100,7 +1124,7 @@ git commit -m "test: exercise persistent SSH endpoints"
 
 - [ ] **Step 1: Write failing documentation/package tests**
 
-Assert documentation contains Linux/OpenSSH/Node.js/Codex-auth/tmux prerequisites, strict trust ownership, catalog example, built-in local default, `tmux -L qiyan-bot` inspection, `disconnect_endpoint`, `restart_endpoint`, explicit attachment flows, remote project roots, and recovery behavior. Assert `npm pack --dry-run --json` includes `assets/endpoints.example.jsonc`, the fixed `assets/remote/qiyan-ssh-helper.mjs`, and `docs/ssh-workers.md` but no SSH keys, auth, runtime sockets, `.tmp`, or endpoint catalog.
+Assert documentation contains Linux/OpenSSH/Node.js/Codex-auth/tmux prerequisites, strict trust ownership, catalog example, built-in local default, `tmux -L qiyan-bot` inspection, `disconnect_endpoint`, `restart_endpoint`, explicit attachment flows, remote project roots, and recovery behavior. Assert `npm pack --dry-run --json` includes `assets/endpoints.example.jsonc`, fixed `assets/remote/qiyan-ssh-helper.mjs`, fixed `assets/remote/qiyan-app-server-launcher.sh`, and `docs/ssh-workers.md` but no SSH keys, auth, runtime sockets, `.tmp`, or endpoint catalog.
 
 - [ ] **Step 2: Run docs/package tests and verify RED**
 
@@ -1168,6 +1192,8 @@ git commit -m "docs: add SSH worker setup"
 - [ ] A dropped SSH tunnel does not stop the remote App Server or active turn.
 - [ ] Reconnection uses the same remote process and reconciles each worker final once through the existing durable delivery cursor.
 - [ ] Attested runtime incarnation is stable across tunnel reconnect and changes across restart/reboot even when deterministic tmux/socket names are reused.
+- [ ] Runtime loss and stale cleanup require the attested App Server PID/process group to be empty; explicit shutdown terminates and verifies the whole group without orphaning Codex.
+- [ ] Cold startup rebuilds capacity from authoritative active managed turns before accepting input, including recovered counts above the configured limit.
 - [ ] Remote reboot/process loss starts a new App Server and resumes native threads.
 - [ ] Every backend tmux command uses `tmux -L qiyan-bot -f /dev/null`; normal tmux and user tmux configuration remain untouched.
 - [ ] Host trust, package installation, and authentication remain user-owned.
