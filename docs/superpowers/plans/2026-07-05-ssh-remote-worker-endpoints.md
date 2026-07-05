@@ -21,6 +21,7 @@ New focused units:
 - `src/endpoints/binding-store.ts` — SQLite-backed resolved SSH destination binding.
 - `src/endpoints/admission-gate.ts` — endpoint-scoped work leases and atomic drain fencing for lifecycle operations.
 - `src/endpoints/manager.ts` — built-in local endpoint, lazy SSH runtime creation, startup activation, disconnect, restart, and generation events.
+- `src/endpoints/capacity-recovery.ts` — rebuild conservative remote turn-capacity claims from durable runtime and operation hints before ingress.
 - `src/endpoints/ssh-process.ts` — bounded child-process runner and redacted failure mapping.
 - `src/endpoints/ssh-config.ts` — `ssh -G` parsing, strict common options, and ControlMaster selection.
 - `src/endpoints/ssh-host.ts` — fixed Linux remote filesystem commands and streaming transfer primitives.
@@ -435,6 +436,7 @@ Make `AppServerPool.request()` await a deduplicated resolver/start promise. Exis
 - provisional claims retain their exact `clientUserMessageId` correlation; `startTurn` generates and sends an opaque capacity-correlation ID when a caller did not supply one, so no dispatched start is unreconcilable;
 - `reconcileEndpointClaims(endpointId)` reads full authoritative histories after reconnect, binds matching provisional starts, retains active/incomplete claims, and releases a claim exactly once only for a terminal turn or a full-idle proof that its client message is absent.
 - `restoreObservedActiveTurn(endpointId, threadId, turnId)` rebuilds a deterministic active claim from cold-start history, deduplicates by endpoint/thread/turn, and deliberately bypasses the admission ceiling for already-running work; `claims.size >= maxConcurrentTurns` still rejects every new claim until enough recovered turns finish.
+- `restoreProvisionalTurnCapacity(endpointId, threadId, claimId, clientUserMessageId)` rebuilds a durable unresolved start hint, deduplicates by stable operation claim ID, bypasses the ceiling conservatively, and is later bound or released by `reconcileEndpointClaims`.
 
 Test active and provisional claims across tunnel loss, incomplete reconnect history, later terminal/absent proof, repeated reconciliation, and one capacity-available signal.
 
@@ -898,6 +900,8 @@ export interface WorkerFileBridge {
 
 Uploads do not acquire a second lease. Extend `SessionService.send` with a `prepareInput({session, projectRoot, lease})` callback executed inside the exact mapping's outer `session-mutation` lease from Task 8. Production resolves each selected attachment through `toWorkerInput` using that same lease and mapping. After preparation, `SessionService` rechecks the mapping/project and passes the same lease into `startTurn` or `turn/steer`; the pool validates its still-current endpoint generation. This one fence spans attachment upload and dispatch.
 
+Also add an `onBeforeNativeDispatch` callback inside that fence, after the final mapping/generation checks and immediately before the App Server call. For `mode:"start"`, production durably checkpoints a strict non-secret capacity hint `{phase:"provisional-start",endpoint,threadId,mappingId,clientUserMessageId}` while preserving pending-settings fields. If checkpointing fails, do not dispatch. This creates no false negative: a crash before the hint means native dispatch did not begin; a crash after it may restore a conservative provisional claim. For steer, retain the existing exact target-turn checkpoint instead of creating a second turn claim.
+
 Local delegates to `AttachmentStore.toUserInput` and `prepareOutbound`. SSH upload uses `openForUpload` and the fixed helper to create an owner-only temporary regular file, stream from the retained descriptor, verify size/SHA-256, and atomically rename to a content-addressed private staging path.
 
 SSH download first applies project containment policy, then asks the fixed helper to open with `O_RDONLY | O_NOFOLLOW`, require a regular file with `fstat`, and stream from that same descriptor. Use a bounded frame containing initial device/inode/size metadata, exactly that many bytes, and a final SHA-256 plus second `fstat`; reject identity, size, timestamp, or digest changes. Ingest into a non-promoted local temporary object. Immediately before promotion, recheck the exact registry mapping/project and endpoint generation captured at start. Any mismatch, interruption, or path swap removes temporary state. Keep existing operation/turn attachment holds unchanged.
@@ -941,6 +945,8 @@ test("restart_endpoint checkpoints phases and refuses an active worker", async (
 
 Add crash-recovery cases at `draining`, `idle_proven`, `runtime_stopped`, and `runtime_started`. Use identical deterministic tmux/socket names with different attested incarnation tokens to prove recovery never confuses a replacement runtime with the checkpointed one. Add an explicit-disconnect case with a pending reconnect timer and prove recovery leaves no stale timer capable of recreating the stopped runtime.
 
+For recovered `send_to_session`, strictly parse the optional capacity hint written in Task 9. Reject unknown fields or malformed identities. A valid provisional-start hint is available to production's pre-dispatch capacity restoration before this operation's normal authoritative reconciliation; the operation reconciler must preserve the same client-message correlation and never create a second claim.
+
 - [ ] **Step 2: Run tool tests and verify RED**
 
 Run: `npm test -- tests/assistant/tools.test.ts tests/assistant/policy.test.ts tests/production-app.test.ts`
@@ -978,11 +984,13 @@ git commit -m "feat: expose endpoint lifecycle tools"
 ## Task 11: Production composition, dynamic subscriptions, and recovery
 
 **Files:**
+- Create: `src/endpoints/capacity-recovery.ts`
 - Modify: `src/production-app.ts`
 - Modify: `src/events/relay.ts`
 - Modify: `src/assistant/session-observations.ts`
 - Modify: `src/config.ts`
 - Test: `tests/production-startup.test.ts`
+- Test: `tests/endpoints/capacity-recovery.test.ts`
 - Test: `tests/production-app.test.ts`
 - Test: `tests/events/relay.test.ts`
 - Test: `tests/assistant/session-dashboard-notifications.test.ts`
@@ -996,6 +1004,7 @@ Test these exact behaviors with fake local and SSH endpoints:
 - referenced remote endpoints start before managed-session reconciliation;
 - a cold process start with an empty pool rebuilds claims for every authoritative nonterminal managed turn before chat adapters accept work;
 - recovered active turns deduplicate and may exceed a newly lowered configured limit, blocking new claims until enough turns become terminal;
+- an unavailable SSH endpoint with a durable last-known active turn and a separate provisional-start operation still lets QiYan start but reserves both claims before the internal scheduler/dispatcher and chat ingress;
 - one remote failure leaves QiYan/local/other remotes healthy and marks only its sessions unavailable;
 - dynamic remote notifications use the correct endpoint ID and generation;
 - SSH `connection-lost` retains active and provisional capacity claims while local/proven `runtime-lost` preserves current cleanup behavior;
@@ -1020,11 +1029,25 @@ test("cold startup restores surviving remote capacity before accepting input", a
   assert.equal(app.chatAdapters.startedAfterCapacityRecovery, true);
   assert.throws(() => app.pool.claimTurnCapacity("local", "thread-new", "new"), /at most 1 turn/u);
 });
+
+test("unavailable remote durable hints reserve capacity before all ingress", async () => {
+  const app = fixtureProduction({
+    maxConcurrentTurns: 1,
+    unavailableEndpoints: ["offline"],
+    persistedActiveTurns: [{ endpoint: "offline", threadId: "t1", turnId: "turn-1" }],
+    recoverableSends: [{ operationId: "op-2", hint: provisionalHint("offline", "t2", "message-2") }],
+  });
+  await app.start();
+  assert.equal(app.health, "running");
+  assert.equal(app.pool.activeTurnCount, 2);
+  assert.equal(app.internalDispatcher.startedAfterCapacityRecovery, true);
+  assert.equal(app.chatAdapters.startedAfterCapacityRecovery, true);
+});
 ```
 
 - [ ] **Step 2: Run production tests and verify RED**
 
-Run: `npm test -- tests/production-startup.test.ts tests/production-app.test.ts tests/events/relay.test.ts tests/assistant/session-dashboard-notifications.test.ts`
+Run: `npm test -- tests/endpoints/capacity-recovery.test.ts tests/production-startup.test.ts tests/production-app.test.ts tests/events/relay.test.ts tests/assistant/session-dashboard-notifications.test.ts`
 
 Expected: FAIL because production still assumes one project endpoint.
 
@@ -1034,16 +1057,18 @@ Replace the single project `endpoint` variable with `localEndpoint` plus `Endpoi
 
 Generalize unavailable/reconnect handlers to `ManagedAppServerEndpoint` and pass their typed `EndpointLossKind` into the pool; keep assistant recovery separate. Remove the `session.endpoint === local` filter from managed-session recovery. Group registry sessions by endpoint, activate each endpoint, reconcile successes, and warn failures without throwing application startup.
 
-On cold startup, keep chat adapters stopped until referenced endpoint activation and managed-session reconciliation have returned authoritative histories. For every nonterminal turn in those histories, call `restoreObservedActiveTurn`; this rebuild is idempotent and may place the pool above its configured maximum. Then start input adapters. After an in-process connection returns, call `AppServerPool.reconcileEndpointClaims` before normal capacity wakeup. In both paths, use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
+Implement `restoreDurableEndpointCapacity` before any internal scheduler, assistant dispatcher, or chat adapter starts. It iterates current managed remote mappings and restores every non-null `RuntimeStore.activeTurn` as an observed active claim. It then scans `OperationStore.listRecoverable()` for `send_to_session` records with a strictly valid provisional-start capacity hint, restores one provisional claim keyed by operation ID, and adds its endpoint to startup activation even if no current mapping references it. It stores no message text or attachment data. Missing/malformed hints are ignored only when native dispatch was never checkpointed; an invalid present hint is quarantined as an operation recovery error.
+
+After conservative seeding, activate the union of registry and capacity-hint endpoints. For successfully reconnected endpoints, managed-session reconciliation returns authoritative histories; call `restoreObservedActiveTurn` for every nonterminal turn and `reconcileEndpointClaims` to bind/release seeded hints. For unavailable endpoints, retain hints while allowing application startup to continue. Only after this phase starts the internal scheduler/assistant dispatcher and chat adapters. Recovered claims may place the pool above its configured maximum. After an in-process connection returns, call `reconcileEndpointClaims` before normal capacity wakeup. In both paths, use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
 
 - [ ] **Step 4: Run production tests and commit**
 
-Run: `npm test -- tests/production-startup.test.ts tests/production-app.test.ts tests/events/relay.test.ts tests/assistant/session-dashboard-notifications.test.ts tests/integration/mcp-assistant.test.ts`
+Run: `npm test -- tests/endpoints/capacity-recovery.test.ts tests/production-startup.test.ts tests/production-app.test.ts tests/events/relay.test.ts tests/assistant/session-dashboard-notifications.test.ts tests/integration/mcp-assistant.test.ts`
 
 Expected: PASS.
 
 ```bash
-git add src/production-app.ts src/events/relay.ts src/assistant/session-observations.ts src/config.ts tests/production-startup.test.ts tests/production-app.test.ts tests/events tests/assistant/session-dashboard-notifications.test.ts
+git add src/endpoints/capacity-recovery.ts src/production-app.ts src/events/relay.ts src/assistant/session-observations.ts src/config.ts tests/endpoints/capacity-recovery.test.ts tests/production-startup.test.ts tests/production-app.test.ts tests/events tests/assistant/session-dashboard-notifications.test.ts
 git commit -m "feat: recover managed SSH endpoints"
 ```
 
@@ -1194,6 +1219,7 @@ git commit -m "docs: add SSH worker setup"
 - [ ] Attested runtime incarnation is stable across tunnel reconnect and changes across restart/reboot even when deterministic tmux/socket names are reused.
 - [ ] Runtime loss and stale cleanup require the attested App Server PID/process group to be empty; explicit shutdown terminates and verifies the whole group without orphaning Codex.
 - [ ] Cold startup rebuilds capacity from authoritative active managed turns before accepting input, including recovered counts above the configured limit.
+- [ ] An unavailable remote restores last-known active and checkpointed provisional-start claims before internal/chat ingress and retains them until authoritative reconciliation.
 - [ ] Remote reboot/process loss starts a new App Server and resumes native threads.
 - [ ] Every backend tmux command uses `tmux -L qiyan-bot -f /dev/null`; normal tmux and user tmux configuration remain untouched.
 - [ ] Host trust, package installation, and authentication remain user-owned.
