@@ -13,9 +13,9 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
-  const beforeInstall = readme.slice(0, firstInstall);
-  assert.match(beforeInstall, /digest/iu);
-  assert.match(beforeInstall, /test -n "\$digest"/u);
+  assert.match(readme, /npm install --global --prefix "\$HOME\/\.local"[\s\\]+https:\/\/github\.com\/O123O\/qiyan-bot\/releases\/latest\/download\/qiyan-bot\.tgz/iu);
+  assert.doesNotMatch(readme, /workdir=\$\(mktemp|sha256sum --check/iu);
+  assert.match(readme, /manual digest verification.*installation guide/iu);
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
   for (const expected of [
     "docs/installation.md",
