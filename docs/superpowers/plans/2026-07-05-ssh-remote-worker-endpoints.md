@@ -121,11 +121,20 @@ Add `endpointCatalogPath: join(qiyanHome, "endpoints.json")` and `endpointBindin
 ```ts
 test("rejects a destination change while managed mappings reference the endpoint", () => {
   const store = new EndpointBindingStore(db);
-  store.verifyOrBind("devbox", { hostname: "one", user: "xin", port: 22 }, false);
+  const first = { hostname: "one", user: "xin", port: 22 };
+  store.checkExisting("devbox", first, false);
+  assert.equal(store.get("devbox"), undefined);
+  store.commitAfterActivation("devbox", first, false);
   assert.throws(
-    () => store.verifyOrBind("devbox", { hostname: "two", user: "xin", port: 22 }, true),
+    () => store.checkExisting("devbox", { hostname: "two", user: "xin", port: 22 }, true),
     (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_IDENTITY_CHANGED",
   );
+});
+
+test("read-only validation never binds a failed first activation", () => {
+  const store = new EndpointBindingStore(db);
+  store.checkExisting("devbox", { hostname: "one", user: "xin", port: 22 }, false);
+  assert.equal(store.get("devbox"), undefined);
 });
 ```
 
@@ -147,7 +156,15 @@ CREATE TABLE endpoint_bindings (
 );
 ```
 
-The store hashes `hostname\0user\0port`, never stores complete SSH configuration, permits the first binding, accepts the same binding, rejects a change while the registry reports references, and replaces it only when there are no managed or transitional mappings.
+The store hashes `hostname\0user\0port` and never stores complete SSH configuration. Expose separate APIs:
+
+```ts
+checkExisting(endpointId: string, destination: SshDestination, hasReferences: boolean): void;
+commitAfterActivation(endpointId: string, destination: SshDestination, hasReferences: boolean): void;
+get(endpointId: string): { destinationSha256: string } | undefined;
+```
+
+`checkExisting` is read-only: an absent binding passes, the same binding passes, a change with managed/transitional references fails before any connection, and a change without references is eligible but not written. `commitAfterActivation` runs in a serialized SQLite transaction after successful App Server/account preflight, repeats the same conflict rules against current state, and inserts/replaces only then. Thus failed first activation writes nothing, while a referenced endpoint is never contacted at a changed destination.
 
 - [ ] **Step 7: Run focused tests and commit**
 
@@ -352,6 +369,17 @@ test("a replacement generation ignores stale endpoint callbacks", async () => {
   first.emitUnavailable();
   assert.equal(pool.endpointGeneration("devbox").endpoint, second);
 });
+
+test("connection loss retains active and provisional capacity until authoritative reconciliation", async () => {
+  const active = pool.restoreTurnCapacityClaim("devbox", "thread-a", "active", { phase: "active", turnId: "turn-a" });
+  await pool.startTurn("devbox", { threadId: "thread-b", clientUserMessageId: "message-b" }).catch(() => undefined);
+  pool.markEndpointUnavailable("devbox", "connection-lost");
+  assert.equal(pool.activeTurnCount, 2);
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 0);
+  pool.markTurnTerminal(active.endpointId, active.threadId, "turn-a");
+  assert.equal(pool.activeTurnCount, 0);
+});
 ```
 
 - [ ] **Step 2: Run pool tests and verify RED**
@@ -363,21 +391,41 @@ Expected: FAIL because the endpoint lifecycle contract and resolver are absent.
 - [ ] **Step 3: Define and implement the lifecycle contract**
 
 ```ts
+export type RuntimeIdentity =
+  | { kind: "local"; pid: number; startTime: string }
+  | { kind: "ssh"; token: string; pid: number; linuxStartTime: string };
+
+export type EndpointLossKind = "connection-lost" | "runtime-lost";
+
+export interface EndpointWorkLease {
+  readonly endpointId: string;
+  readonly lifecycleGeneration: number;
+  readonly endpointGeneration: number;
+  readonly leaseId: string;
+}
+
 export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
   shutdownRuntime(): Promise<void>;
-  runtimeIdentity(): Promise<string | undefined>;
+  runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;
-  onUnavailable(listener: () => void): () => void;
+  onUnavailable(listener: (kind: EndpointLossKind) => void): () => void;
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void;
 }
 ```
 
-For `LocalEndpoint`, `closeConnection()` and `shutdownRuntime()` both call the current stop logic; `runtimeIdentity()` returns a process identity token. Preserve assistant CODEX_HOME and MCP process attestation.
+For `LocalEndpoint`, `closeConnection()` and `shutdownRuntime()` both call the current stop logic; `runtimeIdentity()` returns `{kind:"local",pid,startTime}`. Preserve assistant CODEX_HOME and MCP process attestation. Add strict runtime validation for either discriminated identity when durable operation checkpoints are decoded; reject unknown fields, unsafe PIDs, invalid tokens, and non-decimal start times.
 
-Make `AppServerPool.request()` await a deduplicated resolver/start promise. Existing constructor-only endpoints remain compatible. Add replacement generations without changing capacity-claim semantics.
+Make `AppServerPool.request()` await a deduplicated resolver/start promise. Existing constructor-only endpoints remain compatible. Add replacement generations and split unavailability semantics:
+
+- `runtime-lost` preserves today's local behavior of releasing only self-owned claims whose execution process is proven gone;
+- `connection-lost` retains every active and provisional claim plus terminal-before-start evidence;
+- provisional claims retain their exact `clientUserMessageId` correlation; `startTurn` generates and sends an opaque capacity-correlation ID when a caller did not supply one, so no dispatched start is unreconcilable;
+- `reconcileEndpointClaims(endpointId)` reads full authoritative histories after reconnect, binds matching provisional starts, retains active/incomplete claims, and releases a claim exactly once only for a terminal turn or a full-idle proof that its client message is absent.
+
+Test active and provisional claims across tunnel loss, incomplete reconnect history, later terminal/absent proof, repeated reconciliation, and one capacity-available signal.
 
 - [ ] **Step 4: Run pool/local tests and commit**
 
@@ -443,7 +491,7 @@ const required = [
 
 Every master, tunnel, reconnect, host operation, and transfer generation reruns `ssh -G`. Compare its normalized host/user/port with any durable binding, then add explicit `HostName`, `-l`, and `-p` command-line arguments so a later alias reread cannot change the final destination. The alias remains the host-pattern selector for ProxyJump, identities, and other user configuration. Honor a user ControlMaster only when both effective `controlmaster` and `controlpath` are usable with those pinned destination arguments. Otherwise add a QiYan-owned `-S` control path, `ControlMaster=auto`, and bounded `ControlPersist`. Provide an explicit `ssh -O exit` operation only for QiYan-owned masters.
 
-Do not persist a first or replacement binding during configuration inspection. `EndpointManager` commits it only after the pinned connection completes App Server initialization and account preflight. Add tests that failed activation leaves no binding and concurrent first activation is serialized.
+Do not persist a first or replacement binding during configuration inspection. This task calls only `checkExisting` before connection and carries a `PendingDestinationBinding` containing the normalized tuple through activation; Task 7 owns the post-success commit. Test that planning and failed process attempts never change the binding store.
 
 - [ ] **Step 4: Run SSH tests and commit**
 
@@ -476,9 +524,24 @@ test("every tmux command uses the alternate qiyan-bot server", async () => {
   await runtime.start();
   await runtime.stop();
   for (const call of runner.remoteCommandsContaining("tmux")) {
-    assert.match(call, /tmux -L qiyan-bot/u);
+    assert.match(call, /tmux -L qiyan-bot -f \/dev\/null/u);
     assert.doesNotMatch(call, /tmux (?:ls|kill-server)(?:\s|$)/u);
   }
+});
+
+test("a hostile user tmux config cannot destroy detached QiYan sessions", async () => {
+  userTmuxConfig.write("set -g destroy-unattached on\nset-hook -g session-created 'run-shell false'\n");
+  await runtime.start();
+  assert.equal(await runtime.inspect(), "healthy");
+  assert.equal(userTmuxConfig.readCount, 0);
+});
+
+test("the fixed login launcher preserves login-only worker environment", async () => {
+  loginProfile.set({ PATH: "/login-only/bin", CODEX_HOME: "/login-only/codex-home" });
+  await runtime.start();
+  assert.deepEqual(helper.observedEnvironment(), {
+    PATH: "/login-only/bin", CODEX_HOME: "/login-only/codex-home",
+  });
 });
 
 test("reuses an existing healthy App Server instead of starting another", async () => {
@@ -517,17 +580,19 @@ Expected: FAIL because the fixed helper, argument codec, incarnation record, and
 
 - [ ] **Step 5: Implement the fixed helper, remote preflight, and tmux supervision**
 
-Use endpoint-hash session names, a short mode-0700 remote directory, and these lifecycle commands through fixed scripts:
+Use endpoint-hash session names, a short mode-0700 remote directory, and these lifecycle commands through fixed scripts. Every backend invocation includes both the alternate label and disabled user configuration:
 
 ```text
-tmux -L qiyan-bot has-session -t <encoded-session>
-tmux -L qiyan-bot new-session -d -s <encoded-session> <fixed-login-shell-launcher>
-tmux -L qiyan-bot kill-session -t <encoded-session>
+tmux -L qiyan-bot -f /dev/null has-session -t <encoded-session>
+tmux -L qiyan-bot -f /dev/null new-session -d -s <encoded-session> <fixed-login-shell-launcher>
+tmux -L qiyan-bot -f /dev/null kill-session -t <encoded-session>
 ```
 
-Preflight proves Linux, Node.js, required core utilities, `tmux`, remote login-shell `codex`, and normalized home/uid. Bootstrap `assets/remote/qiyan-ssh-helper.mjs` into the private runtime directory with mode 0700 and verify the packaged SHA-256 before each new runtime generation. The only remote command form is a fixed helper/bootstrap operation plus strictly validated ASCII operation names, hex/decimal IDs, or bounded base64url arguments. The helper decodes paths as data and uses Node filesystem/child-process APIs with `shell: false`.
+Preflight proves Linux, Node.js, required core utilities, `tmux`, remote login-shell `codex`, normalized home/uid, and an absolute executable login shell whose path matches a strict safe-token allowlist. Bootstrap `assets/remote/qiyan-ssh-helper.mjs` into the private runtime directory with mode 0700 and verify the packaged SHA-256 before each new runtime generation. The only remote command form is a fixed helper/bootstrap operation plus strictly validated ASCII operation names, hex/decimal IDs, or bounded base64url arguments. The helper decodes paths as data and uses Node filesystem/child-process APIs with `shell: false`.
 
-At launch, the helper creates a random 128-bit incarnation token, records `{token,pid,linuxStartTime}` atomically as mode 0600, starts the resolved Codex executable without a shell, and remains the tmux-supervised parent. `runtimeIdentity()` validates the metadata against `/proc/<pid>/stat`; deterministic tmux/socket names are never treated as incarnation identity. Never use the tmux pane for RPC. Remove an App Server socket or stale metadata only after `has-session` proves the owned session absent.
+Make `<fixed-login-shell-launcher>` concrete: the validated login-shell path runs with `-lc`; its fixed command contains only `exec node`, the allowlisted private helper path, the `run-app-server` operation, and encoded arguments. The login shell therefore loads login-only `PATH`, `CODEX_HOME`, provider settings, and Codex configuration before the helper uses `spawn("codex", args, {shell:false, env:process.env})`. No decoded value or profile-derived environment value is inserted into the shell command.
+
+At launch, the helper creates a random 128-bit incarnation token, records `{kind:"ssh",token,pid,linuxStartTime}` atomically as mode 0600, starts the resolved Codex executable without a shell, and remains the tmux-supervised parent. `runtimeIdentity()` validates the metadata against `/proc/<pid>/stat`; deterministic tmux/socket names are never treated as incarnation identity. Never use the tmux pane for RPC. Remove an App Server socket or stale metadata only after `has-session` proves the owned session absent.
 
 - [ ] **Step 6: Write failing endpoint reconnect tests**
 
@@ -535,7 +600,8 @@ Use a fake WebSocket wire and tunnel process to prove:
 
 - first start launches tmux then tunnel;
 - tunnel loss marks only the connection unavailable;
-- reconnect uses the same attested `{token,pid,linuxStartTime}` identity;
+- unexpected tunnel/WebSocket loss emits `connection-lost`, while an attested missing supervisor emits `runtime-lost`;
+- reconnect uses the same attested `{kind:"ssh",token,pid,linuxStartTime}` identity;
 - runtime restart or simulated reboot returns a different identity despite identical tmux/socket names;
 - `closeConnection()` leaves tmux alive;
 - `shutdownRuntime()` kills only the endpoint session;
@@ -555,7 +621,7 @@ Expected: FAIL because `SshEndpoint` does not exist.
 
 `SshEndpoint` implements `ManagedAppServerEndpoint`, creates `ssh -N -L local_socket:remote_socket` with the current generation's pinned destination arguments, uses `StreamLocalBindUnlink=yes`, connects with `WebSocketWire`, performs the same initialize/initialized sequence and `MINIMUM_SUPPORTED_CODEX_VERSION` check as `LocalEndpoint`, rejects approvals, and exposes the attested helper incarnation identity. Compatibility failures retain only the parsed version or `unknown`.
 
-`closeConnection()` closes WebSocket/tunnel and a QiYan-owned ControlMaster but leaves tmux running. `shutdownRuntime()` first closes the connection, then kills only the endpoint tmux session. Unexpected loss emits one unavailable transition per generation.
+`closeConnection()` closes WebSocket/tunnel and a QiYan-owned ControlMaster but leaves tmux running. `shutdownRuntime()` first closes the connection, then kills only the endpoint tmux session. Unexpected tunnel/WebSocket loss emits `connection-lost`; only an attested absent/dead supervisor emits `runtime-lost`. Intentional lifecycle closure suppresses unavailable events. Emit one transition per generation.
 
 - [ ] **Step 9: Run endpoint tests and commit**
 
@@ -613,9 +679,24 @@ test("explicit disconnect cancels a scheduled reconnect", async () => {
   assert.equal(remote.runtimeStarts, 0);
   assert.equal(manager.desiredState("devbox"), "disconnected");
 });
+
+test("a drain does not reject nested RPCs from an already-admitted lease", async () => {
+  const outer = manager.withWorkLease("devbox", "session-mutation", async (_endpoint, lease) => {
+    workspaceCheckpoint.arrive();
+    await workspaceCheckpoint.continue;
+    await pool.request("devbox", "thread/read", { threadId: "t" }, undefined, lease);
+    await pool.request("devbox", "thread/resume", { threadId: "t" }, undefined, lease);
+  });
+  await workspaceCheckpoint.reached;
+  const draining = manager.disconnect("devbox");
+  await manager.waitUntilDraining("devbox");
+  workspaceCheckpoint.release();
+  await outer;
+  await draining;
+});
 ```
 
-Also test deduplicated starts, catalog reload on inactive start, binding only after successful activation, config mutation between connection generations, close-on-QiYan-shutdown versus runtime shutdown, exponential reconnect, and callback generation fencing. Test that draining waits for an already-admitted start/steer/session mutation/file transfer, then rereads native history; an active turn or unprovable read reopens the gate and prevents shutdown.
+Also test deduplicated starts, catalog reload on inactive start, binding only after successful App Server/account activation, no binding after failed first activation, serialized concurrent first activation, config mutation between connection generations, close-on-QiYan-shutdown versus runtime shutdown, exponential reconnect, and callback generation fencing. Test that draining waits for an already-admitted generic multi-RPC operation, then rereads native history; an active turn or unprovable read reopens the gate and prevents shutdown. Task 8 wires the same lease through concrete session/workspace sequences and Task 9 wires file transfers.
 
 - [ ] **Step 2: Run manager tests and verify RED**
 
@@ -625,7 +706,9 @@ Expected: FAIL because `EndpointManager` does not exist.
 
 - [ ] **Step 3: Implement `EndpointManager`**
 
-Implement an `EndpointAdmissionGate` per endpoint. Ordinary pool calls and session lifecycle mutations acquire a counted lease before resolving/using an endpoint; Task 9 applies the same public lease API to worker file transfers. `beginDrain()` atomically rejects new leases, waits for existing leases, and returns a generation-bound drain handle that either commits shutdown or reopens admission. Lifecycle-owned reads and stop/start calls use the handle's private path and do not reacquire an ordinary lease.
+Implement an `EndpointAdmissionGate` per endpoint. `beginDrain()` atomically rejects new leases, waits for existing leases, and returns a generation-bound drain handle that either commits shutdown or reopens admission. Lifecycle-owned reads and stop/start calls use the handle's private path and do not reacquire an ordinary lease.
+
+`withWorkLease` creates an opaque `EndpointWorkLease` once per logical operation. `AppServerPool.request`, `startTurn`, `readFullThread`, and `interrupt` accept an optional final lease parameter and pass it through every nested/reconciliation RPC. Without a lease, the pool obtains one around the whole public call. With a lease, the resolver validates endpoint ID, lifecycle generation, and lease liveness and does not reacquire admission. A stale, foreign, released, or fabricated token is rejected. This makes admitted work reentrant across a drain without allowing new work.
 
 Use this public surface:
 
@@ -633,7 +716,7 @@ Use this public surface:
 export class EndpointManager {
   normalize(id?: string): string; // omitted => local
   ensureReady(id?: string): Promise<ManagedAppServerEndpoint>;
-  withWorkLease<T>(id: string | undefined, kind: "rpc" | "session-mutation" | "file-transfer", run: (endpoint: ManagedAppServerEndpoint, generation: number) => Promise<T>): Promise<T>;
+  withWorkLease<T>(id: string | undefined, kind: "rpc" | "session-mutation" | "file-transfer", run: (endpoint: ManagedAppServerEndpoint, lease: EndpointWorkLease) => Promise<T>): Promise<T>;
   activateReferenced(ids: readonly string[]): Promise<{ unavailable: string[] }>;
   disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void>;
   restart(id?: string, checkpoint?: (value: unknown) => void): Promise<void>;
@@ -645,7 +728,9 @@ export class EndpointManager {
 
 Each endpoint tracks an explicit process-local desired state: `automatic`, `draining`, or `disconnected`, plus a lifecycle generation. Before disconnect/restart, transition to `draining`, cancel and generation-fence scheduled reconnects, drain existing leases, then read every managed thread directly and prove idle. If connection cannot be restored or any status is active/systemError/unprovable, reopen admission in `automatic` state and return a no-effect error. Keep the gate closed from the final idle proof through stop/restart. A later normal endpoint operation changes `disconnected` back to `automatic`; a stale reconnect timer cannot do so.
 
-Checkpoint the old attested `{token,pid,linuxStartTime}` runtime identity and stopped/started phases so operation recovery can distinguish tunnel reconnection from a replacement runtime and finish idempotently.
+Serialize endpoint activation. Before contact, require the read-only `checkExisting` result from Task 1 and use Task 5's pinned destination. Only after initialize and account preflight succeed, call `commitAfterActivation` with a fresh registry-reference check, then publish the endpoint as ready. A failed activation or a commit conflict closes the new connection and publishes no ready generation.
+
+Checkpoint the old validated discriminated `RuntimeIdentity` and stopped/started phases so operation recovery can distinguish tunnel reconnection from a replacement runtime and finish idempotently.
 
 Normal application shutdown calls `closeConnections()`: local stops, SSH tunnels close, remote tmux persists. Explicit disconnect calls `shutdownRuntime()` for either implementation. Restart validates catalog/SSH prerequisites before stop, then shuts down and starts a new endpoint generation.
 
@@ -691,6 +776,8 @@ export interface WorkspaceHost {
 
 Run existing traversal, symlink, protected-root, fallback collision, missing-parent, inode replacement, and dispatch race tests against both hosts. The fake SSH host records operations rather than touching local filesystem paths. Include newline, quote, `$()`, backtick, leading-hyphen, space, and Unicode paths and prove none appears literally in a recorded remote command.
 
+Add concrete `SessionService` and `SessionLifecycle` races: pause an already-admitted mutation after its first workspace check, begin endpoint draining, then allow its first and second nested RPC plus a second workspace assertion. All calls using the same lease must finish and drain must wait. A second mutation arriving after drain starts must fail before workspace or RPC effects. Assert endpoint lease is acquired before `ThreadGate` to prevent lock inversion.
+
 - [ ] **Step 2: Run workspace tests and verify RED**
 
 Run: `npm test -- tests/sessions/project-workspace.test.ts tests/endpoints/ssh-host.test.ts`
@@ -707,13 +794,13 @@ Keep path projection, overlap rules, device/inode checks, fallback exclusivity, 
 
 ```ts
 export class WorkspaceRouter {
-  prepareCreate(endpointId: string, nickname: string, requested?: string): Promise<PreparedProjectWorkspace>;
-  prepareExisting(endpointId: string, path: string): Promise<PreparedProjectWorkspace>;
-  assertDispatchable(endpointId: string, prepared: PreparedProjectWorkspace): Promise<void>;
+  prepareCreate(endpointId: string, nickname: string, requested?: string, lease?: EndpointWorkLease): Promise<PreparedProjectWorkspace>;
+  prepareExisting(endpointId: string, path: string, lease?: EndpointWorkLease): Promise<PreparedProjectWorkspace>;
+  assertDispatchable(endpointId: string, prepared: PreparedProjectWorkspace, lease?: EndpointWorkLease): Promise<void>;
 }
 ```
 
-Modify lifecycle and session service calls to carry endpoint ID for every prepare/assert operation. Recovery must use the endpoint recorded in the operation checkpoint or registry mapping, never the current default.
+Modify lifecycle and session service mutation paths to acquire one endpoint `session-mutation` lease outside `ThreadGate`, then carry the same token through every workspace prepare/assert and every pool RPC. Do not reacquire between validation, reservation, resume/start/steer, rollback, or promotion. Read-only single-RPC calls may let the pool acquire a short lease. Recovery must use the endpoint recorded in the operation checkpoint or registry mapping, never the current default, and must obtain one new lease for the whole recovered logical operation.
 
 - [ ] **Step 5: Run workspace/session tests and commit**
 
@@ -733,16 +820,21 @@ git commit -m "refactor: route workspace policy by endpoint"
 - Modify: `src/attachments/store.ts`
 - Modify: `src/chat/output-actions.ts`
 - Modify: `src/production-app.ts`
+- Modify: `src/sessions/service.ts`
 - Test: `tests/endpoints/worker-file-bridge.test.ts`
 - Test: `tests/attachments/store.test.ts`
 - Test: `tests/assistant/tools.test.ts`
+- Test: `tests/sessions/service.test.ts`
 
 - [ ] **Step 1: Write failing explicit-transfer tests**
 
 ```ts
 test("send_to_session uploads only selected active-attempt attachments", async () => {
   const bridge = fixtureRemoteBridge();
-  const input = await bridge.toWorkerInput("devbox", "scope", "file_a");
+  const input = await bridge.toWorkerInput({
+    lease, mapping: { endpoint: "devbox", thread_id: "thread-1", mapping_id: "map-1" },
+    projectRoot: "/home/xin/project", scopeId: "scope", attachmentId: "file_a",
+  });
   assert.deepEqual(input, { type: "mention", name: "requirements.pdf", path: bridge.remotePath("file_a") });
   assert.deepEqual(bridge.uploadedIds, ["file_a"]);
 });
@@ -758,11 +850,11 @@ test("prepare_chat_attachment downloads one selected remote project file", async
 });
 ```
 
-Also prove no upload occurs for text-only sends, local behavior remains direct, remote hash mismatch cleans temporary state, traversal/symlinks/special files fail before streaming, interrupted streams do not promote, and `send_chat_attachment` stays endpoint-agnostic. Add races where the selected path is replaced after containment validation, the mapping ID/project changes, the endpoint connection generation changes, or disconnect begins while a transfer is active. The first three must fail without promotion; disconnect must wait for the admitted transfer and reject transfers arriving after draining begins.
+Also prove no upload occurs for text-only sends, local behavior remains direct, remote hash mismatch cleans temporary state, traversal/symlinks/special files fail before streaming, interrupted streams do not promote, and `send_chat_attachment` stays endpoint-agnostic. Add races where the selected path is replaced after containment validation, the mapping ID/project changes, the endpoint connection generation changes, or disconnect begins while a transfer is active. For upload, pause after bytes are prepared but before `turn/start`/`turn/steer`, then replace the mapping or connection generation and prove no RPC sends the stale remote path. For download, mismatches fail without promotion. Disconnect waits for an admitted transfer/send sequence and rejects transfers arriving after draining begins.
 
 - [ ] **Step 2: Run bridge tests and verify RED**
 
-Run: `npm test -- tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts`
+Run: `npm test -- tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts tests/sessions/service.test.ts`
 
 Expected: FAIL because the bridge does not exist.
 
@@ -770,7 +862,13 @@ Expected: FAIL because the bridge does not exist.
 
 ```ts
 export interface WorkerFileBridge {
-  toWorkerInput(endpointId: string, scopeId: string, attachmentId: FileHandleId): Promise<unknown>;
+  toWorkerInput(input: {
+    lease: EndpointWorkLease;
+    mapping: MappingIdentity;
+    projectRoot: string;
+    scopeId: string;
+    attachmentId: FileHandleId;
+  }): Promise<unknown>;
   prepareProjectFile(input: {
     endpointId: string;
     projectRoot: string;
@@ -782,7 +880,9 @@ export interface WorkerFileBridge {
 }
 ```
 
-Every local or remote transfer acquires `EndpointManager.withWorkLease(endpointId, "file-transfer", ...)` for its complete validation/stream/promotion lifetime. Capture the endpoint connection generation and, for project downloads, the exact `MappingIdentity`, managed state, and project directory before opening bytes.
+`prepareProjectFile` acquires `EndpointManager.withWorkLease(endpointId, "file-transfer", ...)` for its complete validation/stream/promotion lifetime. Capture the endpoint connection generation and the exact `MappingIdentity`, managed state, and project directory before opening bytes.
+
+Uploads do not acquire a second lease. Extend `SessionService.send` with a `prepareInput({session, projectRoot, lease})` callback executed inside the exact mapping's outer `session-mutation` lease from Task 8. Production resolves each selected attachment through `toWorkerInput` using that same lease and mapping. After preparation, `SessionService` rechecks the mapping/project and passes the same lease into `startTurn` or `turn/steer`; the pool validates its still-current endpoint generation. This one fence spans attachment upload and dispatch.
 
 Local delegates to `AttachmentStore.toUserInput` and `prepareOutbound`. SSH upload uses `openForUpload` and the fixed helper to create an owner-only temporary regular file, stream from the retained descriptor, verify size/SHA-256, and atomically rename to a content-addressed private staging path.
 
@@ -792,12 +892,12 @@ Change `createChatOutputActions` to accept `prepareAttachment(owner, relativePat
 
 - [ ] **Step 4: Run bridge tests and commit**
 
-Run: `npm test -- tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts tests/integration/mcp-assistant.test.ts`
+Run: `npm test -- tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts tests/sessions/service.test.ts tests/integration/mcp-assistant.test.ts`
 
 Expected: PASS.
 
 ```bash
-git add src/endpoints/worker-file-bridge.ts src/attachments/store.ts src/chat/output-actions.ts src/production-app.ts tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts
+git add src/endpoints/worker-file-bridge.ts src/attachments/store.ts src/chat/output-actions.ts src/production-app.ts src/sessions/service.ts tests/endpoints/worker-file-bridge.test.ts tests/attachments/store.test.ts tests/assistant/tools.test.ts tests/sessions/service.test.ts
 git commit -m "feat: bridge files to SSH workers"
 ```
 
@@ -845,7 +945,7 @@ restart_endpoint: z.object({ endpoint: z.string().min(1).default("local") }).str
 Register both as side-effecting operations. Actions delegate to `EndpointManager` with operation checkpoints. Reconciliation is idempotent:
 
 - disconnect recovery reacquires the endpoint drain, cancels reconnect, proves idle again when stop was not checkpointed, and ensures the runtime is stopped;
-- restart recovery compares the checkpointed old attested `{token,pid,linuxStartTime}` identity, finishes a stopped start, accepts an already-started different attested incarnation only at the `runtime_started` phase, or performs the restart if the exact old incarnation still runs;
+- restart recovery parses the checkpoint with the strict discriminated `RuntimeIdentity` validator, compares the old identity, finishes a stopped start, accepts an already-started different attested incarnation only at the `runtime_started` phase, or performs the restart if the exact old incarnation still runs;
 - neither operation is blindly marked successful from an unproven transport state.
 
 Update the concise policy tool list and add only the endpoint/default semantics, not examples for every tool.
@@ -882,6 +982,8 @@ Test these exact behaviors with fake local and SSH endpoints:
 - referenced remote endpoints start before managed-session reconciliation;
 - one remote failure leaves QiYan/local/other remotes healthy and marks only its sessions unavailable;
 - dynamic remote notifications use the correct endpoint ID and generation;
+- SSH `connection-lost` retains active and provisional capacity claims while local/proven `runtime-lost` preserves current cleanup behavior;
+- reconnect reconciles retained claims from full history before advertising capacity, releasing terminal/absent claims once and retaining active/incomplete claims;
 - tunnel recovery calls `EventRelay.reconcileEndpoint`, whose existing delivery cursor prevents duplicate worker finals;
 - one unavailable and one recovered warning are emitted per incident;
 - normal QiYan shutdown closes remote tunnels but leaves tmux runtime alive.
@@ -906,9 +1008,9 @@ Expected: FAIL because production still assumes one project endpoint.
 
 Replace the single project `endpoint` variable with `localEndpoint` plus `EndpointManager`. Pass `manager.ensureReady` to the pool resolver. Register notification, permission, ready, and unavailable callbacks exactly once per endpoint generation through `manager.onEndpoint`.
 
-Generalize unavailable/reconnect handlers to `ManagedAppServerEndpoint`; keep assistant recovery separate. Remove the `session.endpoint === local` filter from managed-session recovery. Group registry sessions by endpoint, activate each endpoint, reconcile successes, and warn failures without throwing application startup.
+Generalize unavailable/reconnect handlers to `ManagedAppServerEndpoint` and pass their typed `EndpointLossKind` into the pool; keep assistant recovery separate. Remove the `session.endpoint === local` filter from managed-session recovery. Group registry sessions by endpoint, activate each endpoint, reconcile successes, and warn failures without throwing application startup.
 
-Use existing `EventRelay.reconcileEndpoint` and runtime delivery cursor instead of adding a second final-delivery ledger.
+After a connection returns, call `AppServerPool.reconcileEndpointClaims` before normal capacity wakeup and then use existing `EventRelay.reconcileEndpoint` plus its runtime delivery cursor instead of adding a second final-delivery ledger. An incomplete claim reconciliation keeps capacity reserved but does not block message/session-state reconciliation.
 
 - [ ] **Step 4: Run production tests and commit**
 
@@ -935,7 +1037,7 @@ git commit -m "feat: recover managed SSH endpoints"
 
 - [ ] **Step 1: Write failing fixture contract tests**
 
-Require `tmux` in the image, preserve the no-auth-in-image contract, and assert acceptance commands use `tmux -L qiyan-bot` without touching default tmux.
+Require `tmux` in the image, preserve the no-auth-in-image contract, and assert every backend command uses `tmux -L qiyan-bot -f /dev/null` without touching default tmux.
 
 - [ ] **Step 2: Run fixture tests and verify RED**
 
@@ -967,7 +1069,7 @@ npm run ssh-worker:endpoint-check
 
 Then run the documented endpoint acceptance command that:
 
-1. starts the real remote App Server under `tmux -L qiyan-bot`;
+1. starts the real remote App Server under `tmux -L qiyan-bot -f /dev/null`;
 2. initializes through the SSH Unix-socket tunnel;
 3. creates a disposable remote thread and starts a bounded task;
 4. terminates only the tunnel;
@@ -1019,7 +1121,7 @@ Document this setup flow exactly:
 }
 ```
 
-Explain that the key is an OpenSSH alias, the backend never trusts a new key or installs/authenticates Codex, ordinary `tmux ls` does not show QiYan's server, and `tmux -L qiyan-bot list-sessions` deliberately does.
+Explain that the key is an OpenSSH alias, the backend never trusts a new key or installs/authenticates Codex, ordinary `tmux ls` does not show QiYan's server, and `tmux -L qiyan-bot -f /dev/null list-sessions` deliberately does without loading user tmux configuration.
 
 State that QiYan requires Codex `0.142.5` or newer on local and SSH worker hosts. Newer Codex releases are accepted; the exact `0.142.5` Docker fixture and generated-protocol manifest are reproducibility records, not installation ceilings.
 
@@ -1067,7 +1169,7 @@ git commit -m "docs: add SSH worker setup"
 - [ ] Reconnection uses the same remote process and reconciles each worker final once through the existing durable delivery cursor.
 - [ ] Attested runtime incarnation is stable across tunnel reconnect and changes across restart/reboot even when deterministic tmux/socket names are reused.
 - [ ] Remote reboot/process loss starts a new App Server and resumes native threads.
-- [ ] Every tmux command uses `tmux -L qiyan-bot`; normal tmux remains untouched.
+- [ ] Every backend tmux command uses `tmux -L qiyan-bot -f /dev/null`; normal tmux and user tmux configuration remain untouched.
 - [ ] Host trust, package installation, and authentication remain user-owned.
 - [ ] Local and SSH workers accept Codex `0.142.5` or newer, reject older/unparseable versions, and do not treat the generated schema version as an exact runtime pin.
 - [ ] Destination rebinding is rejected while sessions reference the endpoint.
