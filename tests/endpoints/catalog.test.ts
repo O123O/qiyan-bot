@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -59,4 +61,26 @@ test("reload validates changed bytes and preserves the prior snapshot on failure
   await writeFile(path, "{", { mode: 0o600 });
   await assert.rejects(catalog.reload(), /invalid endpoint catalog/u);
   assert.equal(catalog.require("one").projectsRoot, "/work");
+});
+
+test("rejects oversized, hard-linked, executable, and FIFO catalogs", async (t) => {
+  const root = await privateTemp(t);
+  const path = join(root, "endpoints.json");
+  await writeFile(path, Buffer.alloc(1024 * 1024 + 1), { mode: 0o600 });
+  await assert.rejects(EndpointCatalog.open(path), /exceeds 1 MiB/u);
+
+  await rm(path);
+  const target = join(root, "hardlink-target.json");
+  await writeFile(target, JSON.stringify({ version: 1, endpoints: {} }), { mode: 0o600 });
+  await link(target, path);
+  await assert.rejects(EndpointCatalog.open(path), /regular owner file/u);
+
+  await rm(path);
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: {} }), { mode: 0o700 });
+  await chmod(path, 0o700);
+  await assert.rejects(EndpointCatalog.open(path), /mode 0600/u);
+
+  await rm(path);
+  await promisify(execFile)("mkfifo", [path]);
+  await assert.rejects(EndpointCatalog.open(path), /regular owner file/u);
 });

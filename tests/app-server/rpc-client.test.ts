@@ -11,6 +11,7 @@ class MemoryWire implements RpcWire {
   onMessage(listener: (message: string) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener); }
   onClose(listener: (error?: Error) => void): () => void { this.closes.add(listener); return () => this.closes.delete(listener); }
   receive(message: unknown): void { for (const listener of this.messages) listener(JSON.stringify(message)); }
+  receiveRaw(message: string): void { for (const listener of this.messages) listener(message); }
   emitClose(error?: Error): void { for (const listener of this.closes) listener(error); }
 }
 
@@ -42,4 +43,25 @@ test("generic RPC client rejects aborts, timeouts, and wire closure", async () =
   const closed = client.request("close", {});
   wire.emitClose(new Error("wire lost"));
   await assert.rejects(closed, /wire lost/u);
+});
+
+test("ignores valid JSON with invalid RPC shapes", () => {
+  const wire = new MemoryWire();
+  new RpcClient(wire, { requestTimeoutMs: 100 });
+  for (const value of ["null", "[]", "1", "true", JSON.stringify({ id: {} }), JSON.stringify({ method: 1 })]) {
+    assert.doesNotThrow(() => wire.receiveRaw(value));
+  }
+});
+
+test("closing during an asynchronous server request never writes or rejects unhandled", async () => {
+  const wire = new MemoryWire();
+  const client = new RpcClient(wire, { requestTimeoutMs: 100 });
+  let resolve!: (value: unknown) => void;
+  client.onServerRequest(() => new Promise((done) => { resolve = done; }));
+  wire.receive({ id: 7, method: "approve", params: {} });
+  await new Promise((done) => setImmediate(done));
+  client.close();
+  resolve({ accepted: true });
+  await new Promise((done) => setImmediate(done));
+  assert.deepEqual(wire.sent, []);
 });

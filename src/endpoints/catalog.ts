@@ -48,7 +48,7 @@ export class EndpointCatalog {
 async function bootstrap(path: string): Promise<void> {
   let handle;
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     return;
   } catch (error) {
     if (!isErrno(error, "ENOENT")) throw catalogError("endpoint catalog must be a regular owner file with mode 0600");
@@ -77,16 +77,15 @@ async function bootstrap(path: string): Promise<void> {
 async function readDocument(path: string): Promise<EndpointCatalogDocument> {
   let file;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const state = await file.stat();
     const expectedUid = process.getuid?.();
     if (!state.isFile() || state.nlink !== 1 || (expectedUid !== undefined && state.uid !== expectedUid)) {
       throw catalogError("endpoint catalog must be a regular owner file with mode 0600");
     }
-    if ((state.mode & 0o077) !== 0) throw catalogError("endpoint catalog must have mode 0600");
+    if ((state.mode & 0o7777 & ~0o600) !== 0) throw catalogError("endpoint catalog must have mode 0600");
     if (state.size > MAX_CATALOG_BYTES) throw catalogError("endpoint catalog exceeds 1 MiB");
-    const bytes = await file.readFile();
-    if (bytes.byteLength > MAX_CATALOG_BYTES) throw catalogError("endpoint catalog exceeds 1 MiB");
+    const bytes = await boundedRead(file);
     try {
       return documentSchema.parse(JSON.parse(bytes.toString("utf8"))) as EndpointCatalogDocument;
     } catch (error) {
@@ -101,6 +100,20 @@ async function readDocument(path: string): Promise<EndpointCatalogDocument> {
   } finally {
     await file?.close();
   }
+}
+
+async function boundedRead(file: Awaited<ReturnType<typeof open>>): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= MAX_CATALOG_BYTES) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_CATALOG_BYTES + 1 - total));
+    const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, null);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  if (total > MAX_CATALOG_BYTES) throw catalogError("endpoint catalog exceeds 1 MiB");
+  return Buffer.concat(chunks, total);
 }
 
 function catalogError(message: string): AppError { return new AppError("CONFIGURATION_ERROR", message); }

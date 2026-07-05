@@ -85,8 +85,13 @@ export class RpcClient {
   }
 
   private receive(value: string): void {
-    let message: RpcResponse | RpcRequest | RpcNotification;
-    try { message = JSON.parse(value) as RpcResponse | RpcRequest | RpcNotification; } catch { return; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(value); } catch { return; }
+    if (!isRecord(parsed)) return;
+    const hasId = (typeof parsed.id === "number" || typeof parsed.id === "string");
+    const hasMethod = typeof parsed.method === "string";
+    if (!hasId && !hasMethod) return;
+    const message = parsed as unknown as RpcResponse | RpcRequest | RpcNotification;
     if ("id" in message && !("method" in message)) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -101,16 +106,22 @@ export class RpcClient {
   }
 
   private async handleServerRequest(request: RpcRequest): Promise<void> {
+    let response: unknown;
     try {
       if (!this.serverRequestHandler) throw new Error(`Unhandled server request: ${request.method}`);
-      this.write({ id: request.id, result: await this.serverRequestHandler(request) });
+      response = { id: request.id, result: await this.serverRequestHandler(request) };
     } catch (error) {
-      this.write({ id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } });
+      response = { id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } };
     }
+    if (!this.closed) this.write(response);
   }
 
   private write(message: unknown): void {
     if (this.closed) throw new Error("app-server client is closed");
     this.wire.send(JSON.stringify(message));
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
