@@ -543,4 +543,11 @@ export const migrations: readonly Migration[] = [
     WHERE attachment_id IS NOT NULL
       AND (state IN ('confirmed', 'failed') OR (state = 'uncertain' AND mandatory = 0));
   `,
+  `
+  CREATE TABLE endpoint_bindings (
+    endpoint_id TEXT PRIMARY KEY,
+    destination_sha256 TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  `,
 ];

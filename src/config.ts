@@ -73,6 +73,7 @@ export interface BotConfig {
   assistantWorkdir: string;
   dataDir: string;
   sessionRegistryPath: string;
+  endpointCatalogPath: string;
   codexBinary: string;
   maxConcurrentTurns: number;
   maxCollectCount: number;
@@ -130,6 +131,7 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     assistantWorkdir: resolve(parsed.ASSISTANT_WORKDIR ?? join(defaultRoot, "qiyan-workdir")),
     dataDir,
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
+    endpointCatalogPath: resolve(join(defaultRoot, "endpoints.json")),
     codexBinary: parsed.CODEX_BINARY,
     maxConcurrentTurns: parsed.MAX_CONCURRENT_TURNS,
     maxCollectCount: parsed.MAX_COLLECT_COUNT,

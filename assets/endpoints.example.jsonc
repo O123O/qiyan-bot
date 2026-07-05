@@ -1,0 +1,10 @@
+{
+  // The key is an alias from your OpenSSH configuration.
+  "version": 1,
+  "endpoints": {
+    "devbox": {
+      "type": "ssh",
+      "projects_root": "~/qiyan-projects"
+    }
+  }
+}

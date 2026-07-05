@@ -135,6 +135,7 @@ test("loadConfig applies bounded defaults", () => {
   assert.equal(config.userHome, "/home/test-user");
   assert.equal(config.dataDir, "/home/test-user/private-qiyan/data");
   assert.equal(config.sessionRegistryPath, "/home/test-user/private-qiyan/data/sessions.json");
+  assert.equal(config.endpointCatalogPath, "/home/test-user/private-qiyan/endpoints.json");
   assert.equal(config.assistantSandboxMode, "danger-full-access");
 });
 
