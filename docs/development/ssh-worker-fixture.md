@@ -1,8 +1,8 @@
 # SSH worker development fixture
 
-## Development fixture, not remote-worker support
+## Development fixture for remote-worker support
 
-This Docker Compose fixture models a separate Linux machine for developing QiYan's future SSH endpoint pool. It proves key-only SSH, an independently authenticated Codex profile, persistent remote projects, and a Codex App Server carried over standard input/output. It **does not implement QiYan remote-worker routing**.
+This Docker Compose fixture models a separate Linux machine for testing QiYan's SSH endpoint pool. It provides key-only SSH, an independently authenticated Codex profile, and persistent remote projects. QiYan's production endpoint uses a detached tmux App Server and Unix-socket tunnel; the fixture check retains a short stdio probe as a prerequisite diagnostic.
 
 The fixture is **source checkout only**. Its Docker files, TypeScript helpers, and npm development commands are not included in the QiYan release archive.
 
@@ -37,9 +37,10 @@ Then verify the complete boundary:
 
 ```bash
 npm run ssh-worker:check
+npm run ssh-worker:endpoint-check
 ```
 
-The check validates the remote `HOME`, `CODEX_HOME`, projects directory, exact pinned Codex version, App Server `initialize` response, and `account/read`. It does not create a thread or send a model task. Before login, the final verdict is `authentication required`; after login, it is `authenticated`.
+The first check validates the remote `HOME`, `CODEX_HOME`, projects directory, exact pinned Codex version, App Server `initialize` response, and `account/read`. The endpoint check starts the real detached App Server under QiYan's isolated tmux server, drops only its local transport, reconnects, and verifies the same attested runtime identity. Neither command creates a thread or sends a model task. Before login, the first check reports `authentication required`; endpoint persistence remains testable on either side of that authentication boundary.
 
 ## Daily operation and persistence
 
@@ -61,7 +62,7 @@ ssh -F .tmp/ssh-worker/config qiyan-ssh-worker
 
 That configuration sets `IdentitiesOnly yes`, `StrictHostKeyChecking yes`, a fixture-specific `UserKnownHostsFile`, and forwarding restrictions. It does not modify `~/.ssh/config`.
 
-The future App Server transport has this shape:
+The prerequisite App Server probe has this shape:
 
 ```bash
 ssh -T -F .tmp/ssh-worker/config qiyan-ssh-worker codex app-server --listen stdio://
@@ -89,4 +90,3 @@ Authentication, private keys, host trust, and project files are runtime secrets 
 - `authentication required`: run `npm run ssh-worker:login`; never copy the host's credential file into the volume.
 - Codex version mismatch: rebuild with the repository's pinned version. A deliberate test override must use the same `QIYAN_SSH_WORKER_CODEX_VERSION` for startup and checks.
 - Changed generated files or unsafe permissions: stop, inspect `.tmp/ssh-worker`, and use reset if the fixture should be discarded. The helper fails closed instead of repairing suspicious state.
-

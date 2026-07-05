@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { AppError } from "../core/errors.ts";
 
 export interface BoundedProcessResult { stdout: Buffer; stderr: Buffer }
@@ -6,7 +7,7 @@ export interface BoundedProcessResult { stdout: Buffer; stderr: Buffer }
 export function runBoundedProcess(
   command: string,
   args: readonly string[],
-  options: { timeoutMs: number; maxOutputBytes: number; input?: Uint8Array; signal?: AbortSignal },
+  options: { timeoutMs: number; maxOutputBytes: number; input?: Uint8Array | AsyncIterable<Uint8Array | string>; signal?: AbortSignal },
 ): Promise<BoundedProcessResult> {
   if (options.signal?.aborted) {
     return Promise.reject(options.signal.reason instanceof Error ? options.signal.reason : new Error("SSH process aborted"));
@@ -69,15 +70,28 @@ export function runBoundedProcess(
       stop(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input closed before it was sent"));
       finishExited();
     });
-    if (options.input) {
-      child.stdin.write(options.input, (error) => {
+    if (options.input !== undefined) {
+      void writeProcessInput(child.stdin, options.input).then(() => {
         inputSettled = true;
-        if (error) stop(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input could not be sent"));
-        else child.stdin.end();
+        finishExited();
+      }, () => {
+        inputSettled = true;
+        stop(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input could not be sent"));
         finishExited();
       });
-    } else {
-      child.stdin.end();
-    }
+    } else child.stdin.end();
   });
+}
+
+async function writeProcessInput(
+  target: import("node:stream").Writable,
+  input: Uint8Array | AsyncIterable<Uint8Array | string>,
+): Promise<void> {
+  if (Symbol.asyncIterator in Object(input)) {
+    for await (const value of input as AsyncIterable<Uint8Array | string>) {
+      const chunk = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+      if (!target.write(chunk)) await once(target, "drain");
+    }
+  } else if (!target.write(input as Uint8Array)) await once(target, "drain");
+  await new Promise<void>((resolve, reject) => target.end((error?: Error | null) => error ? reject(error) : resolve()));
 }

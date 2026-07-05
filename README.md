@@ -20,7 +20,8 @@ Read this before installing or launching:
 
 - Linux
 - Node.js 24 or newer
-- `codex-cli 0.142.5`
+- `codex-cli 0.142.5` or newer
+- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+, tmux, Codex 0.142.5+, and its own authenticated Codex profile
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install
@@ -49,6 +50,7 @@ Setup guides:
 - [Telegram — implemented](docs/chat-apps/telegram.md)
 - [Slack — implemented](docs/chat-apps/slack.md)
 - [Personal WeChat — experimental](docs/chat-apps/wechat.md)
+- [SSH worker endpoints](docs/ssh-workers.md)
 
 ## Configure and run
 
@@ -154,7 +156,7 @@ QIYAN_WEIXIN_LIVE=1 npm test -- tests/integration/weixin-live.test.ts
 
 The Slack live test requires dedicated `SLACK_TEST_*` credentials, a designated channel with recent owner fixtures, and an exact `SLACK_TEST_ALLOW_WRITES=TEAM_ID:OWNER_USER_ID` guard. It is skipped by default and writes visible test messages/files.
 
-For future remote-worker development, source checkouts include a secret-free, localhost-only [SSH worker development fixture](https://github.com/O123O/qiyan-bot/blob/main/docs/development/ssh-worker-fixture.md). It validates a separate Codex App Server over SSH but is not wired into QiYan's session routing.
+Source checkouts include a secret-free, localhost-only [SSH worker development fixture](docs/development/ssh-worker-fixture.md) for testing the supported SSH endpoint path.
 
 ## Troubleshooting
 
@@ -168,4 +170,4 @@ For future remote-worker development, source checkouts include a secret-free, lo
 - No Slack input: verify owner/workspace IDs, invite QiYan to the channel, mention it once in the thread, and review the [Slack troubleshooting steps](docs/chat-apps/slack.md#troubleshooting-and-revocation).
 - No WeChat input: verify the service uses the same home as `weixin-login`, stop competing pollers, and review the [personal WeChat troubleshooting steps](docs/chat-apps/wechat.md#troubleshooting).
 
-SSH endpoints, interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.
+Interactive approval UI, multi-user tenancy, and arbitrary remote recipients are deferred.

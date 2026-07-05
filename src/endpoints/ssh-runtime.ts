@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -8,11 +8,11 @@ import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan 
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "cc58d83c6ca8d674505879fe04fa200cebdebcad9ae3c82edffdaba854e33382";
+export const REMOTE_HELPER_SHA256 = "3389db2c782ce29ee7137d534fb39f18ae66d3dd6939c7ad8dfdeea86d763db2";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "workspace", "tunnel"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -35,6 +35,15 @@ export interface RemoteRuntimeClient {
   bootstrap(payload: RemoteBootstrapPayload): Promise<void>;
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string): Promise<T>;
   closeControlMaster?(): Promise<void>;
+}
+
+export interface RemoteTransferClient {
+  invokeTransfer<T>(
+    operation: "read-file" | "write-file",
+    args: readonly string[],
+    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number },
+    installedHelperPath: string,
+  ): Promise<T>;
 }
 
 export interface RemoteBootstrapPayload {
@@ -168,6 +177,18 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH helper returned an invalid response"); }
   }
 
+  async invokeTransfer<T>(
+    operation: "read-file" | "write-file",
+    args: readonly string[],
+    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number },
+    installedHelperPath: string,
+  ): Promise<T> {
+    const command = buildInstalledHelperCommand(installedHelperPath, operation, args);
+    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? 60_000);
+    try { return JSON.parse(result.stdout.toString("utf8")) as T; }
+    catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH file helper returned an invalid response"); }
+  }
+
   async closeControlMaster(): Promise<void> {
     if (!this.options.plan.ownsControlMaster) return;
     const run = this.options.run ?? runBoundedProcess;
@@ -177,10 +198,28 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   }
 
   private execute(command: readonly string[], input?: Buffer): Promise<BoundedProcessResult> {
+    return this.executePrepared(command, input);
+  }
+
+  private async executePrepared(
+    command: readonly string[],
+    input?: Uint8Array | AsyncIterable<Uint8Array | string>,
+    maxOutputBytes = 1024 * 1024,
+    timeoutMs = 30_000,
+  ): Promise<BoundedProcessResult> {
+    if (this.options.plan.ownsControlMaster) {
+      const directory = dirname(this.options.plan.controlPath!);
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const state = await lstat(directory);
+      const uid = process.getuid?.();
+      if (!state.isDirectory() || state.isSymbolicLink() || (state.mode & 0o077) !== 0 || (uid !== undefined && state.uid !== uid)) {
+        throw new AppError("CONFIGURATION_ERROR", "unsafe SSH ControlMaster directory");
+      }
+    }
     const run = this.options.run ?? runBoundedProcess;
     return run(this.options.sshBinary ?? "ssh", buildSshRemoteArgs(this.options.plan, command), {
-      timeoutMs: 30_000,
-      maxOutputBytes: 1024 * 1024,
+      timeoutMs,
+      maxOutputBytes,
       ...(input ? { input } : {}),
     });
   }

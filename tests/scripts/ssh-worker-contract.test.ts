@@ -13,7 +13,7 @@ test("SSH worker image pins its base, packages, account, and copied inputs", asy
   assert.match(dockerfile, /^ENV CODEX_HOME=\/home\/codex\/\.codex$/mu);
   assert.match(
     dockerfile,
-    /^RUN apt-get update \\\n && apt-get install -y --no-install-recommends \\\n\s+ca-certificates \\\n\s+git \\\n\s+openssh-client \\\n\s+openssh-server \\\n && rm -f \/etc\/ssh\/ssh_host_\* \\\n && npm install --global "@openai\/codex@\$\{CODEX_VERSION\}" \\/mu,
+    /^RUN apt-get update \\\n && apt-get install -y --no-install-recommends \\\n\s+ca-certificates \\\n\s+git \\\n\s+openssh-client \\\n\s+openssh-server \\\n\s+procps \\\n\s+tmux \\\n && rm -f \/etc\/ssh\/ssh_host_\* \\\n && npm install --global "@openai\/codex@\$\{CODEX_VERSION\}" \\/mu,
   );
   assert.match(
     dockerfile,

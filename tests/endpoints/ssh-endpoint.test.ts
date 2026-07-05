@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { RpcWire } from "../../src/app-server/rpc-client.ts";
-import { SshEndpoint, type SshTunnel } from "../../src/endpoints/ssh-endpoint.ts";
+import { openSshUnixTunnel, SshEndpoint, type SshTunnel } from "../../src/endpoints/ssh-endpoint.ts";
 import type { RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 class FakeWire implements RpcWire {
@@ -33,6 +37,34 @@ class FakeTunnel extends EventEmitter implements SshTunnel {
 }
 
 const identity: RuntimeIdentity = { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+
+test("bridges a private local Unix socket through an SSH byte stream", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-tunnel-"));
+  const localSocketPath = join(root, "app-server.sock");
+  const fixture = new URL("../fixtures/fake-ssh-tunnel.mjs", import.meta.url);
+  await chmod(fixture, 0o755);
+  context.after(async () => { await rm(root, { recursive: true, force: true }); });
+
+  const tunnel = await openSshUnixTunnel({
+    plan: {
+      alias: "devbox",
+      destination: { hostname: "example.test", user: "worker", port: 22 },
+      commonArgs: [],
+      ownsControlMaster: false,
+    },
+    localSocketPath,
+    remoteSocketPath: "/tmp/qiyan-1000/0123456789abcdef01234567/app-server.sock",
+    sshBinary: fixture.pathname,
+  });
+  context.after(async () => { await tunnel.close(); });
+
+  const peer = createConnection(localSocketPath);
+  context.after(() => peer.destroy());
+  await new Promise<void>((resolve, reject) => peer.once("connect", resolve).once("error", reject));
+  const received = new Promise<Buffer>((resolve, reject) => peer.once("data", resolve).once("error", reject));
+  peer.write("ping");
+  assert.equal((await received).toString("utf8"), "ping");
+});
 
 test("initializes over a tunnel and reconnects to the same detached runtime", async () => {
   const wires = [new FakeWire(), new FakeWire()];

@@ -117,8 +117,7 @@ export class EndpointManager {
     this.cancelReconnect(record);
     const drain = await record.gate.beginDrain();
     try {
-      const endpoint = await this.activate(endpointId, true);
-      const identity = await this.requireRuntimeIdentity(endpoint);
+      const { endpoint, identity } = await this.shutdownTarget(endpointId, record);
       checkpoint?.({ phase: "draining", identity });
       await this.requireManagedThreadsIdle(endpointId, endpoint);
       checkpoint?.({ phase: "idle_proven", identity });
@@ -143,8 +142,7 @@ export class EndpointManager {
     const preparedReplacement = await this.prepareCandidate(endpointId);
     const drain = await record.gate.beginDrain();
     try {
-      const endpoint = await this.activate(endpointId, true);
-      const identity = await this.requireRuntimeIdentity(endpoint);
+      const { endpoint, identity } = await this.shutdownTarget(endpointId, record);
       checkpoint?.({ phase: "draining", identity });
       await this.requireManagedThreadsIdle(endpointId, endpoint);
       checkpoint?.({ phase: "idle_proven", identity });
@@ -239,9 +237,9 @@ export class EndpointManager {
   }
 
   private scheduleReconnect(endpointId: string, record: EndpointRecord, generation: number, _kind: EndpointLossKind): void {
-    if (record.gate.desiredState !== "automatic" || record.reconnect) return;
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
-      if (!referenced || record.endpoint?.id !== endpointId || record.generation !== generation || record.gate.desiredState !== "automatic" || record.reconnect) return;
+      if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation || record.gate.desiredState !== "automatic" || record.reconnect) return;
       const delay = Math.min(30_000, 1_000 * 2 ** Math.min(record.reconnectAttempt, 5));
       record.reconnectAttempt += 1;
       const schedule = this.options.schedule ?? ((delayMs: number, run: () => void) => {
@@ -251,7 +249,7 @@ export class EndpointManager {
       });
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
-        if (record.generation !== generation || record.gate.desiredState !== "automatic") return;
+        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic") return;
         void this.activate(endpointId, false).catch(() => this.scheduleReconnect(endpointId, record, generation, "connection-lost"));
       });
     }).catch(() => undefined);
@@ -269,12 +267,26 @@ export class EndpointManager {
   }
 
   private enqueueLifecycle<T>(record: EndpointRecord, run: () => Promise<T>): Promise<T> {
+    if (this.closing) return Promise.reject(new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down"));
     const previous = record.lifecycle ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(run);
     const settled = result.then(() => undefined, () => undefined);
     record.lifecycle = settled;
     void settled.finally(() => { if (record.lifecycle === settled) delete record.lifecycle; });
     return result;
+  }
+
+  private async shutdownTarget(endpointId: string, record: EndpointRecord): Promise<{ endpoint: ManagedAppServerEndpoint; identity: RuntimeIdentity }> {
+    const current = record.endpoint;
+    if (current) {
+      const identity = await current.runtimeIdentity().catch(() => undefined);
+      if (identity) {
+        const managed = await this.options.managedThreadIds(endpointId);
+        if (managed.length === 0 || current.state === "ready") return { endpoint: current, identity };
+      }
+    }
+    const endpoint = await this.activate(endpointId, true);
+    return { endpoint, identity: await this.requireRuntimeIdentity(endpoint) };
   }
 
   private record(id: string): EndpointRecord {

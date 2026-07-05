@@ -317,6 +317,14 @@ export class AttachmentStore {
     };
   }
 
+  async discard(scopeId: string, id: FileHandleId): Promise<void> {
+    const row = this.db.prepare("SELECT local_path, ref_count FROM attachments WHERE id = ? AND scope_id = ?").get(id, scopeId) as { local_path: string; ref_count: number } | undefined;
+    if (!row) return;
+    if (row.ref_count !== 0) this.invalid("cannot discard a retained attachment");
+    const removed = this.db.prepare("DELETE FROM attachments WHERE id = ? AND scope_id = ? AND ref_count = 0").run(id, scopeId).changes;
+    if (removed === 1) await unlink(row.local_path).catch(() => undefined);
+  }
+
   totalBytes(): number {
     return Number((this.db.prepare("SELECT COALESCE(SUM(size), 0) AS total FROM attachments").get() as { total: number }).total);
   }

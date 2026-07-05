@@ -214,8 +214,10 @@ test("all adapters share the real dispatcher while WeChat tools keep the initiat
   const tools = createAssistantTools(operations, createChatOutputActions({
     deliveries,
     attachments,
-    assistantDir: project,
-    managedProjectRoot: () => { throw new Error("unexpected managed owner"); },
+    prepareAttachment: (owner, relativePath, scopeId, requestedId) => {
+      if (owner !== "assistant") throw new Error("unexpected managed owner");
+      return attachments.prepareOutbound(scopeId, project, relativePath, undefined, undefined, requestedId);
+    },
     binding: (attemptId) => attemptBinding(db, attemptId),
   }), { maxCollectCount: 20 });
   const toolContext = { sourceContextId: "weixin:generation:message:1", attemptId: lease.attemptId, turnId: "turn-1" };

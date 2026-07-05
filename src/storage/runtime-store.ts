@@ -101,11 +101,12 @@ export class RuntimeStore {
     });
   }
 
-  listSessions(): Array<{ endpointId: string; threadId: string; mappingId: string; managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string }> {
-    return (this.db.prepare("SELECT endpoint_id, thread_id, mapping_id, management_state, restore_state, native_status FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
+  listSessions(): Array<{ endpointId: string; threadId: string; mappingId: string; managementState: ManagementState; restoreState?: ManagementState; nativeStatus: string; activeTurnId?: string }> {
+    return (this.db.prepare("SELECT endpoint_id, thread_id, mapping_id, management_state, restore_state, native_status, active_turn_id FROM session_runtime").all() as Array<Record<string, unknown>>).map((row) => ({
       endpointId: String(row.endpoint_id), threadId: String(row.thread_id), mappingId: String(row.mapping_id), managementState: String(row.management_state) as ManagementState,
       ...(row.restore_state ? { restoreState: String(row.restore_state) as ManagementState } : {}),
       nativeStatus: String(row.native_status),
+      ...(row.active_turn_id ? { activeTurnId: String(row.active_turn_id) } : {}),
     }));
   }
 

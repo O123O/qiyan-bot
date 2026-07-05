@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { chmod, mkdir, readFile, realpath } from "node:fs/promises";
+import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
@@ -63,8 +63,21 @@ import { WeixinOutboundStore } from "./weixin/outbound-store.ts";
 import { WeixinDeliveryAdapter } from "./weixin/delivery-adapter.ts";
 import { authorizationIncident, WeixinChatAdapter } from "./weixin/chat-adapter.ts";
 import { WeixinIncidentRouter } from "./weixin/incident-router.ts";
+import { EndpointCatalog } from "./endpoints/catalog.ts";
+import { EndpointBindingStore } from "./endpoints/binding-store.ts";
+import { EndpointManager } from "./endpoints/manager.ts";
+import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
+import { SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
+import { WebSocketWire } from "./app-server/websocket-wire.ts";
+import { SshHost } from "./endpoints/ssh-host.ts";
+import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
+import type { EndpointLossKind, ManagedAppServerEndpoint } from "./endpoints/types.ts";
+import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
+import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
+const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
 
@@ -129,11 +142,17 @@ export async function buildProductionApp(
   let finals!: FinalMessageStore;
   let endpoint!: LocalEndpoint;
   let assistantEndpoint!: LocalEndpoint;
+  let endpointCatalog!: EndpointCatalog;
+  let endpointBindings!: EndpointBindingStore;
+  let endpointManager!: EndpointManager;
   let pool!: AppServerPool;
   let discovery!: SessionDiscovery;
   let lifecycle!: SessionLifecycle;
   let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
+  let workspaceRouter!: WorkspaceRouter;
+  let workerFiles!: WorkerFileBridge;
+  let recoveredEndpointIds: string[] = [];
   let sessions!: SessionService;
   let relay!: EventRelay;
   let assistant!: AssistantRuntime;
@@ -152,6 +171,9 @@ export async function buildProductionApp(
   let acceptingReadyEvents = false;
   let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
+  const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
+  const projectEndpointRecoveries = new Map<string, Promise<void>>();
+  const remoteContexts = new Map<string, { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string }>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
@@ -205,6 +227,8 @@ export async function buildProductionApp(
         db = openDatabase(databasePath);
         operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
         dashboardStore = new SessionDashboardStore(db);
+        endpointBindings = new EndpointBindingStore(db);
+        endpointCatalog = await EndpointCatalog.open(config.endpointCatalogPath);
         runConversationRoutingBackfill(db, telegramBinding);
       },
       stop: async () => { db.close(); },
@@ -375,7 +399,80 @@ export async function buildProductionApp(
           validateEnvironment: () => assistantProfile.assertIntact(),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
-        pool = new AppServerPool([endpoint, assistantEndpoint], { maxConcurrentTurns: config.maxConcurrentTurns });
+        const sshRuntimeRoot = join(dataDir, "ssh-runtime");
+        await mkdir(sshRuntimeRoot, { recursive: true, mode: 0o700 });
+        await chmod(sshRuntimeRoot, 0o700);
+        const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
+        const planner = new SshGenerationPlanner({
+          sshBinary: "ssh",
+          runtimeDir: sshRuntimeRoot,
+          hasReferences: (id) => hasEndpointIdentityReferences(id),
+          checkExisting: (id, destination, references) => endpointBindings.checkExisting(id, destination, references),
+        });
+        endpointManager = new EndpointManager({
+          localEndpoint: endpoint,
+          catalog: endpointCatalog,
+          createRemote: async (definition) => {
+            const generation = await planner.createGeneration(definition.id);
+            const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
+            const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+            const socketRoot = join(sshRuntimeRoot, "sockets", createHash("sha256").update(definition.id).digest("hex").slice(0, 24));
+            await mkdir(socketRoot, { recursive: true, mode: 0o700 });
+            await chmod(socketRoot, 0o700);
+            const localSocket = join(socketRoot, "app-server.sock");
+            const remoteEndpoint = new SshEndpoint({
+              id: definition.id,
+              runtime: remoteRuntime,
+              minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
+              openTunnel: (remoteSocketPath) => openSshUnixTunnel({ plan: generation.plan, localSocketPath: localSocket, remoteSocketPath }),
+              connectWire: () => WebSocketWire.connect(localSocket, { timeoutMs: 10_000, trustedRoot: socketRoot }),
+            });
+            remoteContexts.set(definition.id, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
+            return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
+          },
+          hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
+          commitBinding: (binding, references) => endpointBindings.commitAfterActivation(binding.endpointId, binding.destination, references),
+          managedThreadIds: (id) => Object.values(registry.snapshot().sessions).filter((session) => session.endpoint === id).map((session) => session.thread_id),
+        });
+        pool = new AppServerPool([endpoint, assistantEndpoint], {
+          maxConcurrentTurns: config.maxConcurrentTurns,
+          resolveEndpoint: (id) => endpointManager.ensureReady(id),
+          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithWorkLease(id, lease, run),
+        });
+        recoveredEndpointIds = new EndpointCapacityRecovery({
+          runtime,
+          registry,
+          operations,
+          pool,
+          quarantine: (operation, reason) => operations.failAndUnbind(operation.id, { message: reason }),
+        }).restoreBeforeIngress();
+        workspaceRouter = new WorkspaceRouter(async (id) => {
+          if (id === "local") return projectWorkspaces;
+          await endpointManager.ensureReady(id);
+          const context = remoteContexts.get(id);
+          if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
+          const home = context.runtime.remoteHome;
+          const projectsRoot = context.projectsRoot.startsWith("~/") ? posix.resolve(home, context.projectsRoot.slice(2)) : posix.resolve(context.projectsRoot);
+          return new ProjectWorkspacePolicy({
+            userHome: home,
+            qiyanHome: context.runtime.remoteRuntimeDir,
+            assistantWorkdir: context.runtime.remoteRuntimeDir,
+            dataDir: context.runtime.remoteRuntimeDir,
+            registryPath: posix.join(context.runtime.remoteRuntimeDir, "sessions.json"),
+            defaultProjectsRoot: projectsRoot,
+            host: new SshHost(id, context.remote, context.runtime.remoteHelperPath),
+          });
+        }, (id, lease) => endpointManager.validateWorkLease(lease, id));
+        workerFiles = new WorkerFileBridge({
+          attachments,
+          registry,
+          endpoints: endpointManager,
+          remote: (id) => {
+            const context = remoteContexts.get(id);
+            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath, runtimeDir: context.runtime.remoteRuntimeDir } : undefined;
+          },
+          maxFileBytes: config.attachmentMaxBytes,
+        });
         const durableLease = conversations.lease();
         if (durableLease) {
           const identity = registry.snapshot().assistant;
@@ -387,8 +484,8 @@ export async function buildProductionApp(
         }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, projectWorkspaces, threadGate);
-        sessions = new SessionService(pool, registry, runtime, finals, deliveries, projectWorkspaces, threadGate);
+        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager);
+        sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
           readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
@@ -402,28 +499,18 @@ export async function buildProductionApp(
           onTerminal: (event) => observations.observeTerminal(event),
         }, attachments);
         scheduler = new AssistantScheduler();
-        unsubscribers.push(endpoint.onNotification((method, params) => {
-          if (!observations.accept(endpoint.id, method, params)) runBackground(() => onNotification(endpoint.id, method, params), () => recordBackgroundFailure("project notification"));
-        }));
+        unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
-        unsubscribers.push(endpoint.onPermissionBlocked((event) => runBackground(async () => {
-          await relay.handlePermissionBlocked(endpoint.id, event);
-          const mapping = event.threadId ? registry.getByIdentity(endpoint.id, event.threadId) : undefined;
-          if (event.threadId && mapping && runtime.getSession(endpoint.id, event.threadId, mapping.session.mapping_id)?.managementState === "managed") {
-            const state = runtime.getSession(endpoint.id, event.threadId, mapping.session.mapping_id)!;
-            runtime.reconcileNativeState(endpoint.id, event.threadId, mapping.session.mapping_id, state.nativeStatus, runtime.activeTurn(endpoint.id, event.threadId, mapping.session.mapping_id), dashboardStore.allocateObservationSequence());
-            dashboardStore.observeLifecycle({ endpointId: endpoint.id, threadId: event.threadId }, Date.now());
-            await renderDashboardSafely();
-          }
-          enqueuePendingEvents();
-        }, () => recordBackgroundFailure("permission notification"))));
-        unsubscribers.push(endpoint.onReady(() => { if (acceptingReadyEvents) runBackground(() => relay.reconcileEndpoint(endpoint.id), () => recordBackgroundFailure("project ready reconciliation")); }));
-        unsubscribers.push(endpoint.onUnavailable(() => runBackground(() => handleEndpointUnavailable(endpoint), () => recordBackgroundFailure("project unavailable handling"))));
-        unsubscribers.push(assistantEndpoint.onUnavailable(() => {
+        unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
           assistantToolReadiness.block();
-          runBackground(() => handleEndpointUnavailable(assistantEndpoint), () => recordBackgroundFailure("assistant unavailable handling"));
+          runBackground(() => handleEndpointUnavailable(assistantEndpoint, kind), () => recordBackgroundFailure("assistant unavailable handling"));
         }));
-      }, stop: async () => { for (const unsubscribe of unsubscribers.splice(0)) unsubscribe(); await observations.idle(); },
+      }, stop: async () => {
+        for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
+        for (const subscriptions of projectEndpointSubscriptions.values()) for (const unsubscribe of subscriptions) unsubscribe();
+        projectEndpointSubscriptions.clear();
+        await observations.idle();
+      },
     },
     {
       name: "endpoint",
@@ -431,7 +518,7 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          await endpoint.start();
+          await endpointManager.ensureReady("local");
           await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
           if (endpoint.state !== "ready" || assistantEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
           endpointsCommitted = true;
@@ -439,7 +526,7 @@ export async function buildProductionApp(
           stopping = true;
           for (const timer of reconnectTimers.values()) clearTimeout(timer);
           reconnectTimers.clear();
-          await Promise.all([assistantEndpoint.stop(), endpoint.stop()]).catch(() => undefined);
+          await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]).catch(() => undefined);
           throw error;
         }
       },
@@ -448,7 +535,7 @@ export async function buildProductionApp(
         endpointsCommitted = false;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
-        await Promise.all([assistantEndpoint.stop(), endpoint.stop()]);
+        await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]);
       },
     },
     {
@@ -499,13 +586,16 @@ export async function buildProductionApp(
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
+        const referencedEndpoints = [...new Set([
+          ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
+          ...recoveredEndpointIds,
+        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id);
+        await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
         await lifecycle.reconcileAdopting();
         await lifecycle.reconcileRemovals();
         await resumeManagedSessions();
-        await observations.drain(endpoint.id);
-        await relay.reconcileEndpoint(endpoint.id);
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
         acceptingReadyEvents = true;
@@ -569,27 +659,29 @@ export async function buildProductionApp(
       },
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        const project = await projectWorkspaces.prepareCreate(args.nickname, args.project_dir);
-        const mappingId = `mapping_${randomUUID()}`;
-        const workspaceReceipt = projectWorkspaceReceipt(project);
-        let dispatchStarted = false;
-        let settingsObservationSequence: number | undefined;
-        context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
-        const settings = await lifecycle.create(args.nickname, endpointId, project, context.operationId, (thread, currentSettings) => {
-          settingsObservationSequence = dashboardStore.allocateObservationSequence();
-          context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted, threadId: thread.id, currentSettings, settingsObservationSequence });
-          hydrateThreadOrder(endpointId, thread);
-        }, () => {
-          dispatchStarted = true;
+        return endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
+          const project = await workspaceRouter.prepareCreate(endpointId, args.nickname, args.project_dir, lease);
+          const mappingId = `mapping_${randomUUID()}`;
+          const workspaceReceipt = projectWorkspaceReceipt(project);
+          let dispatchStarted = false;
+          let settingsObservationSequence: number | undefined;
           context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
-        }, mappingId);
-        advanceNativeWatermark(args.nickname);
-        observeLifecycle(args.nickname);
-        observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
-        await renderDashboardSafely();
-        const mapping = registry.get(args.nickname);
-        if (!mapping || mapping.mapping_id !== mappingId) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
-        return { nickname: args.nickname, mapping_id: mapping.mapping_id };
+          const settings = await lifecycle.create(args.nickname, endpointId, project, context.operationId, (thread, currentSettings) => {
+            settingsObservationSequence = dashboardStore.allocateObservationSequence();
+            context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted, threadId: thread.id, currentSettings, settingsObservationSequence });
+            hydrateThreadOrder(endpointId, thread);
+          }, () => {
+            dispatchStarted = true;
+            context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
+          }, mappingId, lease);
+          advanceNativeWatermark(args.nickname);
+          observeLifecycle(args.nickname);
+          observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
+          await renderDashboardSafely();
+          const mapping = registry.get(args.nickname);
+          if (!mapping || mapping.mapping_id !== mappingId) throw new AppError("OPERATION_UNCERTAIN", "created session mapping was not committed");
+          return { nickname: args.nickname, mapping_id: mapping.mapping_id };
+        });
       },
       adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
@@ -639,8 +731,6 @@ export async function buildProductionApp(
           : { pendingSettings, ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }) });
         const resolvedAttachments: Array<{ contextId: string; attachmentId: FileHandleId }> = (args.attachment_ids as string[])
           .map((id) => attemptScope.resolveAttachment(context.attemptId, id));
-        const files = resolvedAttachments.map((attachment) => attachments.toUserInput(attachment.contextId, attachment.attachmentId));
-        const input = [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
         const holds = resolvedAttachments.map((attachment, index) => ({
           ...attachment,
           id: `${workerAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId)}:${index}`,
@@ -651,7 +741,31 @@ export async function buildProductionApp(
           result = await sessions.send(args.nickname, args.content, {
             mode: args.mode,
             clientUserMessageId: `${context.effectiveSourceContextId}:${context.callId}`,
-            input,
+            prepareInput: async ({ session, projectRoot, lease }) => {
+              if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "worker endpoint lease is unavailable");
+              const files = await Promise.all(resolvedAttachments.map((attachment) => workerFiles.toWorkerInput({
+                lease,
+                mapping: session,
+                projectRoot,
+                scopeId: attachment.contextId,
+                attachmentId: attachment.attachmentId,
+              })));
+              return [...(args.content.length > 0 ? [{ type: "text", text: args.content, text_elements: [] }] : []), ...files];
+            },
+            onBeforeNativeDispatch: ({ session, mode, activeTurnId }) => {
+              if (mode === "steer") {
+                context.checkpoint({ turnId: activeTurnId });
+                return;
+              }
+              context.checkpoint({
+                pendingSettings,
+                ...(settingsObservationSequence === undefined ? {} : { settingsObservationSequence }),
+                capacityHint: {
+                  phase: "provisional-start", endpoint: session.endpoint, threadId: session.thread_id,
+                  mappingId: session.mapping_id, clientUserMessageId: `${context.effectiveSourceContextId}:${context.callId}`,
+                },
+              });
+            },
             ...(pendingSettings ? { settings: pendingSettings } : {}),
           });
         } catch (error) {
@@ -700,7 +814,17 @@ export async function buildProductionApp(
         await renderDashboardSafely();
         return { interrupted: true, turnId };
       },
-      list_models: async (args) => sessions.models(args.endpoint ?? "local"),
+      list_models: async (args) => sessions.models(projectEndpoint(args.endpoint)),
+      disconnect_endpoint: async (args, context) => {
+        const endpointId = projectEndpoint(args.endpoint);
+        await endpointManager.disconnect(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        return { endpoint: endpointId, state: "disconnected" };
+      },
+      restart_endpoint: async (args, context) => {
+        const endpointId = projectEndpoint(args.endpoint);
+        await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        return { endpoint: endpointId, state: "ready" };
+      },
       set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
       set_reasoning_effort: async (args) => { await sessions.setEffort(args.nickname, args.effort); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
       get_goal: async (args) => {
@@ -756,8 +880,7 @@ export async function buildProductionApp(
       ...createChatOutputActions({
         deliveries,
         attachments,
-        assistantDir,
-        managedProjectRoot: (owner) => sessions.managedProjectRoot(owner),
+        prepareAttachment: prepareChatAttachment,
         binding: assistantAttemptBinding,
       }),
       get_chat_history: createChatHistoryAction(() => chatRegistry, assistantAttemptBinding),
@@ -890,6 +1013,47 @@ export async function buildProductionApp(
     return endpointId;
   }
 
+  function hasEndpointIdentityReferences(endpointId: string): boolean {
+    return Object.values(registry.snapshot().sessions).some((session) => session.endpoint === endpointId)
+      || Boolean(pool?.hasClaims(endpointId))
+      || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId));
+  }
+
+  function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
+    for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
+    const current = () => {
+      try {
+        const value = endpointManager.endpointGeneration(target.id);
+        return value.endpoint === target && value.generation === generation;
+      } catch { return false; }
+    };
+    pool.replaceEndpoint(target);
+    const subscriptions = [
+      target.onNotification((method, params) => {
+        if (!current()) return;
+        if (!observations.accept(target.id, method, params)) runBackground(() => onNotification(target.id, method, params), () => recordBackgroundFailure("project notification"));
+      }),
+      target.onPermissionBlocked((event) => {
+        if (!current()) return;
+        runBackground(async () => {
+          await relay.handlePermissionBlocked(target.id, event);
+          const mapping = event.threadId ? registry.getByIdentity(target.id, event.threadId) : undefined;
+          if (event.threadId && mapping && runtime.getSession(target.id, event.threadId, mapping.session.mapping_id)?.managementState === "managed") {
+            const state = runtime.getSession(target.id, event.threadId, mapping.session.mapping_id)!;
+            runtime.reconcileNativeState(target.id, event.threadId, mapping.session.mapping_id, state.nativeStatus, runtime.activeTurn(target.id, event.threadId, mapping.session.mapping_id), dashboardStore.allocateObservationSequence());
+            dashboardStore.observeLifecycle({ endpointId: target.id, threadId: event.threadId }, Date.now());
+            await renderDashboardSafely();
+          }
+          enqueuePendingEvents();
+        }, () => recordBackgroundFailure("permission notification"));
+      }),
+      target.onReady(() => { if (current() && acceptingReadyEvents) runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation")); }),
+      target.onUnavailable((kind) => { if (current()) runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling")); }),
+    ];
+    projectEndpointSubscriptions.set(target.id, subscriptions);
+    if (acceptingReadyEvents && target.state === "ready") runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation"));
+  }
+
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
     if (endpointId === identity.endpoint && method === "turn/completed" && params.threadId === identity.thread_id) {
@@ -1008,10 +1172,17 @@ export async function buildProductionApp(
           const id = chatAttachmentFileHandle(operation.contextId, operation.attemptId, operation.callId);
           let prepared = attachments.get(operation.contextId, id);
           if (!prepared) {
-            const ownerRoot = args.owner === "assistant" ? assistantDir : sessions.managedProjectRoot(args.owner);
-            prepared = await attachments.prepareOutbound(operation.contextId, ownerRoot, args.relative_path, undefined, undefined, id);
+            prepared = await prepareChatAttachment(args.owner, args.relative_path, operation.contextId, id);
           }
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
+        } else if (operation.kind === "disconnect_endpoint") {
+          const endpointId = projectEndpoint(args.endpoint);
+          await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
+        } else if (operation.kind === "restart_endpoint") {
+          const endpointId = projectEndpoint(args.endpoint);
+          await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
           const binding = assistantAttemptBinding(operation.attemptId);
@@ -1185,6 +1356,23 @@ export async function buildProductionApp(
     }
   }
 
+  async function prepareChatAttachment(owner: string, relativePath: string, scopeId: string, requestedId: FileHandleId) {
+    if (owner === "assistant") {
+      return attachments.prepareOutbound(scopeId, assistantDir, relativePath, undefined, undefined, requestedId);
+    }
+    const session = registry.get(owner);
+    if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${owner}`);
+    if (session.lifecycle_state !== "managed") throw new AppError("SESSION_DETACHED", `${owner} is not managed`);
+    return workerFiles.prepareProjectFile({
+      endpointId: session.endpoint,
+      projectRoot: session.project_dir,
+      mapping: session,
+      scopeId,
+      relativePath,
+      requestedId,
+    });
+  }
+
   function projectWorkspaceReceipt(project: PreparedProjectWorkspace): Record<string, unknown> {
     return {
       projectDir: project.path,
@@ -1195,18 +1383,22 @@ export async function buildProductionApp(
     };
   }
 
-  async function resumeManagedSessions(): Promise<void> {
+  async function resumeManagedSessions(endpointFilter?: string): Promise<void> {
     for (const session of Object.values(registry.managedSnapshot().sessions)) {
-      if (session.endpoint !== endpoint.id) continue;
+      if (endpointFilter && session.endpoint !== endpointFilter) continue;
       const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
       if (state?.managementState === "managed") {
         runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
       }
     }
+    const reconciledEndpoints = new Set<string>();
     for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
-      if (session.endpoint !== endpoint.id) continue;
+      if (endpointFilter && session.endpoint !== endpointFilter) continue;
       try {
         const response = await lifecycle.reconcileManaged(nickname, session);
+        reconciledEndpoints.add(session.endpoint);
+        const activeTurn = [...(response.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
+        if (activeTurn) pool.restoreObservedActiveTurn(session.endpoint, session.thread_id, activeTurn.id);
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         const nativeObservationSequence = dashboardStore.allocateObservationSequence();
         hydrateThreadOrder(session.endpoint, response.thread);
@@ -1225,13 +1417,41 @@ export async function buildProductionApp(
         }
       }
     }
+    if (endpointFilter && !reconciledEndpoints.has(endpointFilter)
+      && !Object.values(registry.managedSnapshot().sessions).some((session) => session.endpoint === endpointFilter)) {
+      reconciledEndpoints.add(endpointFilter);
+    }
+    for (const endpointId of reconciledEndpoints) {
+      await pool.reconcileEndpointClaims(endpointId);
+      await observations.drain(endpointId);
+      await relay.reconcileEndpoint(endpointId);
+    }
   }
 
-  async function handleEndpointUnavailable(target: LocalEndpoint): Promise<void> {
+  function recoverProjectEndpoint(endpointId: string): Promise<void> {
+    const existing = projectEndpointRecoveries.get(endpointId);
+    if (existing) return existing;
+    const recovery = (async () => {
+      await resumeManagedSessions(endpointId);
+      await reconcileOperations();
+      deliveries.prepare({
+        id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
+        kind: "system_warning",
+        binding: currentOwnerBinding(),
+        body: `[system] ${endpointId} app-server reconnected`,
+        mandatory: true,
+      });
+      await renderDashboardSafely();
+    })().finally(() => { if (projectEndpointRecoveries.get(endpointId) === recovery) projectEndpointRecoveries.delete(endpointId); });
+    projectEndpointRecoveries.set(endpointId, recovery);
+    return recovery;
+  }
+
+  async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
     endpointIncident += 1;
-    acceptingReadyEvents = false;
-    pool.markEndpointUnavailable(target.id);
+    if (target.id === assistantEndpoint.id) acceptingReadyEvents = false;
+    pool.markEndpointUnavailable(target.id, kind);
     for (const session of runtime.listSessions()) {
       if (session.endpointId === target.id && session.managementState === "managed") {
         runtime.setSession(session.endpointId, session.threadId, session.mappingId, "unavailable", "notLoaded");
@@ -1252,7 +1472,7 @@ export async function buildProductionApp(
     db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
       VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
       .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now());
-    scheduleReconnect(target);
+    if (target.id === assistantEndpoint.id) scheduleReconnect(assistantEndpoint);
     await renderDashboardSafely();
   }
 
@@ -1275,9 +1495,7 @@ export async function buildProductionApp(
       await target.start();
       await lifecycle.reconcileAdopting();
       await lifecycle.reconcileRemovals();
-      await resumeManagedSessions();
-      await observations.drain(endpoint.id);
-      await relay.reconcileEndpoint(endpoint.id);
+      await resumeManagedSessions(endpoint.id);
       await reconcileOperations();
       await renderDashboardSafely();
     } else {

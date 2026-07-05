@@ -18,13 +18,19 @@ test("WebSocket wire exchanges App Server frames over a Unix socket", async (t) 
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   });
-  websocket.on("connection", (peer) => peer.on("message", (value) => {
-    const request = JSON.parse(value.toString()) as { id: number };
-    peer.send(JSON.stringify({ id: request.id, result: { ready: true } }));
-  }));
+  let extensionHeader: string | undefined;
+  websocket.on("connection", (peer, request) => {
+    extensionHeader = request.headers["sec-websocket-extensions"];
+    peer.on("message", (value) => {
+      const rpc = JSON.parse(value.toString()) as { id: number };
+      peer.send(JSON.stringify({ id: rpc.id, result: { ready: true } }));
+    });
+  });
   await new Promise<void>((resolve, reject) => server.listen(socket, () => resolve()).once("error", reject));
   await chmod(socket, 0o600);
   const wire = await WebSocketWire.connect(socket, { timeoutMs: 500, trustedRoot: root });
+  try { assert.equal(extensionHeader, undefined); }
+  catch (error) { wire.close(); throw error; }
   const client = new RpcClient(wire, { requestTimeoutMs: 500 });
   assert.deepEqual(await client.request("initialize", {}), { ready: true });
   client.close();

@@ -12,7 +12,8 @@
     "assets/remote/qiyan-app-server-launcher.sh",
     "assets/remote/qiyan-ssh-helper.mjs",
     "assets/slack/manifest.yaml",
-    "docs/chat-apps/wechat.md"
+    "docs/chat-apps/wechat.md",
+    "docs/ssh-workers.md"
   ],
   "engines": {
     "node": ">=24"
@@ -28,6 +29,7 @@
     "ssh-worker:up": "node --import tsx scripts/ssh-worker.ts up",
     "ssh-worker:login": "node --import tsx scripts/ssh-worker.ts login",
     "ssh-worker:check": "node --import tsx scripts/ssh-worker.ts check",
+    "ssh-worker:endpoint-check": "QIYAN_SSH_ENDPOINT_INTEGRATION=1 node scripts/run-tests.mjs tests/integration/ssh-endpoint.test.ts",
     "ssh-worker:down": "node --import tsx scripts/ssh-worker.ts down",
     "ssh-worker:reset": "node --import tsx scripts/ssh-worker.ts reset"
   },

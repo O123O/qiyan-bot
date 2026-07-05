@@ -1,14 +1,13 @@
 import { createHash } from "node:crypto";
 import type { ToolActionContext } from "../assistant/tools.ts";
-import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
+import type { AttachmentStore, FileHandleId, StoredAttachment } from "../attachments/store.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { ConversationBinding } from "./binding.ts";
 
 interface ChatOutputOptions {
   deliveries: DeliveryStore;
   attachments: AttachmentStore;
-  assistantDir: string;
-  managedProjectRoot(owner: string): string;
+  prepareAttachment(owner: string, relativePath: string, scopeId: string, requestedId: FileHandleId): Promise<StoredAttachment>;
   binding(attemptId: string): ConversationBinding;
 }
 
@@ -24,13 +23,8 @@ export function createChatOutputActions(options: ChatOutputOptions) {
       }).id,
     }),
     prepare_chat_attachment: async (args: { owner: string; relative_path: string }, context: ToolActionContext) => {
-      const ownerRoot = args.owner === "assistant" ? options.assistantDir : options.managedProjectRoot(args.owner);
-      const prepared = await options.attachments.prepareOutbound(
-        context.effectiveSourceContextId,
-        ownerRoot,
-        args.relative_path,
-        undefined,
-        undefined,
+      const prepared = await options.prepareAttachment(
+        args.owner, args.relative_path, context.effectiveSourceContextId,
         chatAttachmentFileHandle(context.effectiveSourceContextId, context.attemptId, context.callId),
       );
       return {

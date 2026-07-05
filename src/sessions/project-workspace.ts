@@ -64,7 +64,6 @@ export class ProjectWorkspacePolicy {
     const existed = await pathExists(this.host, path);
     const projected = await this.assertProjectedSafe(path);
     await this.host.mkdir(path, { recursive: true, mode: 0o700 });
-    if (!existed) await this.host.chmod(path, 0o700);
     return this.finalize(path, !existed, false, existed ? undefined : projected);
   }
 
@@ -107,7 +106,6 @@ export class ProjectWorkspacePolicy {
       if (isErrno(error, "EEXIST")) throw new AppError("OPERATION_CONFLICT", `fallback project directory already exists for nickname: ${nickname}`);
       throw error;
     }
-    await this.host.chmod(leaf, 0o700);
     return this.finalize(leaf, true, true);
   }
 

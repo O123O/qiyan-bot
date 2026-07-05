@@ -23,6 +23,8 @@ export const ASSISTANT_TOOL_SCHEMAS = {
   collect_messages: z.object({ nickname, count: z.number().int().positive() }).strict(),
   interrupt_session: z.object({ nickname, turn_id: z.string().optional() }).strict(),
   list_models: z.object({ endpoint: z.string().optional() }).strict(),
+  disconnect_endpoint: z.object({ endpoint: z.string().min(1).default("local") }).strict(),
+  restart_endpoint: z.object({ endpoint: z.string().min(1).default("local") }).strict(),
   set_session_model: z.object({ nickname, model: z.string().min(1) }).strict(),
   set_reasoning_effort: z.object({ nickname, effort: z.string().min(1) }).strict(),
   get_goal: z.object({ nickname }).strict(),

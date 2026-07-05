@@ -9,6 +9,8 @@ RUN apt-get update \
       git \
       openssh-client \
       openssh-server \
+      procps \
+      tmux \
  && rm -f /etc/ssh/ssh_host_* \
  && npm install --global "@openai/codex@${CODEX_VERSION}" \
  && useradd --create-home --home-dir /home/codex --shell /bin/bash --password NP codex \

@@ -115,6 +115,24 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "active-1"));
 });
 
+test("prepares worker input inside the verified execution fence before native dispatch", async () => {
+  const { endpoint, service } = await fixture();
+  let prepared = false;
+  await service.send("payments", "attached", {
+    prepareInput: async ({ session, projectRoot }) => {
+      prepared = true;
+      assert.equal(session.mapping_id, mappingId);
+      assert.equal(projectRoot, endpoint.cwd);
+      assert.equal(endpoint.calls.at(-1)?.method, "thread/read");
+      return [{ type: "mention", name: "notes.txt", path: "/remote/notes.txt" }];
+    },
+  });
+  assert.equal(prepared, true);
+  assert.deepEqual(endpoint.calls.find((call) => call.method === "turn/start")?.params.input, [
+    { type: "mention", name: "notes.txt", path: "/remote/notes.txt" },
+  ]);
+});
+
 test("execution performs a fresh native cwd and project check before every mutation", async () => {
   const { endpoint, service, failWorkspace } = await fixture();
   await service.send("payments", "start");

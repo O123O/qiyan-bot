@@ -7,7 +7,7 @@ import { SessionDashboardDocumentSchema } from "../../src/assistant/dashboard-sc
 
 const policyPath = fileURLToPath(new URL("../../assets/assistant/AGENTS.md", import.meta.url));
 const catalog = [
-  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session"]],
+  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session", "disconnect_endpoint", "restart_endpoint"]],
   ["Work and results", ["send_to_session", "read_worker_message", "collect_messages", "interrupt_session"]],
   ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
   ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],

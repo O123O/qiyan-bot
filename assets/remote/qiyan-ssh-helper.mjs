@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
-import { chmod, mkdir, open, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createConnection } from "node:net";
 
 const TMUX = ["-L", "qiyan-bot", "-f", "/dev/null"];
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
@@ -16,21 +17,39 @@ const operation = process.argv[2];
 const encoded = process.argv.slice(3);
 
 try {
-  let result;
-  switch (operation) {
+  if (operation === "tunnel") {
+    await tunnelSocket(decodeJson(encoded, 1));
+  } else {
+    let result;
+    switch (operation) {
     case "preflight": result = preflight(); break;
     case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
     case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
     case "start": result = await start(decodeJson(encoded, 1)); break;
     case "stop": result = await stop(decodeJson(encoded, 1)); break;
     case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
+    case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
+    }
+    process.stdout.write(`${JSON.stringify(result)}\n`);
   }
-  process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch {
   process.stderr.write("qiyan remote helper failed\n");
   process.exitCode = 1;
+}
+
+async function tunnelSocket(value) {
+  const socketPath = value?.socketPath;
+  if (typeof socketPath !== "string" || !socketPath.endsWith("/app-server.sock")) throw new Error("invalid tunnel request");
+  const runtimeDir = dirname(socketPath);
+  requireRuntimeDir(runtimeDir);
+  if (socketPath !== join(runtimeDir, "app-server.sock")) throw new Error("invalid tunnel request");
+  const socket = createConnection({ path: socketPath, allowHalfOpen: true });
+  await new Promise((resolve, reject) => socket.once("connect", resolve).once("error", reject));
+  process.stdin.pipe(socket);
+  socket.pipe(process.stdout);
+  await new Promise((resolve, reject) => socket.once("close", resolve).once("error", reject));
 }
 
 function decodeJson(values, count) {
@@ -115,17 +134,16 @@ async function stop(value) {
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
   if (identity) {
-    const members = membersOfGroup(identity.processGroupId);
-    const owned = members.filter((pid) => processHasToken(pid, identity.token));
-    if (members.length > 0 && (owned.length === 0 || owned.length !== members.length)) throw new Error("runtime process group ownership cannot be proven");
+    let members = ownedGroupMembers(identity);
     if (members.length > 0) {
       try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
-      if (membersOfGroup(identity.processGroupId).length > 0) {
+      members = ownedGroupMembers(identity);
+      if (members.length > 0) {
         try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
         await waitForEmptyGroup(identity.processGroupId, 2_000);
       }
-      if (membersOfGroup(identity.processGroupId).length > 0) throw new Error("runtime process group did not stop");
+      if (ownedGroupMembers(identity).length > 0) throw new Error("runtime process group did not stop");
     }
   }
   await run("tmux", [...TMUX, "kill-session", "-t", paths.session], true);
@@ -136,12 +154,17 @@ async function stop(value) {
 
 async function readFileDescriptor(value) {
   const path = value?.path;
+  const root = value?.root;
   const maxBytes = value?.maxBytes;
-  if (typeof path !== "string" || !isAbsolute(path) || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 16 * 1024 * 1024) throw new Error("invalid read request");
+  if (typeof path !== "string" || !isAbsolute(path) || typeof root !== "string" || !isAbsolute(root)
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024) throw new Error("invalid read request");
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await file.stat({ bigint: true });
     if (!before.isFile() || before.size > BigInt(maxBytes)) throw new Error("invalid source file");
+    const canonicalRoot = await realpath(root);
+    const actual = await realpath(`/proc/self/fd/${file.fd}`);
+    if (!pathWithin(canonicalRoot, actual)) throw new Error("source file escapes project root");
     const bytes = Buffer.alloc(Number(before.size));
     let offset = 0;
     while (offset < bytes.byteLength) {
@@ -156,6 +179,61 @@ async function readFileDescriptor(value) {
       sha256: sha256(bytes), dataBase64: bytes.toString("base64"),
     };
   } finally { await file.close(); }
+}
+
+async function writeFileDescriptor(value) {
+  const runtimeDir = value?.runtimeDir;
+  const expectedSize = value?.size;
+  const expectedSha256 = value?.sha256;
+  requireRuntimeDir(runtimeDir);
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > 64 * 1024 * 1024
+    || typeof expectedSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expectedSha256)) throw new Error("invalid write request");
+  const filesDir = join(runtimeDir, "files");
+  await ensurePrivateDirectory(filesDir);
+  const target = join(filesDir, expectedSha256);
+  const existing = await verifyStoredFile(target, expectedSize, expectedSha256);
+  if (existing) return { path: target, size: expectedSize, sha256: expectedSha256 };
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  const file = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  const hash = createHash("sha256");
+  let size = 0;
+  try {
+    for await (const value of process.stdin) {
+      const chunk = Buffer.from(value);
+      size += chunk.byteLength;
+      if (size > expectedSize) throw new Error("uploaded file exceeds declared size");
+      hash.update(chunk);
+      await file.write(chunk);
+    }
+    if (size !== expectedSize || hash.digest("hex") !== expectedSha256) throw new Error("uploaded file integrity mismatch");
+    await file.sync();
+    await file.close();
+    renameSync(temporary, target);
+    return { path: target, size, sha256: expectedSha256 };
+  } catch (error) {
+    await file.close().catch(() => undefined);
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function verifyStoredFile(path, expectedSize, expectedSha256) {
+  let file;
+  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+  try {
+    const state = await file.stat();
+    if (!state.isFile() || state.size !== expectedSize || (state.mode & 0o077) !== 0 || state.uid !== process.getuid?.()) throw new Error("invalid staged file");
+    const hash = createHash("sha256");
+    for await (const chunk of file.createReadStream({ autoClose: false })) hash.update(chunk);
+    if (hash.digest("hex") !== expectedSha256) throw new Error("invalid staged file");
+    return true;
+  } finally { await file.close(); }
+}
+
+function pathWithin(root, candidate) {
+  const projected = relative(root, candidate);
+  return projected === "" || (!projected.startsWith("..") && !isAbsolute(projected));
 }
 
 async function workspace(value) {
@@ -245,6 +323,13 @@ function processHasToken(pid, token) {
   let environment;
   try { environment = readFileSync(`/proc/${pid}/environ`); } catch { return false; }
   return environment.toString("utf8").split("\0").includes(`QIYAN_RUNTIME_TOKEN=${token}`);
+}
+
+function ownedGroupMembers(identity) {
+  const members = membersOfGroup(identity.processGroupId);
+  const owned = members.filter((pid) => processHasToken(pid, identity.token));
+  if (members.length > 0 && (owned.length === 0 || owned.length !== members.length)) throw new Error("runtime process group ownership cannot be proven");
+  return owned;
 }
 
 function identityMatches(identity) {

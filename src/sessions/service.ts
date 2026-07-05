@@ -23,13 +23,27 @@ export class SessionService {
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease">,
   ) {}
 
-  async send(nickname: string, text: string, options: { mode?: "auto" | "start" | "steer"; clientUserMessageId?: string; input?: unknown[]; settings?: { model?: string; effort?: string } } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
+  async send(nickname: string, text: string, options: {
+    mode?: "auto" | "start" | "steer";
+    clientUserMessageId?: string;
+    input?: unknown[];
+    settings?: { model?: string; effort?: string };
+    prepareInput?(context: { session: RegistrySession; projectRoot: string; lease?: EndpointWorkLease }): Promise<unknown[]>;
+    onBeforeNativeDispatch?(context: { session: RegistrySession; mode: "start" | "steer"; activeTurnId?: string; lease?: EndpointWorkLease }): void | Promise<void>;
+  } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     return this.runVerifiedExecution(nickname, async (session, cwd, lease) => {
       const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
       const mode = options.mode ?? "auto";
-      const input = options.input ?? [{ type: "text", text, text_elements: [] }];
       if (activeTurn) {
         if (mode === "start") throw new AppError("SESSION_BUSY", `${nickname} already has an active turn`);
+      } else if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
+      const input = options.prepareInput
+        ? await options.prepareInput({ session, projectRoot: cwd, ...(lease ? { lease } : {}) })
+        : options.input ?? [{ type: "text", text, text_elements: [] }];
+      this.assertExactManaged(nickname, session.mapping_id);
+      if (activeTurn) {
+        await options.onBeforeNativeDispatch?.({ session, mode: "steer", activeTurnId: activeTurn, ...(lease ? { lease } : {}) });
+        this.assertExactManaged(nickname, session.mapping_id);
         try {
           const response = await this.pool.request<{ turnId: string }>(session.endpoint, "turn/steer", {
             threadId: session.thread_id, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, expectedTurnId: activeTurn,
@@ -43,8 +57,9 @@ export class SessionService {
           return { mode: "steer" as const, turnId: activeTurn };
         }
       }
-      if (mode === "steer") throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
       const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
+      this.assertExactManaged(nickname, session.mapping_id);
+      await options.onBeforeNativeDispatch?.({ session, mode: "start", ...(lease ? { lease } : {}) });
       this.assertExactManaged(nickname, session.mapping_id);
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,

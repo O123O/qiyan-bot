@@ -32,6 +32,7 @@ export class WebSocketWire implements RpcWire {
       handshakeTimeout: options.timeoutMs,
       maxPayload: MAX_FRAME_BYTES,
       followRedirects: false,
+      perMessageDeflate: false,
     });
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {

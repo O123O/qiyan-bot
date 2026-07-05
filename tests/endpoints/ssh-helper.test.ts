@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { Readable } from "node:stream";
 import test from "node:test";
 import {
   REMOTE_HELPER_SHA256,
@@ -62,15 +63,26 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
 
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");
-  const readArg = encodeRemoteArgument(JSON.stringify({ path: source, maxBytes: 1024 }));
+  const readArg = encodeRemoteArgument(JSON.stringify({ path: source, root: runtimeDir, maxBytes: 1024 }));
   const read = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", readArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.equal(Buffer.from(JSON.parse(read.stdout.toString("utf8")).dataBase64, "base64").toString(), "descriptor-safe");
   await symlink(source, `${runtimeDir}/report-link.txt`);
-  const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, maxBytes: 1024 }));
+  const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, root: runtimeDir, maxBytes: 1024 }));
   await assert.rejects(
     runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", linkArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }),
     /failed/u,
   );
+
+  const upload = Buffer.from("streamed-upload");
+  const uploadSha = createHash("sha256").update(upload).digest("hex");
+  const uploadArg = encodeRemoteArgument(JSON.stringify({ runtimeDir, size: upload.byteLength, sha256: uploadSha }));
+  const written = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "write-file", uploadArg], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024, input: Readable.from([upload]),
+  });
+  const uploaded = JSON.parse(written.stdout.toString("utf8")) as { path: string; size: number; sha256: string };
+  assert.equal(uploaded.path, `${runtimeDir}/files/${uploadSha}`);
+  assert.equal(await readFile(uploaded.path, "utf8"), "streamed-upload");
+  assert.equal((await stat(uploaded.path)).mode & 0o777, 0o600);
 });
 
 test("published packages include both remote runtime assets", async () => {

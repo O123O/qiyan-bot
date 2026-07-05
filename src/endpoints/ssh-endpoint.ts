@@ -1,16 +1,17 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { lstat, mkdir, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, unlink } from "node:fs/promises";
+import { createServer, type Server, type Socket } from "node:net";
+import { dirname, join } from "node:path";
 import { AppError } from "../core/errors.ts";
 import { APP_VERSION } from "../version.ts";
 import type { PermissionBlockedEvent } from "../app-server/local-endpoint.ts";
 import type { RpcRequest } from "../app-server/protocol.ts";
 import { RpcClient, type RpcWire } from "../app-server/rpc-client.ts";
 import { requireMinimumCodexVersion } from "../app-server/version-compat.ts";
-import { buildControlMasterExitArgs, buildSshArgs, type SshConnectionPlan } from "./ssh-config.ts";
+import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan } from "./ssh-config.ts";
 import { runBoundedProcess } from "./ssh-process.ts";
-import type { SshRuntimeController } from "./ssh-runtime.ts";
+import { buildInstalledHelperCommand, type SshRuntimeController } from "./ssh-runtime.ts";
 import type { EndpointLossKind, RuntimeIdentity } from "./types.ts";
 
 export interface SshTunnel {
@@ -180,65 +181,106 @@ export async function openSshUnixTunnel(options: {
   await mkdir(dirname(options.localSocketPath), { recursive: true, mode: 0o700 });
   if (options.plan.ownsControlMaster) await mkdir(dirname(options.plan.controlPath!), { recursive: true, mode: 0o700 });
   await unlink(options.localSocketPath).catch((error) => { if (!isErrno(error, "ENOENT")) throw error; });
-  let processError: Error | undefined;
-  const child = spawn(options.sshBinary ?? "ssh", buildSshArgs(options.plan, [
-    "-N", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
-    "-L", `${options.localSocketPath}:${options.remoteSocketPath}`,
-  ]), { stdio: ["pipe", "pipe", "pipe"], shell: false });
-  child.stdout.on("data", () => { /* tunnel stdout is not part of the protocol */ });
-  child.stderr.on("data", () => { /* drain without logging potentially sensitive SSH diagnostics */ });
-  child.on("error", (error) => { processError = error; });
-  try {
-    await waitForTunnelSocket(child, options.localSocketPath, options.timeoutMs ?? 10_000, () => processError);
-    return new ProcessSshTunnel(child, async () => {
+  const helperPath = join(dirname(options.remoteSocketPath), "qiyan-ssh-helper.mjs");
+  const command = buildInstalledHelperCommand(helperPath, "tunnel", [JSON.stringify({ socketPath: options.remoteSocketPath })]);
+  const tunnel = new ProcessSshTunnel({
+    sshBinary: options.sshBinary ?? "ssh",
+    sshArgs: buildSshRemoteArgs(options.plan, command),
+    localSocketPath: options.localSocketPath,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    closeMaster: async () => {
       if (!options.plan.ownsControlMaster) return;
       await runBoundedProcess(options.sshBinary ?? "ssh", buildControlMasterExitArgs(options.plan), {
         timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
       }).catch(() => undefined);
-    });
-  } catch (error) {
-    child.kill("SIGTERM");
-    throw error;
-  }
+    },
+  });
+  await tunnel.listen();
+  return tunnel;
 }
 
 class ProcessSshTunnel implements SshTunnel {
   private readonly events = new EventEmitter();
+  private readonly server: Server;
   private intentional = false;
-  constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly closeMaster: () => Promise<void>) {
-    child.once("error", (error) => { if (!this.intentional) this.events.emit("close", error); });
-    child.once("exit", () => { if (!this.intentional) this.events.emit("close", new Error("SSH tunnel exited")); });
+  private emittedClose = false;
+  private peer?: Socket;
+  private child?: ChildProcessWithoutNullStreams;
+
+  constructor(private readonly options: {
+    sshBinary: string;
+    sshArgs: readonly string[];
+    localSocketPath: string;
+    timeoutMs: number;
+    closeMaster(): Promise<void>;
+  }) {
+    this.server = createServer({ allowHalfOpen: true }, (peer) => this.accept(peer));
   }
+
+  async listen(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new AppError("ENDPOINT_UNAVAILABLE", "SSH tunnel did not open in time"));
+      }, this.options.timeoutMs);
+      timeout.unref?.();
+      const cleanup = () => { clearTimeout(timeout); this.server.off("error", failed); };
+      const failed = () => { cleanup(); reject(new AppError("ENDPOINT_UNAVAILABLE", "SSH tunnel could not start")); };
+      this.server.once("error", failed);
+      this.server.listen(this.options.localSocketPath, () => { cleanup(); resolve(); });
+    });
+    await chmod(this.options.localSocketPath, 0o600);
+    this.server.on("error", () => this.fail(new Error("local SSH bridge failed")));
+  }
+
   onClose(listener: (error?: Error) => void): () => void { this.events.on("close", listener); return () => this.events.off("close", listener); }
+
   async close(): Promise<void> {
     this.intentional = true;
-    if (this.child.exitCode === null && this.child.signalCode === null) {
+    this.peer?.destroy();
+    await this.stopChild();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    await unlink(this.options.localSocketPath).catch((error) => { if (!isErrno(error, "ENOENT")) throw error; });
+    await this.options.closeMaster();
+  }
+
+  private accept(peer: Socket): void {
+    if (this.intentional || this.peer) { peer.destroy(); return; }
+    this.peer = peer;
+    const child = spawn(this.options.sshBinary, [...this.options.sshArgs], { stdio: ["pipe", "pipe", "pipe"], shell: false });
+    this.child = child;
+    child.stderr.on("data", () => { /* drain without logging potentially sensitive SSH diagnostics */ });
+    child.once("error", () => this.fail(new Error("SSH tunnel could not start")));
+    child.once("exit", () => this.fail(new Error("SSH tunnel exited")));
+    peer.once("error", () => this.fail(new Error("local SSH bridge failed")));
+    peer.once("close", () => { if (!this.intentional) void this.stopChild(); });
+    peer.pipe(child.stdin);
+    child.stdout.pipe(peer);
+  }
+
+  private fail(error: Error): void {
+    if (this.intentional || this.emittedClose) return;
+    this.emittedClose = true;
+    this.events.emit("close", error);
+  }
+
+  private async stopChild(): Promise<void> {
+    const child = this.child;
+    delete this.child;
+    if (child && child.exitCode === null && child.signalCode === null) {
       await new Promise<void>((resolve) => {
         let hard: ReturnType<typeof setTimeout> | undefined;
         const force = setTimeout(() => {
-          this.child.kill("SIGKILL");
+          child.kill("SIGKILL");
           hard = setTimeout(resolve, 500);
           hard.unref?.();
         }, 2_000);
         force.unref?.();
-        this.child.once("exit", () => { clearTimeout(force); if (hard) clearTimeout(hard); resolve(); });
-        this.child.kill("SIGTERM");
+        child.once("exit", () => { clearTimeout(force); if (hard) clearTimeout(hard); resolve(); });
+        child.kill("SIGTERM");
       });
     }
-    await this.closeMaster();
   }
-}
-
-async function waitForTunnelSocket(child: ChildProcessWithoutNullStreams, path: string, timeoutMs: number, processError: () => Error | undefined): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (processError()) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH tunnel could not start");
-    if (child.exitCode !== null || child.signalCode !== null) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH tunnel exited before opening");
-    const state = await lstat(path).catch(() => undefined);
-    if (state?.isSocket()) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new AppError("ENDPOINT_UNAVAILABLE", "SSH tunnel did not open in time");
 }
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException { return error instanceof Error && "code" in error && error.code === code; }
