@@ -8,11 +8,11 @@ import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan 
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "0b46b29c413f81d0b6768e8d7965b1287d7a6cd20a7bf00c7324a27ff71ad8eb";
-export const REMOTE_LAUNCHER_SHA256 = "051e003f215d28cad899d8ab27777a04c627f825a385b32383d47f35037dc630";
+export const REMOTE_HELPER_SHA256 = "cc58d83c6ca8d674505879fe04fa200cebdebcad9ae3c82edffdaba854e33382";
+export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -22,7 +22,7 @@ const preflightSchema = z.object({
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent") }).strict(),
-  z.object({ status: z.literal("unhealthy") }).strict(),
+  z.object({ status: z.literal("unhealthy"), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional() }).strict(),
   z.object({ status: z.literal("healthy"), identity: z.unknown() }).strict(),
 ]);
 
@@ -49,11 +49,11 @@ export interface SshRuntimeController {
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
   closeTransport?(): Promise<void>;
-  stop(): Promise<void>;
+  stop(expectedIdentity?: RuntimeIdentity): Promise<void>;
 }
 
 export class SshRuntime implements SshRuntimeController {
-  private prepared?: { runtimeDir: string; helperPath: string; session: string; shell: string };
+  private prepared?: { runtimeDir: string; helperPath: string; session: string; shell: string; home: string };
 
   constructor(private readonly options: { endpointId: string; remote: RemoteRuntimeClient; assetRoot?: string }) {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
@@ -62,6 +62,18 @@ export class SshRuntime implements SshRuntimeController {
   get remoteSocketPath(): string {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
     return `${this.prepared.runtimeDir}/app-server.sock`;
+  }
+  get remoteHelperPath(): string {
+    if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
+    return this.prepared.helperPath;
+  }
+  get remoteRuntimeDir(): string {
+    if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
+    return this.prepared.runtimeDir;
+  }
+  get remoteHome(): string {
+    if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
+    return this.prepared.home;
   }
 
   async ensureStarted(): Promise<RuntimeIdentity> {
@@ -81,7 +93,7 @@ export class SshRuntime implements SshRuntimeController {
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
-    return current.status === "healthy" ? current.identity : undefined;
+    return current.status === "healthy" || (current.status === "unhealthy" && current.identity) ? current.identity : undefined;
   }
 
   async classifyLoss(): Promise<EndpointLossKind> {
@@ -89,9 +101,10 @@ export class SshRuntime implements SshRuntimeController {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(): Promise<void> {
+  async stop(expectedIdentity?: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
-    try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session })], prepared.helperPath); }
+    if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
+    try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session, expected: expectedIdentity })], prepared.helperPath); }
     finally { await this.closeTransport(); }
   }
 
@@ -106,6 +119,7 @@ export class SshRuntime implements SshRuntimeController {
       helperPath: `${runtimeDir}/qiyan-ssh-helper.mjs`,
       session: `qiyan-${endpointHash}`,
       shell: preflight.shell,
+      home: preflight.home,
     };
     const assets = await loadRemoteAssets(this.options.assetRoot);
     await this.options.remote.bootstrap({ runtimeDir, ...assets });
@@ -114,11 +128,12 @@ export class SshRuntime implements SshRuntimeController {
   }
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<
-    { status: "absent" | "unhealthy" } | { status: "healthy"; identity: RuntimeIdentity }
+    { status: "absent" } | { status: "unhealthy"; identity?: RuntimeIdentity } | { status: "healthy"; identity: RuntimeIdentity }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
       runtimeDir: prepared.runtimeDir, session: prepared.session,
     })], prepared.helperPath));
+    if (parsed.status === "unhealthy") return { status: "unhealthy", ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }) };
     if (parsed.status !== "healthy") return parsed;
     return { status: "healthy", identity: parseRuntimeIdentity(parsed.identity) };
   }

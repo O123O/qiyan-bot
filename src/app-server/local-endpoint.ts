@@ -146,7 +146,7 @@ export class LocalEndpoint {
   }
 
   closeConnection(): Promise<void> { return this.stop(); }
-  shutdownRuntime(): Promise<void> { return this.stop(); }
+  shutdownRuntime(_expectedIdentity?: RuntimeIdentity): Promise<void> { return this.stop(); }
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     return this.protocolIdentity ? { kind: "local", pid: this.protocolIdentity.pid, startTime: this.protocolIdentity.startTime } : undefined;
   }

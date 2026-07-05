@@ -18,7 +18,7 @@ export interface EndpointWorkLease {
 export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
-  shutdownRuntime(): Promise<void>;
+  shutdownRuntime(expectedIdentity?: RuntimeIdentity): Promise<void>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;

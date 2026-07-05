@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
 import type { AppServerPool } from "../app-server/pool.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
@@ -7,6 +6,9 @@ import type { MappingIdentity, MappingLifecycleState, RegistrySession, SessionRe
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { PreparedProjectWorkspace, ProjectWorkspacePolicy } from "./project-workspace.ts";
 import type { ThreadGate } from "./thread-gate.ts";
+import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
+import type { EndpointManager } from "../endpoints/manager.ts";
+import type { EndpointWorkLease } from "../endpoints/types.ts";
 
 interface ThreadView { id: string; cwd: string; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -30,6 +32,7 @@ export class SessionLifecycle {
     private readonly clock: Clock,
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
     private readonly gate: ThreadGate,
+    private readonly endpoints?: Pick<EndpointManager, "withWorkLease">,
   ) {}
 
   async create(
@@ -41,16 +44,17 @@ export class SessionLifecycle {
     onDispatching?: () => void,
     mappingId = `mapping_${randomUUID()}`,
   ): Promise<CurrentSessionSettings> {
+    return this.withMutationLease(endpointId, async (lease) => {
     if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
-    await this.workspaces.assertDispatchable(project);
+    await this.assertDispatchable(endpointId, project, lease);
     onDispatching?.();
-    const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(project.path, threadSource));
+    const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(project.path, threadSource), undefined, lease);
     if (response.thread.threadSource !== threadSource) throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
     const settings = this.responseSettings(response);
     onThreadCreated?.(response.thread, settings);
     await this.gate.run(endpointId, response.thread.id, async () => {
-      await this.workspaces.assertDispatchable(project);
-      await this.verifyCwd(response.thread.cwd, project.path);
+      await this.assertDispatchable(endpointId, project, lease);
+      await this.verifyCwd(endpointId, response.thread.cwd, project.path, lease);
       if (response.thread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${response.thread.id} was created in ${response.thread.status.type} state`);
       await this.registry.createManaged(nickname, {
         endpoint: endpointId,
@@ -62,6 +66,7 @@ export class SessionLifecycle {
       this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
     });
     return settings;
+    });
   }
 
   async adopt(
@@ -71,13 +76,13 @@ export class SessionLifecycle {
     onThreadRead?: (thread: ThreadView) => void,
     mappingId = `mapping_${randomUUID()}`,
   ): Promise<void> {
-    await this.gate.run(endpointId, threadId, async () => {
+    await this.withMutationLease(endpointId, (lease) => this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
-      const before = await this.read(endpointId, threadId);
+      const before = await this.read(endpointId, threadId, lease);
       this.requireAdoptableBeforeResume(before.thread);
-      const project = await this.workspaces.prepareExisting(before.thread.cwd);
-      await this.workspaces.assertDispatchable(project);
-      await this.verifyCwd(before.thread.cwd, project.path);
+      const project = await this.prepareExisting(endpointId, before.thread.cwd, lease);
+      await this.assertDispatchable(endpointId, project, lease);
+      await this.verifyCwd(endpointId, before.thread.cwd, project.path, lease);
       onThreadRead?.(before.thread);
       const reserved: RegistrySession = {
         endpoint: endpointId,
@@ -90,19 +95,19 @@ export class SessionLifecycle {
       this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
       let resumed = false;
       try {
-        await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId });
+        await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
         resumed = true;
-        const after = await this.read(endpointId, threadId);
+        const after = await this.read(endpointId, threadId, lease);
         this.requireIdle(after.thread);
-        await this.workspaces.assertDispatchable(project);
-        await this.verifyCwd(after.thread.cwd, project.path);
+        await this.assertDispatchable(endpointId, project, lease);
+        await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
         await this.registry.promote(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
         this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
       } catch (error) {
         if (resumed) {
           try {
-            await this.pool.request(endpointId, "thread/unsubscribe", { threadId });
+            await this.pool.request(endpointId, "thread/unsubscribe", { threadId }, undefined, lease);
             await this.registry.removeIfMatch(nickname, reserved);
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
@@ -110,7 +115,7 @@ export class SessionLifecycle {
         }
         throw error;
       }
-    });
+    }));
   }
 
   async unadopt(nickname: string, checkpoint?: (value: LifecycleCheckpoint) => void): Promise<void> {
@@ -162,22 +167,22 @@ export class SessionLifecycle {
     for (const [nickname, expected] of entries) {
       await this.gate.run(expected.endpoint, expected.thread_id, async () => {
         const session = this.assertExact(nickname, expected, "adopting");
-        const project = await this.workspaces.prepareExisting(session.project_dir);
+        const project = await this.prepareExisting(session.endpoint, session.project_dir);
         let resumed = false;
         try {
-          await this.workspaces.assertDispatchable(project);
+          await this.assertDispatchable(session.endpoint, project);
           if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
           const before = await this.read(session.endpoint, session.thread_id);
           this.requireAdoptableBeforeResume(before.thread);
-          await this.verifyCwd(before.thread.cwd, project.path);
+          await this.verifyCwd(session.endpoint, before.thread.cwd, project.path);
           this.assertExact(nickname, expected, "adopting");
           await this.pool.request(session.endpoint, "thread/resume", { threadId: session.thread_id });
           resumed = true;
           const afterResume = this.assertExact(nickname, expected, "adopting");
           const native = await this.read(afterResume.endpoint, afterResume.thread_id);
           this.requireIdle(native.thread);
-          await this.verifyCwd(native.thread.cwd, project.path);
-          await this.workspaces.assertDispatchable(project);
+          await this.verifyCwd(session.endpoint, native.thread.cwd, project.path);
+          await this.assertDispatchable(session.endpoint, project);
           const promotable = this.assertExact(nickname, expected, "adopting");
           await this.registry.promote(nickname, promotable);
           this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
@@ -203,17 +208,17 @@ export class SessionLifecycle {
   async reconcileManaged(nickname: string, expected: RegistrySession): Promise<ThreadResponse> {
     return this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
-      const project = await this.workspaces.prepareExisting(session.project_dir);
-      await this.workspaces.assertDispatchable(project);
+      const project = await this.prepareExisting(session.endpoint, session.project_dir);
+      await this.assertDispatchable(session.endpoint, project);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       const before = await this.read(session.endpoint, session.thread_id);
-      await this.verifyCwd(before.thread.cwd, project.path);
+      await this.verifyCwd(session.endpoint, before.thread.cwd, project.path);
       this.assertExact(nickname, expected, "managed");
       const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id });
       const afterResume = this.assertExact(nickname, expected, "managed");
       const authoritative = await this.read(afterResume.endpoint, afterResume.thread_id);
-      await this.verifyCwd(authoritative.thread.cwd, project.path);
-      await this.workspaces.assertDispatchable(project);
+      await this.verifyCwd(session.endpoint, authoritative.thread.cwd, project.path);
+      await this.assertDispatchable(session.endpoint, project);
       const current = this.assertExact(nickname, expected, "managed");
       this.runtime.setSession(current.endpoint, current.thread_id, current.mapping_id, "managed", authoritative.thread.status.type);
       if (!this.runtime.currentEpoch(current.endpoint, current.thread_id, current.mapping_id)) {
@@ -260,8 +265,8 @@ export class SessionLifecycle {
     return current;
   }
 
-  private read(endpointId: string, threadId: string): Promise<ThreadResponse> {
-    return this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true });
+  private read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
+    return this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
   }
 
   private requireIdle(thread: ThreadView): void {
@@ -274,11 +279,21 @@ export class SessionLifecycle {
     }
   }
 
-  private async verifyCwd(actual: string, expected: string): Promise<void> {
+  private async verifyCwd(endpointId: string, actual: string, expected: string, lease?: EndpointWorkLease): Promise<void> {
     let canonicalActual: string;
-    try { canonicalActual = await realpath(actual); }
+    try { canonicalActual = (await this.prepareExisting(endpointId, actual, lease)).path; }
     catch { throw new AppError("CWD_MISMATCH", `thread cwd does not exist: ${actual}`); }
     if (canonicalActual !== expected) throw new AppError("CWD_MISMATCH", `thread cwd ${canonicalActual} does not match ${expected}`);
+  }
+
+  private withMutationLease<T>(endpointId: string, run: (lease?: EndpointWorkLease) => Promise<T>): Promise<T> {
+    return this.endpoints ? this.endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => run(lease)) : run(undefined);
+  }
+  private prepareExisting(endpointId: string, path: string, lease?: EndpointWorkLease) {
+    return this.workspaces instanceof WorkspaceRouter ? this.workspaces.prepareExisting(endpointId, path, lease) : this.workspaces.prepareExisting(path);
+  }
+  private assertDispatchable(endpointId: string, project: PreparedProjectWorkspace, lease?: EndpointWorkLease) {
+    return this.workspaces instanceof WorkspaceRouter ? this.workspaces.assertDispatchable(endpointId, project, lease) : this.workspaces.assertDispatchable(project);
   }
 
   private baseline(thread: ThreadView): string | undefined { return thread.turns.at(-1)?.id; }

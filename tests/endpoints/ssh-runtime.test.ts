@@ -53,7 +53,7 @@ test("starts and stops only its endpoint runtime and refuses unhealthy replaceme
   const runtime = new SshRuntime({ endpointId: "devbox", remote });
   await runtime.ensureStarted();
   assert.equal(remote.calls.filter((call) => call.operation === "start").length, 1);
-  await runtime.stop();
+  await runtime.stop(remote.identity);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1);
 
   remote.status = "unhealthy";

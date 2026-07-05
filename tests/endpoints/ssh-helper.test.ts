@@ -33,6 +33,9 @@ test("the helper hard-codes the isolated tmux server and disables user tmux conf
   assert.match(helper, /"-L", "qiyan-bot", "-f", "\/dev\/null"/u);
   assert.doesNotMatch(helper, /kill-server/u);
   assert.doesNotMatch(helper, /shell:\s*true/u);
+  const launcher = await readFile(launcherPath, "utf8");
+  assert.match(launcher, /QIYAN_RUNTIME_TOKEN/u);
+  assert.match(helper, /processHasToken/u);
 });
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {

@@ -55,7 +55,8 @@ export class AppServerPool {
   private nextClaimGeneration = 1;
   private workLeaseProvider?: WorkLeaseProvider;
 
-  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint> }) {
+  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint>; workLeaseProvider?: WorkLeaseProvider }) {
+    if (options.workLeaseProvider) this.workLeaseProvider = options.workLeaseProvider;
     for (const endpoint of endpoints) this.publishEndpoint(endpoint);
   }
 

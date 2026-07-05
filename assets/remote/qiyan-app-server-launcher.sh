@@ -23,6 +23,9 @@ case "$codex_path" in
 esac
 [ -x "$codex_path" ] || exit 69
 
+QIYAN_RUNTIME_TOKEN=$token
+export QIYAN_RUNTIME_TOKEN
+
 start_time=$(cut -d ' ' -f 22 "/proc/$$/stat")
 process_group=$(ps -o pgid= -p "$$" | tr -d ' ')
 case "$start_time:$process_group" in

@@ -108,6 +108,34 @@ test("disconnect drains admitted work, rejects new work, proves idle, and stops 
   assert.equal(value.manager.desiredState("devbox"), "disconnected");
 });
 
+test("concurrent disconnects serialize and stop one exact runtime generation", async () => {
+  const value = fixture();
+  await value.manager.ensureReady("devbox");
+  const checkpoints: unknown[] = [];
+  await Promise.all([
+    value.manager.disconnect("devbox", (item) => checkpoints.push(item)),
+    value.manager.disconnect("devbox", (item) => checkpoints.push(item)),
+  ]);
+  assert.equal(value.remotes.get("devbox")!.runtimeStops, 1);
+  assert.deepEqual(checkpoints.map((item) => (item as { phase: string }).phase), ["draining", "idle_proven", "runtime_stopped"]);
+});
+
+test("restart prepares the replacement before stopping the current runtime", async () => {
+  const value = fixture();
+  const current = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  value.remotes.delete("devbox");
+  let failPreparation = true;
+  const original = value.manager as unknown as { options: { createRemote: (definition: { id: string }, refs: boolean) => Promise<unknown> } };
+  const create = original.options.createRemote;
+  original.options.createRemote = async (definition, refs) => {
+    if (failPreparation) throw new Error("SSH preflight failed");
+    return create(definition as never, refs);
+  };
+  await assert.rejects(value.manager.restart("devbox"), /preflight failed/u);
+  assert.equal(current.runtimeStops, 0);
+  failPreparation = false;
+});
+
 test("active history prevents disconnect and reopens admission without stopping", async () => {
   const value = fixture();
   const endpoint = await value.manager.ensureReady("devbox") as FakeEndpoint;

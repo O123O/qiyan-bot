@@ -24,6 +24,7 @@ try {
     case "start": result = await start(decodeJson(encoded, 1)); break;
     case "stop": result = await stop(decodeJson(encoded, 1)); break;
     case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
+    case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -74,12 +75,14 @@ async function inspect(value) {
   const identityFile = await stat(paths.identityPath).catch(() => undefined);
   const socketFile = await stat(paths.socketPath).catch(() => undefined);
   const identity = await readIdentity(paths.identityPath);
-  const groupAlive = identity ? membersOfGroup(identity.processGroupId).length > 0 : false;
+  const group = identity ? membersOfGroup(identity.processGroupId) : [];
+  const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
+  const groupAlive = group.length > 0;
   if (tmux.code !== 0) {
-    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy" };
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
     return { status: "absent" };
   }
-  if (!identity || !identityMatches(identity)) return { status: "unhealthy" };
+  if (!identity || !identityMatches(identity)) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) return { status: "unhealthy" };
   return { status: "healthy", identity };
 }
@@ -109,9 +112,13 @@ async function stop(value) {
   const paths = runtimePaths(value);
   const inspected = await inspect(value);
   const identity = await readIdentity(paths.identityPath);
-  if (inspected.status === "unhealthy" && !identity) throw new Error("runtime identity cannot be proven");
+  const expected = validIdentity(value?.expected);
+  if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
   if (identity) {
-    if (membersOfGroup(identity.processGroupId).length > 0) {
+    const members = membersOfGroup(identity.processGroupId);
+    const owned = members.filter((pid) => processHasToken(pid, identity.token));
+    if (members.length > 0 && (owned.length === 0 || owned.length !== members.length)) throw new Error("runtime process group ownership cannot be proven");
+    if (members.length > 0) {
       try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
       if (membersOfGroup(identity.processGroupId).length > 0) {
@@ -149,6 +156,30 @@ async function readFileDescriptor(value) {
       sha256: sha256(bytes), dataBase64: bytes.toString("base64"),
     };
   } finally { await file.close(); }
+}
+
+async function workspace(value) {
+  const action = value?.action;
+  const path = value?.path;
+  if (action === "home") return { path: userInfo().homedir };
+  if (typeof path !== "string" || !isAbsolute(path) || Buffer.byteLength(path) > 16 * 1024) throw new Error("invalid workspace path");
+  if (action === "lstat") {
+    let state;
+    try { state = await import("node:fs/promises").then(({ lstat }) => lstat(path, { bigint: true })); }
+    catch (error) { if (error?.code === "ENOENT") return { kind: "missing" }; throw error; }
+    const kind = state.isSymbolicLink() ? "symlink" : state.isDirectory() ? "directory" : state.isFile() ? "file" : "other";
+    return { kind, device: state.dev.toString(10), inode: state.ino.toString(10) };
+  }
+  if (action === "realpath") return { path: await import("node:fs/promises").then(({ realpath }) => realpath(path)) };
+  if (action === "mkdir") {
+    if (typeof value.recursive !== "boolean" || value.mode !== 0o700) throw new Error("invalid mkdir request");
+    await mkdir(path, { recursive: value.recursive, mode: value.mode }); return { ok: true };
+  }
+  if (action === "chmod") {
+    if (value.mode !== 0o700) throw new Error("invalid chmod request");
+    await chmod(path, value.mode); return { ok: true };
+  }
+  throw new Error("invalid workspace operation");
 }
 
 function runtimePaths(value) {
@@ -197,9 +228,23 @@ async function readIdentity(path) {
   if (!state.isFile() || state.uid !== process.getuid?.() || (state.mode & 0o077) !== 0 || state.size > 4096) return undefined;
   let value;
   try { value = JSON.parse(await readFile(path, "utf8")); } catch { return undefined; }
+  return validIdentity(value);
+}
+
+function validIdentity(value) {
   if (value?.kind !== "ssh" || !HEX_128.test(value.token) || !Number.isSafeInteger(value.pid) || value.pid < 2
     || !DECIMAL.test(value.linuxStartTime) || !Number.isSafeInteger(value.processGroupId) || value.processGroupId < 2) return undefined;
   return value;
+}
+
+function sameIdentity(left, right) {
+  return left.token === right.token && left.pid === right.pid && left.linuxStartTime === right.linuxStartTime && left.processGroupId === right.processGroupId;
+}
+
+function processHasToken(pid, token) {
+  let environment;
+  try { environment = readFileSync(`/proc/${pid}/environ`); } catch { return false; }
+  return environment.toString("utf8").split("\0").includes(`QIYAN_RUNTIME_TOKEN=${token}`);
 }
 
 function identityMatches(identity) {

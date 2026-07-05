@@ -24,11 +24,13 @@ interface EndpointRecord {
   subscriptions: Array<() => void>;
   reconnect?: ScheduledWork;
   reconnectAttempt: number;
+  lifecycle?: Promise<void>;
 }
 
 export class EndpointManager {
   private readonly records = new Map<string, EndpointRecord>();
   private readonly endpointListeners = new Set<(endpoint: ManagedAppServerEndpoint, generation: number) => void>();
+  private closing = false;
 
   constructor(private readonly options: {
     localEndpoint: ManagedAppServerEndpoint;
@@ -45,6 +47,7 @@ export class EndpointManager {
   normalize(id?: string): string { return id ?? "local"; }
 
   async ensureReady(id?: string): Promise<ManagedAppServerEndpoint> {
+    if (this.closing) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down");
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
     if (record.gate.desiredState === "draining") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is draining: ${endpointId}`);
@@ -106,15 +109,21 @@ export class EndpointManager {
   async disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
+    return this.enqueueLifecycle(record, () => this.disconnectInternal(endpointId, record, checkpoint));
+  }
+
+  private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
     if (record.gate.desiredState === "disconnected") return;
     this.cancelReconnect(record);
     const drain = await record.gate.beginDrain();
     try {
       const endpoint = await this.activate(endpointId, true);
-      checkpoint?.({ phase: "validated", identity: await endpoint.runtimeIdentity() });
+      const identity = await this.requireRuntimeIdentity(endpoint);
+      checkpoint?.({ phase: "draining", identity });
       await this.requireManagedThreadsIdle(endpointId, endpoint);
-      await endpoint.shutdownRuntime();
-      checkpoint?.({ phase: "stopped" });
+      checkpoint?.({ phase: "idle_proven", identity });
+      await endpoint.shutdownRuntime(identity);
+      checkpoint?.({ phase: "runtime_stopped", identity });
       drain.disconnect();
     } catch (error) {
       drain.reopen();
@@ -125,21 +134,24 @@ export class EndpointManager {
   async restart(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
+    return this.enqueueLifecycle(record, () => this.restartInternal(endpointId, record, checkpoint));
+  }
+
+  private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
     this.cancelReconnect(record);
-    if (endpointId !== "local") {
-      await this.options.catalog.reload();
-      this.options.catalog.require(endpointId);
-    }
+    if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
+    const preparedReplacement = await this.prepareCandidate(endpointId);
     const drain = await record.gate.beginDrain();
     try {
       const endpoint = await this.activate(endpointId, true);
-      const identity = await endpoint.runtimeIdentity();
-      checkpoint?.({ phase: "validated", identity });
+      const identity = await this.requireRuntimeIdentity(endpoint);
+      checkpoint?.({ phase: "draining", identity });
       await this.requireManagedThreadsIdle(endpointId, endpoint);
-      await endpoint.shutdownRuntime();
-      checkpoint?.({ phase: "stopped", identity });
-      const replacement = await this.activate(endpointId, true, true);
-      checkpoint?.({ phase: "started", identity: await replacement.runtimeIdentity() });
+      checkpoint?.({ phase: "idle_proven", identity });
+      await endpoint.shutdownRuntime(identity);
+      checkpoint?.({ phase: "runtime_stopped", identity });
+      const replacement = await this.startCandidate(record, preparedReplacement);
+      checkpoint?.({ phase: "runtime_started", identity: await this.requireRuntimeIdentity(replacement) });
       drain.reopen();
     } catch (error) {
       drain.reopen();
@@ -148,7 +160,12 @@ export class EndpointManager {
   }
 
   async closeConnections(): Promise<void> {
-    const closing = [...this.records.values()].flatMap((record) => {
+    this.closing = true;
+    const records = [...this.records.values()];
+    for (const record of records) this.cancelReconnect(record);
+    await Promise.allSettled(records.flatMap((record) => record.lifecycle ? [record.lifecycle] : []));
+    await Promise.allSettled(records.flatMap((record) => record.activation ? [record.activation] : []));
+    const closing = records.flatMap((record) => {
       this.cancelReconnect(record);
       return record.endpoint ? [record.endpoint.closeConnection()] : [];
     });
@@ -162,35 +179,38 @@ export class EndpointManager {
     return () => this.endpointListeners.delete(listener);
   }
 
-  private async activate(endpointId: string, lifecycle: boolean, forceReplacement = false): Promise<ManagedAppServerEndpoint> {
+  private async activate(endpointId: string, lifecycle: boolean): Promise<ManagedAppServerEndpoint> {
     const record = this.record(endpointId);
     if (!lifecycle && record.gate.desiredState !== "automatic") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is ${record.gate.desiredState}: ${endpointId}`);
-    if (!forceReplacement && record.endpoint?.state === "ready") return record.endpoint;
+    if (record.endpoint?.state === "ready") return record.endpoint;
     if (record.activation) return record.activation;
     let activation!: Promise<ManagedAppServerEndpoint>;
     activation = (async () => {
-      let candidate: ActivationCandidate;
-      if (endpointId === "local") {
-        candidate = { endpoint: this.options.localEndpoint };
-      } else {
-        await this.options.catalog.reload();
-        const definition = this.options.catalog.require(endpointId);
-        candidate = await this.options.createRemote(definition, await this.options.hasIdentityReferences(endpointId));
-      }
-      try {
-        await candidate.endpoint.start();
-        if (candidate.pendingBinding && this.options.commitBinding) {
-          await this.options.commitBinding(candidate.pendingBinding, await this.options.hasIdentityReferences(endpointId));
-        }
-      } catch (error) {
-        await candidate.endpoint.closeConnection().catch(() => undefined);
-        throw error;
-      }
-      this.publish(record, candidate.endpoint);
-      return candidate.endpoint;
+      return this.startCandidate(record, await this.prepareCandidate(endpointId));
     })().finally(() => { if (record.activation === activation) delete record.activation; });
     record.activation = activation;
     return activation;
+  }
+
+  private async prepareCandidate(endpointId: string): Promise<ActivationCandidate> {
+    if (endpointId === "local") return { endpoint: this.options.localEndpoint };
+    await this.options.catalog.reload();
+    const definition = this.options.catalog.require(endpointId);
+    return this.options.createRemote(definition, await this.options.hasIdentityReferences(endpointId));
+  }
+
+  private async startCandidate(record: EndpointRecord, candidate: ActivationCandidate): Promise<ManagedAppServerEndpoint> {
+    try {
+      await candidate.endpoint.start();
+      if (candidate.pendingBinding && this.options.commitBinding) {
+        await this.options.commitBinding(candidate.pendingBinding, await this.options.hasIdentityReferences(candidate.endpoint.id));
+      }
+    } catch (error) {
+      await candidate.endpoint.closeConnection().catch(() => undefined);
+      throw error;
+    }
+    this.publish(record, candidate.endpoint);
+    return candidate.endpoint;
   }
 
   private publish(record: EndpointRecord, endpoint: ManagedAppServerEndpoint): void {
@@ -240,6 +260,21 @@ export class EndpointManager {
   private cancelReconnect(record: EndpointRecord): void {
     record.reconnect?.cancel();
     delete record.reconnect;
+  }
+
+  private async requireRuntimeIdentity(endpoint: ManagedAppServerEndpoint): Promise<RuntimeIdentity> {
+    const identity = await endpoint.runtimeIdentity();
+    if (!identity) throw new AppError("OPERATION_UNCERTAIN", `runtime identity is unavailable: ${endpoint.id}`);
+    return identity;
+  }
+
+  private enqueueLifecycle<T>(record: EndpointRecord, run: () => Promise<T>): Promise<T> {
+    const previous = record.lifecycle ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(run);
+    const settled = result.then(() => undefined, () => undefined);
+    record.lifecycle = settled;
+    void settled.finally(() => { if (record.lifecycle === settled) delete record.lifecycle; });
+    return result;
   }
 
   private record(id: string): EndpointRecord {

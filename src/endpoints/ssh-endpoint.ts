@@ -92,9 +92,9 @@ export class SshEndpoint {
     await this.options.runtime.closeTransport?.();
   }
 
-  async shutdownRuntime(): Promise<void> {
+  async shutdownRuntime(expectedIdentity?: RuntimeIdentity): Promise<void> {
     await this.closeConnection();
-    await this.options.runtime.stop();
+    await this.options.runtime.stop(expectedIdentity);
   }
 
   runtimeIdentity(): Promise<RuntimeIdentity | undefined> { return this.options.runtime.runtimeIdentity(); }
