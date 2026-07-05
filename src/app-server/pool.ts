@@ -1,4 +1,5 @@
 import { AppError } from "../core/errors.ts";
+import type { EndpointLossKind, ManagedAppServerEndpoint } from "../endpoints/types.ts";
 
 export interface AppServerEndpoint {
   readonly id: string;
@@ -27,12 +28,17 @@ interface TurnStartResponse { turn: { id: string } }
 interface ClaimState extends TurnCapacityClaim {
   phase: "provisional" | "active";
   turnId?: string;
-  selfOwned: boolean;
+  origin: "caller" | "implicit" | "cold-active" | "cold-provisional";
+  clientUserMessageId?: string;
 }
 
 interface TerminalClaim extends TurnCapacityClaim { turnId: string }
 
 class StartProvenAbsentError extends Error {}
+
+function isTerminal(status: string): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
+}
 
 export class AppServerPool {
   private readonly endpoints = new Map<string, AppServerEndpoint>();
@@ -40,10 +46,12 @@ export class AppServerPool {
   private readonly terminalBeforeStart = new Set<string>();
   private readonly terminalClaims = new Map<string, TerminalClaim>();
   private readonly capacityListeners = new Set<() => void>();
+  private readonly endpointStarts = new Map<string, Promise<AppServerEndpoint>>();
+  private readonly resolvedProvisional = new Set<string>();
   private capacitySignalPending = false;
   private nextClaimGeneration = 1;
 
-  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void> }) {
+  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint> }) {
     for (const endpoint of endpoints) this.endpoints.set(endpoint.id, endpoint);
   }
 
@@ -53,12 +61,33 @@ export class AppServerPool {
     return endpoint;
   }
 
+  private async ensureEndpoint(id: string): Promise<AppServerEndpoint> {
+    const existing = this.endpoints.get(id);
+    if (existing?.state === "ready") return existing;
+    const pending = this.endpointStarts.get(id);
+    if (pending) return pending;
+    if (!this.options.resolveEndpoint) throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint is unavailable: ${id}`);
+    const start = (async () => {
+      const endpoint = existing ?? await this.options.resolveEndpoint!(id);
+      if (endpoint.id !== id) throw new AppError("OPERATION_CONFLICT", "resolved endpoint identity changed");
+      this.endpoints.set(id, endpoint);
+      if (!("start" in endpoint) || typeof endpoint.start !== "function") throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint cannot be started: ${id}`);
+      await endpoint.start();
+      if (endpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint is unavailable: ${id}`);
+      return endpoint;
+    })().finally(() => this.endpointStarts.delete(id));
+    this.endpointStarts.set(id, start);
+    return start;
+  }
+
   request<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal): Promise<T> {
-    return this.endpoint(endpointId).request<T>(method, params, signal);
+    const existing = this.endpoints.get(endpointId);
+    if (existing?.state === "ready") return existing.request<T>(method, params, signal);
+    return this.ensureEndpoint(endpointId).then((endpoint) => endpoint.request<T>(method, params, signal));
   }
 
   claimTurnCapacity(endpointId: string, threadId: string, claimId: string): TurnCapacityClaim {
-    return this.createClaim(endpointId, threadId, claimId, false);
+    return this.createClaim(endpointId, threadId, claimId, "caller");
   }
 
   restoreTurnCapacityClaim(endpointId: string, threadId: string, claimId: string, state: { phase: "provisional" | "active"; turnId?: string }): TurnCapacityClaim {
@@ -78,7 +107,7 @@ export class AppServerPool {
       if (state.phase === "active" && state.turnId !== terminal.turnId) this.conflict(`terminal capacity claim ${claimId} changed turn`);
       return this.publicClaim(terminal);
     }
-    const claim = this.createClaim(endpointId, threadId, claimId, false);
+    const claim = this.createClaim(endpointId, threadId, claimId, "caller");
     if (state.phase === "active") {
       this.bindTurnCapacityClaim(claim, state.turnId!);
     }
@@ -121,6 +150,74 @@ export class AppServerPool {
     return () => { this.capacityListeners.delete(listener); };
   }
 
+  restoreObservedActiveTurn(endpointId: string, threadId: string, turnId: string): TurnCapacityClaim {
+    const existing = [...this.claims.values()].find((state) => state.endpointId === endpointId && state.threadId === threadId && state.phase === "active" && state.turnId === turnId);
+    if (existing) return this.publicClaim(existing);
+    const terminal = [...this.terminalClaims.values()].find((state) => state.endpointId === endpointId && state.threadId === threadId && state.turnId === turnId);
+    if (terminal) return this.publicClaim(terminal);
+    const claim = this.createClaim(endpointId, threadId, `observed:${endpointId}:${threadId}:${turnId}`, "cold-active", true);
+    this.bindTurnCapacityClaim(claim, turnId);
+    return claim;
+  }
+
+  restoreProvisionalTurnCapacity(endpointId: string, threadId: string, claimId: string, clientUserMessageId: string): TurnCapacityClaim | undefined {
+    if (this.resolvedProvisional.has(claimId)) return undefined;
+    const claim = this.createClaim(endpointId, threadId, claimId, "cold-provisional", true);
+    const state = this.claims.get(claim.id);
+    if (state) state.clientUserMessageId = clientUserMessageId;
+    return claim;
+  }
+
+  hasClaims(endpointId: string): boolean {
+    return [...this.claims.values()].some((state) => state.endpointId === endpointId);
+  }
+
+  async reconcileEndpointClaims(endpointId: string): Promise<void> {
+    const byThread = new Map<string, ClaimState[]>();
+    for (const state of this.claims.values()) {
+      if (state.endpointId !== endpointId) continue;
+      const values = byThread.get(state.threadId) ?? [];
+      values.push(state);
+      byThread.set(state.threadId, values);
+    }
+    for (const [threadId, states] of byThread) {
+      let history: ThreadHistory;
+      try { history = await this.readFullThread(endpointId, threadId); } catch { continue; }
+      const threadStatus = typeof history.status === "string" ? history.status : history.status?.type;
+      const fullyIdle = threadStatus === "idle" && history.turns.every((turn) => turn.itemsView === "full");
+      for (const state of states) {
+        if (!this.claims.has(state.id)) continue;
+        if (state.phase === "active" && state.turnId) {
+          const turn = history.turns.find((candidate) => candidate.id === state.turnId);
+          if (turn && isTerminal(turn.status)) this.markTurnTerminal(endpointId, threadId, state.turnId);
+          else if (!turn && fullyIdle) this.releaseClaimState(state);
+          continue;
+        }
+        const turn = state.clientUserMessageId === undefined ? undefined : history.turns.find((candidate) =>
+          candidate.items.some((item) => item.type === "userMessage" && item.clientId === state.clientUserMessageId));
+        if (!turn) {
+          if (fullyIdle) { this.resolved(state.id); this.releaseClaimState(state); }
+          continue;
+        }
+        if (isTerminal(turn.status)) {
+          this.resolved(state.id);
+          this.recordTerminalClaim(state, turn.id);
+          this.releaseClaimState(state);
+          continue;
+        }
+        const duplicate = [...this.claims.values()].find((candidate) => candidate.id !== state.id
+          && candidate.endpointId === endpointId && candidate.threadId === threadId
+          && candidate.phase === "active" && candidate.turnId === turn.id);
+        if (duplicate) {
+          this.resolved(state.id);
+          this.releaseClaimState(state);
+        } else {
+          this.bindTurnCapacityClaim(state, turn.id);
+        }
+      }
+    }
+  }
+
   async startTurn<T extends TurnStartResponse = TurnStartResponse>(
     endpointId: string,
     params: { threadId: string; [key: string]: unknown },
@@ -128,12 +225,15 @@ export class AppServerPool {
   ): Promise<T> {
     const claim = callerClaim
       ? this.publicClaim(this.requiredClaim(callerClaim))
-      : this.createClaim(endpointId, params.threadId, `implicit:${crypto.randomUUID()}`, true);
+      : this.createClaim(endpointId, params.threadId, `implicit:${crypto.randomUUID()}`, "implicit");
     if (claim.endpointId !== endpointId || claim.threadId !== params.threadId) this.conflict("turn start does not match its capacity claim");
 
     let response: T;
     try {
       try {
+        const clientUserMessageId = typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : undefined;
+        const state = this.claims.get(claim.id);
+        if (state && clientUserMessageId) state.clientUserMessageId = clientUserMessageId;
         response = await this.request<T>(endpointId, "turn/start", params);
       } catch (startError) {
         if (typeof params.clientUserMessageId !== "string") {
@@ -204,12 +304,14 @@ export class AppServerPool {
   }
 
   markTurnTerminal(endpointId: string, threadId: string, turnId: string): void {
-    const state = [...this.claims.values()].find((candidate) =>
+    const states = [...this.claims.values()].filter((candidate) =>
       candidate.endpointId === endpointId && candidate.threadId === threadId
       && candidate.phase === "active" && candidate.turnId === turnId);
-    if (state) {
-      this.recordTerminalClaim(state, turnId);
-      this.releaseClaimState(state);
+    if (states.length > 0) {
+      for (const state of states) {
+        this.recordTerminalClaim(state, turnId);
+        this.releaseClaimState(state);
+      }
       return;
     }
     const key = this.turnKey(endpointId, threadId, turnId);
@@ -217,25 +319,31 @@ export class AppServerPool {
     if (this.terminalBeforeStart.size > 1_000) this.terminalBeforeStart.delete(this.terminalBeforeStart.values().next().value!);
   }
 
-  markEndpointUnavailable(endpointId: string): void {
+  markEndpointUnavailable(endpointId: string, kind: EndpointLossKind = "runtime-lost"): void {
+    if (kind === "connection-lost") return;
     for (const state of [...this.claims.values()]) {
-      if (state.endpointId === endpointId && state.selfOwned) this.releaseClaimState(state);
+      if (state.endpointId === endpointId && state.origin !== "caller") this.releaseClaimState(state);
     }
     for (const key of this.terminalBeforeStart) if (key.startsWith(`${endpointId}:`)) this.terminalBeforeStart.delete(key);
   }
 
   get activeTurnCount(): number { return this.claims.size; }
 
-  private createClaim(endpointId: string, threadId: string, claimId: string, selfOwned: boolean): TurnCapacityClaim {
+  private resolved(claimId: string): void {
+    this.resolvedProvisional.add(claimId);
+    if (this.resolvedProvisional.size > 1_000) this.resolvedProvisional.delete(this.resolvedProvisional.values().next().value!);
+  }
+
+  private createClaim(endpointId: string, threadId: string, claimId: string, origin: ClaimState["origin"], bypassLimit = false): TurnCapacityClaim {
     const existing = this.claims.get(claimId);
     if (existing) {
       if (existing.endpointId !== endpointId || existing.threadId !== threadId) this.conflict(`capacity claim ${claimId} changed identity`);
       return this.publicClaim(existing);
     }
-    if (this.claims.size >= this.options.maxConcurrentTurns) {
+    if (!bypassLimit && this.claims.size >= this.options.maxConcurrentTurns) {
       throw new AppError("CAPACITY_EXCEEDED", `at most ${this.options.maxConcurrentTurns} turns may run concurrently`);
     }
-    const state: ClaimState = { id: claimId, endpointId, threadId, generation: this.nextClaimGeneration++, phase: "provisional", selfOwned };
+    const state: ClaimState = { id: claimId, endpointId, threadId, generation: this.nextClaimGeneration++, phase: "provisional", origin };
     this.claims.set(claimId, state);
     return this.publicClaim(state);
   }

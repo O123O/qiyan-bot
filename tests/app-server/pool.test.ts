@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppServerPool, type AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
+import type { ManagedAppServerEndpoint } from "../../src/endpoints/types.ts";
 
 class FakeEndpoint implements AppServerEndpoint {
-  readonly id = "local";
+  readonly id: string = "local";
   state: AppServerEndpoint["state"] = "ready";
   fail = false;
   nextTurn = 1;
@@ -265,4 +266,64 @@ test("capacity listeners fire once when a full pool becomes available and unsubs
   pool.releaseTurnCapacityClaim(second);
   await Promise.resolve();
   assert.equal(calls.length, 1);
+});
+
+test("lazily resolves and starts one endpoint generation", async () => {
+  class Remote extends FakeEndpoint implements ManagedAppServerEndpoint {
+    override readonly id = "devbox";
+    override state: ManagedAppServerEndpoint["state"] = "stopped";
+    starts = 0;
+    async start() { this.starts += 1; this.state = "ready"; }
+    async closeConnection() { this.state = "stopped"; }
+    async shutdownRuntime() { this.state = "stopped"; }
+    async runtimeIdentity() { return { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 }; }
+    onNotification() { return () => undefined; }
+    onReady() { return () => undefined; }
+    onUnavailable() { return () => undefined; }
+    onPermissionBlocked() { return () => undefined; }
+  }
+  const remote = new Remote();
+  let resolutions = 0;
+  const pool = new AppServerPool([new FakeEndpoint()], {
+    maxConcurrentTurns: 2,
+    resolveEndpoint: async (id) => { resolutions += 1; assert.equal(id, "devbox"); return remote; },
+  });
+  await Promise.all([pool.request("devbox", "model/list", {}), pool.request("devbox", "thread/list", {})]);
+  assert.equal(resolutions, 1);
+  assert.equal(remote.starts, 1);
+});
+
+test("connection loss retains and coalesces cold active and provisional claims", async () => {
+  let terminal = false;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>() => ({ thread: {
+      status: { type: terminal ? "idle" : "active" },
+      turns: [{ id: "turn-a", status: terminal ? "completed" : "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "message-a" }] }],
+    } }) as T,
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  assert.equal(pool.activeTurnCount, 2);
+  pool.markEndpointUnavailable("devbox", "connection-lost");
+  assert.equal(pool.activeTurnCount, 2);
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 1);
+  terminal = true;
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 0);
+  await pool.reconcileEndpointClaims("devbox");
+  assert.equal(pool.activeTurnCount, 0);
+});
+
+test("cold restored claims may exceed the limit but block new claims and release on runtime loss", () => {
+  const pool = new AppServerPool([new FakeEndpoint()], { maxConcurrentTurns: 1 });
+  pool.restoreObservedActiveTurn("remote", "t1", "turn-1");
+  pool.restoreProvisionalTurnCapacity("remote", "t2", "recovered:op-2", "message-2");
+  assert.equal(pool.activeTurnCount, 2);
+  assert.equal(pool.hasClaims("remote"), true);
+  assert.throws(() => pool.claimTurnCapacity("local", "new", "new"), /at most 1 turn/u);
+  pool.markEndpointUnavailable("remote", "runtime-lost");
+  assert.equal(pool.activeTurnCount, 0);
 });

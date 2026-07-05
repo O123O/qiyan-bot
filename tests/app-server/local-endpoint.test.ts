@@ -35,6 +35,7 @@ test("initializes app-server before becoming ready", async () => {
   const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => child as never });
   await endpoint.start();
   assert.equal(endpoint.state, "ready");
+  assert.deepEqual(await endpoint.runtimeIdentity(), undefined);
   assert.equal(requests[0]?.method, "initialize");
   assert.equal((requests[0]?.params as any).clientInfo.version, "0.4.0");
   assert.equal(requests[1]?.method, "initialized");
@@ -166,6 +167,7 @@ test("a delayed exit from an old child cannot close a restarted endpoint", async
   const endpoint = new LocalEndpoint({ codexBinary: "codex", spawn: () => children[index++] as never, resolveMcpClientIdentity: async (pid) => ({ pid: pid + 1_000, startTime: `start-${pid}` }) });
   await endpoint.start();
   assert.deepEqual(endpoint.mcpClientIdentity, { pid: 1_101, startTime: "start-101" });
+  assert.deepEqual(await endpoint.runtimeIdentity(), { kind: "local", pid: 1_101, startTime: "start-101" });
   await endpoint.stop();
   assert.equal(endpoint.mcpClientIdentity, undefined);
   await endpoint.start();

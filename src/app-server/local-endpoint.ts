@@ -7,6 +7,7 @@ import { JsonRpcClient } from "./json-rpc-client.ts";
 import type { RpcRequest } from "./protocol.ts";
 import { APP_VERSION } from "../version.ts";
 import { requireMinimumCodexVersion } from "./version-compat.ts";
+import type { EndpointLossKind, RuntimeIdentity } from "../endpoints/types.ts";
 
 export interface PermissionBlockedEvent {
   method: string;
@@ -79,7 +80,7 @@ export class LocalEndpoint {
         if (this.client === client) delete this.client;
         if (this.state !== "stopped") {
           this.state = "unavailable";
-          this.events.emit("unavailable");
+          this.events.emit("unavailable", "runtime-lost" satisfies EndpointLossKind);
         }
       }
     });
@@ -92,7 +93,7 @@ export class LocalEndpoint {
         if (this.client === client) delete this.client;
         if (unexpectedly) {
           this.state = "unavailable";
-          this.events.emit("unavailable");
+          this.events.emit("unavailable", "runtime-lost" satisfies EndpointLossKind);
         }
       }
     });
@@ -144,6 +145,12 @@ export class LocalEndpoint {
     await exited;
   }
 
+  closeConnection(): Promise<void> { return this.stop(); }
+  shutdownRuntime(): Promise<void> { return this.stop(); }
+  async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
+    return this.protocolIdentity ? { kind: "local", pid: this.protocolIdentity.pid, startTime: this.protocolIdentity.startTime } : undefined;
+  }
+
   request<T>(method: string, params: unknown, signal?: AbortSignal): Promise<T> {
     if (this.state !== "ready" || !this.client) return Promise.reject(new AppError("ENDPOINT_UNAVAILABLE", "local app-server is unavailable"));
     return this.client.request<T>(method, params, signal);
@@ -159,7 +166,7 @@ export class LocalEndpoint {
     return () => this.events.off("ready", listener);
   }
 
-  onUnavailable(listener: () => void): () => void {
+  onUnavailable(listener: (kind: EndpointLossKind) => void): () => void {
     this.events.on("unavailable", listener);
     return () => this.events.off("unavailable", listener);
   }
