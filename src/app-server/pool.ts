@@ -191,9 +191,13 @@ export class AppServerPool {
 
   restoreProvisionalTurnCapacity(endpointId: string, threadId: string, claimId: string, clientUserMessageId: string): TurnCapacityClaim | undefined {
     if (this.resolvedProvisional.has(claimId)) return undefined;
+    const existing = this.claims.get(claimId);
+    if (existing?.clientUserMessageId !== undefined && existing.clientUserMessageId !== clientUserMessageId) {
+      this.conflict(`capacity claim ${claimId} changed message correlation`);
+    }
     const claim = this.createClaim(endpointId, threadId, claimId, "cold-provisional", true);
     const state = this.claims.get(claim.id);
-    if (state) state.clientUserMessageId = clientUserMessageId;
+    if (state && state.clientUserMessageId === undefined) state.clientUserMessageId = clientUserMessageId;
     return claim;
   }
 

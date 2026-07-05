@@ -395,6 +395,16 @@ test("a provisional claim bound during recovery stays resolved after its turn te
   assert.equal(pool.activeTurnCount, 0);
 });
 
+test("a restored provisional claim cannot change its stable message correlation", () => {
+  const pool = new AppServerPool([new FakeEndpoint()], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a");
+  assert.throws(
+    () => pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-b"),
+    /changed message correlation/u,
+  );
+  assert.equal(pool.activeTurnCount, 1);
+});
+
 test("cold restored claims may exceed the limit but block new claims and release on runtime loss", () => {
   const pool = new AppServerPool([new FakeEndpoint()], { maxConcurrentTurns: 1 });
   pool.restoreObservedActiveTurn("remote", "t1", "turn-1");
