@@ -415,3 +415,16 @@ test("cold restored claims may exceed the limit but block new claims and release
   pool.markEndpointUnavailable("remote", "runtime-lost");
   assert.equal(pool.activeTurnCount, 0);
 });
+
+test("one endpoint lease spans a turn start and its nested RPC", async () => {
+  const endpoint = new FakeEndpoint();
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  let acquisitions = 0;
+  pool.setWorkLeaseProvider(async (endpointId, existing, run) => {
+    if (existing) return run(existing);
+    acquisitions += 1;
+    return run({ endpointId, lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "lease-1" });
+  });
+  await pool.startTurn("local", { threadId: "thread-1", input: [] });
+  assert.equal(acquisitions, 1);
+});

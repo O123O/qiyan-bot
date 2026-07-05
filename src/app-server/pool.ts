@@ -1,5 +1,5 @@
 import { AppError } from "../core/errors.ts";
-import type { EndpointLossKind, ManagedAppServerEndpoint } from "../endpoints/types.ts";
+import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint } from "../endpoints/types.ts";
 
 export interface AppServerEndpoint {
   readonly id: string;
@@ -33,6 +33,7 @@ interface ClaimState extends TurnCapacityClaim {
 }
 
 interface TerminalClaim extends TurnCapacityClaim { turnId: string }
+type WorkLeaseProvider = <T>(endpointId: string, existing: EndpointWorkLease | undefined, run: (lease: EndpointWorkLease | undefined) => Promise<T>) => Promise<T>;
 
 class StartProvenAbsentError extends Error {}
 
@@ -52,6 +53,7 @@ export class AppServerPool {
   private readonly resolvedProvisional = new Set<string>();
   private capacitySignalPending = false;
   private nextClaimGeneration = 1;
+  private workLeaseProvider?: WorkLeaseProvider;
 
   constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint> }) {
     for (const endpoint of endpoints) this.publishEndpoint(endpoint);
@@ -74,6 +76,8 @@ export class AppServerPool {
     this.endpointStarts.delete(endpoint.id);
     return this.publishEndpoint(endpoint);
   }
+
+  setWorkLeaseProvider(provider: WorkLeaseProvider): void { this.workLeaseProvider = provider; }
 
   private async ensureEndpoint(id: string): Promise<AppServerEndpoint> {
     const existing = this.endpoints.get(id);
@@ -109,7 +113,11 @@ export class AppServerPool {
     return start;
   }
 
-  request<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal): Promise<T> {
+  request<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal, lease?: EndpointWorkLease): Promise<T> {
+    return this.withWorkLease(endpointId, lease, () => this.requestAdmitted<T>(endpointId, method, params, signal));
+  }
+
+  private requestAdmitted<T>(endpointId: string, method: string, params: unknown, signal?: AbortSignal): Promise<T> {
     const existing = this.endpoints.get(endpointId);
     if (existing?.state === "ready") return existing.request<T>(method, params, signal);
     return this.ensureEndpoint(endpointId).then((endpoint) => endpoint.request<T>(method, params, signal));
@@ -256,6 +264,16 @@ export class AppServerPool {
     endpointId: string,
     params: { threadId: string; [key: string]: unknown },
     callerClaim?: TurnCapacityClaim,
+    lease?: EndpointWorkLease,
+  ): Promise<T> {
+    return this.withWorkLease(endpointId, lease, (admitted) => this.startTurnAdmitted<T>(endpointId, params, callerClaim, admitted));
+  }
+
+  private async startTurnAdmitted<T extends TurnStartResponse>(
+    endpointId: string,
+    params: { threadId: string; [key: string]: unknown },
+    callerClaim: TurnCapacityClaim | undefined,
+    lease: EndpointWorkLease | undefined,
   ): Promise<T> {
     const claim = callerClaim
       ? this.publicClaim(this.requiredClaim(callerClaim))
@@ -270,10 +288,10 @@ export class AppServerPool {
       try {
         const state = this.claims.get(claim.id);
         if (state) state.clientUserMessageId = clientUserMessageId;
-        response = await this.request<T>(endpointId, "turn/start", startParams);
+        response = await this.request<T>(endpointId, "turn/start", startParams, undefined, lease);
       } catch (startError) {
         try {
-          const actual = await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId);
+          const actual = await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, undefined, lease);
           response = { turn: actual } as unknown as T;
         } catch (reconciliationError) {
           if (reconciliationError instanceof StartProvenAbsentError) {
@@ -286,7 +304,7 @@ export class AppServerPool {
 
       if (callerSuppliedCorrelation) {
         try {
-          response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, response.turn.id) } as T;
+          response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, response.turn.id, lease) } as T;
         } catch (error) {
           if (error instanceof StartProvenAbsentError) {
             this.releaseTurnCapacityClaim(claim);
@@ -306,10 +324,14 @@ export class AppServerPool {
     }
   }
 
-  async readFullThread(endpointId: string, threadId: string): Promise<ThreadHistory> {
+  async readFullThread(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadHistory> {
+    return this.withWorkLease(endpointId, lease, (admitted) => this.readFullThreadAdmitted(endpointId, threadId, admitted));
+  }
+
+  private async readFullThreadAdmitted(endpointId: string, threadId: string, lease: EndpointWorkLease | undefined): Promise<ThreadHistory> {
     let response: { thread: ThreadHistory };
     try {
-      response = await this.request(endpointId, "thread/read", { threadId, includeTurns: true });
+      response = await this.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
     } catch (error) {
       throw new AppError("OPERATION_UNCERTAIN", `full thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -319,14 +341,18 @@ export class AppServerPool {
     return response.thread;
   }
 
-  async interrupt(endpointId: string, threadId: string, turnId: string): Promise<void> {
+  async interrupt(endpointId: string, threadId: string, turnId: string, lease?: EndpointWorkLease): Promise<void> {
+    return this.withWorkLease(endpointId, lease, (admitted) => this.interruptAdmitted(endpointId, threadId, turnId, admitted));
+  }
+
+  private async interruptAdmitted(endpointId: string, threadId: string, turnId: string, lease: EndpointWorkLease | undefined): Promise<void> {
     let terminal = false;
     try {
-      await this.request(endpointId, "turn/interrupt", { threadId, turnId });
+      await this.request(endpointId, "turn/interrupt", { threadId, turnId }, undefined, lease);
       terminal = true;
     } catch (error) {
       try {
-        const history = await this.request<{ thread: { turns: Array<{ id: string; status: string }> } }>(endpointId, "thread/read", { threadId, includeTurns: true });
+        const history = await this.request<{ thread: { turns: Array<{ id: string; status: string }> } }>(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
         terminal = history.thread.turns.some((turn) => turn.id === turnId && new Set(["completed", "failed", "interrupted"]).has(turn.status));
       } catch { /* the original interrupt outcome remains uncertain */ }
       if (!terminal) throw error;
@@ -415,12 +441,12 @@ export class AppServerPool {
     });
   }
 
-  private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, candidateTurnId?: string): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
+  private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, candidateTurnId?: string, lease?: EndpointWorkLease): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
     const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 30_000);
     do {
       let history: { thread: ThreadHistory };
       try {
-        history = await this.request(endpointId, "thread/read", { threadId, includeTurns: true });
+        history = await this.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
       } catch (error) {
         throw new AppError("OPERATION_UNCERTAIN", `turn/start outcome could not be reconciled because thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -447,6 +473,10 @@ export class AppServerPool {
 
   private conflict(message: string): never {
     throw new AppError("OPERATION_CONFLICT", `OPERATION_CONFLICT: ${message}`);
+  }
+
+  private withWorkLease<T>(endpointId: string, lease: EndpointWorkLease | undefined, run: (lease: EndpointWorkLease | undefined) => Promise<T>): Promise<T> {
+    return this.workLeaseProvider ? this.workLeaseProvider(endpointId, lease, run) : run(lease);
   }
 
   private publishEndpoint(endpoint: AppServerEndpoint): number {
