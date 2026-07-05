@@ -72,6 +72,13 @@ export function buildSshArgs(plan: SshConnectionPlan, operationArgs: readonly st
   return [...baseArgs(plan, true), ...operationArgs, plan.alias];
 }
 
+export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly string[]): string[] {
+  if (command.length === 0 || command.some((token) => !/^[A-Za-z0-9_./-]+$/u.test(token))) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH remote command token");
+  }
+  return [...baseArgs(plan, true), plan.alias, ...command];
+}
+
 export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
   if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
   return [...baseArgs(plan, false), "-S", plan.controlPath!, "-O", "exit", plan.alias];
