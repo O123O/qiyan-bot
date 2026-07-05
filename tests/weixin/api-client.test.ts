@@ -56,7 +56,7 @@ test("sends exact authenticated getupdates headers and base info", async () => {
   assert.equal(headers.get("Authorization"), "Bearer private-bearer-token");
   assert.equal(headers.get("AuthorizationType"), "ilink_bot_token");
   assert.equal(headers.get("X-WECHAT-UIN"), Buffer.from("42").toString("base64"));
-  assert.equal(headers.get("iLink-App-ClientVersion"), "1024");
+  assert.equal(headers.get("iLink-App-ClientVersion"), "1280");
 });
 
 test("bounds the next long poll by Tencent's parsed server timeout plus response overhead", async () => {

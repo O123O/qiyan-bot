@@ -663,9 +663,9 @@ async function claimAndRemoveStaleOperationLease(
   }
   await revalidateFixtureTrust(trust);
   const quarantineMetadata = await optionalMetadata(quarantinePath);
+  if (quarantineMetadata === undefined) return false;
   if (
-    quarantineMetadata === undefined
-    || quarantineMetadata.dev !== stale.directory.device
+    quarantineMetadata.dev !== stale.directory.device
     || quarantineMetadata.ino !== stale.directory.inode
   ) {
     return restoreUnexpectedQuarantine(trust, quarantinePath);
@@ -676,12 +676,17 @@ async function claimAndRemoveStaleOperationLease(
   try {
     quarantined = await inspectOperationLease(trust, quarantinePath);
   } catch {
+    if (await optionalMetadata(quarantinePath) === undefined) return false;
     return restoreUnexpectedQuarantine(trust, quarantinePath);
   }
   if (!sameOperationLease(quarantined, expected)) {
     return restoreUnexpectedQuarantine(trust, quarantinePath);
   }
-  await removeQuarantinedOperationLease(trust, expected);
+  try { await removeQuarantinedOperationLease(trust, expected); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
   return true;
 }
 
@@ -749,8 +754,11 @@ async function cleanAbandonedLeaseTemporaries(trust: FixtureTrust, heldLease: Op
   for (const name of names) {
     if (!OPERATION_LEASE_TEMPORARY_NAME.test(name)) continue;
     const temporaryPath = join(trust.state.path, name);
-    const metadata = await lstat(temporaryPath);
-    await removeLeaseTemporary(trust, temporaryPath, identity(temporaryPath, metadata), heldLease);
+    let temporary: OperationLease;
+    try { temporary = await inspectOperationLease(trust, temporaryPath); }
+    catch { continue; }
+    if (!await operationLeaseIsStale(temporary.owner)) continue;
+    await removeLeaseTemporary(trust, temporaryPath, temporary.directory, heldLease);
   }
 }
 

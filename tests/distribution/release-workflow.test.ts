@@ -5,6 +5,7 @@ import test from "node:test";
 
 test("release workflow validates, checks, packs, and uploads only a versioned runtime package", async () => {
   const workflow = await readFile(resolve(".github/workflows/release.yml"), "utf8");
+  const manifest = JSON.parse(await readFile(resolve("package.json"), "utf8")) as { files: string[] };
 
   for (const required of [
     "tags:", "- \"v*\"", "contents: write", "actions/checkout@v6", "actions/setup-node@v6", "node-version: 24",
@@ -19,6 +20,13 @@ test("release workflow validates, checks, packs, and uploads only a versioned ru
   }
   assert.doesNotMatch(workflow, /npm publish/u);
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/u);
+  const allowlist = workflow.match(/cat > expected-package-files\.txt <<'EOF'\n([\s\S]*?)\n\s*EOF/u)?.[1]
+    ?.split("\n").map((line) => line.trim()).filter(Boolean);
+  assert.deepEqual(allowlist, [
+    "package/README.md",
+    ...manifest.files.map((path) => `package/${path}`),
+    "package/package.json",
+  ].sort());
   const retiredBuildName = ["codex", "Bot"].join("");
   assert.doesNotMatch(await readFile(resolve("scripts/build.mjs"), "utf8"), new RegExp(retiredBuildName, "u"));
 });

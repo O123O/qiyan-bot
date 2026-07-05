@@ -33,7 +33,7 @@ test("active source and documentation use only the QiYan identity", async () => 
 
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as Record<string, unknown>;
   assert.equal(manifest.name, "qiyan-bot");
-  assert.equal(manifest.version, "0.4.0");
+  assert.equal(manifest.version, "0.5.0");
   assert.deepEqual(manifest.bin, { "qiyan-bot": "dist/qiyan-bot" });
 });
 

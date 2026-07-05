@@ -10,7 +10,7 @@ import { APP_VERSION } from "../../src/version.ts";
 test("protocol and package identities share the release version", async () => {
   const manifest = JSON.parse(await import("node:fs/promises").then(({ readFile }) => readFile("package.json", "utf8")));
   assert.equal(APP_VERSION, manifest.version);
-  assert.equal(APP_VERSION, "0.4.0");
+  assert.equal(APP_VERSION, "0.5.0");
 });
 
 test("finds the nearest qiyan-bot package manifest from a module URL", async (context) => {

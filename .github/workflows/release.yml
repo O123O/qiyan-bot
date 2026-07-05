@@ -51,9 +51,13 @@ jobs:
           package/README.md
           package/assets/assistant/AGENTS.md
           package/assets/assistant/session-status.example.json
+          package/assets/endpoints.example.jsonc
+          package/assets/remote/qiyan-app-server-launcher.sh
+          package/assets/remote/qiyan-ssh-helper.mjs
           package/assets/slack/manifest.yaml
-          package/docs/chat-apps/wechat.md
           package/dist/qiyan-bot
+          package/docs/chat-apps/wechat.md
+          package/docs/ssh-workers.md
           package/package.json
           EOF
           diff -u expected-package-files.txt package-files.txt

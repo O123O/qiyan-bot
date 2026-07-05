@@ -341,7 +341,7 @@ test("checks the fixed remote environment and authenticated App Server without c
     id: 1,
     method: "initialize",
     params: {
-      clientInfo: { name: "qiyan_ssh_worker_check", title: "QiYan SSH Worker Check", version: "0.4.0" },
+      clientInfo: { name: "qiyan_ssh_worker_check", title: "QiYan SSH Worker Check", version: "0.5.0" },
       capabilities: { experimentalApi: true, requestAttestation: false },
     },
   });
@@ -862,7 +862,11 @@ test("removes a safe stale key staging directory before generating a complete pa
   await chmod(restrictiveStale, 0o500);
   const abandonedLeaseTemporary = join(paths.stateDir, ".operation-lease-Ef56w7");
   await mkdir(abandonedLeaseTemporary, { mode: 0o700 });
-  await chmod(abandonedLeaseTemporary, 0o500);
+  await writeFile(
+    join(abandonedLeaseTemporary, "owner.json"),
+    `${JSON.stringify({ pid: 2_147_483_647, startTime: "1" })}\n`,
+    { mode: 0o600 },
+  );
 
   await ensureFixtureState(paths, stagingRunner([]));
 
@@ -947,7 +951,11 @@ test("reclaims a verifiably stale operation lease and removes abandoned lease te
   await installOperationLease(paths, { pid: 2_147_483_647, startTime: "1" });
   const abandoned = join(paths.stateDir, ".operation-lease-Ab12z9");
   await mkdir(abandoned, { mode: 0o700 });
-  await chmod(abandoned, 0o500);
+  await writeFile(
+    join(abandoned, "owner.json"),
+    `${JSON.stringify({ pid: 2_147_483_647, startTime: "1" })}\n`,
+    { mode: 0o600 },
+  );
   const abandonedQuarantine = join(paths.stateDir, `.operation-lease-quarantine-${"a".repeat(32)}`);
   await mkdir(abandonedQuarantine, { mode: 0o700 });
   await writeFile(
