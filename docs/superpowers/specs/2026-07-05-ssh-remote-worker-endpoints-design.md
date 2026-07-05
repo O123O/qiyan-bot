@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-05
 
-**Status:** Awaiting written-spec review
+**Status:** Approved for implementation
 
 ## Purpose
 
@@ -145,7 +145,9 @@ The first release is connect-only. A usable remote host has:
 
 The backend uses batch mode, no PTY for control and transfer channels, strict host-key checking, and bounded connection timeouts. It never uses `accept-new`, edits `~/.ssh/config`, writes `known_hosts`, initiates login, or copies credentials. The user may perform those actions directly or ask QiYan to do them with normal shell tools outside backend policy.
 
-Startup records the remote Codex version for diagnostics and validates required App Server behavior through initialization and capability calls. It does not rely on a brittle exact version string when the required protocol is available.
+The checked-in App Server types remain generated reproducibly from Codex `0.142.5`, but runtime compatibility is not an exact package pin. Codex `0.142.5` is the minimum supported version for both local and SSH worker App Servers. Initialization accepts the same numeric release or any newer numeric release, including a newer release with a prerelease/build suffix, and rejects an older or unparseable version with a clear compatibility error. Required App Server behavior is still validated through initialization and capability calls. This lets users update Codex normally without forcing a matching QiYan release while preserving a defined lower compatibility boundary.
+
+The Docker SSH fixture may continue installing and checking one exact Codex build for reproducible tests. That fixture build pin is separate from QiYan's runtime minimum-version gate.
 
 Remote Codex uses the remote host's native configuration, auth, skills, plugins, tools, permissions, and thread store. Worker sessions are expected to use the user's normal automatic/non-approval mode; interactive approval mode is not supported by QiYan worker routing.
 
