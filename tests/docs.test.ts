@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import test from "node:test";
-import { SERVICE_UNSET_ENV_NAMES } from "../src/config-source.ts";
 
 test("README links to all focused guides and every local guide target exists", async () => {
   const readme = await readFile(resolve("README.md"), "utf8");
@@ -15,7 +14,7 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(overview, /auto-release on external takeover/iu);
   assert.doesNotMatch(overview, /unadopt when you take over/iu);
   assert.match(readme, /Telegram.*Slack.*WeChat.*run together/iu);
-  assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
+  assert.doesNotMatch(readme, /upgrading-to-v0\.3|fresh v0\.3|versions? before v0\.3/iu);
   const firstInstall = readme.indexOf("npm install --global");
   assert.ok(firstInstall > 0);
   assert.match(readme, /npm install --global --prefix "\$HOME\/\.local"[\s\\]+https:\/\/github\.com\/O123O\/qiyan-bot\/releases\/latest\/download\/qiyan-bot\.tgz/iu);
@@ -25,7 +24,6 @@ test("README links to all focused guides and every local guide target exists", a
   for (const expected of [
     "docs/installation.md",
     "docs/sqlite.md",
-    "docs/upgrading-to-v0.3.md",
     "docs/setup.md",
     "docs/chat-apps/telegram.md",
     "docs/chat-apps/slack.md",
@@ -85,35 +83,8 @@ test("installation guide covers Release install, no-Git source build, version, a
   assert.match(guide, /GitHub Release assets.*no supported npm-registry package/isu);
   assert.match(guide, /nonempty GitHub `sha256:` asset digest/iu);
   assert.match(guide, /test -n "\$digest"/u);
-  assert.match(guide, /older than v0\.3\.0.*do \*\*not\*\* use the generic updater/isu);
-});
-
-test("v0.3 upgrade guide requires a fresh stopped cutover and a non-inheriting service", async () => {
-  const guide = await readFile(resolve("docs/upgrading-to-v0.3.md"), "utf8");
-  for (const required of [
-    "destructive", "disable --now", "auth.json", "rm -rf", "config-check", "WorkingDirectory=",
-    "ExecStart=", "--home", "UnsetEnvironment=", "EnvironmentFile=", "assistant-login", "round trip",
-  ]) {
-    assert.equal(guide.includes(required), true, `v0.3 cutover guide is missing: ${required}`);
-  }
-  assert.match(guide, /only values carried forward.*configuration.*auth\.json/isu);
-  assert.match(guide, /Do not add `EnvironmentFile=`/u);
-  assert.match(guide, /old managed sessions.*not adopted automatically/isu);
-  assert.match(guide, /set -euo pipefail/u);
-  assert.ok(guide.indexOf('config-check --home "$stage"') < guide.indexOf('rm -rf -- "$old_home"'));
-  assert.match(guide, /deliberately drops `QIYAN_HOME`, `ASSISTANT_WORKDIR`, `DATA_DIR`, and `SESSION_REGISTRY_PATH`/u);
-  assert.equal([...guide.matchAll(/env -i HOME="\$HOME" PATH="\$PATH" qiyan-bot config-check/gu)].length, 2);
-  assert.ok([...guide.matchAll(/O_NOFOLLOW/gu)].length >= 2);
-  assert.ok([...guide.matchAll(/fstatSync/gu)].length >= 2);
-  const stagedAuthParse = guide.indexOf('JSON.parse(bytes.toString("utf8"))');
-  assert.ok(stagedAuthParse >= 0 && stagedAuthParse < guide.indexOf("STAGED_AUTH, bytes"));
-  const pathGate = guide.indexOf('OLD_HOME="$old_home" NEW_HOME="$new_home"');
-  assert.ok(pathGate >= 0 && pathGate < guide.indexOf('rm -rf -- "$old_home"'));
-  for (const invariant of ["exact absolute normalized path", "exact canonical path", "old_home cannot be a filesystem root", "new_home must be the exact $HOME/.qiyan-bot", "staging must be outside", "must not overlap"]) {
-    assert.equal(guide.includes(invariant), true, `v0.3 cutover path gate is missing: ${invariant}`);
-  }
-  const unset = guide.match(/^UnsetEnvironment=(.+)$/mu)?.[1]?.trim().split(/\s+/u);
-  assert.deepEqual(new Set(unset), SERVICE_UNSET_ENV_NAMES);
+  assert.doesNotMatch(guide, /upgrading-to-v0\.3|fresh v0\.3|older than v0\.3/iu);
+  await assert.rejects(access(resolve("docs/upgrading-to-v0.3.md")));
 });
 
 test("full-access and non-interactive worker warnings precede installation and launch", async () => {
@@ -243,11 +214,10 @@ test("WeChat guide documents the implemented personal-owner adapter without envi
   assert.doesNotMatch(guide, /\]\(\.\.\/(?:installation|setup)\.md\)/u);
 });
 
-test("shared setup and upgrade docs treat WeChat as a managed-credential adapter", async () => {
+test("shared setup docs treat WeChat as a managed-credential adapter", async () => {
   const readme = await readFile(resolve("README.md"), "utf8");
   const setup = await readFile(resolve("docs/setup.md"), "utf8");
   const install = await readFile(resolve("docs/installation.md"), "utf8");
-  const upgrade = await readFile(resolve("docs/upgrading-to-v0.3.md"), "utf8");
   const envExample = await readFile(resolve(".env.example"), "utf8");
   assert.match(readme, /Telegram.*Slack.*WeChat.*implemented/isu);
   assert.match(readme, /personal WeChat.*experimental.*automated-test(?:ed| coverage).*(?:not|has not been) successfully live-tested/isu);
@@ -256,8 +226,6 @@ test("shared setup and upgrade docs treat WeChat as a managed-credential adapter
   assert.match(setup, /PRIMARY_CHAT_APP=(?:telegram\|slack\|weixin|telegram, slack, or weixin)|PRIMARY_CHAT_APP.*weixin/iu);
   assert.match(setup, /qiyan-bot weixin-login/iu);
   assert.match(install, /WeChat adapter|chat-apps\/wechat\.md/iu);
-  assert.match(upgrade, /credentials\/weixin\.json/iu);
-  assert.match(upgrade, /WEIXIN_BOT_TOKEN.*WEIXIN_BOT_ID.*WEIXIN_OWNER_USER_ID/isu);
   assert.match(envExample, /WeChat credentials.*not.*\.env/iu);
   assert.match(envExample, /PRIMARY_CHAT_APP=.*weixin/iu);
   assert.doesNotMatch(envExample, /^WEIXIN_(?:BOT_TOKEN|BOT_ID|OWNER_USER_ID)=/mu);

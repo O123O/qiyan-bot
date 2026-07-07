@@ -53,7 +53,6 @@ The Release archive is a bundled runtime with no production dependency tree. For
 Setup guides:
 
 - [Shared Codex and assistant setup](docs/setup.md)
-- [Required fresh cutover for versions before v0.3.0](docs/upgrading-to-v0.3.md)
 - [Telegram — implemented](docs/chat-apps/telegram.md)
 - [Slack — implemented](docs/chat-apps/slack.md)
 - [Personal WeChat — experimental](docs/chat-apps/wechat.md)
@@ -156,7 +155,7 @@ The assistant also does not inherit home-scoped user skills. Put assistant-only 
 - `<assistant-workdir>/assistant-context.json`: mode-0400 real-home/QiYan-home context
 - `<assistant-workdir>/session-status.json`: mode-0400 session dashboard
 
-This is the v0.3 fresh QiYan state format. State created before v0.3.0 is rejected without migration or mutation. Do not use the generic updater for that first transition: follow the [required destructive fresh-cutover guide](docs/upgrading-to-v0.3.md). Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
+Stop the process before copying state, and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
 
 SQLite durability, NFS constraints, database backups, and automatic dashboard-metadata recovery are documented in [SQLite durability and recovery](docs/sqlite.md).
 

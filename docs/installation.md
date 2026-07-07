@@ -50,8 +50,6 @@ Do not install `main.tar.gz` globally. It is source without `dist/`; `npm ci` an
 
 ## Update
 
-If the installed version is older than v0.3.0, do **not** use the generic updater and restart against its existing state. v0.3 intentionally rejects that database and registry. Follow the [required fresh v0.3 cutover](upgrading-to-v0.3.md) first.
-
 ```bash
 qiyan-bot --update
 ```
