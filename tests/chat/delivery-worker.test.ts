@@ -50,6 +50,32 @@ test("adapter-specific retry proof overrides generic HTTP status handling", asyn
   assert.equal(store.get(ambiguous.id)?.state, "uncertain");
 });
 
+test("every delivery failure reaches the metadata-only operational callback", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({
+    id: "observable", kind: "chat",
+    binding: { adapterId: "telegram", conversationKey: "owner", destination: { chatId: "owner" } },
+    body: "secret body", mandatory: true,
+  });
+  const adapter: ChatDeliveryAdapter = {
+    id: "telegram",
+    sendMessage: async () => { throw new Error("secret-token"); },
+    isSafeToRetry: () => true,
+  };
+  const seen: Array<{ adapter: string; state: string }> = [];
+  const worker = new DeliveryWorker(
+    store,
+    new ChatAdapterRegistry([{ delivery: adapter }]),
+    undefined,
+    undefined,
+    undefined,
+    (record) => { seen.push({ adapter: record.binding.adapterId, state: record.state }); },
+  );
+  await assert.rejects(worker.processOne(delivery.id));
+  assert.deepEqual(seen, [{ adapter: "telegram", state: "prepared" }]);
+  assert.equal(JSON.stringify(seen).includes("secret"), false);
+});
+
 test("a deterministic Slack rejection fails without retrying", async () => {
   const store = new DeliveryStore(createTestDatabase());
   const binding = { adapterId: "slack", conversationKey: "slack:C1", destination: { channel: "C1" } } as const;

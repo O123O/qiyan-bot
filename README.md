@@ -82,9 +82,10 @@ On a systemd-based Linux desktop or server, install and start QiYan as an enable
 ```bash
 qiyan-bot service install
 qiyan-bot service status
+qiyan-bot service logs
 ```
 
-The service supervises the same foreground process, so tmux is unnecessary. Other lifecycle actions are `start`, `stop`, `restart`, and `uninstall`. The generated unit contains only absolute paths and environment-variable names; QiYan continues to read credentials from its private `.env`, which is never copied into the unit. Installation validates this service-effective configuration rather than temporary shell-only bot variables. An existing unit not marked as QiYan-managed is never overwritten or removed. See the [shared setup guide](docs/setup.md) for user-service path, lingering, and recovery details.
+The service supervises the same foreground process, so tmux is unnecessary. Other lifecycle actions are `start`, `stop`, `restart`, and `uninstall`. `service status` always points to `service logs`, which reads the latest 100 journal entries even if a stale service-operation lock exists. Runtime journal events report adapter startup, accepted or safely ignored input, assistant turn submission and completion, polling and reconnect failures or recovery, delivery failures, and contained background failures. These events contain bounded metadata only—never message bodies, attachment contents, tokens, or Codex credentials. The generated unit contains only absolute paths and environment-variable names; QiYan continues to read credentials from its private `.env`, which is never copied into the unit. Installation validates this service-effective configuration rather than temporary shell-only bot variables. An existing unit not marked as QiYan-managed is never overwritten or removed. See the [shared setup guide](docs/setup.md) for user-service path, lingering, and recovery details.
 
 QiYan home is selected by CLI `--home`, then process `QIYAN_HOME`, then `$HOME/.qiyan-bot`. Other settings use CLI, then process environment, then `<QIYAN_HOME>/.env`, then defaults. `QIYAN_HOME` itself is intentionally not allowed inside `.env`.
 

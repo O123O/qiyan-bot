@@ -46,6 +46,7 @@ test("unauthorized and unsupported updates advance offset without downloads or r
   const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "poll-ignore-")), { maxFileBytes: 10, maxStoreBytes: 100 });
   await attachments.initialize();
   let downloads = 0;
+  const operational: unknown[] = [];
   const api = {
     getUpdates: async () => [
       { update_id: 1, message: { message_id: 1, date: 1, chat: { id: 1, type: "private" }, from: { id: 99 }, text: "secret", document: { file_id: "x" } } },
@@ -53,11 +54,51 @@ test("unauthorized and unsupported updates advance offset without downloads or r
     ],
     downloadFile: async () => { downloads += 1; return { stream: Readable.from([]) }; },
   };
-  const poller = new TelegramPoller(db, api, attachments, { ownerId: 42, onMessage: async () => undefined });
+  const poller = new TelegramPoller(db, api, attachments, {
+    ownerId: 42,
+    onMessage: async () => undefined,
+    onOperationalEvent: (event) => { operational.push(event); },
+  });
   await poller.pollOnce();
   assert.equal((db.prepare("SELECT next_update_id FROM telegram_state").get() as any).next_update_id, 3);
   assert.equal((db.prepare("SELECT COUNT(*) AS count FROM source_contexts").get() as any).count, 0);
   assert.equal(downloads, 0);
+  assert.deepEqual(operational, [
+    { level: "warn", code: "chat_input_ignored", adapter: "telegram", reason: "unauthorized_sender" },
+    { level: "info", code: "chat_input_ignored", adapter: "telegram", reason: "unsupported_update" },
+  ]);
+});
+
+test("polling failures and recovery are observable without exposing raw errors", async () => {
+  const db = createTestDatabase();
+  const attachments = new AttachmentStore(db, await mkdtemp(join(tmpdir(), "poll-observe-")), { maxFileBytes: 10, maxStoreBytes: 100 });
+  await attachments.initialize();
+  const operational: unknown[] = [];
+  let calls = 0;
+  const api = {
+    getUpdates: async (_offset: number, signal?: AbortSignal) => {
+      calls += 1;
+      if (calls === 1) throw new Error("secret-token");
+      if (calls === 2) return [];
+      await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return [];
+    },
+    downloadFile: async () => ({ stream: Readable.from([]) }),
+  };
+  const poller = new TelegramPoller(db, api, attachments, {
+    ownerId: 42,
+    onMessage: async () => undefined,
+    retrySleep: async () => undefined,
+    onOperationalEvent: (event) => { operational.push(event); },
+  });
+  poller.start();
+  while (calls < 3) await new Promise((resolve) => setImmediate(resolve));
+  await poller.stop();
+  assert.deepEqual(operational, [
+    { level: "warn", code: "chat_ingress_failed", adapter: "telegram", consecutiveFailures: 1 },
+    { level: "info", code: "chat_ingress_recovered", adapter: "telegram", consecutiveFailures: 1 },
+  ]);
+  assert.equal(JSON.stringify(operational).includes("secret-token"), false);
 });
 
 test("source, retain, notice, and offset roll back together when the native checkpoint fails", async () => {

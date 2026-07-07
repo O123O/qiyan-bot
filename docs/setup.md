@@ -60,9 +60,10 @@ For unattended operation on systemd-based Linux, install an enabled user service
 ```bash
 qiyan-bot service install
 qiyan-bot service status
+qiyan-bot service logs
 ```
 
-Use `qiyan-bot service start|stop|restart` for normal control and `qiyan-bot service uninstall` to stop, disable, and remove the generated unit. The service runs the same foreground process under systemd, so tmux is unnecessary. Inspect logs with `journalctl --user -u qiyan-bot.service`. Whether a user service remains active after logout is a host policy; an administrator or the user may enable lingering separately with `loginctl enable-linger "$USER"` when appropriate. QiYan does not change lingering policy.
+Use `qiyan-bot service start|stop|restart` for normal control and `qiyan-bot service uninstall` to stop, disable, and remove the generated unit. The service runs the same foreground process under systemd, so tmux is unnecessary. `qiyan-bot service logs` prints the latest 100 entries; follow them live with `journalctl --user -u qiyan-bot.service -f`. Runtime events distinguish adapter startup, accepted or safely ignored input, assistant turn submission and completion, ingress or reconnect failure and recovery, delivery failure, and contained background failure without recording message bodies, attachment contents, tokens, or Codex credentials. Read-only `status` and `logs` remain available even when a stale service-operation lock blocks mutations. Whether a user service remains active after logout is a host policy; an administrator or the user may enable lingering separately with `loginctl enable-linger "$USER"` when appropriate. QiYan does not change lingering policy.
 
 Use `qiyan-bot --home /absolute/private/home` consistently for validation, login, run, and `service install` when overriding the default. Put service configuration in the private `.env`; temporary shell-only bot variables are deliberately ignored when `service install` validates what the service will actually read. The generated unit starts in the private QiYan home, and QiYan changes to `qiyan-workdir` before starting either Codex App Server. Do not use an external `EnvironmentFile`; QiYan reads its private mode-0600 `.env` itself.
 

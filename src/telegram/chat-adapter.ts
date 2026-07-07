@@ -5,6 +5,7 @@ import type { CanonicalChatSource } from "../core/types.ts";
 import { TelegramPoller } from "./poller.ts";
 import { createTelegramTransports, type TelegramTransports } from "./transport.ts";
 import { TelegramDeliveryAdapter } from "./delivery-adapter.ts";
+import type { OperationalEventSink } from "../core/operational-log.ts";
 
 interface TelegramChatAdapterDependencies {
   createTransports?: (token: string) => TelegramTransports;
@@ -21,7 +22,13 @@ export class TelegramChatAdapter implements ChatAdapter {
   constructor(
     db: Database,
     attachments: AttachmentStore,
-    options: { token: string; ownerId: number; maxMessageBytes: number; onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void> },
+    options: {
+      token: string;
+      ownerId: number;
+      maxMessageBytes: number;
+      onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void>;
+      onOperationalEvent?: OperationalEventSink;
+    },
     dependencies: TelegramChatAdapterDependencies = {},
   ) {
     this.transports = (dependencies.createTransports ?? createTelegramTransports)(options.token);
@@ -30,6 +37,7 @@ export class TelegramChatAdapter implements ChatAdapter {
       ownerId: options.ownerId,
       maxMessageBytes: options.maxMessageBytes,
       onMessage: options.onMessage,
+      ...(options.onOperationalEvent === undefined ? {} : { onOperationalEvent: options.onOperationalEvent }),
     });
   }
 

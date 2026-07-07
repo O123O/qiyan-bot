@@ -11,6 +11,7 @@ export const SYSTEMD_UNIT_NAME = "qiyan-bot.service";
 export const MANAGED_UNIT_MARKER = "# Managed by qiyan-bot; use `qiyan-bot service uninstall` to remove.";
 const MAX_UNIT_BYTES = 64 * 1024;
 const MAX_SYSTEMCTL_OUTPUT_BYTES = 4 * 1024;
+const MAX_JOURNAL_OUTPUT_BYTES = 64 * 1024;
 
 export interface SystemdOutcome {
   code: number | null;
@@ -69,6 +70,7 @@ export class SystemdUserService {
     userHome: string;
     executable: string;
     runner?: SystemdRunner;
+    journalRunner?: SystemdRunner;
     unitStore?: SystemdUnitStore;
     env?: NodeJS.ProcessEnv;
     expectedUid?: number;
@@ -80,10 +82,14 @@ export class SystemdUserService {
     }
     this.unitPath = join(defaultConfigHome, "systemd", "user", SYSTEMD_UNIT_NAME);
     this.runner = options.runner ?? ((args) => runSystemctl(args, options.env ?? process.env));
+    this.journalRunner = options.journalRunner ?? ((args) => runJournalctl(args, options.env ?? process.env));
     this.unitStore = options.unitStore ?? new NodeSystemdUnitStore(options.userHome, options.expectedUid ?? process.getuid?.());
   }
 
+  private readonly journalRunner: SystemdRunner;
+
   async execute(action: ServiceAction, input: { qiyanHome?: string } = {}): Promise<string> {
+    if (action === "status" || action === "logs") return this.executeLocked(action, input);
     return this.unitStore.withOperationLease(() => this.executeLocked(action, input));
   }
 
@@ -109,8 +115,9 @@ export class SystemdUserService {
       case "status": {
         const active = await this.probe(["is-active", SYSTEMD_UNIT_NAME], activeStates);
         const enabled = await this.probe(["is-enabled", SYSTEMD_UNIT_NAME], enabledStates);
-        return `${SYSTEMD_UNIT_NAME} is ${active} and ${enabled}.\n`;
+        return `${SYSTEMD_UNIT_NAME} is ${active} and ${enabled}.\nRecent logs: qiyan-bot service logs\n`;
       }
+      case "logs": return this.logs();
       case "uninstall": {
         const managed = await this.unitStore.verifyManaged(this.unitPath);
         if (!managed) {
@@ -123,6 +130,16 @@ export class SystemdUserService {
         return `Stopped and removed ${SYSTEMD_UNIT_NAME}.\n`;
       }
     }
+  }
+
+  private async logs(): Promise<string> {
+    const args = ["--user", "--unit", SYSTEMD_UNIT_NAME, "--lines", "100", "--no-pager", "--output", "short-iso"];
+    let outcome: SystemdOutcome;
+    try { outcome = await this.journalRunner(args); }
+    catch { throw configuration("journalctl could not start"); }
+    if (outcome.signal !== null) throw configuration(`journalctl exited from signal ${outcome.signal}`);
+    if (outcome.code !== 0) throw configuration(`journalctl failed with status ${String(outcome.code)}`);
+    return outcome.stdout;
   }
 
   private async required(args: readonly string[]): Promise<void> {
@@ -355,7 +372,15 @@ function validateSystemdPath(value: string, label: string): void {
 }
 
 async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv): Promise<SystemdOutcome> {
-  const child = spawn("systemctl", ["--user", ...args], {
+  return runBoundedCommand("systemctl", ["--user", ...args], hostEnv, MAX_SYSTEMCTL_OUTPUT_BYTES);
+}
+
+async function runJournalctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv): Promise<SystemdOutcome> {
+  return runBoundedCommand("journalctl", args, hostEnv, MAX_JOURNAL_OUTPUT_BYTES);
+}
+
+async function runBoundedCommand(command: string, args: readonly string[], hostEnv: NodeJS.ProcessEnv, maxOutputBytes: number): Promise<SystemdOutcome> {
+  const child = spawn(command, [...args], {
     env: systemctlEnvironment(hostEnv),
     shell: false,
     stdio: ["ignore", "pipe", "ignore"],
@@ -367,7 +392,7 @@ async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv)
     child.stdout.on("data", (chunk: Buffer) => {
       if (exceeded) return;
       bytes += chunk.byteLength;
-      if (bytes > MAX_SYSTEMCTL_OUTPUT_BYTES) {
+      if (bytes > maxOutputBytes) {
         exceeded = true;
         chunks.length = 0;
         child.kill();
@@ -377,7 +402,7 @@ async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv)
     });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
-      if (exceeded) return reject(configuration("systemctl --user returned too much output"));
+      if (exceeded) return reject(configuration(`${command} returned too much output`));
       resolveOutcome({ code, signal, stdout: Buffer.concat(chunks, bytes).toString("utf8") });
     });
   });

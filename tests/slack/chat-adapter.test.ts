@@ -219,11 +219,13 @@ test("Slack reconnects independently of heartbeat tolerance and cancels a pendin
   const deliveries = new DeliveryStore(db);
   const conversations = new ConversationStore(db, deliveries, attachments);
   const socket = new FakeSocket();
+  const operational: unknown[] = [];
   const timers: Array<{ callback: () => void; delayMs: number; cancelled: boolean }> = [];
   const adapter = new SlackChatAdapter(db, attachments, conversations, deliveries, {
     config,
     maxMessageBytes: 100,
     onMessage: async (source, effects) => { conversations.acceptChatSource(source, effects); },
+    onOperationalEvent: (event) => { operational.push(event); },
   }, {
     clients: clients([]),
     createSocketModeClient: () => socket,
@@ -247,6 +249,10 @@ test("Slack reconnects independently of heartbeat tolerance and cancels a pendin
   assert.equal(socket.starts, 2);
   assert.equal(timers.length, 2);
   assert.equal(timers[1]?.delayMs, 2_000);
+  assert.deepEqual(operational, [
+    { level: "warn", code: "chat_connection_lost", adapter: "slack" },
+    { level: "warn", code: "chat_reconnect_failed", adapter: "slack", consecutiveFailures: 1 },
+  ]);
 
   socket.onStart = () => { socket.emit("disconnected"); };
   timers[1]?.callback();

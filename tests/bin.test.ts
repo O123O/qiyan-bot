@@ -118,6 +118,14 @@ if (argv[1] === "is-active") process.stdout.write("active\\n");
 if (argv[1] === "is-enabled") process.stdout.write("enabled\\n");
 `);
   await chmod(fakeSystemctl, 0o755);
+  const fakeJournalctl = join(serviceBin, "journalctl");
+  await writeFile(fakeJournalctl, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+writeFileSync(join(process.env.HOME, "journalctl-call.json"), JSON.stringify({ argv: process.argv.slice(2), leaked: Boolean(process.env.TELEGRAM_BOT_TOKEN || process.env.OTHER_SECRET) }));
+process.stdout.write("safe journal output\\n");
+`);
+  await chmod(fakeJournalctl, 0o755);
   const serviceEnv = {
     PATH: `${serviceBin}:${process.env.PATH ?? ""}`,
     HOME: serviceHome,
@@ -153,8 +161,16 @@ if (argv[1] === "is-enabled") process.stdout.write("enabled\\n");
   assert.doesNotMatch(installedUnit, /process-secret|private-file-token|other-secret/u);
   const serviceStatus = spawnSync(executable, ["service", "status"], { cwd: temp, encoding: "utf8", env: serviceEnv });
   assert.equal(serviceStatus.status, 0);
-  assert.equal(serviceStatus.stdout, "qiyan-bot.service is active and enabled.\n");
+  assert.equal(serviceStatus.stdout, "qiyan-bot.service is active and enabled.\nRecent logs: qiyan-bot service logs\n");
   assert.equal(serviceStatus.stderr, "");
+  const serviceLogs = spawnSync(executable, ["service", "logs"], { cwd: temp, encoding: "utf8", env: serviceEnv });
+  assert.equal(serviceLogs.status, 0);
+  assert.equal(serviceLogs.stdout, "safe journal output\n");
+  assert.equal(serviceLogs.stderr, "");
+  assert.deepEqual(JSON.parse(await readFile(join(serviceHome, "journalctl-call.json"), "utf8")), {
+    argv: ["--user", "--unit", "qiyan-bot.service", "--lines", "100", "--no-pager", "--output", "short-iso"],
+    leaked: false,
+  });
   const serviceUninstall = spawnSync(executable, ["service", "uninstall"], { cwd: temp, encoding: "utf8", env: serviceEnv });
   assert.equal(serviceUninstall.status, 0);
   assert.equal(serviceUninstall.stdout, "Stopped and removed qiyan-bot.service.\n");

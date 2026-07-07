@@ -1,6 +1,7 @@
 import type { AttachmentStore } from "../attachments/store.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { Database } from "../storage/database.ts";
+import type { OperationalEventSink } from "../core/operational-log.ts";
 import { classifyUpdate, toTelegramCanonicalSource } from "./adapter.ts";
 import type { TelegramUpdate } from "./types.ts";
 
@@ -17,8 +18,16 @@ export class TelegramPoller {
     private readonly db: Database,
     private readonly api: PollApi,
     private readonly attachments: AttachmentStore,
-    private readonly options: { ownerId: number; onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void>; maxMessageBytes?: number },
+    private readonly options: {
+      ownerId: number;
+      onMessage(source: CanonicalChatSource, commitNativeCheckpoint: () => void): Promise<void>;
+      maxMessageBytes?: number;
+      onOperationalEvent?: OperationalEventSink;
+      retrySleep?: (ms: number) => Promise<void>;
+    },
   ) {}
+
+  private readonly reportedIgnoreReasons = new Set<string>();
 
   async pollOnce(signal?: AbortSignal): Promise<number> {
     let offset = this.offset();
@@ -27,6 +36,15 @@ export class TelegramPoller {
       if (update.update_id < offset) continue;
       const classified = classifyUpdate(update, this.options.ownerId);
       if (classified.kind === "ignored") {
+        if (!this.reportedIgnoreReasons.has(classified.reason)) {
+          this.reportedIgnoreReasons.add(classified.reason);
+          this.options.onOperationalEvent?.({
+            level: classified.reason === "unauthorized_sender" ? "warn" : "info",
+            code: "chat_input_ignored",
+            adapter: "telegram",
+            reason: classified.reason,
+          });
+        }
         this.advance(update.update_id + 1);
         offset = update.update_id + 1;
         continue;
@@ -59,9 +77,22 @@ export class TelegramPoller {
   }
 
   private async loop(signal: AbortSignal): Promise<void> {
+    let consecutiveFailures = 0;
     while (!signal.aborted) {
-      try { await this.pollOnce(signal); }
-      catch (error) { if (signal.aborted) return; await new Promise((resolve) => setTimeout(resolve, 1_000)); }
+      try {
+        await this.pollOnce(signal);
+        if (consecutiveFailures > 0) {
+          this.options.onOperationalEvent?.({ level: "info", code: "chat_ingress_recovered", adapter: "telegram", consecutiveFailures });
+          consecutiveFailures = 0;
+        }
+      } catch {
+        if (signal.aborted) return;
+        consecutiveFailures += 1;
+        if (consecutiveFailures === 1 || consecutiveFailures % 30 === 0) {
+          this.options.onOperationalEvent?.({ level: "warn", code: "chat_ingress_failed", adapter: "telegram", consecutiveFailures });
+        }
+        await (this.options.retrySleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(1_000);
+      }
     }
   }
 

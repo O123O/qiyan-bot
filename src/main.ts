@@ -12,6 +12,7 @@ import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./weixin/login.ts
 import { bootstrapWeixin } from "./weixin/bootstrap.ts";
 import { buildServiceEffectiveEnvironment, SystemdUserService } from "./service/systemd-user.ts";
 import { AppError } from "./core/errors.ts";
+import { createOperationalLogSink } from "./core/operational-log.ts";
 import { isAbsolute, resolve } from "node:path";
 
 export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
@@ -90,7 +91,10 @@ export async function main(env = process.env, argv: readonly string[] = process.
     weixinConfigured: weixin.configured,
     ...(command.assistantWorkdir === undefined ? {} : { assistantWorkdir: command.assistantWorkdir }),
   });
-  const app = await createApp(config, weixin.configured ? { weixinCredential: weixin.credential } : {});
+  const app = await createApp(config, {
+    ...(weixin.configured ? { weixinCredential: weixin.credential } : {}),
+    onOperationalEvent: createOperationalLogSink(),
+  });
   await runForegroundApp(app);
 }
 

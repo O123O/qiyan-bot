@@ -23,6 +23,7 @@ test("parses an explicit assistant workdir", () => {
   assert.deepEqual(parseCliArgs(["service", "stop"]), { command: "service", action: "stop" });
   assert.deepEqual(parseCliArgs(["service", "restart"]), { command: "service", action: "restart" });
   assert.deepEqual(parseCliArgs(["service", "status"]), { command: "service", action: "status" });
+  assert.deepEqual(parseCliArgs(["service", "logs"]), { command: "service", action: "logs" });
   assert.deepEqual(parseCliArgs(["service", "uninstall"]), { command: "service", action: "uninstall" });
 });
 
@@ -55,7 +56,8 @@ test("formats useful top-level and command-specific help", () => {
 
   assert.match(formatCliHelp("weixin-login"), /qiyan-bot weixin-login \[--home <path>\]/u);
   assert.match(formatCliHelp("config-check"), /qiyan-bot config-check \[--home <path>\]/u);
-  assert.match(formatCliHelp("service"), /install\|start\|stop\|restart\|status\|uninstall/u);
+  assert.match(formatCliHelp("service"), /install\|start\|stop\|restart\|status\|logs\|uninstall/u);
+  assert.match(formatCliHelp("service"), /journal/u);
 });
 
 test("rejects missing, repeated, and unknown CLI arguments", () => {

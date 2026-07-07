@@ -23,7 +23,8 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
-import type { ManagementState } from "./core/types.ts";
+import type { OperationalEventSink } from "./core/operational-log.ts";
+import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
@@ -50,7 +51,7 @@ import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { openDatabase, type Database } from "./storage/database.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
-import { ConversationStore } from "./storage/conversation-store.ts";
+import { ConversationStore, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
@@ -191,7 +192,12 @@ export function reconcileOwnershipBeforeRelayWithLease(
 
 export async function buildProductionApp(
   config: BotConfig,
-  options: { chdir?: (path: string) => void; chatAdapters?: readonly ChatAdapter[]; weixinCredential?: WeixinCredentialHandle } = {},
+  options: {
+    chdir?: (path: string) => void;
+    chatAdapters?: readonly ChatAdapter[];
+    weixinCredential?: WeixinCredentialHandle;
+    onOperationalEvent?: OperationalEventSink;
+  } = {},
 ): Promise<BotApp> {
   const telegramConfig = config.chat.telegram;
   const token = randomBytes(32).toString("base64url");
@@ -267,6 +273,12 @@ export async function buildProductionApp(
   let endpointsCommitted = false;
   let backgroundIncident = 0;
   let operationReconciliationTail: Promise<void> = Promise.resolve();
+  const report = options.onOperationalEvent ?? (() => undefined);
+
+  const acceptChat = async (source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void> => {
+    await dispatcher.accept(source, effects);
+    report({ level: "info", code: "chat_input_accepted", adapter: source.binding.adapterId });
+  };
 
   const phases: AppPhase[] = [
     {
@@ -352,14 +364,16 @@ export async function buildProductionApp(
             token: telegramConfig.token,
             ownerId: telegramConfig.ownerId,
             maxMessageBytes: config.attachmentMaxBytes,
-            onMessage: (source, commitNativeCheckpoint) => dispatcher.accept(source, { commitNativeCheckpoint }),
+            onMessage: (source, commitNativeCheckpoint) => acceptChat(source, { commitNativeCheckpoint }),
+            onOperationalEvent: report,
           }));
         let slack: SlackChatAdapter | undefined;
         if (!options.chatAdapters && config.chat.slack) {
           slack = new SlackChatAdapter(db, attachments, conversations, deliveries, {
             config: config.chat.slack,
             maxMessageBytes: config.attachmentMaxBytes,
-            onMessage: (source, effects) => dispatcher.accept(source, effects),
+            onMessage: acceptChat,
+            onOperationalEvent: report,
           });
           configured.push(slack);
         } else if (options.chatAdapters) {
@@ -400,7 +414,7 @@ export async function buildProductionApp(
               }
             },
             isTransient: isRetryableWeixinIngressFailure,
-            onMessage: (source, effects) => dispatcher.accept(source, effects),
+            onMessage: acceptChat,
             maxMediaBytes: config.attachmentMaxBytes,
           });
           const delivery = new WeixinDeliveryAdapter({
@@ -697,6 +711,7 @@ export async function buildProductionApp(
           membershipObserver: attemptScope,
           runtimeObserver: assistant,
           scheduler,
+          onOperationalEvent: (code) => { report({ level: code === "assistant_submission_uncertain" ? "warn" : "info", code }); },
           onDeferredTerminal: (turn) => runBackground(
             () => processAssistantTerminal({ threadId: identity.thread_id, turn }),
             () => recordBackgroundFailure("deferred assistant terminal"),
@@ -750,7 +765,14 @@ export async function buildProductionApp(
     {
       name: "delivery",
       start: async () => {
-        deliveryWorker = new DeliveryWorker(deliveries, chatRegistry, attachments, undefined, (delivery) => { persistDeliveryState(delivery); });
+        deliveryWorker = new DeliveryWorker(
+          deliveries,
+          chatRegistry,
+          attachments,
+          undefined,
+          (delivery) => { persistDeliveryState(delivery); },
+          (delivery) => { report({ level: "warn", code: "delivery_failed", adapter: delivery.binding.adapterId }); },
+        );
         deliveryWorker.start();
       },
       stop: async () => { await deliveryWorker.stop(); },
@@ -758,7 +780,10 @@ export async function buildProductionApp(
     { name: "maintenance", start: async () => undefined, stop: async () => undefined },
     {
       name: "chat-ingress",
-      start: async () => { await Promise.all(chats.map((adapter) => adapter.start())); },
+      start: async () => {
+        await Promise.all(chats.map((adapter) => adapter.start()));
+        for (const adapter of chats) report({ level: "info", code: "chat_ingress_started", adapter: adapter.delivery.id });
+      },
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
   ];
@@ -1736,6 +1761,7 @@ export async function buildProductionApp(
   }
 
   function recordBackgroundFailure(label: string): void {
+    report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
     try {
       backgroundIncident += 1;
       const id = `background-failure:${backgroundIncident}`;
@@ -1748,7 +1774,10 @@ export async function buildProductionApp(
     } catch { /* containment path cannot safely escalate */ }
   }
 
-  return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance } });
+  return composeApp(phases, { maintenance: { intervalMs: 60_000, run: async () => {
+    try { await runMaintenance(); }
+    catch (error) { recordBackgroundFailure("maintenance"); throw error; }
+  } } });
 
   async function runMaintenance(): Promise<void> {
     await attachments.cleanupExpired();

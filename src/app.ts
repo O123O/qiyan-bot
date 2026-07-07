@@ -1,6 +1,7 @@
 import type { BotConfig } from "./config.ts";
 import { StartupPhaseError } from "./core/errors.ts";
 import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
+import type { OperationalEventSink } from "./core/operational-log.ts";
 
 export { StartupPhaseError } from "./core/errors.ts";
 
@@ -9,6 +10,7 @@ export interface AppPhase { name: string; start(): Promise<void>; stop(): Promis
 export interface AppRuntimeOptions {
   phases?: readonly AppPhase[];
   weixinCredential?: WeixinCredentialHandle;
+  onOperationalEvent?: OperationalEventSink;
 }
 
 export class TerminalInbox<T> {
@@ -102,5 +104,8 @@ export function composeApp(
 export async function createApp(config: BotConfig, options: AppRuntimeOptions = {}): Promise<BotApp> {
   if (options.phases) return composeApp(options.phases);
   const { buildProductionApp } = await import("./production-app.ts");
-  return buildProductionApp(config, options.weixinCredential ? { weixinCredential: options.weixinCredential } : {});
+  return buildProductionApp(config, {
+    ...(options.weixinCredential ? { weixinCredential: options.weixinCredential } : {}),
+    ...(options.onOperationalEvent ? { onOperationalEvent: options.onOperationalEvent } : {}),
+  });
 }

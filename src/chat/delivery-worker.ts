@@ -15,6 +15,7 @@ export class DeliveryWorker {
     private readonly attachments?: AttachmentStore,
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     private readonly onStateChange: (delivery: DeliveryRecord, error?: unknown) => Promise<void> | void = () => undefined,
+    private readonly onOperationalFailure: (delivery: DeliveryRecord) => Promise<void> | void = () => undefined,
   ) {}
 
   async processOne(id: string): Promise<void> {
@@ -62,6 +63,7 @@ export class DeliveryWorker {
         this.store.abandonUncertain(id);
         this.prepareUncertainWarning(delivery);
       }
+      await this.notifyOperationalFailure(this.store.get(id)!);
       if (!safeToRetry) await this.notify(this.store.get(id)!, error);
       throw error;
     }
@@ -110,6 +112,11 @@ export class DeliveryWorker {
   private async notify(delivery: DeliveryRecord, error?: unknown): Promise<void> {
     try { await this.onStateChange(delivery, error); }
     catch { /* delivery state is authoritative */ }
+  }
+
+  private async notifyOperationalFailure(delivery: DeliveryRecord): Promise<void> {
+    try { await this.onOperationalFailure(delivery); }
+    catch { /* delivery state remains authoritative */ }
   }
 
   private async sendAttachment(adapter: ChatDeliveryAdapter, delivery: DeliveryRecord, body: string): Promise<JsonValue> {

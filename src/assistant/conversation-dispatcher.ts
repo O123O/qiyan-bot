@@ -44,7 +44,14 @@ interface DispatcherOptions {
   scheduler?: AssistantScheduler;
   retryMs?: number;
   stopWaitMs?: number;
+  onOperationalEvent?: (event: DispatcherOperationalEvent) => void;
 }
+
+export type DispatcherOperationalEvent =
+  | "assistant_turn_started"
+  | "assistant_turn_steered"
+  | "assistant_submission_uncertain"
+  | "assistant_turn_terminal";
 
 export class ConversationDispatcher {
   private tail: Promise<void> = Promise.resolve();
@@ -95,6 +102,7 @@ export class ConversationDispatcher {
         this.noteConversationPeriod();
         this.store.beginTerminalizing(turn.id);
         this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
+        this.options.onOperationalEvent?.("assistant_turn_terminal");
       } else {
         this.earlyTerminals.set(turn.id, turn);
       }
@@ -149,6 +157,7 @@ export class ConversationDispatcher {
               this.store.beginTerminalizing(turn.id);
               this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
               this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
+              this.options.onOperationalEvent?.("assistant_turn_terminal");
               this.options.onDeferredTerminal?.(turn);
             },
             () => { if (recoveryGeneration === this.recoveryGeneration) this.scheduleRecovery(); },
@@ -265,6 +274,7 @@ export class ConversationDispatcher {
           if (!early && !isTerminal(response.turn.status)) throw error;
         }
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turn.id);
+        this.options.onOperationalEvent?.("assistant_turn_started");
         this.options.membershipObserver?.notifyMembership(submission.contextId);
         this.options.runtimeObserver?.hydrateActive();
         if (early || isTerminal(response.turn.status)) {
@@ -273,6 +283,7 @@ export class ConversationDispatcher {
           this.store.beginTerminalizing(response.turn.id);
           this.options.runtimeObserver?.beginTerminalizing?.(response.turn.id);
           this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, response.turn.id);
+          this.options.onOperationalEvent?.("assistant_turn_terminal");
           this.options.onDeferredTerminal?.(early ?? response.turn);
           return;
         }
@@ -297,6 +308,7 @@ export class ConversationDispatcher {
       this.trackNativeSubmission(() => this.runner.steer(params)),
       (response) => {
         this.store.markSubmitted(submission.attemptId, submission.contextId, response.turnId);
+        this.options.onOperationalEvent?.("assistant_turn_steered");
         this.options.membershipObserver?.notifyMembership(submission.contextId);
         this.options.runtimeObserver?.hydrateActive();
         this.pump();
@@ -315,6 +327,7 @@ export class ConversationDispatcher {
     }
     const reconciliationGeneration = recoveryGeneration ?? ++this.recoveryGeneration;
     this.store.markUncertain(submission.attemptId, submission.contextId);
+    this.options.onOperationalEvent?.("assistant_submission_uncertain");
     this.launch(
       this.runner.readThread(),
       (thread) => {
@@ -335,6 +348,7 @@ export class ConversationDispatcher {
       turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId));
     if (positive) {
       this.store.markSubmitted(submission.attemptId, submission.contextId, positive.id);
+      this.options.onOperationalEvent?.(submission.submissionKind === "start" ? "assistant_turn_started" : "assistant_turn_steered");
       this.options.membershipObserver?.notifyMembership(submission.contextId);
       this.options.runtimeObserver?.hydrateActive();
       if (claim) this.pool.bindTurnCapacityClaim(claim, positive.id);
@@ -343,6 +357,7 @@ export class ConversationDispatcher {
         this.store.beginTerminalizing(positive.id);
         this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
         this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, positive.id);
+        this.options.onOperationalEvent?.("assistant_turn_terminal");
         this.options.onDeferredTerminal?.(positive);
       } else this.pump();
       return;

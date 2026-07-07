@@ -81,7 +81,11 @@ const chat = (id: string, conversationKey = "chat-1", attachmentIds: readonly st
   receivedAt: 1,
 });
 
-function fixture(maxConcurrentTurns = 1, dispatcherOptions: { stopWaitMs?: number; onDeferredTerminal?: (turn: TurnSnapshot) => void } = {}) {
+function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
+  stopWaitMs?: number;
+  onDeferredTerminal?: (turn: TurnSnapshot) => void;
+  onOperationalEvent?: (event: "assistant_turn_started" | "assistant_turn_steered" | "assistant_submission_uncertain" | "assistant_turn_terminal") => void;
+} = {}) {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
   const store = new ConversationStore(db, deliveries);
@@ -111,7 +115,8 @@ test("stop durably marks an unresolved native submission and returns within its 
 });
 
 test("starts an idle conversation and naturally steers same-conversation follow-ups", async () => {
-  const { runner, dispatcher } = fixture();
+  const operational: string[] = [];
+  const { runner, dispatcher } = fixture(1, { onOperationalEvent: (event) => { operational.push(event); } });
   await dispatcher.accept(chat("first"));
   assert.equal(runner.starts.length, 1);
   const startClientId = runner.starts[0]!.params.clientUserMessageId;
@@ -135,6 +140,8 @@ test("starts an idle conversation and naturally steers same-conversation follow-
   });
   runner.steers[0]!.result.resolve({ turnId: "turn-1" });
   await dispatcher.idle();
+  await dispatcher.terminal({ id: "turn-1", status: "completed", itemsView: "full", items: [] });
+  assert.deepEqual(operational, ["assistant_turn_started", "assistant_turn_steered", "assistant_turn_terminal"]);
   await dispatcher.stop();
 });
 

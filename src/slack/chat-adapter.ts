@@ -4,6 +4,7 @@ import type { ConversationBinding } from "../chat/binding.ts";
 import type { ChatAdapter, ChatHistoryProvider } from "../chat/contracts.ts";
 import type { SlackConfig } from "../config.ts";
 import { AppError } from "../core/errors.ts";
+import type { OperationalEventSink } from "../core/operational-log.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { ConversationStore, ChatAcceptanceEffects } from "../storage/conversation-store.ts";
 import type { Database } from "../storage/database.ts";
@@ -69,6 +70,7 @@ export class SlackChatAdapter implements ChatAdapter {
   private reconnectFailures = 0;
   private reconnectNeeded = false;
   private reconnectGeneration = 0;
+  private connectionIncidentOpen = false;
   private readonly eventTasks = new Set<Promise<void>>();
 
   private readonly socketListener = (value: unknown): void => {
@@ -78,12 +80,16 @@ export class SlackChatAdapter implements ChatAdapter {
     const body = reduceEnvelopeBody(event?.body);
     const task = this.handler.handle({ body, ack: () => Promise.resolve(ack()) })
       .then(() => this.worker.drain())
-      .catch(() => undefined);
+      .catch(() => { this.options.onOperationalEvent?.({ level: "warn", code: "chat_ingress_failed", adapter: "slack", consecutiveFailures: 1 }); });
     this.eventTasks.add(task);
     void task.finally(() => { this.eventTasks.delete(task); });
   };
 
   private readonly disconnectedListener = (): void => {
+    if (!this.connectionIncidentOpen) {
+      this.connectionIncidentOpen = true;
+      this.options.onOperationalEvent?.({ level: "warn", code: "chat_connection_lost", adapter: "slack" });
+    }
     this.reconnectNeeded = true;
     this.scheduleReconnect();
   };
@@ -97,6 +103,7 @@ export class SlackChatAdapter implements ChatAdapter {
       config: SlackConfig;
       maxMessageBytes: number;
       onMessage(source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void>;
+      onOperationalEvent?: OperationalEventSink;
     },
     dependencies: SlackChatAdapterDependencies = {},
   ) {
@@ -223,8 +230,27 @@ export class SlackChatAdapter implements ChatAdapter {
       const task = Promise.resolve()
         .then(() => this.socket.start())
         .then(
-          () => { connected = true; this.reconnectFailures = 0; },
-          () => { failed = true; this.reconnectFailures += 1; this.reconnectNeeded = true; },
+          () => {
+            connected = true;
+            const recoveredFailures = this.reconnectFailures;
+            this.reconnectFailures = 0;
+            if (!this.reconnectNeeded && this.connectionIncidentOpen) {
+              this.connectionIncidentOpen = false;
+              this.options.onOperationalEvent?.({
+                level: "info", code: "chat_connection_reconnected", adapter: "slack", consecutiveFailures: recoveredFailures,
+              });
+            }
+          },
+          () => {
+            failed = true;
+            this.reconnectFailures += 1;
+            this.reconnectNeeded = true;
+            if (this.reconnectFailures === 1 || this.reconnectFailures % 10 === 0) {
+              this.options.onOperationalEvent?.({
+                level: "warn", code: "chat_reconnect_failed", adapter: "slack", consecutiveFailures: this.reconnectFailures,
+              });
+            }
+          },
         )
         .finally(() => {
           if (this.reconnectTask !== task) return;

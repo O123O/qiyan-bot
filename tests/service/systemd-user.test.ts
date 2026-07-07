@@ -49,6 +49,7 @@ test("service-effective validation removes every environment value unset by the 
 
 test("installs, controls, and reports one user service with fixed systemctl arguments", async () => {
   const calls: string[][] = [];
+  const journalCalls: string[][] = [];
   const writes: Array<{ path: string; contents: string }> = [];
   const removals: string[] = [];
   const runner: SystemdRunner = async (args) => {
@@ -61,6 +62,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
     userHome: "/home/user",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner,
+    journalRunner: async (args) => { journalCalls.push([...args]); return { code: 0, signal: null, stdout: "safe journal output\n" }; },
     unitStore: {
       withOperationLease: async (operation) => operation(),
       install: async (path, contents) => { writes.push({ path, contents }); },
@@ -73,12 +75,14 @@ test("installs, controls, and reports one user service with fixed systemctl argu
   assert.equal(await service.execute("start"), "Started qiyan-bot.service.\n");
   assert.equal(await service.execute("stop"), "Stopped qiyan-bot.service.\n");
   assert.equal(await service.execute("restart"), "Restarted qiyan-bot.service.\n");
-  assert.equal(await service.execute("status"), "qiyan-bot.service is active and enabled.\n");
+  assert.equal(await service.execute("status"), "qiyan-bot.service is active and enabled.\nRecent logs: qiyan-bot service logs\n");
+  assert.equal(await service.execute("logs"), "safe journal output\n");
   assert.equal(await service.execute("uninstall"), "Stopped and removed qiyan-bot.service.\n");
   assert.equal(writes.length, 1);
   assert.equal(writes[0]?.path, "/home/user/.config/systemd/user/qiyan-bot.service");
   assert.match(writes[0]?.contents ?? "", /ExecStart="\/home\/user\/\.local\/bin\/qiyan-bot"/u);
   assert.deepEqual(removals, ["/home/user/.config/systemd/user/qiyan-bot.service"]);
+  assert.deepEqual(journalCalls, [["--user", "--unit", "qiyan-bot.service", "--lines", "100", "--no-pager", "--output", "short-iso"]]);
   assert.deepEqual(calls, [
     ["daemon-reload"],
     ["enable", "qiyan-bot.service"],
@@ -108,6 +112,27 @@ test("systemctl failures are actionable without returning command output", async
   );
 });
 
+test("read-only status and logs remain available when a stale operation lock exists", async () => {
+  let leaseCalls = 0;
+  const service = new SystemdUserService({
+    userHome: "/home/user",
+    executable: "/home/user/.local/bin/qiyan-bot",
+    runner: async (args) => args[0] === "is-active"
+      ? { code: 0, signal: null, stdout: "active\n" }
+      : { code: 0, signal: null, stdout: "enabled\n" },
+    journalRunner: async () => ({ code: 0, signal: null, stdout: "recent\n" }),
+    unitStore: {
+      withOperationLease: async () => { leaseCalls += 1; throw new Error("stale lock"); },
+      install: async () => undefined,
+      verifyManaged: async () => true,
+      remove: async () => undefined,
+    },
+  });
+  assert.match(await service.execute("status"), /active and enabled/u);
+  assert.equal(await service.execute("logs"), "recent\n");
+  assert.equal(leaseCalls, 0);
+});
+
 test("status rejects an unrecognized failed probe instead of reporting unknown health", async () => {
   const service = new SystemdUserService({
     userHome: "/home/user",
@@ -131,7 +156,7 @@ test("status reports documented nonzero systemd enabled states", async () => {
       : { code: 1, signal: null, stdout: "masked-runtime\n" },
     unitStore: { withOperationLease: async (operation) => operation(), install: async () => undefined, verifyManaged: async () => true, remove: async () => undefined },
   });
-  assert.equal(await service.execute("status"), "qiyan-bot.service is inactive and masked-runtime.\n");
+  assert.equal(await service.execute("status"), "qiyan-bot.service is inactive and masked-runtime.\nRecent logs: qiyan-bot service logs\n");
 });
 
 test("uninstall is idempotent and reloads systemd after an already-removed unit", async () => {
