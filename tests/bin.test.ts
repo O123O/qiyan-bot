@@ -75,9 +75,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.deepEqual(tree.dependencies?.["qiyan-bot"]?.dependencies ?? {}, {});
 
   const executable = join(installRoot, "node_modules", ".bin", "qiyan-bot");
-  const bundledExecutable = await readFile(join(packageRoot, "dist", "qiyan-bot"), "utf8");
-  assert.equal(bundledExecutable.startsWith("#!/usr/bin/env node\n"), true);
-  assert.doesNotMatch(bundledExecutable, /from\s+["']node:sqlite["']/u);
+  assert.equal((await readFile(join(packageRoot, "dist", "qiyan-bot"), "utf8")).startsWith("#!/usr/bin/env node\n"), true);
   assert.notEqual((await stat(executable)).mode & 0o111, 0);
 
   const version = spawnSync(executable, ["--version"], {
@@ -98,43 +96,6 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   assert.match(help.stdout, /^QiYan personal assistant bot\n/u);
   assert.match(help.stdout, /qiyan-bot assistant-login/u);
   assert.equal(help.stderr, "");
-
-  const limitedBuiltinsLoader = join(temp, "limited-builtins-loader.mjs");
-  await writeFile(limitedBuiltinsLoader, `export async function resolve(specifier, context, nextResolve) {
-  if (specifier === "node:util") {
-    return {
-      shortCircuit: true,
-      url: "data:text/javascript,export%20function%20isDeepStrictEqual()%20%7B%20return%20false%3B%20%7D",
-    };
-  }
-  return nextResolve(specifier, context);
-}
-`);
-  const missingSqlitePreload = join(temp, "missing-sqlite-preload.cjs");
-  await writeFile(missingSqlitePreload, `const Module = require("node:module");
-const originalLoad = Module._load;
-Module._load = function (request, parent, isMain) {
-  if (request === "node:sqlite") throw new Error("node:sqlite is unavailable");
-  return originalLoad.call(this, request, parent, isMain);
-};
-`);
-  const missingSqliteProbe = spawnSync(process.execPath, ["--require", missingSqlitePreload, "-e", "require('node:sqlite')"], {
-    cwd: temp,
-    encoding: "utf8",
-  });
-  assert.notEqual(missingSqliteProbe.status, 0);
-  const compatibilityHelp = spawnSync(process.execPath, [
-    "--require", missingSqlitePreload,
-    "--experimental-loader", limitedBuiltinsLoader,
-    executable, "--help",
-  ], {
-    cwd: temp,
-    encoding: "utf8",
-    env: { PATH: process.env.PATH ?? "", NODE_NO_WARNINGS: "1" },
-  });
-  assert.equal(compatibilityHelp.status, 0);
-  assert.equal(compatibilityHelp.stdout, help.stdout);
-  assert.equal(compatibilityHelp.stderr, "");
 
   const checkedHome = join(temp, "checked-qiyan-home");
   await mkdir(checkedHome, { mode: 0o700 });

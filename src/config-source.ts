@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import * as nodeUtil from "node:util";
+import { parseEnv } from "node:util";
 import { AppError } from "./core/errors.ts";
 
 export const BOT_SECRET_ENV_NAMES = new Set([
@@ -129,7 +129,7 @@ async function readPrivateDotenv(
       throw managedError("QiYan .env changed unexpectedly while it was read");
     }
     assertDotenvLines(contents);
-    const parsed = nodeUtil.parseEnv(contents);
+    const parsed = parseEnv(contents);
     const result: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed)) {
       if (key === "QIYAN_HOME") throw managedError("QIYAN_HOME cannot be defined inside .env");

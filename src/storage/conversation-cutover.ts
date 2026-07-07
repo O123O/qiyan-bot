@@ -1,10 +1,9 @@
 import { AppError } from "../core/errors.ts";
 import { statSync } from "node:fs";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
 import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
-import { loadDatabaseSync } from "./sqlite.ts";
 
 const readOnlyOperations = [
   "list_managed_sessions",
@@ -35,7 +34,6 @@ export function preflightConversationCutover(path: string, hasLegacyTelegramBind
   }
   let inspector: DatabaseSync | undefined;
   try {
-    const DatabaseSync = loadDatabaseSync();
     inspector = new DatabaseSync(path, { readOnly: true });
     const tables = new Set((inspector.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(({ name }) => name));
     if (!tables.has("source_contexts")) return;

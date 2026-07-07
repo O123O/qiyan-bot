@@ -1,17 +1,15 @@
 import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { migrations } from "./migrations.ts";
 import { AppError } from "../core/errors.ts";
-import { loadDatabaseSync, type DatabaseSyncConstructor } from "./sqlite.ts";
 
 export type Database = DatabaseSync;
 
 export function openDatabase(path: string): Database {
-  const DatabaseSync = loadDatabaseSync();
   if (path !== ":memory:") {
     const state = existingFileState(path);
-    if (state === "nonempty") assertQiYanDatabase(path, DatabaseSync);
+    if (state === "nonempty") assertQiYanDatabase(path);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   }
   const db = new DatabaseSync(path);
@@ -28,7 +26,7 @@ function existingFileState(path: string): "missing" | "empty" | "nonempty" {
   }
 }
 
-function assertQiYanDatabase(path: string, DatabaseSync: DatabaseSyncConstructor): void {
+function assertQiYanDatabase(path: string): void {
   let inspector: DatabaseSync | undefined;
   try {
     inspector = new DatabaseSync(path, { readOnly: true });
