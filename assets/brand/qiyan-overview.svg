@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 640" role="img" aria-labelledby="title description">
+  <title id="title">QiYan is one general assistant that manages many Codex project sessions</title>
+  <desc id="description">The user talks to QiYan through chat apps. QiYan handles everyday work directly and coordinates ordinary resumable Codex sessions for complex local and remote projects.</desc>
+
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fbfd" />
+      <stop offset="1" stop-color="#eef4f7" />
+    </linearGradient>
+    <linearGradient id="qiyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#082f5b" />
+      <stop offset="1" stop-color="#155f79" />
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="13" flood-color="#082f5b" flood-opacity=".12" />
+    </filter>
+    <marker id="arrow-navy" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0l10 5-10 5z" fill="#355a76" />
+    </marker>
+    <marker id="arrow-coral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0l10 5-10 5z" fill="#ef4b3f" />
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0l10 5-10 5z" fill="#16877f" />
+    </marker>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { fill: #527087; font-size: 12px; font-weight: 700; letter-spacing: 1.7px; }
+      .title { fill: #082f5b; font-size: 25px; font-weight: 750; }
+      .card-title { fill: #082f5b; font-size: 19px; font-weight: 750; }
+      .subtitle { fill: #60798c; font-size: 14px; font-weight: 500; }
+      .body { fill: #28485f; font-size: 14px; font-weight: 600; }
+      .small { fill: #6b8292; font-size: 12px; font-weight: 550; }
+      .chip { fill: #28485f; font-size: 12px; font-weight: 700; }
+      .white-title { fill: #fff; font-size: 32px; font-weight: 780; }
+      .white-subtitle { fill: #dcecf1; font-size: 16px; font-weight: 600; }
+      .white-body { fill: #f4fbfc; font-size: 13px; font-weight: 650; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="638" rx="28" fill="url(#canvas)" stroke="#dce7ed" stroke-width="2" />
+  <circle cx="1112" cy="82" r="112" fill="#dcefed" opacity=".38" />
+  <circle cx="1128" cy="66" r="62" fill="#f9d9d3" opacity=".38" />
+  <path d="M32 555c126-86 212-55 311 30" fill="none" stroke="#d7e7ed" stroke-width="22" stroke-linecap="round" opacity=".55" />
+
+  <text x="48" y="55" class="eyebrow">ONE ASSISTANT · MANY PROJECTS</text>
+  <text x="48" y="91" class="title">Everyday help now. Complex work carried forward.</text>
+
+  <!-- Relationship arrows sit behind the cards. -->
+  <path d="M267 315h66" fill="none" stroke="#355a76" stroke-width="3" marker-start="url(#arrow-navy)" marker-end="url(#arrow-navy)" />
+  <path d="M627 225h79" fill="none" stroke="#ef4b3f" stroke-width="3" marker-end="url(#arrow-coral)" />
+  <path d="M627 424h79" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#arrow-teal)" />
+
+  <g filter="url(#shadow)">
+    <!-- User and chat surfaces. -->
+    <rect x="48" y="145" width="219" height="366" rx="24" fill="#fff" />
+    <circle cx="157.5" cy="213" r="42" fill="#eaf2f6" />
+    <circle cx="157.5" cy="200" r="13" fill="#355a76" />
+    <path d="M130 237c4-18 16-27 27.5-27s23.5 9 27.5 27" fill="#355a76" />
+    <text x="157.5" y="280" text-anchor="middle" class="eyebrow">YOU</text>
+    <text x="157.5" y="308" text-anchor="middle" class="card-title">One private owner</text>
+    <text x="157.5" y="334" text-anchor="middle" class="subtitle">Talk naturally from any</text>
+    <text x="157.5" y="353" text-anchor="middle" class="subtitle">connected chat app</text>
+
+    <rect x="72" y="379" width="171" height="34" rx="17" fill="#edf5f8" />
+    <circle cx="92" cy="396" r="5" fill="#2a86c7" />
+    <text x="106" y="401" class="chip">Telegram</text>
+
+    <rect x="72" y="420" width="171" height="34" rx="17" fill="#f2eef8" />
+    <circle cx="92" cy="437" r="5" fill="#7456a4" />
+    <text x="106" y="442" class="chip">Slack</text>
+
+    <rect x="72" y="461" width="171" height="34" rx="17" fill="#edf7f1" />
+    <circle cx="92" cy="478" r="5" fill="#24a565" />
+    <text x="106" y="483" class="chip">WeChat · experimental</text>
+
+    <!-- QiYan core. -->
+    <rect x="333" y="127" width="294" height="394" rx="30" fill="url(#qiyan)" />
+    <circle cx="480" cy="199" r="40" fill="#fff" opacity=".12" />
+    <path d="M459 198a21 21 0 1 1 27 20l15 9-7-19" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M486 185c9 8 9 19 0 27M476 191c5 4 5 11 0 15" fill="none" stroke="#ff5a49" stroke-width="4" stroke-linecap="round" />
+    <text x="480" y="270" text-anchor="middle" class="white-title">QiYan</text>
+    <text x="480" y="296" text-anchor="middle" class="white-subtitle">Your general assistant</text>
+
+    <rect x="359" y="329" width="242" height="58" rx="16" fill="#fff" opacity=".12" />
+    <circle cx="383" cy="358" r="8" fill="#ff5a49" />
+    <text x="402" y="354" class="white-body">Understands the request</text>
+    <text x="402" y="373" fill="#cfe3e8" font-size="12">and chooses how to handle it</text>
+
+    <rect x="359" y="397" width="242" height="58" rx="16" fill="#fff" opacity=".12" />
+    <circle cx="383" cy="426" r="8" fill="#55c4b8" />
+    <text x="402" y="422" class="white-body">Keeps the conversation</text>
+    <text x="402" y="441" fill="#cfe3e8" font-size="12">while work continues elsewhere</text>
+
+    <rect x="379" y="473" width="202" height="28" rx="14" fill="#fff" opacity=".16" />
+    <text x="480" y="492" text-anchor="middle" fill="#fff" font-size="11.5" font-weight="700">Answers return to your current chat</text>
+
+    <!-- Direct-assistance path. -->
+    <rect x="706" y="127" width="446" height="185" rx="24" fill="#fff" />
+    <rect x="706" y="127" width="8" height="185" rx="4" fill="#ef4b3f" />
+    <circle cx="755" cy="177" r="24" fill="#fff0ed" />
+    <path d="m755 160 4 11 11 4-11 4-4 11-4-11-11-4 11-4z" fill="#ef4b3f" />
+    <text x="794" y="166" class="eyebrow">GENERAL ASSISTANT</text>
+    <text x="794" y="194" class="title">Direct help</text>
+    <text x="794" y="218" class="subtitle">QiYan handles it directly and replies immediately.</text>
+
+    <rect x="742" y="244" width="87" height="34" rx="17" fill="#fff0ed" />
+    <text x="785.5" y="266" text-anchor="middle" class="chip">Questions</text>
+    <rect x="839" y="244" width="70" height="34" rx="17" fill="#f2f6f8" />
+    <text x="874" y="266" text-anchor="middle" class="chip">Files</text>
+    <rect x="919" y="244" width="99" height="34" rx="17" fill="#f2f6f8" />
+    <text x="968.5" y="266" text-anchor="middle" class="chip">Small tasks</text>
+    <rect x="1028" y="244" width="92" height="34" rx="17" fill="#f2f6f8" />
+    <text x="1074" y="266" text-anchor="middle" class="chip">Research</text>
+
+    <!-- Managed-project path. -->
+    <rect x="706" y="337" width="446" height="246" rx="24" fill="#fff" />
+    <rect x="706" y="337" width="8" height="246" rx="4" fill="#16877f" />
+    <circle cx="755" cy="386" r="24" fill="#e8f7f4" />
+    <path d="M743 395h24v-18h-11l-4-5h-9z" fill="none" stroke="#16877f" stroke-width="3" stroke-linejoin="round" />
+    <text x="794" y="375" class="eyebrow">CODEX PROJECT MANAGER</text>
+    <text x="794" y="403" class="title">Complex project work</text>
+    <text x="794" y="427" class="subtitle">QiYan coordinates resumable Codex sessions.</text>
+
+    <g>
+      <rect x="742" y="453" width="116" height="72" rx="15" fill="#edf7f5" stroke="#cfe9e5" />
+      <circle cx="760" cy="473" r="5" fill="#16877f" />
+      <text x="772" y="478" class="body" font-size="13">Project A</text>
+      <text x="760" y="505" class="small">local session</text>
+
+      <rect x="871" y="453" width="116" height="72" rx="15" fill="#edf7f5" stroke="#cfe9e5" />
+      <circle cx="889" cy="473" r="5" fill="#16877f" />
+      <text x="901" y="478" class="body" font-size="13">Project B</text>
+      <text x="889" y="505" class="small">local session</text>
+
+      <rect x="1000" y="453" width="116" height="72" rx="15" fill="#edf7f5" stroke="#cfe9e5" />
+      <circle cx="1018" cy="473" r="5" fill="#ef4b3f" />
+      <text x="1030" y="478" class="body" font-size="13">SSH project</text>
+      <text x="1018" y="505" class="small">remote session</text>
+    </g>
+
+    <rect x="742" y="540" width="374" height="27" rx="13.5" fill="#eaf2f6" />
+    <text x="929" y="558.5" text-anchor="middle" fill="#355a76" font-size="11.5" font-weight="750">start · resume · steer · report · unadopt when you take over</text>
+  </g>
+
+  <!-- Arrow labels. -->
+  <rect x="272" y="278" width="56" height="24" rx="12" fill="#fff" stroke="#d9e5eb" />
+  <text x="300" y="294" text-anchor="middle" class="small" font-size="11">chat</text>
+  <rect x="642" y="187" width="60" height="24" rx="12" fill="#fff" stroke="#f6d3ce" />
+  <text x="672" y="203" text-anchor="middle" fill="#b83b33" font-size="11" font-weight="700">handles</text>
+  <rect x="638" y="386" width="67" height="24" rx="12" fill="#fff" stroke="#cde7e3" />
+  <text x="671.5" y="402" text-anchor="middle" fill="#116d67" font-size="11" font-weight="700">manages</text>
+
+  <text x="929" y="613" text-anchor="middle" class="small">Real project directories · standard Codex threads · local or SSH endpoints</text>
+</svg>

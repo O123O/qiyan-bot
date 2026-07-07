@@ -23,6 +23,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   const requiredFiles = new Set([
     "package/README.md",
     "package/assets/brand/qiyan-logo.png",
+    "package/assets/brand/qiyan-overview.svg",
     "package/assets/assistant/AGENTS.md",
     "package/assets/assistant/session-status.example.json",
     "package/assets/endpoints.example.jsonc",

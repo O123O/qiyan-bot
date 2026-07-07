@@ -9,6 +9,8 @@ test("README links to all focused guides and every local guide target exists", a
   assert.ok(readme.indexOf("general-purpose personal assistant") < readme.indexOf("Telegram"));
   assert.match(readme, /handle small filesystem tasks directly/iu);
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
+  assert.match(readme, /assets\/brand\/qiyan-overview\.svg/iu);
+  await access(resolve("assets/brand/qiyan-overview.svg"));
   assert.match(readme, /Telegram.*Slack.*WeChat.*run together/iu);
   assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");

@@ -6,6 +6,16 @@
 
 QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powered by Codex. It can answer and handle small filesystem tasks directly, or deliberately delegate sustained project work to ordinary, resumable Codex sessions. Telegram and Slack are implemented and live-tested. Personal WeChat is experimental: it is implemented with automated-test coverage but has not been successfully live-tested. Telegram, Slack, and WeChat can run together behind the same transport-neutral backend.
 
+## One assistant, many project sessions
+
+> **QiYan is both your everyday assistant and your Codex project manager.** It handles questions, files, and small tasks directly. For sustained or complex work, it starts or resumes the right Codex session, keeps it attached to its real project directory, and helps you steer and track the work from chat.
+
+<p align="center">
+  <img src="assets/brand/qiyan-overview.svg" alt="QiYan handles everyday requests directly and manages resumable Codex sessions for complex projects" width="100%">
+</p>
+
+Each managed project remains an ordinary, resumable Codex session in its own project directory. You can unadopt it from QiYan, continue it directly with Codex, and adopt it again later without creating a separate worker format.
+
 QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
 
 ## Security model

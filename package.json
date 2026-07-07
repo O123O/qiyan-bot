@@ -8,6 +8,7 @@
   "files": [
     "dist/qiyan-bot",
     "assets/brand/qiyan-logo.png",
+    "assets/brand/qiyan-overview.svg",
     "assets/assistant/AGENTS.md",
     "assets/assistant/session-status.example.json",
     "assets/endpoints.example.jsonc",
