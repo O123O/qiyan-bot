@@ -4,7 +4,7 @@
 
 **Goal:** Prevent QiYan database corruption from unsupported WAL-on-NFS use, reject existing corruption before external work starts, and recover the current production state without losing readable authoritative rows.
 
-**Architecture:** File-backed SQLite uses verified DELETE/EXTRA rollback journaling behind the existing storage interface. Production holds a stable adjacent advisory lease for the full database lifetime, and existing state receives a full non-immutable read-only integrity check before mutation. A packaged, explicit command copies every readable authoritative row, rebuilds only the corrupt dashboard metadata table into a verified fresh-schema candidate, retains the complete old artifact set, and performs a verified multi-file swap with rollback.
+**Architecture:** File-backed SQLite uses verified DELETE/EXTRA rollback journaling behind the existing storage interface. Production holds a stable adjacent advisory lease for the full database lifetime, and existing state receives a full non-immutable integrity check on a private disposable artifact copy before canonical mutation. The copy is writable only so SQLite can recover hot rollback journals there. A packaged, explicit command copies every readable authoritative row, rebuilds only the corrupt dashboard metadata table into a verified fresh-schema candidate, retains the complete old artifact set, and performs a verified multi-file swap with rollback.
 
 **Tech Stack:** Strict TypeScript, Node.js 24 built-ins (`node:sqlite`, `node:fs`, `node:child_process`, `node:crypto`), Linux `flock`, Node test runner.
 
@@ -48,7 +48,7 @@ new AppError(
 )
 ```
 
-Require the main file and every artifact that existed before inspection to remain byte-identical. Newly created read-only WAL/SHM coordination files are permitted and cleaned by the test. Add an injected inspector-close failure seam or equivalent focused unit test proving a raw close error cannot replace the static marker/integrity verdict.
+Require the main file and every artifact that existed before inspection to remain byte-identical. All WAL/SHM coordination and hot-journal recovery writes must be confined to a private disposable copy that is cleaned after inspection. Add an injected inspector-close failure seam or equivalent focused unit test proving a raw close error cannot replace the static marker/integrity verdict. Add a crash-generated hot rollback-journal fixture proving the copy recovers for validation while canonical bytes remain unchanged until the later canonical writable open.
 
 - [ ] **Step 4: Run focused tests and verify RED**
 
@@ -60,11 +60,12 @@ Expected: settings, hot-WAL conversion, and full corruption detection fail again
 
 Refactor the preflight to calculate a sanitized verdict first and close in a contained cleanup block. For nonempty existing files:
 
-1. open non-immutable read-only;
-2. set `busy_timeout=5000`;
-3. validate marker/version;
-4. require exactly one `integrity_check` row equal to `ok`;
-5. close without allowing close exceptions to expose or replace the selected static error.
+1. copy the stable main and existing WAL/SHM/journal set through no-follow handles into a private mode-0700 disposable directory;
+2. open the copy non-immutably and writable so SQLite may recover a hot rollback journal without changing canonical artifacts;
+3. set `busy_timeout=5000`;
+4. validate marker/version;
+5. require exactly one `integrity_check` row equal to `ok`;
+6. close and remove the copy without allowing cleanup exceptions to expose or replace the selected static error.
 
 For the writable connection, set `busy_timeout=5000` before journal conversion, select and verify DELETE for file databases, set and verify `synchronous=EXTRA`, enable and verify foreign keys, and only then migrate. Close the writable handle on any configuration/migration failure. Do not pass SQLite error text to `AppError`.
 

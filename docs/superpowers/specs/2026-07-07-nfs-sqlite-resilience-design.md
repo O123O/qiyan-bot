@@ -11,8 +11,8 @@ QiYan cannot copy Codex CLI's behavior of treating SQLite as an optional index. 
 Keep one authoritative SQLite database and remove its dependency on WAL:
 
 - File-backed databases use `journal_mode=DELETE`, `synchronous=EXTRA`, `foreign_keys=ON`, and a 5-second busy timeout. QiYan verifies the actual pragma values it relies on.
-- Existing nonempty databases receive a full read-only `PRAGMA integrity_check` before journal conversion, migrations, or any application mutation.
-- The inspector is non-immutable so it sees committed frames from a legacy hot WAL. Read-only SQLite may create new WAL/SHM coordination sidecars; the invariant is that the main file and every pre-existing sidecar remain byte-identical, not that inspection creates no files.
+- Existing nonempty databases receive a full `PRAGMA integrity_check` on a byte-stable disposable copy before canonical journal conversion, migrations, or any application mutation.
+- The inspector copy is non-immutable and writable so it sees committed frames from a legacy hot WAL and can recover a legitimate hot rollback journal. Canonical main/WAL/SHM/journal artifacts remain byte-identical through inspection; SQLite coordination and recovery writes occur only inside a private mode-0700 disposable directory.
 - A static `CONFIGURATION_ERROR` distinguishes a valid QiYan marker with corrupt contents from a foreign or unsupported database. Raw SQLite diagnostics, database contents, and private paths are never included.
 - Production acquires a lifetime advisory lease beside `bot.sqlite3` before cutover preflight or any SQLite open. The stable owner-only lock file is never unlinked. The database closes successfully before the lease is released.
 - Automatic repair is forbidden. The one supported repair for this incident is an explicit, packaged, offline `recover-dashboard-metadata` command with a retained byte backup.
@@ -23,7 +23,7 @@ This is safer and smaller than filesystem detection: QiYan uses one synchronous 
 
 For an existing nonempty database:
 
-1. Open a non-immutable read-only inspector and set its busy timeout.
+1. Copy the stable canonical main and existing WAL/SHM/journal set through no-follow handles into a private disposable directory, then open that copy non-immutably and writable so SQLite may recover a hot rollback journal.
 2. Validate `qiyan_state(product='qiyan-bot')` and supported state version 2 or 3.
 3. Run full `PRAGMA integrity_check` and require exactly one row whose result is `ok`.
 4. Close the inspector while containing close failures so they cannot replace the selected sanitized verdict.
@@ -101,7 +101,7 @@ Automated tests cover:
 
 - real file pragma values and absence of persistent WAL/SHM files after a normal close;
 - a child-process hot-WAL crash fixture whose WAL-only committed row survives preflight and DELETE conversion;
-- deterministic corruption of a non-marker page, sanitized rejection before writable mutation, and byte identity of the main and all pre-existing artifacts while allowing newly created read-only coordination sidecars;
+- deterministic corruption of a non-marker page, sanitized rejection before canonical writable mutation, byte identity of the complete canonical artifact set, and a crash-generated hot rollback journal recovered only on the disposable inspection copy;
 - unchanged foreign/unsupported database behavior and close-error containment;
 - lease contention, idempotent release, UID/type/link/mode checks, post-lock inode replacement detection, and reacquisition;
 - failed storage start, retry after failed start, and cleanup after a real later startup failure, including close-before-release ordering;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, chown, link, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, chown, link, mkdir, mkdtemp, open, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -266,9 +266,11 @@ test("installation displaces the complete old artifact generation and advances t
   const value = await recoveryFixture(t);
   await createHotWal(value.databasePath);
   await writeFile(`${value.databasePath}-journal`, "", { mode: 0o600 });
+  await chmod(value.databasePath, 0o600);
   const before = await artifactBytes(value.databasePath);
   assert.deepEqual(Object.keys(before).sort(), ["-journal", "-shm", "-wal", "main"]);
   const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+  assert.equal((await stat(prepared.candidatePath)).mode & 0o777, 0o600);
 
   await installPreparedDashboardMetadataRecovery(prepared);
 
@@ -286,6 +288,26 @@ test("installation displaces the complete old artifact generation and advances t
   assert.equal(installed.prepare("SELECT next_update_id FROM telegram_state").get()!.next_update_id, 99);
   assert.equal(installed.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
   installed.close();
+  assert.equal((await stat(value.databasePath)).mode & 0o777, 0o600);
+});
+
+test("a final installed-manifest sync failure never rolls the installed candidate back", async (t) => {
+  const value = await recoveryFixture(t);
+  const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+
+  await assert.rejects(installPreparedDashboardMetadataRecovery(prepared, {
+    beforeStep: async (step) => {
+      if ((step as string) === "sync-installed-manifest") throw new Error("secret final manifest sync failure");
+    },
+  }), (error: unknown) => error instanceof AppError
+    && error.message === "QiYan Bot state database recovery installed the candidate, but final manifest sync failed; keep the service stopped");
+
+  assert.equal(JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")).state, "installed");
+  await assert.rejects(access(prepared.candidatePath));
+  const installed = new DatabaseSync(value.databasePath, { readOnly: true });
+  assert.equal(installed.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
+  installed.close();
+  await access(join(prepared.quarantinePath, "displaced", "bot.sqlite3"));
 });
 
 test("ordinary installation failures restore originals, clean the candidate, and record rollback", async (t) => {

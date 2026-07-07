@@ -1,5 +1,21 @@
-import { mkdirSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  rmSync,
+  statSync,
+  writeSync,
+  type BigIntStats,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { migrations } from "./migrations.ts";
 import { AppError } from "../core/errors.ts";
@@ -12,6 +28,19 @@ interface OpenDatabaseOptions {
 
 const integrityFailure = "QiYan Bot state database failed integrity check; restore or recover it before starting";
 const journalingFailure = "QiYan Bot state database could not enable safe journaling";
+const inspectionSuffixes = ["", "-wal", "-shm", "-journal"] as const;
+
+interface InspectionArtifact {
+  suffix: typeof inspectionSuffixes[number];
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
 
 export function openDatabase(path: string, options: OpenDatabaseOptions = {}): Database {
   if (path !== ":memory:") {
@@ -40,9 +69,13 @@ function existingFileState(path: string): "missing" | "empty" | "nonempty" {
 
 function assertQiYanDatabase(path: string, closeInspector: (inspector: DatabaseSync) => void): void {
   let inspector: DatabaseSync | undefined;
+  let inspection: { path: string; cleanup(): void } | undefined;
   let verdict: "foreign" | "integrity" | "valid" = "foreign";
   try {
-    inspector = new DatabaseSync(path, { readOnly: true });
+    inspection = createInspectionCopy(path);
+    // Writable access is confined to the disposable copy so SQLite can recover
+    // a legitimate hot rollback journal without touching canonical state.
+    inspector = new DatabaseSync(inspection.path);
     inspector.exec("PRAGMA busy_timeout=5000");
     const marker = inspector.prepare("SELECT product, state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get() as
       { product?: unknown; state_version?: unknown } | undefined;
@@ -60,8 +93,141 @@ function assertQiYanDatabase(path: string, closeInspector: (inspector: DatabaseS
         try { inspector.close(); } catch { /* Preserve the sanitized verdict. */ }
       }
     }
+    if (inspection) {
+      try { inspection.cleanup(); }
+      catch { if (verdict === "valid") verdict = "integrity"; }
+    }
   }
   if (verdict !== "valid") throw new AppError("CONFIGURATION_ERROR", verdict === "foreign" ? "not a QiYan Bot state database" : integrityFailure);
+}
+
+function createInspectionCopy(path: string): { path: string; cleanup(): void } {
+  const root = mkdtempSync(join(tmpdir(), "qiyan-bot-db-inspection-"));
+  const copyPath = join(root, basename(path));
+  try {
+    chmodSync(root, 0o700);
+    const copied: InspectionArtifact[] = [];
+    for (const suffix of inspectionSuffixes) {
+      try { copied.push(copyInspectionArtifact(`${path}${suffix}`, `${copyPath}${suffix}`, suffix)); }
+      catch (error) {
+        if (suffix !== "" && isErrno(error, "ENOENT")) continue;
+        throw error;
+      }
+    }
+    const current = captureInspectionArtifacts(path);
+    if (!sameInspectionArtifacts(copied, current)) throw new Error("database changed during inspection copy");
+    return { path: copyPath, cleanup: () => { rmSync(root, { recursive: true, force: true }); } };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function copyInspectionArtifact(
+  sourcePath: string,
+  destinationPath: string,
+  suffix: typeof inspectionSuffixes[number],
+): InspectionArtifact {
+  const initial = lstatSync(sourcePath, { bigint: true });
+  if (!initial.isFile() || initial.isSymbolicLink()) throw new Error("unsafe database artifact");
+  const source = openSync(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  let destination: number | undefined;
+  try {
+    const opened = fstatSync(source, { bigint: true });
+    assertInspectionIdentity(initial, opened);
+    destination = openSync(
+      destinationPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    const size = Number(opened.size);
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error("unsafe database artifact size");
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < size) {
+      const bytesRead = readSync(source, buffer, 0, Math.min(buffer.length, size - position), position);
+      if (bytesRead === 0) throw new Error("unexpected database artifact eof");
+      let written = 0;
+      while (written < bytesRead) {
+        const bytesWritten = writeSync(destination, buffer, written, bytesRead - written, position + written);
+        if (bytesWritten === 0) throw new Error("short database artifact write");
+        written += bytesWritten;
+      }
+      position += bytesRead;
+    }
+    fsyncSync(destination);
+    const after = fstatSync(source, { bigint: true });
+    assertInspectionIdentity(opened, after);
+    assertInspectionIdentity(after, lstatSync(sourcePath, { bigint: true }));
+    return inspectionArtifact(suffix, after);
+  } finally {
+    try { if (destination !== undefined) closeSync(destination); }
+    finally { closeSync(source); }
+  }
+}
+
+function captureInspectionArtifacts(path: string): InspectionArtifact[] {
+  const artifacts: InspectionArtifact[] = [];
+  for (const suffix of inspectionSuffixes) {
+    try {
+      const value = lstatSync(`${path}${suffix}`, { bigint: true });
+      if (!value.isFile() || value.isSymbolicLink()) throw new Error("unsafe database artifact");
+      artifacts.push(inspectionArtifact(suffix, value));
+    } catch (error) {
+      if (suffix !== "" && isErrno(error, "ENOENT")) continue;
+      throw error;
+    }
+  }
+  return artifacts;
+}
+
+function inspectionArtifact(suffix: typeof inspectionSuffixes[number], value: BigIntStats): InspectionArtifact {
+  return {
+    suffix,
+    dev: value.dev,
+    ino: value.ino,
+    uid: value.uid,
+    mode: value.mode,
+    nlink: value.nlink,
+    size: value.size,
+    mtimeNs: value.mtimeNs,
+    ctimeNs: value.ctimeNs,
+  };
+}
+
+function assertInspectionIdentity(left: BigIntStats, right: BigIntStats): void {
+  if (
+    !right.isFile()
+    || right.isSymbolicLink()
+    || left.dev !== right.dev
+    || left.ino !== right.ino
+    || left.uid !== right.uid
+    || left.mode !== right.mode
+    || left.nlink !== right.nlink
+    || left.size !== right.size
+    || left.mtimeNs !== right.mtimeNs
+    || left.ctimeNs !== right.ctimeNs
+  ) throw new Error("database artifact changed");
+}
+
+function sameInspectionArtifacts(left: readonly InspectionArtifact[], right: readonly InspectionArtifact[]): boolean {
+  return left.length === right.length && left.every((artifact, index) => {
+    const candidate = right[index];
+    return candidate !== undefined
+      && artifact.suffix === candidate.suffix
+      && artifact.dev === candidate.dev
+      && artifact.ino === candidate.ino
+      && artifact.uid === candidate.uid
+      && artifact.mode === candidate.mode
+      && artifact.nlink === candidate.nlink
+      && artifact.size === candidate.size
+      && artifact.mtimeNs === candidate.mtimeNs
+      && artifact.ctimeNs === candidate.ctimeNs;
+  });
+}
+
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function configureDatabase(db: Database, fileBacked: boolean): void {

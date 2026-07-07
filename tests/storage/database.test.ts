@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { access, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -75,6 +76,47 @@ test("a committed hot WAL survives preflight and conversion to rollback journali
   await assertNoArtifacts(path);
 });
 
+test("a hot rollback journal is recovered only after byte-stable copied preflight", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-hot-journal-"));
+  const path = join(root, "bot.sqlite3");
+  const initial = openDatabase(path);
+  initial.exec(`
+    CREATE TABLE rollback_fixture(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+    WITH RECURSIVE sequence(value) AS (
+      SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 2000
+    ) INSERT INTO rollback_fixture(id, payload) SELECT value, zeroblob(2000) FROM sequence;
+  `);
+  initial.close();
+
+  const script = `
+    import { DatabaseSync } from "node:sqlite";
+    const db = new DatabaseSync(process.argv[1]);
+    db.exec("PRAGMA journal_mode=DELETE; PRAGMA cache_size=5; PRAGMA cache_spill=ON; BEGIN IMMEDIATE;");
+    db.exec("UPDATE rollback_fixture SET payload = randomblob(2000)");
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script, path], { encoding: "utf8", env: {} });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, "");
+  assert.equal(child.stderr, "");
+  await access(`${path}-journal`);
+  const before = await databaseArtifactBytes(path);
+  assert.deepEqual(Object.keys(before).sort(), ["-journal", "main"]);
+
+  let atPreflightBoundary: Record<string, string> | undefined;
+  const reopened = openDatabase(path, {
+    closeInspector: (inspector) => {
+      atPreflightBoundary = databaseArtifactBytesSync(path);
+      inspector.close();
+    },
+  });
+  assert.deepEqual(atPreflightBoundary, before);
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM rollback_fixture WHERE payload != zeroblob(2000)").get()!.count, 0);
+  assert.equal(reopened.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
+  reopened.close();
+  await assertNoArtifacts(path);
+});
+
 test("preflight reads a WAL-only unsupported state marker without mutating legacy state", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-hot-wal-marker-"));
   const path = join(root, "bot.sqlite3");
@@ -99,17 +141,11 @@ test("preflight reads a WAL-only unsupported state marker without mutating legac
   const ignoresWal = new DatabaseSync(`file:${path}?immutable=1`, { readOnly: true });
   assert.equal(ignoresWal.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 2);
   ignoresWal.close();
-  const seesWal = new DatabaseSync(path, { readOnly: true });
-  assert.equal(seesWal.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 4);
-  seesWal.close();
-
-  await rm(`${path}-shm`, { force: true });
-  const beforeMain = await readFile(path);
-  const beforeWal = await readFile(`${path}-wal`);
+  const before = await databaseArtifactBytes(path);
+  assert.deepEqual(Object.keys(before).sort(), ["-shm", "-wal", "main"]);
   assert.throws(() => openDatabase(path), (error: unknown) => error instanceof AppError
     && error.code === "CONFIGURATION_ERROR" && error.message === "not a QiYan Bot state database");
-  assert.deepEqual(await readFile(path), beforeMain);
-  assert.deepEqual(await readFile(`${path}-wal`), beforeWal);
+  assert.deepEqual(await databaseArtifactBytes(path), before);
   await removeArtifacts(path);
 });
 
@@ -265,4 +301,26 @@ async function assertNoArtifacts(path: string): Promise<void> {
 
 async function removeArtifacts(path: string): Promise<void> {
   for (const suffix of ["-wal", "-shm", "-journal"]) await rm(`${path}${suffix}`, { force: true });
+}
+
+async function databaseArtifactBytes(path: string): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    try { result[suffix || "main"] = (await readFile(`${path}${suffix}`)).toString("base64"); }
+    catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  return result;
+}
+
+function databaseArtifactBytesSync(path: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    try { result[suffix || "main"] = readFileSync(`${path}${suffix}`).toString("base64"); }
+    catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  return result;
 }

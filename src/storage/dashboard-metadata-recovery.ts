@@ -18,6 +18,7 @@ const unsafeSource = "QiYan Bot state database recovery source is unsafe";
 const installValidationFailure = "QiYan Bot state database recovery installation validation failed; candidate was not installed";
 const restoredInstallFailure = "QiYan Bot state database recovery installation failed; original state was restored";
 const manualRestoreFailure = "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine";
+const installedManifestFailure = "QiYan Bot state database recovery installed the candidate, but final manifest sync failed; keep the service stopped";
 const leaseCleanupFailure = "QiYan Bot state database recovery completed, but database lease cleanup failed; keep the service stopped";
 
 interface DirectoryPin {
@@ -72,6 +73,7 @@ export type RecoveryInstallStep =
   | "install-candidate"
   | "sync-installed"
   | "write-installed"
+  | "sync-installed-manifest"
   | "restore-candidate"
   | "restore-original"
   | "sync-rolled-back"
@@ -148,7 +150,7 @@ export async function prepareDashboardMetadataRecovery(
     candidatePath = join(quarantinePath, "candidate.sqlite3");
     const built = buildCandidate(join(workingRoot, basename(databasePath)), candidatePath);
     await assertNoSidecars(candidatePath);
-    await syncFile(candidatePath);
+    await setFileModeAndSync(candidatePath, Number(artifacts[0]!.mode & 0o777n));
     await syncDirectory(quarantinePath);
     const candidate = await captureArtifact(candidatePath, "", expectedUid);
 
@@ -180,6 +182,7 @@ export async function installPreparedDashboardMetadataRecovery(
   const displacedRoot = join(prepared.quarantinePath, "displaced");
   const moved: ArtifactPin[] = [];
   let candidateInstalled = false;
+  let installedManifestPublished = false;
   try {
     await mkdir(displacedRoot, { mode: 0o700 });
     for (const artifact of internals.artifacts) {
@@ -228,8 +231,12 @@ export async function installPreparedDashboardMetadataRecovery(
     await syncDirectory(prepared.quarantinePath);
 
     await options.beforeStep?.("write-installed");
-    await writeManifest(prepared.quarantinePath, { ...internals.manifest, state: "installed" });
+    await writeManifest(prepared.quarantinePath, { ...internals.manifest, state: "installed" }, async () => {
+      installedManifestPublished = true;
+      await options.beforeStep?.("sync-installed-manifest");
+    });
   } catch {
+    if (installedManifestPublished) throw configuration(installedManifestFailure);
     try {
       if (candidateInstalled) {
         await options.beforeStep?.("restore-candidate");
@@ -618,7 +625,11 @@ function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
-async function writeManifest(quarantinePath: string, manifest: Record<string, unknown>): Promise<void> {
+async function writeManifest(
+  quarantinePath: string,
+  manifest: Record<string, unknown>,
+  afterRename?: () => Promise<void>,
+): Promise<void> {
   const temporary = join(quarantinePath, `.manifest.${randomUUID()}.tmp`);
   const target = join(quarantinePath, "manifest.json");
   const file = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
@@ -629,7 +640,18 @@ async function writeManifest(quarantinePath: string, manifest: Record<string, un
     await file.close();
   }
   await rename(temporary, target);
+  await afterRename?.();
   await syncDirectory(quarantinePath);
+}
+
+async function setFileModeAndSync(path: string, mode: number): Promise<void> {
+  const file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    await file.chmod(mode);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
 }
 
 async function syncFile(path: string): Promise<void> {
