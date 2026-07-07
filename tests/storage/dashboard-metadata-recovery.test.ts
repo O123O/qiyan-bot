@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, chmod, chown, link, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import { AppError } from "../../src/core/errors.ts";
 import { openDatabase } from "../../src/storage/database.ts";
-import { prepareDashboardMetadataRecovery, RECOVERY_TABLES } from "../../src/storage/dashboard-metadata-recovery.ts";
+import { acquireDatabaseLease } from "../../src/storage/database-lease.ts";
+import {
+  installPreparedDashboardMetadataRecovery,
+  prepareDashboardMetadataRecovery,
+  recoverDashboardMetadata,
+  RECOVERY_TABLES,
+  type RecoveryInstallStep,
+} from "../../src/storage/dashboard-metadata-recovery.ts";
 import { runConversationRoutingBackfill } from "../../src/storage/conversation-cutover.ts";
 
 interface Watermarks {
@@ -199,6 +207,258 @@ test("source races cannot publish an inconsistent backup manifest", async (t) =>
   }
 });
 
+test("recovery rejects unsafe parent and artifact identities before publishing a backup", async (t) => {
+  {
+    const value = await recoveryFixture(t);
+    await chmod(value.root, 0o770);
+    await assert.rejects(prepareDashboardMetadataRecovery(value.databasePath), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery source is unsafe");
+  }
+
+  for (const artifactCase of ["main-symlink", "sidecar-symlink", "main-hardlink", "sidecar-fifo"] as const) {
+    const value = await recoveryFixture(t);
+    if (artifactCase === "main-symlink") {
+      const target = join(value.root, "original.sqlite3");
+      await rename(value.databasePath, target);
+      await symlink(target, value.databasePath);
+    } else if (artifactCase === "sidecar-symlink") {
+      const target = join(value.root, "sidecar-target");
+      await writeFile(target, "sidecar", { mode: 0o600 });
+      await symlink(target, `${value.databasePath}-wal`);
+    } else if (artifactCase === "main-hardlink") {
+      await link(value.databasePath, join(value.root, "second-link.sqlite3"));
+    } else {
+      const child = spawnSync("mkfifo", [`${value.databasePath}-shm`], { encoding: "utf8" });
+      assert.equal(child.status, 0);
+    }
+    await assert.rejects(prepareDashboardMetadataRecovery(value.databasePath), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery source is unsafe", artifactCase);
+  }
+
+  if (process.geteuid?.() === 0) {
+    const value = await recoveryFixture(t);
+    await chown(value.databasePath, 1, 1);
+    await assert.rejects(prepareDashboardMetadataRecovery(value.databasePath), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery source is unsafe");
+  }
+});
+
+test("recovery rejects replacement of its validated parent directory", async (t) => {
+  const value = await recoveryFixture(t);
+  const bytes = await readFile(value.databasePath);
+  const movedRoot = `${value.root}-moved`;
+  t.after(() => rm(movedRoot, { recursive: true, force: true }));
+  const reported: string[] = [];
+
+  await assert.rejects(prepareDashboardMetadataRecovery(value.databasePath, {
+    afterParentValidation: async () => {
+      await rename(value.root, movedRoot);
+      await mkdir(value.root, { mode: 0o700 });
+      await writeFile(value.databasePath, bytes, { mode: 0o600 });
+    },
+    onBackupComplete: (path) => { reported.push(path); },
+  }), (error: unknown) => error instanceof AppError
+    && error.message === "QiYan Bot state database recovery source is unsafe");
+  assert.deepEqual(reported, []);
+});
+
+test("installation displaces the complete old artifact generation and advances the manifest", async (t) => {
+  const value = await recoveryFixture(t);
+  await createHotWal(value.databasePath);
+  await writeFile(`${value.databasePath}-journal`, "", { mode: 0o600 });
+  const before = await artifactBytes(value.databasePath);
+  assert.deepEqual(Object.keys(before).sort(), ["-journal", "-shm", "-wal", "main"]);
+  const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+
+  await installPreparedDashboardMetadataRecovery(prepared);
+
+  const manifest = JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")) as Record<string, unknown>;
+  assert.equal(manifest.state, "installed");
+  await assert.rejects(access(prepared.candidatePath));
+  for (const [key, bytes] of Object.entries(before)) {
+    const suffix = key === "main" ? "" : key;
+    const name = `bot.sqlite3${suffix}`;
+    assert.equal((await readFile(join(prepared.quarantinePath, "backup", name))).toString("base64"), bytes);
+    assert.equal((await readFile(join(prepared.quarantinePath, "displaced", name))).toString("base64"), bytes);
+  }
+  for (const suffix of ["-wal", "-shm", "-journal"]) await assert.rejects(access(`${value.databasePath}${suffix}`));
+  const installed = new DatabaseSync(value.databasePath, { readOnly: true });
+  assert.equal(installed.prepare("SELECT next_update_id FROM telegram_state").get()!.next_update_id, 99);
+  assert.equal(installed.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
+  installed.close();
+});
+
+test("ordinary installation failures restore originals, clean the candidate, and record rollback", async (t) => {
+  const failureSteps: RecoveryInstallStep[] = [
+    "write-installing",
+    "move-original",
+    "install-candidate",
+    "sync-installed",
+    "write-installed",
+  ];
+  for (const failureStep of failureSteps) {
+    const value = await recoveryFixture(t);
+    const before = await readFile(value.databasePath);
+    const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+    await assert.rejects(installPreparedDashboardMetadataRecovery(prepared, {
+      beforeStep: async (step) => { if (step === failureStep) throw new Error("secret injected install failure"); },
+    }), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery installation failed; original state was restored");
+
+    assert.deepEqual(await readFile(value.databasePath), before, failureStep);
+    await assert.rejects(access(prepared.candidatePath));
+    assert.equal(JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")).state, "rolled_back");
+  }
+});
+
+test("partial multi-artifact displacement and published-candidate failures restore the exact generation", async (t) => {
+  for (const failure of ["partial-displacement", "published-candidate"] as const) {
+    const value = await recoveryFixture(t);
+    await createHotWal(value.databasePath);
+    await writeFile(`${value.databasePath}-journal`, "", { mode: 0o600 });
+    const before = await artifactBytes(value.databasePath);
+    const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+
+    await assert.rejects(installPreparedDashboardMetadataRecovery(prepared, {
+      beforeStep: async (step, detail) => {
+        if (failure === "partial-displacement" && step === "move-original" && detail === "bot.sqlite3-shm") {
+          throw new Error("secret partial displacement failure");
+        }
+        if (failure === "published-candidate" && step === "sync-installed") {
+          throw new Error("secret post-publication failure");
+        }
+      },
+    }), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery installation failed; original state was restored");
+
+    assert.deepEqual(await artifactBytes(value.databasePath), before, failure);
+    await assert.rejects(access(prepared.candidatePath));
+    const manifest = JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")) as {
+      state: unknown;
+      artifacts: Array<{ name: string; sha256: string }>;
+    };
+    assert.equal(manifest.state, "rolled_back");
+    for (const artifact of manifest.artifacts) {
+      const key = artifact.name === "bot.sqlite3" ? "main" : artifact.name.slice("bot.sqlite3".length);
+      assert.equal(artifact.sha256, sha256(Buffer.from(before[key]!, "base64")), `${failure}:${artifact.name}`);
+    }
+  }
+});
+
+test("pre-install source, candidate, and backup tampering aborts without a restoration claim", async (t) => {
+  for (const tamper of ["source", "candidate", "backup"] as const) {
+    const value = await recoveryFixture(t);
+    const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+    const sourceBefore = await readFile(value.databasePath);
+    const target = tamper === "source"
+      ? value.databasePath
+      : tamper === "candidate"
+        ? prepared.candidatePath
+        : join(prepared.quarantinePath, "backup", "bot.sqlite3");
+    const file = await open(target, "r+");
+    try { await file.write(Buffer.from([0x51]), 0, 1, 0); }
+    finally { await file.close(); }
+    const sourceAfterTamper = await readFile(value.databasePath);
+
+    await assert.rejects(installPreparedDashboardMetadataRecovery(prepared), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery installation validation failed; candidate was not installed");
+    const expectedSource = tamper === "source" ? sourceAfterTamper : sourceBefore;
+    assert.deepEqual(await readFile(value.databasePath), expectedSource, tamper);
+    assert.equal(JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")).state, "backup_complete");
+    await assert.rejects(access(prepared.candidatePath));
+  }
+});
+
+test("rollback failure retains an installing manifest and gives only manual-restore guidance", async (t) => {
+  const value = await recoveryFixture(t);
+  await createHotWal(value.databasePath);
+  await writeFile(`${value.databasePath}-journal`, "", { mode: 0o600 });
+  const before = await artifactBytes(value.databasePath);
+  const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+
+  await assert.rejects(installPreparedDashboardMetadataRecovery(prepared, {
+    beforeStep: async (step) => {
+      if (step === "install-candidate") throw new Error("secret original install failure");
+      if (step === "restore-original") throw new Error("secret rollback failure");
+    },
+  }), (error: unknown) => error instanceof AppError
+    && error.message === "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine"
+    && !/secret/u.test(error.message));
+
+  const manifest = JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")) as {
+    state: unknown;
+    artifacts: Array<{ name: string; sha256: string }>;
+  };
+  assert.equal(manifest.state, "installing");
+  for (const artifact of manifest.artifacts) {
+    const key = artifact.name === "bot.sqlite3" ? "main" : artifact.name.slice("bot.sqlite3".length);
+    const backup = await readFile(join(prepared.quarantinePath, "backup", artifact.name));
+    assert.equal(backup.toString("base64"), before[key]);
+    assert.equal(sha256(backup), artifact.sha256);
+  }
+});
+
+test("rollback interference prevents a restored-state claim", async (t) => {
+  const value = await recoveryFixture(t);
+  const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
+
+  await assert.rejects(installPreparedDashboardMetadataRecovery(prepared, {
+    beforeStep: async (step) => {
+      if (step === "install-candidate") throw new Error("secret install failure");
+      if (step === "sync-rolled-back") {
+        const file = await open(value.databasePath, "r+");
+        try { await file.write(Buffer.from([0x51]), 0, 1, 0); }
+        finally { await file.close(); }
+      }
+    },
+  }), (error: unknown) => error instanceof AppError
+    && error.message === "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine");
+  assert.equal(JSON.parse(await readFile(join(prepared.quarantinePath, "manifest.json"), "utf8")).state, "installing");
+});
+
+test("the complete recovery operation excludes concurrent database owners and releases its lease", async (t) => {
+  const value = await recoveryFixture(t);
+  const held = await acquireDatabaseLease(value.databasePath);
+  await assert.rejects(recoverDashboardMetadata(value.databasePath), (error: unknown) => error instanceof AppError
+    && error.message === "QiYan Bot state database is already in use");
+  await held.release();
+
+  const backups: string[] = [];
+  const recovered = await recoverDashboardMetadata(value.databasePath, {
+    onBackupComplete: (path) => { backups.push(path); },
+  });
+  assert.deepEqual(backups, [recovered.quarantinePath]);
+  const nextOwner = await acquireDatabaseLease(value.databasePath);
+  await nextOwner.release();
+});
+
+test("lease cleanup failures preserve primary recovery outcomes", async (t) => {
+  {
+    const value = await recoveryFixture(t);
+    await assert.rejects(recoverDashboardMetadata(value.databasePath, {
+      acquireLease: async () => ({ release: async () => { throw new Error("secret release failure"); } }),
+    }), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery completed, but database lease cleanup failed; keep the service stopped");
+    const installed = new DatabaseSync(value.databasePath, { readOnly: true });
+    assert.equal(installed.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
+    installed.close();
+  }
+
+  {
+    const value = await recoveryFixture(t);
+    await assert.rejects(recoverDashboardMetadata(value.databasePath, {
+      acquireLease: async () => ({ release: async () => { throw new Error("secret release failure"); } }),
+      installOptions: {
+        beforeStep: async (step) => {
+          if (step === "install-candidate") throw new Error("secret install failure");
+          if (step === "restore-original") throw new Error("secret rollback failure");
+        },
+      },
+    }), (error: unknown) => error instanceof AppError
+      && error.message === "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine");
+  }
+});
+
 async function recoveryFixture(
   t: TestContext,
   watermarks: Watermarks = {},
@@ -272,4 +532,22 @@ async function artifactBytes(databasePath: string): Promise<Record<string, strin
     }
   }
   return result;
+}
+
+async function createHotWal(databasePath: string): Promise<void> {
+  const script = `
+    import { DatabaseSync } from "node:sqlite";
+    const db = new DatabaseSync(process.argv[1]);
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;");
+    db.exec("UPDATE telegram_state SET next_update_id = 99 WHERE singleton = 1");
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script, databasePath], { encoding: "utf8", env: {} });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, "");
+  assert.equal(child.stderr, "");
+}
+
+function sha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }

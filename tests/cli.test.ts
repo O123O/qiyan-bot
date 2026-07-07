@@ -15,6 +15,9 @@ test("parses an explicit assistant workdir", () => {
   assert.deepEqual(parseCliArgs(["weixin-login"]), { command: "weixin-login" });
   assert.deepEqual(parseCliArgs(["weixin-login", "--home", "/srv/qiyan"]), { command: "weixin-login", qiyanHome: "/srv/qiyan" });
   assert.deepEqual(parseCliArgs(["config-check", "--home", "/srv/qiyan"]), { command: "config-check", qiyanHome: "/srv/qiyan" });
+  assert.deepEqual(parseCliArgs(["recover-dashboard-metadata", "--database", "/srv/qiyan/data/bot.sqlite3"]), {
+    command: "recover-dashboard-metadata", databasePath: "/srv/qiyan/data/bot.sqlite3",
+  });
   assert.deepEqual(parseCliArgs(["--version"]), { command: "version" });
   assert.deepEqual(parseCliArgs(["--update"]), { command: "update" });
   assert.deepEqual(parseCliArgs(["service", "install"]), { command: "service", action: "install" });
@@ -35,6 +38,7 @@ test("parses top-level and command-specific help without accepting extra argumen
   assert.deepEqual(parseCliArgs(["config-check", "--help"]), { command: "help", topic: "config-check" });
   assert.deepEqual(parseCliArgs(["service", "--help"]), { command: "help", topic: "service" });
   assert.deepEqual(parseCliArgs(["service", "install", "--help"]), { command: "help", topic: "service" });
+  assert.deepEqual(parseCliArgs(["recover-dashboard-metadata", "--help"]), { command: "help", topic: "recover-dashboard-metadata" });
   assert.throws(() => parseCliArgs(["--help", "--home", "/srv/qiyan"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["assistant-login", "--help", "--home", "/srv/qiyan"]), /unknown argument/);
 });
@@ -56,6 +60,7 @@ test("formats useful top-level and command-specific help", () => {
 
   assert.match(formatCliHelp("weixin-login"), /qiyan-bot weixin-login \[--home <path>\]/u);
   assert.match(formatCliHelp("config-check"), /qiyan-bot config-check \[--home <path>\]/u);
+  assert.match(formatCliHelp("recover-dashboard-metadata"), /qiyan-bot recover-dashboard-metadata --database <absolute-path>/u);
   assert.match(formatCliHelp("service"), /install\|start\|stop\|restart\|status\|logs\|uninstall/u);
   assert.match(formatCliHelp("service"), /journal/u);
   assert.match(formatCliHelp("service"), /captures.*PATH.*reinstall/isu);
@@ -76,6 +81,11 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["service", "unknown-secret"]), /unknown service action/);
   assert.throws(() => parseCliArgs(["service", "start", "--home", "/srv/qiyan"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["service", "install", "--workdir", "/srv/qiyan"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata"]), /--database requires an absolute normalized path/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata", "--database", "relative.sqlite3"]), /absolute normalized path/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata", "--database", "/srv/qiyan/../bot.sqlite3"]), /absolute normalized path/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata", "--database", "/srv/qiyan/bot.sqlite3\nforged"]), /absolute normalized path/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata", "--database", "/one", "--database", "/two"]), /unknown argument/);
 });
 
 test("does not echo an unknown argument into a startup error", () => {

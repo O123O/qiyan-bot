@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { AppError } from "../core/errors.ts";
 import { installConversationRoutingGuards } from "./conversation-cutover.ts";
 import { openDatabase, type Database } from "./database.ts";
+import { acquireDatabaseLease } from "./database-lease.ts";
 import { migrations } from "./migrations.ts";
 import { assertRecoverySchema, recoveryColumns, RECOVERY_TABLES, type RecoveryTable } from "./recovery-schema.ts";
 
@@ -14,6 +15,18 @@ export { RECOVERY_TABLES } from "./recovery-schema.ts";
 const artifactSuffixes = ["", "-wal", "-shm", "-journal"] as const;
 const recoveryFailure = "QiYan Bot state database recovery failed; retained backup was not installed";
 const unsafeSource = "QiYan Bot state database recovery source is unsafe";
+const installValidationFailure = "QiYan Bot state database recovery installation validation failed; candidate was not installed";
+const restoredInstallFailure = "QiYan Bot state database recovery installation failed; original state was restored";
+const manualRestoreFailure = "QiYan Bot state database recovery installation failed; manual restore is required from retained quarantine";
+const leaseCleanupFailure = "QiYan Bot state database recovery completed, but database lease cleanup failed; keep the service stopped";
+
+interface DirectoryPin {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+}
 
 interface ArtifactPin {
   suffix: typeof artifactSuffixes[number];
@@ -33,6 +46,10 @@ interface ArtifactPin {
 interface RecoveryInternals {
   databasePath: string;
   artifacts: readonly ArtifactPin[];
+  candidate: ArtifactPin;
+  expectedUid: number;
+  manifest: Readonly<Record<string, unknown>>;
+  parent: DirectoryPin;
 }
 
 export interface PreparedDashboardMetadataRecovery {
@@ -44,8 +61,34 @@ export interface PreparedDashboardMetadataRecovery {
 
 interface RecoveryOptions {
   expectedUid?: number;
+  afterParentValidation?: () => Promise<void>;
   beforeBackupComplete?: (quarantinePath: string) => Promise<void>;
   onBackupComplete?: (quarantinePath: string) => void;
+}
+
+export type RecoveryInstallStep =
+  | "write-installing"
+  | "move-original"
+  | "install-candidate"
+  | "sync-installed"
+  | "write-installed"
+  | "restore-candidate"
+  | "restore-original"
+  | "sync-rolled-back"
+  | "write-rolled-back";
+
+export interface RecoveryInstallOptions {
+  beforeStep?: (step: RecoveryInstallStep, detail?: string) => Promise<void>;
+}
+
+export interface DashboardMetadataRecoveryOptions {
+  expectedUid?: number;
+  onBackupComplete?: (quarantinePath: string) => void;
+  installOptions?: RecoveryInstallOptions;
+  acquireLease?: (
+    databasePath: string,
+    options: { expectedUid?: number },
+  ) => Promise<{ release(): Promise<void> }>;
 }
 
 const preparedInternals = new WeakMap<PreparedDashboardMetadataRecovery, RecoveryInternals>();
@@ -60,7 +103,10 @@ export async function prepareDashboardMetadataRecovery(
   let candidatePath: string | undefined;
   let backupComplete = false;
   try {
-    const parent = await validateRecoveryParent(databasePath, expectedUid);
+    const parentPin = await validateRecoveryParent(databasePath, expectedUid);
+    await options.afterParentValidation?.();
+    await assertRecoveryParent(parentPin);
+    const parent = parentPin.path;
     const artifacts = await captureArtifactSet(databasePath, expectedUid);
     quarantinePath = join(parent, `.${basename(databasePath)}.recovery-${randomUUID()}`);
     const backupRoot = join(quarantinePath, "backup");
@@ -84,15 +130,17 @@ export async function prepareDashboardMetadataRecovery(
     await options.beforeBackupComplete?.(quarantinePath);
     const afterCopy = await captureArtifactSet(databasePath, expectedUid);
     if (!sameArtifactSet(artifacts, afterCopy)) throw new Error("source changed during backup");
+    await assertRecoveryParent(parentPin);
 
     const recoveryId = randomUUID();
-    await writeManifest(quarantinePath, {
+    const manifest: Record<string, unknown> = {
       version: 1,
       recovery_id: recoveryId,
       canonical_basename: basename(databasePath),
       artifacts: artifacts.map((artifact) => ({ name: artifact.name, sha256: artifact.digest })),
       state: "backup_complete",
-    });
+    };
+    await writeManifest(quarantinePath, manifest);
     await syncDirectory(parent);
     backupComplete = true;
     options.onBackupComplete?.(quarantinePath);
@@ -102,6 +150,7 @@ export async function prepareDashboardMetadataRecovery(
     await assertNoSidecars(candidatePath);
     await syncFile(candidatePath);
     await syncDirectory(quarantinePath);
+    const candidate = await captureArtifact(candidatePath, "", expectedUid);
 
     const prepared: PreparedDashboardMetadataRecovery = {
       quarantinePath,
@@ -109,7 +158,7 @@ export async function prepareDashboardMetadataRecovery(
       copiedTableCount: built.copiedTableCount,
       nextObservationSequence: built.nextObservationSequence,
     };
-    preparedInternals.set(prepared, { databasePath, artifacts });
+    preparedInternals.set(prepared, { databasePath, artifacts, candidate, expectedUid, manifest, parent: parentPin });
     return prepared;
   } catch {
     if (candidatePath) await removeDatabaseArtifacts(candidatePath);
@@ -118,15 +167,158 @@ export async function prepareDashboardMetadataRecovery(
   }
 }
 
-async function validateRecoveryParent(databasePath: string, expectedUid: number): Promise<string> {
+export async function installPreparedDashboardMetadataRecovery(
+  prepared: PreparedDashboardMetadataRecovery,
+  options: RecoveryInstallOptions = {},
+): Promise<void> {
+  const internals = preparedInternals.get(prepared);
+  if (!internals) throw configuration(restoredInstallFailure);
+  preparedInternals.delete(prepared);
+
+  const parent = dirname(internals.databasePath);
+  const backupRoot = join(prepared.quarantinePath, "backup");
+  const displacedRoot = join(prepared.quarantinePath, "displaced");
+  const moved: ArtifactPin[] = [];
+  let candidateInstalled = false;
+  try {
+    await mkdir(displacedRoot, { mode: 0o700 });
+    for (const artifact of internals.artifacts) {
+      const backupPath = join(backupRoot, artifact.name);
+      if (await digestSafeCopy(backupPath, internals.expectedUid) !== artifact.digest) throw new Error("backup changed");
+      await syncFile(backupPath);
+    }
+    await syncFile(prepared.candidatePath);
+    await syncDirectory(backupRoot);
+    await syncDirectory(displacedRoot);
+    await syncDirectory(prepared.quarantinePath);
+    await syncDirectory(parent);
+    const currentArtifacts = await captureArtifactSet(internals.databasePath, internals.expectedUid);
+    if (!sameArtifactSet(internals.artifacts, currentArtifacts)) throw new Error("source changed before installation");
+    const currentCandidate = await captureArtifact(prepared.candidatePath, "", internals.expectedUid);
+    if (
+      currentCandidate.digest !== internals.candidate.digest
+      || !sameArtifactPinState(internals.candidate, currentCandidate)
+    ) throw new Error("candidate changed before installation");
+    await assertRecoveryParent(internals.parent);
+  } catch {
+    await removeDatabaseArtifacts(prepared.candidatePath);
+    throw configuration(installValidationFailure);
+  }
+
+  try {
+    await options.beforeStep?.("write-installing");
+    await writeManifest(prepared.quarantinePath, { ...internals.manifest, state: "installing" });
+
+    for (const artifact of internals.artifacts) {
+      await options.beforeStep?.("move-original", artifact.name);
+      await rename(artifact.path, join(displacedRoot, artifact.name));
+      moved.push(artifact);
+    }
+    await syncDirectory(displacedRoot);
+    await syncDirectory(parent);
+
+    await options.beforeStep?.("install-candidate");
+    await rename(prepared.candidatePath, internals.databasePath);
+    candidateInstalled = true;
+
+    await options.beforeStep?.("sync-installed");
+    await syncFile(internals.databasePath);
+    await syncDirectory(parent);
+    await syncDirectory(displacedRoot);
+    await syncDirectory(prepared.quarantinePath);
+
+    await options.beforeStep?.("write-installed");
+    await writeManifest(prepared.quarantinePath, { ...internals.manifest, state: "installed" });
+  } catch {
+    try {
+      if (candidateInstalled) {
+        await options.beforeStep?.("restore-candidate");
+        await rename(internals.databasePath, prepared.candidatePath);
+        candidateInstalled = false;
+      }
+      for (const artifact of moved.reverse()) {
+        await options.beforeStep?.("restore-original", artifact.name);
+        await rename(join(displacedRoot, artifact.name), artifact.path);
+      }
+      await options.beforeStep?.("sync-rolled-back");
+      await syncDirectory(parent);
+      await syncDirectory(displacedRoot);
+      await syncDirectory(prepared.quarantinePath);
+      await assertRecoveryParent(internals.parent);
+      const restoredArtifacts = await captureArtifactSet(internals.databasePath, internals.expectedUid);
+      if (!sameRestoredArtifactSet(internals.artifacts, restoredArtifacts)) throw new Error("restored source mismatch");
+      await removeDatabaseArtifactsStrict(prepared.candidatePath);
+      await options.beforeStep?.("write-rolled-back");
+      await writeManifest(prepared.quarantinePath, { ...internals.manifest, state: "rolled_back" });
+    } catch {
+      throw configuration(manualRestoreFailure);
+    }
+    throw configuration(restoredInstallFailure);
+  }
+}
+
+export async function recoverDashboardMetadata(
+  databasePath: string,
+  options: DashboardMetadataRecoveryOptions = {},
+): Promise<{ quarantinePath: string }> {
+  const uidOption = options.expectedUid === undefined ? {} : { expectedUid: options.expectedUid };
+  const lease = await (options.acquireLease ?? acquireDatabaseLease)(databasePath, uidOption);
+  let primaryFailure = false;
+  try {
+    const prepared = await prepareDashboardMetadataRecovery(databasePath, {
+      ...uidOption,
+      ...(options.onBackupComplete === undefined ? {} : { onBackupComplete: options.onBackupComplete }),
+    });
+    await installPreparedDashboardMetadataRecovery(prepared, options.installOptions);
+    return { quarantinePath: prepared.quarantinePath };
+  } catch (error) {
+    primaryFailure = true;
+    throw error;
+  } finally {
+    try { await lease.release(); }
+    catch {
+      if (!primaryFailure) throw configuration(leaseCleanupFailure);
+    }
+  }
+}
+
+async function validateRecoveryParent(databasePath: string, expectedUid: number): Promise<DirectoryPin> {
   if (!isAbsolute(databasePath) || resolve(databasePath) !== databasePath) throw new Error("path is not normalized");
   const parent = dirname(databasePath);
   if (await realpath(parent) !== parent) throw new Error("parent is not canonical");
-  const value = await lstat(parent, { bigint: true });
-  if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== BigInt(expectedUid) || (value.mode & 0o022n) !== 0n) {
+  const initial = await lstat(parent, { bigint: true });
+  if (!initial.isDirectory() || initial.isSymbolicLink() || initial.uid !== BigInt(expectedUid) || (initial.mode & 0o022n) !== 0n) {
     throw new Error("unsafe parent");
   }
-  return parent;
+  const directory = await open(parent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await directory.stat({ bigint: true });
+    if (
+      !opened.isDirectory()
+      || opened.dev !== initial.dev
+      || opened.ino !== initial.ino
+      || opened.uid !== initial.uid
+      || opened.mode !== initial.mode
+    ) throw new Error("parent changed");
+  } finally {
+    await directory.close();
+  }
+  const pin = { path: parent, dev: initial.dev, ino: initial.ino, uid: initial.uid, mode: initial.mode };
+  await assertRecoveryParent(pin);
+  return pin;
+}
+
+async function assertRecoveryParent(pin: DirectoryPin): Promise<void> {
+  const current = await lstat(pin.path, { bigint: true });
+  if (
+    !current.isDirectory()
+    || current.isSymbolicLink()
+    || current.dev !== pin.dev
+    || current.ino !== pin.ino
+    || current.uid !== pin.uid
+    || current.mode !== pin.mode
+    || (current.mode & 0o022n) !== 0n
+  ) throw new Error("parent changed");
 }
 
 async function captureArtifactSet(databasePath: string, expectedUid: number): Promise<ArtifactPin[]> {
@@ -221,6 +413,22 @@ function sameArtifactSet(left: readonly ArtifactPin[], right: readonly ArtifactP
       && artifact.suffix === candidate.suffix
       && artifact.digest === candidate.digest
       && sameArtifactPinState(artifact, candidate);
+  });
+}
+
+function sameRestoredArtifactSet(left: readonly ArtifactPin[], right: readonly ArtifactPin[]): boolean {
+  return left.length === right.length && left.every((artifact, index) => {
+    const candidate = right[index];
+    return candidate !== undefined
+      && artifact.suffix === candidate.suffix
+      && artifact.digest === candidate.digest
+      && artifact.dev === candidate.dev
+      && artifact.ino === candidate.ino
+      && artifact.uid === candidate.uid
+      && artifact.mode === candidate.mode
+      && artifact.nlink === candidate.nlink
+      && artifact.size === candidate.size
+      && artifact.mtimeNs === candidate.mtimeNs;
   });
 }
 
@@ -442,6 +650,10 @@ async function assertNoSidecars(path: string): Promise<void> {
 
 async function removeDatabaseArtifacts(path: string): Promise<void> {
   for (const suffix of artifactSuffixes) await rm(`${path}${suffix}`, { force: true }).catch(() => undefined);
+}
+
+async function removeDatabaseArtifactsStrict(path: string): Promise<void> {
+  for (const suffix of artifactSuffixes) await rm(`${path}${suffix}`, { force: true });
 }
 
 async function pathExists(path: string): Promise<boolean> {

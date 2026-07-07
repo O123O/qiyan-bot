@@ -1,7 +1,8 @@
 import { z } from "zod";
+import { isAbsolute, resolve } from "node:path";
 import { AppError, StartupPhaseError, type ErrorCode } from "./core/errors.ts";
 
-export type CliHelpTopic = "root" | "assistant-login" | "weixin-login" | "config-check" | "service";
+export type CliHelpTopic = "root" | "assistant-login" | "weixin-login" | "config-check" | "recover-dashboard-metadata" | "service";
 export type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "logs" | "uninstall";
 
 export type CliCommand =
@@ -9,6 +10,7 @@ export type CliCommand =
   | { command: "assistant-login"; qiyanHome?: string }
   | { command: "weixin-login"; qiyanHome?: string }
   | { command: "config-check"; qiyanHome?: string }
+  | { command: "recover-dashboard-metadata"; databasePath: string }
   | { command: "service"; action: ServiceAction; qiyanHome?: string }
   | { command: "help"; topic: CliHelpTopic }
   | { command: "update" }
@@ -24,6 +26,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     return { command: argv[0] === "--update" ? "update" : "version" };
   }
   if (argv[0] === "service") return parseServiceArgs(argv.slice(1));
+  if (argv[0] === "recover-dashboard-metadata") return parseRecoveryArgs(argv.slice(1));
   if (argv[0] === "assistant-login" || argv[0] === "weixin-login" || argv[0] === "config-check") {
     const command = argv[0];
     if (argv[1] === "--help" || argv[1] === "-h") {
@@ -45,13 +48,30 @@ export function formatCliHelp(topic: CliHelpTopic): string {
   if (topic === "service") {
     return "QiYan systemd user service\n\nUsage:\n  qiyan-bot service <install|start|stop|restart|status|logs|uninstall>\n  qiyan-bot service install [--home <path>]\n\nThe service runs the foreground bot under systemd; tmux is not required.\nInstallation captures the invoking terminal's PATH; reinstall the service after PATH changes.\nUse `qiyan-bot service logs` to read the latest 100 journal entries.\n";
   }
+  if (topic === "recover-dashboard-metadata") {
+    return "QiYan dashboard metadata recovery\n\nUsage:\n  qiyan-bot recover-dashboard-metadata --database <absolute-path>\n\nOptions:\n  -h, --help                  Show help\n  --database <absolute-path>  QiYan state database to recover\n";
+  }
   if (topic !== "root") {
     return `QiYan ${topic}\n\nUsage:\n  qiyan-bot ${topic} [--home <path>]\n\nOptions:\n  -h, --help     Show help\n  --home <path>  QiYan home directory\n`;
   }
-  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot service <action>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
+  return `QiYan personal assistant bot\n\nUsage:\n  qiyan-bot [--home <path>] [--workdir <path>]\n  qiyan-bot assistant-login [--home <path>]\n  qiyan-bot weixin-login [--home <path>]\n  qiyan-bot config-check [--home <path>]\n  qiyan-bot recover-dashboard-metadata --database <absolute-path>\n  qiyan-bot service <action>\n  qiyan-bot --update\n  qiyan-bot --version\n\nRunning without a command starts the long-lived bot in the foreground.\n\nOptions:\n  -h, --help       Show help\n  --home <path>    QiYan home directory\n  --workdir <path> Assistant working directory (run only)\n  --update         Install the latest GitHub Release\n  --version        Print version\n\nRequires Node.js 24 or newer.\n`;
 }
 
 const serviceActions = new Set<ServiceAction>(["install", "start", "stop", "restart", "status", "logs", "uninstall"]);
+
+function parseRecoveryArgs(argv: readonly string[]): CliCommand {
+  if (argv[0] === "--help" || argv[0] === "-h") {
+    if (argv.length !== 1) throw new AppError("CONFIGURATION_ERROR", "unknown argument");
+    return { command: "help", topic: "recover-dashboard-metadata" };
+  }
+  if (argv.length < 2) throw new AppError("CONFIGURATION_ERROR", "--database requires an absolute normalized path");
+  if (argv.length !== 2 || argv[0] !== "--database") throw new AppError("CONFIGURATION_ERROR", "unknown argument");
+  const databasePath = argv[1]!;
+  if (!isAbsolute(databasePath) || resolve(databasePath) !== databasePath || /[\u0000-\u001f\u007f]/u.test(databasePath)) {
+    throw new AppError("CONFIGURATION_ERROR", "--database requires an absolute normalized path");
+  }
+  return { command: "recover-dashboard-metadata", databasePath };
+}
 
 function parseServiceArgs(argv: readonly string[]): CliCommand {
   if (argv[0] === "--help" || argv[0] === "-h") {
