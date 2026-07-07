@@ -20,7 +20,8 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   });
   assert.match(unit, new RegExp(`^${MANAGED_UNIT_MARKER.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\n`, "u"));
   assert.match(unit, /Type=simple/u);
-  assert.match(unit, /WorkingDirectory="\/home\/user\/QiYan Home"/u);
+  assert.match(unit, /WorkingDirectory=\/home\/user\/QiYan Home/u);
+  assert.doesNotMatch(unit, /WorkingDirectory="/u);
   assert.match(unit, /ExecStart="\/home\/user\/My Bin\/qiyan%%bot" --home "\/home\/user\/QiYan Home"/u);
   assert.match(unit, /Restart=on-failure/u);
   assert.match(unit, /TimeoutStopSec=30s/u);

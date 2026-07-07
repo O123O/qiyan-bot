@@ -36,6 +36,7 @@ export function buildServiceEffectiveEnvironment(host: NodeJS.ProcessEnv): NodeJ
 export function renderSystemdUserUnit(input: { executable: string; qiyanHome: string }): string {
   const executable = systemdPath(input.executable, "service executable");
   const qiyanHome = systemdPath(input.qiyanHome, "QiYan home");
+  const workingDirectory = systemdWorkingDirectory(input.qiyanHome, "QiYan home");
   const unset = [...SERVICE_UNSET_ENV_NAMES].join(" ");
   return `${MANAGED_UNIT_MARKER}
 [Unit]
@@ -46,7 +47,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${qiyanHome}
+WorkingDirectory=${workingDirectory}
 ExecStart=${executable} --home ${qiyanHome}
 UnsetEnvironment=${unset}
 Restart=on-failure
@@ -338,9 +339,19 @@ export class NodeSystemdUnitStore implements SystemdUnitStore {
 class MissingDirectoryError extends Error {}
 
 function systemdPath(value: string, label: string): string {
+  validateSystemdPath(value, label);
+  return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
+}
+
+function systemdWorkingDirectory(value: string, label: string): string {
+  validateSystemdPath(value, label);
+  if (/\s$/u.test(value)) throw configuration(`${label} contains unsupported trailing whitespace`);
+  return value.replaceAll("%", "%%");
+}
+
+function validateSystemdPath(value: string, label: string): void {
   if (!isAbsolute(value) || resolve(value) !== value) throw configuration(`${label} must be an absolute normalized path`);
   if (/[\u0000-\u001f\u007f$]/u.test(value)) throw configuration(`${label} contains unsupported characters`);
-  return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
 }
 
 async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv): Promise<SystemdOutcome> {
