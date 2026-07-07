@@ -140,7 +140,7 @@
     </g>
 
     <rect x="742" y="540" width="374" height="27" rx="13.5" fill="#eaf2f6" />
-    <text x="929" y="558.5" text-anchor="middle" fill="#355a76" font-size="11.5" font-weight="750">start · resume · steer · report · unadopt when you take over</text>
+    <text x="929" y="558.5" text-anchor="middle" fill="#355a76" font-size="11.5" font-weight="750">start · resume · steer · report · auto-release on external takeover</text>
   </g>
 
   <!-- Arrow labels. -->

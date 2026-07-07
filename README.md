@@ -16,7 +16,7 @@ QiYan Bot is a single-user, self-hosted, general-purpose personal assistant powe
 
 Each managed project remains an ordinary, resumable Codex session in its own project directory. You can unadopt it from QiYan, continue it directly with Codex, and adopt it again later without creating a separate worker format.
 
-QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. Before opening a managed thread in another Codex client, run `unadopt_session`; adopt it again afterward if QiYan should resume management.
+QiYan keeps the assistant and project workers distinct. The assistant has its own HOME, CODEX_HOME, authentication, instructions, and app-server. Workers use your normal HOME, CODEX_HOME, configuration, credentials, skills, and app-server. If another Codex client starts a turn in a managed thread, QiYan fences its own dispatch, warns you, and automatically unadopts the session once the external turn is idle. For a planned handoff, you can still call `unadopt_session` first to avoid the temporary release-pending window; adopt it again later if QiYan should resume management.
 
 ## Security model
 

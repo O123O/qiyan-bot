@@ -11,6 +11,9 @@ test("README links to all focused guides and every local guide target exists", a
   assert.match(readme, /ordinary, resumable Codex sessions/iu);
   assert.match(readme, /assets\/brand\/qiyan-overview\.svg/iu);
   await access(resolve("assets/brand/qiyan-overview.svg"));
+  const overview = await readFile(resolve("assets/brand/qiyan-overview.svg"), "utf8");
+  assert.match(overview, /auto-release on external takeover/iu);
+  assert.doesNotMatch(overview, /unadopt when you take over/iu);
   assert.match(readme, /Telegram.*Slack.*WeChat.*run together/iu);
   assert.match(readme, /fresh QiYan state format|fresh.*state format.*rejected without migration/isu);
   const firstInstall = readme.indexOf("npm install --global");
@@ -143,7 +146,9 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(setup, /do not use.*EnvironmentFile/iu);
   assert.match(telegram, /cat > "?\$HOME\/\.qiyan-bot\/\.env"?/u);
   assert.doesNotMatch(telegram.split("## 4. Authenticate and start")[1] ?? "", /export\s+TELEGRAM_/u);
-  assert.match(readme, /Before opening a managed thread.*unadopt_session.*adopt it again/isu);
+  assert.match(readme, /another Codex client.*automatically unadopts.*external turn.*idle/isu);
+  assert.match(readme, /planned handoff.*unadopt_session/isu);
+  assert.doesNotMatch(readme, /Before opening a managed thread.*run `unadopt_session`/isu);
   assert.match(setup, /config-check.*at least one configured adapter.*assistant-login.*does not need chat credentials/isu);
 });
 
