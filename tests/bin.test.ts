@@ -151,12 +151,14 @@ process.stdout.write("safe journal output\\n");
   assert.doesNotMatch(shellOnlyInstall.stderr, /process-secret|other-secret/u);
   await assert.rejects(lstat(join(shellOnlyHome, ".config", "systemd", "user", "qiyan-bot.service")),
     (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
-  const serviceInstall = spawnSync(executable, ["service", "install"], { cwd: temp, encoding: "utf8", env: serviceEnv });
+  const serviceInstall = spawnSync(process.execPath, [executable, "service", "install"], { cwd: temp, encoding: "utf8", env: serviceEnv });
   assert.equal(serviceInstall.status, 0);
   assert.equal(serviceInstall.stdout, "Installed and started qiyan-bot.service.\n");
   assert.equal(serviceInstall.stderr, "");
   const installedUnitPath = join(serviceHome, ".config", "systemd", "user", "qiyan-bot.service");
   const installedUnit = await readFile(installedUnitPath, "utf8");
+  const expectedNodeExecutable = `"${process.execPath.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
+  assert.equal(installedUnit.includes(`ExecStart=${expectedNodeExecutable} `), true);
   assert.match(installedUnit, /ExecStart=.*qiyan-bot.* --home .*\.qiyan-bot/u);
   assert.doesNotMatch(installedUnit, /process-secret|private-file-token|other-secret/u);
   const serviceStatus = spawnSync(executable, ["service", "status"], { cwd: temp, encoding: "utf8", env: serviceEnv });

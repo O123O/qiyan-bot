@@ -34,7 +34,8 @@ export function buildServiceEffectiveEnvironment(host: NodeJS.ProcessEnv): NodeJ
   return result;
 }
 
-export function renderSystemdUserUnit(input: { executable: string; qiyanHome: string }): string {
+export function renderSystemdUserUnit(input: { nodeExecutable: string; executable: string; qiyanHome: string }): string {
+  const nodeExecutable = systemdPath(input.nodeExecutable, "Node executable");
   const executable = systemdPath(input.executable, "service executable");
   const qiyanHome = systemdPath(input.qiyanHome, "QiYan home");
   const workingDirectory = systemdWorkingDirectory(input.qiyanHome, "QiYan home");
@@ -49,7 +50,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${workingDirectory}
-ExecStart=${executable} --home ${qiyanHome}
+ExecStart=${nodeExecutable} ${executable} --home ${qiyanHome}
 UnsetEnvironment=${unset}
 Restart=on-failure
 RestartSec=5s
@@ -68,6 +69,7 @@ export class SystemdUserService {
 
   constructor(private readonly options: {
     userHome: string;
+    nodeExecutable: string;
     executable: string;
     runner?: SystemdRunner;
     journalRunner?: SystemdRunner;
@@ -97,7 +99,11 @@ export class SystemdUserService {
     switch (action) {
       case "install": {
         if (!input.qiyanHome) throw configuration("service install requires a QiYan home");
-        await this.unitStore.install(this.unitPath, renderSystemdUserUnit({ executable: this.options.executable, qiyanHome: input.qiyanHome }));
+        await this.unitStore.install(this.unitPath, renderSystemdUserUnit({
+          nodeExecutable: this.options.nodeExecutable,
+          executable: this.options.executable,
+          qiyanHome: input.qiyanHome,
+        }));
         await this.required(["daemon-reload"]);
         await this.required(["enable", SYSTEMD_UNIT_NAME]);
         await this.required(["restart", SYSTEMD_UNIT_NAME]);

@@ -15,11 +15,11 @@
 **Files:**
 - Modify: `tests/service/systemd-user.test.ts`
 
-- [ ] **Step 1: Write the failing renderer test**
+- [x] **Step 1: Write the failing renderer test**
 
 Pass `nodeExecutable: "/home/user/Node Runtime/node%24"` into `renderSystemdUserUnit`, assert that `ExecStart` begins with that safely quoted path followed by the QiYan executable, and add a relative-Node-path rejection assertion.
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
 Run: `npm test -- tests/service/systemd-user.test.ts`
 
@@ -31,8 +31,9 @@ Expected: FAIL because the renderer ignores `nodeExecutable` and still places th
 - Modify: `src/service/systemd-user.ts`
 - Modify: `src/main.ts`
 - Modify: `tests/service/systemd-user.test.ts`
+- Modify: `tests/bin.test.ts`
 
-- [ ] **Step 1: Update the renderer and controller inputs**
+- [x] **Step 1: Update the renderer and controller inputs**
 
 Add `nodeExecutable: string` to `renderSystemdUserUnit`, validate it with `systemdPath`, and render:
 
@@ -42,7 +43,7 @@ ExecStart=${nodeExecutable} ${executable} --home ${qiyanHome}
 
 Add `nodeExecutable: string` to `SystemdUserService` options and pass it through during installation.
 
-- [ ] **Step 2: Supply the production runtime**
+- [x] **Step 2: Supply the production runtime**
 
 Construct the controller in `src/main.ts` with:
 
@@ -55,11 +56,13 @@ const service = new SystemdUserService({
 });
 ```
 
-- [ ] **Step 3: Update deterministic controller fixtures**
+- [x] **Step 3: Update deterministic controller fixtures**
 
 Add `nodeExecutable: "/usr/bin/node"` to every `SystemdUserService` construction in `tests/service/systemd-user.test.ts`, and assert installed unit content starts with `/usr/bin/node` before QiYan.
 
-- [ ] **Step 4: Run focused tests and typecheck**
+In `tests/bin.test.ts`, assert the packaged CLI's installed unit begins `ExecStart` with the test process's exact `process.execPath`, proving the production `main` path supplies the runtime.
+
+- [x] **Step 4: Run focused tests and typecheck**
 
 Run: `npm test -- tests/service/systemd-user.test.ts && npm run typecheck`
 
@@ -71,6 +74,7 @@ Expected: all focused tests pass and TypeScript exits 0.
 - Verify: `src/service/systemd-user.ts`
 - Verify: `src/main.ts`
 - Verify: `tests/service/systemd-user.test.ts`
+- Verify: `tests/bin.test.ts`
 
 - [ ] **Step 1: Run repository verification**
 
@@ -80,13 +84,13 @@ Expected: TypeScript and the complete test suite exit 0.
 
 - [ ] **Step 2: Review the exact diff and generated command**
 
-Run: `git diff --check && git diff -- src/service/systemd-user.ts src/main.ts tests/service/systemd-user.test.ts`
+Run: `git diff --check && git diff -- src/service/systemd-user.ts src/main.ts tests/service/systemd-user.test.ts tests/bin.test.ts`
 
 Expected: no whitespace errors; only the explicit runtime plumbing, assertions, and planning documentation are present.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/main.ts src/service/systemd-user.ts tests/service/systemd-user.test.ts docs/superpowers/specs/2026-07-07-systemd-node-runtime-design.md docs/superpowers/plans/2026-07-07-systemd-node-runtime.md
+git add src/main.ts src/service/systemd-user.ts tests/service/systemd-user.test.ts tests/bin.test.ts docs/superpowers/specs/2026-07-07-systemd-node-runtime-design.md docs/superpowers/plans/2026-07-07-systemd-node-runtime.md
 git commit -m "fix: pin Node runtime in systemd service"
 ```
