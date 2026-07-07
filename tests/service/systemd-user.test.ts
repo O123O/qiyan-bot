@@ -120,6 +120,7 @@ test("read-only status and logs remain available when a stale operation lock exi
   let leaseCalls = 0;
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async (args) => args[0] === "is-active"
       ? { code: 0, signal: null, stdout: "active\n" }
