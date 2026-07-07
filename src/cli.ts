@@ -43,7 +43,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
 
 export function formatCliHelp(topic: CliHelpTopic): string {
   if (topic === "service") {
-    return "QiYan systemd user service\n\nUsage:\n  qiyan-bot service <install|start|stop|restart|status|logs|uninstall>\n  qiyan-bot service install [--home <path>]\n\nThe service runs the foreground bot under systemd; tmux is not required.\nUse `qiyan-bot service logs` to read the latest 100 journal entries.\n";
+    return "QiYan systemd user service\n\nUsage:\n  qiyan-bot service <install|start|stop|restart|status|logs|uninstall>\n  qiyan-bot service install [--home <path>]\n\nThe service runs the foreground bot under systemd; tmux is not required.\nInstallation captures the invoking terminal's PATH; reinstall the service after PATH changes.\nUse `qiyan-bot service logs` to read the latest 100 journal entries.\n";
   }
   if (topic !== "root") {
     return `QiYan ${topic}\n\nUsage:\n  qiyan-bot ${topic} [--home <path>]\n\nOptions:\n  -h, --help     Show help\n  --home <path>  QiYan home directory\n`;

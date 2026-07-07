@@ -151,6 +151,20 @@ process.stdout.write("safe journal output\\n");
   assert.doesNotMatch(shellOnlyInstall.stderr, /process-secret|other-secret/u);
   await assert.rejects(lstat(join(shellOnlyHome, ".config", "systemd", "user", "qiyan-bot.service")),
     (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  const invalidPathHome = join(temp, "invalid-path-service-home");
+  await mkdir(invalidPathHome, { mode: 0o700 });
+  const invalidPathInstall = spawnSync(process.execPath, [executable, "service", "install"], {
+    cwd: temp,
+    encoding: "utf8",
+    env: { ...serviceEnv, HOME: invalidPathHome, PATH: "relative:/usr/bin" },
+  });
+  assert.equal(invalidPathInstall.status, 1);
+  assert.equal(invalidPathInstall.stdout, "");
+  assert.match(invalidPathInstall.stderr, /CONFIGURATION_ERROR.*PATH/u);
+  await assert.rejects(lstat(join(invalidPathHome, ".qiyan-bot")),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  await assert.rejects(lstat(join(invalidPathHome, ".config")),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   const serviceInstall = spawnSync(process.execPath, [executable, "service", "install"], { cwd: temp, encoding: "utf8", env: serviceEnv });
   assert.equal(serviceInstall.status, 0);
   assert.equal(serviceInstall.stdout, "Installed and started qiyan-bot.service.\n");
@@ -160,6 +174,7 @@ process.stdout.write("safe journal output\\n");
   const expectedNodeExecutable = `"${process.execPath.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
   assert.equal(installedUnit.includes(`ExecStart=${expectedNodeExecutable} `), true);
   assert.match(installedUnit, /ExecStart=.*qiyan-bot.* --home .*\.qiyan-bot/u);
+  assert.equal(installedUnit.includes(`Environment="PATH=${serviceEnv.PATH}"`), true);
   assert.doesNotMatch(installedUnit, /process-secret|private-file-token|other-secret/u);
   const serviceStatus = spawnSync(executable, ["service", "status"], { cwd: temp, encoding: "utf8", env: serviceEnv });
   assert.equal(serviceStatus.status, 0);

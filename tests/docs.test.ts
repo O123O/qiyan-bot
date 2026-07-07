@@ -145,6 +145,16 @@ test("primary guides document QiYan home precedence, private dotenv setup, and m
   assert.match(setup, /config-check.*at least one configured adapter.*assistant-login.*does not need chat credentials/isu);
 });
 
+test("service guides document the captured terminal PATH and required reinstall", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  const setup = await readFile(resolve("docs/setup.md"), "utf8");
+  for (const [name, document] of [["README", readme], ["setup", setup]] as const) {
+    assert.match(document, /service install.*captures?.*(?:terminal|invoking shell).*`?PATH`?/isu, `${name} does not explain PATH capture`);
+    assert.match(document, /PATH changes?.*service uninstall.*service install/isu, `${name} does not require service reinstall after PATH changes`);
+    assert.match(document, /does not (?:source|read).*(?:config\.fish|\.bashrc|shell startup)/isu, `${name} does not explain the shell-startup boundary`);
+  }
+});
+
 test("Slack guide covers the implemented single-user Socket Mode setup and limits", async () => {
   const guide = await readFile(resolve("docs/chat-apps/slack.md"), "utf8");
   for (const required of [

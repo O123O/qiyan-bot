@@ -14,24 +14,39 @@ import {
 } from "../../src/service/systemd-user.ts";
 
 test("renders a secret-free foreground user unit with safely quoted paths", () => {
+  const base = {
+    nodeExecutable: "/usr/bin/node",
+    executable: "/bin/qiyan",
+    qiyanHome: "/home/user/.qiyan-bot",
+    path: "/home/user/.local/bin:/usr/local/bin:/usr/bin",
+  };
   const unit = renderSystemdUserUnit({
     nodeExecutable: "/home/user/Node Runtime/node%24",
     executable: "/home/user/My Bin/qiyan%bot",
     qiyanHome: "/home/user/QiYan Home",
+    path: "/home/user/My Bin:/opt/tool%kit/bin:/usr/bin",
   });
   assert.match(unit, new RegExp(`^${MANAGED_UNIT_MARKER.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\n`, "u"));
   assert.match(unit, /Type=simple/u);
   assert.match(unit, /WorkingDirectory=\/home\/user\/QiYan Home/u);
   assert.doesNotMatch(unit, /WorkingDirectory="/u);
   assert.match(unit, /ExecStart="\/home\/user\/Node Runtime\/node%%24" "\/home\/user\/My Bin\/qiyan%%bot" --home "\/home\/user\/QiYan Home"/u);
+  assert.match(unit, /^Environment="PATH=\/home\/user\/My Bin:\/opt\/tool%%kit\/bin:\/usr\/bin"$/mu);
   assert.match(unit, /Restart=on-failure/u);
   assert.match(unit, /TimeoutStopSec=30s/u);
   assert.match(unit, /UMask=0077/u);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);
-  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "relative", executable: "/bin/qiyan", qiyanHome: "/home/user/.qiyan-bot" }), /absolute/u);
-  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "relative", qiyanHome: "/home/user/.qiyan-bot" }), /absolute/u);
-  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "/bin/qiyan\nExecStart=/bin/evil", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
-  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "/home/user/$work/qiyan-bot", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
+  assert.throws(() => renderSystemdUserUnit({ ...base, nodeExecutable: "relative" }), /absolute/u);
+  assert.throws(() => renderSystemdUserUnit({ ...base, executable: "relative" }), /absolute/u);
+  assert.throws(() => renderSystemdUserUnit({ ...base, executable: "/bin/qiyan\nExecStart=/bin/evil" }), /unsupported characters/u);
+  assert.throws(() => renderSystemdUserUnit({ ...base, executable: "/home/user/$work/qiyan-bot" }), /unsupported characters/u);
+  for (const path of ["", "/usr/bin::/bin", "relative:/usr/bin", "/usr/../bin", "/usr/bin\nEnvironment=EVIL=1"]) {
+    assert.throws(() => renderSystemdUserUnit({ ...base, path }), /PATH/u);
+  }
+  assert.throws(
+    () => renderSystemdUserUnit({ ...base, path: `/${"%".repeat(32 * 1024 - 1)}` }),
+    /(?:PATH|unit).*too large/iu,
+  );
 });
 
 test("service-effective validation removes every environment value unset by the unit", () => {
@@ -64,6 +79,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
     userHome: "/home/user",
     nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
+    env: { PATH: "/home/user/.local/bin:/opt/user tools/bin:/usr/bin" },
     runner,
     journalRunner: async (args) => { journalCalls.push([...args]); return { code: 0, signal: null, stdout: "safe journal output\n" }; },
     unitStore: {
@@ -84,6 +100,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
   assert.equal(writes.length, 1);
   assert.equal(writes[0]?.path, "/home/user/.config/systemd/user/qiyan-bot.service");
   assert.match(writes[0]?.contents ?? "", /ExecStart="\/usr\/bin\/node" "\/home\/user\/\.local\/bin\/qiyan-bot"/u);
+  assert.match(writes[0]?.contents ?? "", /^Environment="PATH=\/home\/user\/\.local\/bin:\/opt\/user tools\/bin:\/usr\/bin"$/mu);
   assert.deepEqual(removals, ["/home/user/.config/systemd/user/qiyan-bot.service"]);
   assert.deepEqual(journalCalls, [["--user", "--unit", "qiyan-bot.service", "--lines", "100", "--no-pager", "--output", "short-iso"]]);
   assert.deepEqual(calls, [
@@ -98,6 +115,25 @@ test("installs, controls, and reports one user service with fixed systemctl argu
     ["disable", "--now", "qiyan-bot.service"],
     ["daemon-reload"],
   ]);
+});
+
+test("service install rejects a missing or unsafe terminal PATH before acquiring its real filesystem lease", async (context) => {
+  for (const path of [undefined, "", "relative:/usr/bin", "/usr/bin::/bin"]) {
+    const userHome = await mkdtemp(join(tmpdir(), "qiyan-systemd-invalid-path-"));
+    context.after(() => rm(userHome, { recursive: true, force: true }));
+    await chmod(userHome, 0o700);
+    let systemctlCalls = 0;
+    const service = new SystemdUserService({
+      userHome,
+      nodeExecutable: "/usr/bin/node",
+      executable: join(userHome, ".local/bin/qiyan-bot"),
+      env: path === undefined ? {} : { PATH: path },
+      runner: async () => { systemctlCalls += 1; throw new Error("systemctl must not run"); },
+    });
+    await assert.rejects(service.execute("install", { qiyanHome: join(userHome, ".qiyan-bot") }), /PATH/u);
+    assert.equal(systemctlCalls, 0);
+    await assert.rejects(lstat(join(userHome, ".config")), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+  }
 });
 
 test("systemctl failures are actionable without returning command output", async () => {
@@ -220,6 +256,8 @@ test("managed unit storage is idempotent and refuses symlinks or unmanaged repla
   const store = new NodeSystemdUnitStore(home, process.getuid?.());
   const unitPath = join(home, ".config", "systemd", "user", "qiyan-bot.service");
   const managed = `${MANAGED_UNIT_MARKER}\n[Unit]\nDescription=managed\n`;
+  await assert.rejects(store.install(unitPath, `${managed}${"x".repeat(64 * 1024)}`), /too large/u);
+  await assert.rejects(lstat(unitPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   await store.install(unitPath, managed);
   await store.install(unitPath, managed);
   assert.equal(await readFile(unitPath, "utf8"), managed);

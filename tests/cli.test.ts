@@ -58,6 +58,7 @@ test("formats useful top-level and command-specific help", () => {
   assert.match(formatCliHelp("config-check"), /qiyan-bot config-check \[--home <path>\]/u);
   assert.match(formatCliHelp("service"), /install\|start\|stop\|restart\|status\|logs\|uninstall/u);
   assert.match(formatCliHelp("service"), /journal/u);
+  assert.match(formatCliHelp("service"), /captures.*PATH.*reinstall/isu);
 });
 
 test("rejects missing, repeated, and unknown CLI arguments", () => {

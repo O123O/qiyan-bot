@@ -38,6 +38,7 @@ export async function main(env = process.env, argv: readonly string[] = process.
     if (!executable || !isAbsolute(executable)) throw new AppError("CONFIGURATION_ERROR", "service management requires an absolute qiyan-bot executable path");
     const service = new SystemdUserService({ userHome, nodeExecutable: process.execPath, executable, env });
     if (command.action === "install") {
+      service.validateInstallEnvironment();
       const selected = await loadConfigSource(env, command.qiyanHome === undefined ? {} : { cliHome: command.qiyanHome });
       const loaded = await loadConfigSource(buildServiceEffectiveEnvironment(env), { cliHome: selected.qiyanHome });
       const weixin = await bootstrapWeixin(loaded.qiyanHome);

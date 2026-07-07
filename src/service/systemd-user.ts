@@ -10,6 +10,7 @@ import { AppError } from "../core/errors.ts";
 export const SYSTEMD_UNIT_NAME = "qiyan-bot.service";
 export const MANAGED_UNIT_MARKER = "# Managed by qiyan-bot; use `qiyan-bot service uninstall` to remove.";
 const MAX_UNIT_BYTES = 64 * 1024;
+const MAX_CAPTURED_PATH_BYTES = 32 * 1024;
 const MAX_SYSTEMCTL_OUTPUT_BYTES = 4 * 1024;
 const MAX_JOURNAL_OUTPUT_BYTES = 64 * 1024;
 
@@ -34,13 +35,14 @@ export function buildServiceEffectiveEnvironment(host: NodeJS.ProcessEnv): NodeJ
   return result;
 }
 
-export function renderSystemdUserUnit(input: { nodeExecutable: string; executable: string; qiyanHome: string }): string {
+export function renderSystemdUserUnit(input: { nodeExecutable: string; executable: string; qiyanHome: string; path: string }): string {
   const nodeExecutable = systemdPath(input.nodeExecutable, "Node executable");
   const executable = systemdPath(input.executable, "service executable");
   const qiyanHome = systemdPath(input.qiyanHome, "QiYan home");
   const workingDirectory = systemdWorkingDirectory(input.qiyanHome, "QiYan home");
+  const path = systemdSearchPath(input.path);
   const unset = [...SERVICE_UNSET_ENV_NAMES].join(" ");
-  return `${MANAGED_UNIT_MARKER}
+  const unit = `${MANAGED_UNIT_MARKER}
 [Unit]
 Description=QiYan personal assistant
 Documentation=https://github.com/O123O/qiyan-bot
@@ -50,6 +52,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${workingDirectory}
+Environment=${path}
 ExecStart=${nodeExecutable} ${executable} --home ${qiyanHome}
 UnsetEnvironment=${unset}
 Restart=on-failure
@@ -60,6 +63,8 @@ UMask=0077
 [Install]
 WantedBy=default.target
 `;
+  if (Buffer.byteLength(unit, "utf8") > MAX_UNIT_BYTES) throw configuration("generated systemd unit is too large");
+  return unit;
 }
 
 export class SystemdUserService {
@@ -92,18 +97,36 @@ export class SystemdUserService {
 
   async execute(action: ServiceAction, input: { qiyanHome?: string } = {}): Promise<string> {
     if (action === "status" || action === "logs") return this.executeLocked(action, input);
+    if (action === "install") {
+      const unit = this.renderInstallUnit(input.qiyanHome);
+      return this.unitStore.withOperationLease(() => this.executeLocked(action, input, unit));
+    }
     return this.unitStore.withOperationLease(() => this.executeLocked(action, input));
   }
 
-  private async executeLocked(action: ServiceAction, input: { qiyanHome?: string }): Promise<string> {
+  validateInstallEnvironment(): void {
+    systemdSearchPath(this.capturedPath());
+  }
+
+  private renderInstallUnit(qiyanHome: string | undefined): string {
+    if (!qiyanHome) throw configuration("service install requires a QiYan home");
+    return renderSystemdUserUnit({
+      nodeExecutable: this.options.nodeExecutable,
+      executable: this.options.executable,
+      qiyanHome,
+      path: this.capturedPath(),
+    });
+  }
+
+  private capturedPath(): string {
+    return (this.options.env ?? process.env).PATH ?? "";
+  }
+
+  private async executeLocked(action: ServiceAction, input: { qiyanHome?: string }, installUnit?: string): Promise<string> {
     switch (action) {
       case "install": {
-        if (!input.qiyanHome) throw configuration("service install requires a QiYan home");
-        await this.unitStore.install(this.unitPath, renderSystemdUserUnit({
-          nodeExecutable: this.options.nodeExecutable,
-          executable: this.options.executable,
-          qiyanHome: input.qiyanHome,
-        }));
+        if (installUnit === undefined) throw configuration("service install was not prepared");
+        await this.unitStore.install(this.unitPath, installUnit);
         await this.required(["daemon-reload"]);
         await this.required(["enable", SYSTEMD_UNIT_NAME]);
         await this.required(["restart", SYSTEMD_UNIT_NAME]);
@@ -221,6 +244,7 @@ export class NodeSystemdUnitStore implements SystemdUnitStore {
   }
 
   async install(path: string, contents: string): Promise<void> {
+    if (Buffer.byteLength(contents, "utf8") > MAX_UNIT_BYTES) throw configuration(`${SYSTEMD_UNIT_NAME} is too large`);
     this.assertPath(path);
     await this.prepareDirectory(true);
     const existing = await this.readUnit(path, true);
@@ -363,6 +387,22 @@ class MissingDirectoryError extends Error {}
 
 function systemdPath(value: string, label: string): string {
   validateSystemdPath(value, label);
+  return systemdQuote(value);
+}
+
+function systemdSearchPath(value: string): string {
+  if (Buffer.byteLength(value, "utf8") > MAX_CAPTURED_PATH_BYTES) throw configuration("PATH is too large for service installation");
+  const entries = value.split(":");
+  if (entries.length === 0 || entries.some((entry) => entry.length === 0)) {
+    throw configuration("PATH must contain only nonempty absolute entries for service installation");
+  }
+  for (const entry of entries) validateSystemdPath(entry, "PATH entry");
+  const assignment = systemdQuote(`PATH=${value}`);
+  if (Buffer.byteLength(assignment, "utf8") > MAX_CAPTURED_PATH_BYTES) throw configuration("PATH is too large for service installation");
+  return assignment;
+}
+
+function systemdQuote(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
 }
 
