@@ -2,7 +2,21 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { BotApp } from "../src/app.ts";
-import { runForegroundApp } from "../src/main.ts";
+import { requestServiceRestart, runForegroundApp } from "../src/main.ts";
+
+test("service restart requests a nonzero graceful SIGTERM", () => {
+  const signals: Array<{ pid: number; signal: string }> = [];
+  const control: { pid: number; exitCode: string | number | null | undefined; kill(pid: number, signal: string): void } = {
+    pid: 42,
+    exitCode: undefined,
+    kill: (pid, signal) => { signals.push({ pid, signal }); },
+  };
+
+  requestServiceRestart(control);
+
+  assert.equal(control.exitCode, 1);
+  assert.deepEqual(signals, [{ pid: 42, signal: "SIGTERM" }]);
+});
 
 test("foreground startup announces readiness and stops on a signal", async () => {
   const events: string[] = [];

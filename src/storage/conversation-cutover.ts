@@ -117,18 +117,22 @@ export function runConversationRoutingBackfill(db: Database, telegram?: Conversa
       db.prepare(`UPDATE operations SET effect_class = 'read_only' WHERE kind IN (${placeholders})`).run(...readOnlyOperations);
     }
 
-    db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS source_context_arrival_sequence_idx ON source_contexts(arrival_sequence);
-      CREATE TRIGGER IF NOT EXISTS source_context_arrival_required_insert
-        BEFORE INSERT ON source_contexts WHEN NEW.arrival_sequence IS NULL
-        BEGIN SELECT RAISE(ABORT, 'source arrival sequence is required'); END;
-      CREATE TRIGGER IF NOT EXISTS source_context_arrival_required_update
-        BEFORE UPDATE OF arrival_sequence ON source_contexts WHEN NEW.arrival_sequence IS NULL
-        BEGIN SELECT RAISE(ABORT, 'source arrival sequence is required'); END;
-    `);
+    installConversationRoutingGuards(db);
     validateRoutingBackfill(db);
     db.prepare("UPDATE conversation_cutover SET phase = 'routing_backfilled' WHERE singleton = 1").run();
   });
+}
+
+export function installConversationRoutingGuards(db: Database): void {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS source_context_arrival_sequence_idx ON source_contexts(arrival_sequence);
+    CREATE TRIGGER IF NOT EXISTS source_context_arrival_required_insert
+      BEFORE INSERT ON source_contexts WHEN NEW.arrival_sequence IS NULL
+      BEGIN SELECT RAISE(ABORT, 'source arrival sequence is required'); END;
+    CREATE TRIGGER IF NOT EXISTS source_context_arrival_required_update
+      BEFORE UPDATE OF arrival_sequence ON source_contexts WHEN NEW.arrival_sequence IS NULL
+      BEGIN SELECT RAISE(ABORT, 'source arrival sequence is required'); END;
+  `);
 }
 
 export function finalizeConversationCutover(db: Database, assistant: FullAssistantThreadSnapshot): void {

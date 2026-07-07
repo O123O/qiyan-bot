@@ -2,9 +2,43 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
+import {
+  isDashboardMetadataRecoveryRequired,
+  SessionDashboardStore,
+} from "../../src/storage/session-dashboard-store.ts";
 
 const identity = { endpointId: "local", threadId: "thread-1" };
+
+test("dashboard metadata health validation identifies only invalid metadata", () => {
+  {
+    const db = createTestDatabase();
+    const store = new SessionDashboardStore(db);
+    assert.doesNotThrow(() => store.assertMetadataHealthy());
+    db.close();
+  }
+
+  {
+    const db = createTestDatabase();
+    const store = new SessionDashboardStore(db);
+    db.prepare("DELETE FROM session_dashboard_meta").run();
+    assert.throws(() => store.assertMetadataHealthy(), (error: unknown) => {
+      assert.equal(isDashboardMetadataRecoveryRequired(error), true);
+      assert.equal(error instanceof Error ? error.message : "", "dashboard metadata requires automatic recovery");
+      return true;
+    });
+    db.close();
+  }
+
+  {
+    const db = createTestDatabase();
+    const store = new SessionDashboardStore(db);
+    db.close();
+    assert.throws(() => store.assertMetadataHealthy(), (error: unknown) => {
+      assert.equal(isDashboardMetadataRecoveryRequired(error), false);
+      return true;
+    });
+  }
+});
 
 test("manager notes are stable by thread identity and operation-idempotent", () => {
   const store = new SessionDashboardStore(createTestDatabase());

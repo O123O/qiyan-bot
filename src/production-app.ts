@@ -50,12 +50,14 @@ import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type Pr
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { openDatabase, type Database } from "./storage/database.ts";
+import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lease.ts";
+import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
 import { ConversationStore, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
-import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
+import { isDashboardMetadataRecoveryRequired, SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
 import { SlackChatAdapter } from "./slack/chat-adapter.ts";
@@ -164,6 +166,25 @@ export async function reconcileLifecycleAndOwnership(
   return ownershipEvents.reconcileReleased(registry);
 }
 
+export function createMaintenanceFailureHandler(options: {
+  requestRestart(): void;
+  reportRecoveryRequired(): void;
+  reportRetryableFailure(): void;
+}): (error: unknown) => void {
+  let restartRequested = false;
+  return (error) => {
+    if (!isDashboardMetadataRecoveryRequired(error)) {
+      options.reportRetryableFailure();
+      return;
+    }
+    if (restartRequested) return;
+    restartRequested = true;
+    try { options.reportRecoveryRequired(); }
+    catch { /* Operational reporting cannot prevent a required restart. */ }
+    options.requestRestart();
+  };
+}
+
 export async function reconcileOwnershipBeforeRelay(
   ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">,
   relay: Pick<EventRelay, "reconcileEndpoint">,
@@ -197,6 +218,13 @@ export async function buildProductionApp(
     chatAdapters?: readonly ChatAdapter[];
     weixinCredential?: WeixinCredentialHandle;
     onOperationalEvent?: OperationalEventSink;
+    requestRestart?: () => void;
+    storage?: {
+      acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
+      openDatabase?: (path: string) => Database;
+      closeDatabase?: (database: Database) => void;
+      recoverDatabase?: (path: string) => Promise<unknown>;
+    };
   } = {},
 ): Promise<BotApp> {
   const telegramConfig = config.chat.telegram;
@@ -215,6 +243,8 @@ export async function buildProductionApp(
   let assistantWarnings: string[] = [];
   let assistantProfile!: PreparedAssistantProfile;
   let db!: Database;
+  let databaseLease: DatabaseLease | undefined;
+  let blockedStorageCleanup: { database?: Database; lease: DatabaseLease } | undefined;
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
   let dashboard!: SessionDashboard;
@@ -274,6 +304,14 @@ export async function buildProductionApp(
   let backgroundIncident = 0;
   let operationReconciliationTail: Promise<void> = Promise.resolve();
   const report = options.onOperationalEvent ?? (() => undefined);
+  const handleMaintenanceFailure = createMaintenanceFailureHandler({
+    requestRestart: options.requestRestart ?? (() => undefined),
+    reportRecoveryRequired: () => { report({ level: "warn", code: "database_metadata_recovery_required" }); },
+    reportRetryableFailure: () => { recordBackgroundFailure("maintenance"); },
+  });
+  const acquireStateLease = options.storage?.acquireDatabaseLease ?? acquireDatabaseLease;
+  const openStateDatabase = options.storage?.openDatabase ?? openDatabase;
+  const closeStateDatabase = options.storage?.closeDatabase ?? ((database: Database) => { database.close(); });
 
   const acceptChat = async (source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void> => {
     await dispatcher.accept(source, effects);
@@ -317,17 +355,75 @@ export async function buildProductionApp(
     {
       name: "storage",
       start: async () => {
+        if (blockedStorageCleanup) throw new AppError("CONFIGURATION_ERROR", "previous state database cleanup did not complete; restart QiYan");
         const databasePath = join(dataDir, "bot.sqlite3");
-        preflightConversationCutover(databasePath, telegramBinding !== undefined);
-        db = openDatabase(databasePath);
-        operations = new OperationStore(db); deliveries = new DeliveryStore(db); runtime = new RuntimeStore(db); finals = new FinalMessageStore(db);
-        ownershipEvents = new OwnershipEventStore(db);
-        dashboardStore = new SessionDashboardStore(db);
-        endpointBindings = new EndpointBindingStore(db);
-        endpointCatalog = await EndpointCatalog.open(config.endpointCatalogPath);
-        runConversationRoutingBackfill(db, telegramBinding);
+        const lease = await acquireStateLease(databasePath);
+        let openedDb: Database | undefined;
+        try {
+          const opened = await openStateDatabaseWithAutomaticRecovery(databasePath, {
+            beforeOpen: () => { preflightConversationCutover(databasePath, telegramBinding !== undefined); },
+            openDatabase: (path) => {
+              const database = openStateDatabase(path);
+              openedDb = database;
+              return database;
+            },
+            closeDatabase: (database) => {
+              closeStateDatabase(database);
+              if (openedDb === database) openedDb = undefined;
+            },
+            ...(options.storage?.recoverDatabase === undefined ? {} : { recoverDatabase: options.storage.recoverDatabase }),
+          });
+          openedDb = opened.database;
+          const openedOperations = new OperationStore(openedDb);
+          const openedDeliveries = new DeliveryStore(openedDb);
+          const openedRuntime = new RuntimeStore(openedDb);
+          const openedFinals = new FinalMessageStore(openedDb);
+          const openedOwnershipEvents = new OwnershipEventStore(openedDb);
+          const openedDashboardStore = opened.dashboardStore;
+          const openedEndpointBindings = new EndpointBindingStore(openedDb);
+          const openedEndpointCatalog = await EndpointCatalog.open(config.endpointCatalogPath);
+          runConversationRoutingBackfill(openedDb, telegramBinding);
+
+          db = openedDb;
+          operations = openedOperations;
+          deliveries = openedDeliveries;
+          runtime = openedRuntime;
+          finals = openedFinals;
+          ownershipEvents = openedOwnershipEvents;
+          dashboardStore = openedDashboardStore;
+          endpointBindings = openedEndpointBindings;
+          endpointCatalog = openedEndpointCatalog;
+          databaseLease = lease;
+          if (opened.recovered) report({ level: "warn", code: "database_metadata_recovered" });
+        } catch (error) {
+          let databaseClosed = openedDb === undefined;
+          if (openedDb) {
+            try { closeStateDatabase(openedDb); databaseClosed = true; }
+            catch { /* Retain ownership when SQLite did not close cleanly. */ }
+          }
+          if (!databaseClosed) blockedStorageCleanup = { ...(openedDb ? { database: openedDb } : {}), lease };
+          else {
+            try { await lease.release(); }
+            catch { blockedStorageCleanup = { lease }; }
+          }
+          throw error;
+        }
       },
-      stop: async () => { db.close(); },
+      stop: async () => {
+        const lease = databaseLease;
+        if (!lease) return;
+        try { closeStateDatabase(db); }
+        catch (error) {
+          blockedStorageCleanup = { database: db, lease };
+          throw error;
+        }
+        try { await lease.release(); }
+        catch (error) {
+          blockedStorageCleanup = { lease };
+          throw error;
+        }
+        databaseLease = undefined;
+      },
     },
     {
       name: "registry",
@@ -1777,12 +1873,10 @@ export async function buildProductionApp(
     } catch { /* containment path cannot safely escalate */ }
   }
 
-  return composeApp(phases, { maintenance: { intervalMs: 60_000, run: async () => {
-    try { await runMaintenance(); }
-    catch (error) { recordBackgroundFailure("maintenance"); throw error; }
-  } } });
+  return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance, onFailure: handleMaintenanceFailure } });
 
   async function runMaintenance(): Promise<void> {
+    dashboardStore.assertMetadataHealthy();
     await attachments.cleanupExpired();
     discovery.cleanupExpired();
     reconcileDeliveryEvents();

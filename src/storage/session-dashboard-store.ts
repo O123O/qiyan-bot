@@ -37,8 +37,34 @@ const emptyNotes: ManagerNotes = {
   updated_at: null,
 };
 
+export class DashboardMetadataRecoveryRequiredError extends AppError {
+  constructor() {
+    super("CONFIGURATION_ERROR", "dashboard metadata requires automatic recovery");
+    this.name = "DashboardMetadataRecoveryRequiredError";
+  }
+}
+
+export function isDashboardMetadataRecoveryRequired(error: unknown): error is DashboardMetadataRecoveryRequiredError {
+  return error instanceof DashboardMetadataRecoveryRequiredError;
+}
+
 export class SessionDashboardStore {
   constructor(private readonly db: Database) {}
+
+  assertMetadataHealthy(): void {
+    const rows = this.db.prepare("SELECT * FROM session_dashboard_meta").all() as Array<Record<string, unknown>>;
+    const row = rows[0];
+    if (
+      rows.length !== 1
+      || row?.singleton !== 1
+      || (row.assistant_root !== null && typeof row.assistant_root !== "string")
+      || !binary(row.dirty)
+      || !nonnegativeInteger(row.revision)
+      || !positiveInteger(row.next_observation_sequence)
+      || (row.last_render_error !== null && typeof row.last_render_error !== "string")
+      || !nonnegativeInteger(row.render_failure_generation)
+    ) throw new DashboardMetadataRecoveryRequiredError();
+  }
 
   allocateObservationSequence(): number {
     return inTransaction(this.db, () => this.nextObservationSequence());
@@ -393,4 +419,16 @@ export class SessionDashboardStore {
   private meta(): Record<string, unknown> {
     return this.db.prepare("SELECT * FROM session_dashboard_meta WHERE singleton = 1").get() as Record<string, unknown>;
   }
+}
+
+function binary(value: unknown): boolean {
+  return value === 0 || value === 1;
+}
+
+function nonnegativeInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function positiveInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 }

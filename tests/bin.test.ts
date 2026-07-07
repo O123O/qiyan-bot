@@ -29,6 +29,7 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     "package/assets/endpoints.example.jsonc",
     "package/assets/slack/manifest.yaml",
     "package/docs/chat-apps/wechat.md",
+    "package/docs/sqlite.md",
     "package/docs/ssh-workers.md",
     "package/assets/remote/qiyan-app-server-launcher.sh",
     "package/assets/remote/qiyan-ssh-helper.mjs",

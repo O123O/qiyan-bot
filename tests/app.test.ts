@@ -48,6 +48,25 @@ test("maintenance scheduling is deterministic and stops cleanly", async () => {
   assert.equal(clears, 1);
 });
 
+test("maintenance forwards a rejected run to its failure boundary", async () => {
+  let callback: (() => void) | undefined;
+  const failure = new Error("maintenance failed");
+  const observed: unknown[] = [];
+  const app = composeApp([], {
+    maintenance: {
+      intervalMs: 100,
+      run: async () => { throw failure; },
+      onFailure: (error) => { observed.push(error); },
+    },
+    timers: { setInterval: (fn) => { callback = fn; return 1 as any; }, clearInterval: () => undefined },
+  });
+  await app.start();
+  callback?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.stop();
+  assert.deepEqual(observed, [failure]);
+});
+
 test("maintenance timer setup failures retain a safe startup phase", async () => {
   const app = composeApp([], {
     maintenance: { intervalMs: 100, run: async () => undefined },

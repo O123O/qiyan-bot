@@ -16,6 +16,7 @@
     "assets/remote/qiyan-ssh-helper.mjs",
     "assets/slack/manifest.yaml",
     "docs/chat-apps/wechat.md",
+    "docs/sqlite.md",
     "docs/ssh-workers.md"
   ],
   "engines": {

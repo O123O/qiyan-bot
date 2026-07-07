@@ -15,7 +15,10 @@ import { AppError } from "./core/errors.ts";
 import { createOperationalLogSink } from "./core/operational-log.ts";
 import { isAbsolute, resolve } from "node:path";
 
-export async function main(env = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
+export async function main(
+  env = process.env,
+  argv: readonly string[] = process.argv.slice(2),
+): Promise<void> {
   const command = parseCliArgs(argv);
   if (command.command === "help") {
     process.stdout.write(formatCliHelp(command.topic));
@@ -95,8 +98,20 @@ export async function main(env = process.env, argv: readonly string[] = process.
   const app = await createApp(config, {
     ...(weixin.configured ? { weixinCredential: weixin.credential } : {}),
     onOperationalEvent: createOperationalLogSink(),
+    requestRestart: () => { requestServiceRestart(); },
   });
   await runForegroundApp(app);
+}
+
+interface ServiceProcessControl {
+  pid: number;
+  exitCode: string | number | null | undefined;
+  kill(pid: number, signal: string): unknown;
+}
+
+export function requestServiceRestart(control: ServiceProcessControl = process): void {
+  control.exitCode = 1;
+  control.kill(control.pid, "SIGTERM");
 }
 
 function serviceUserHome(env: NodeJS.ProcessEnv): string {

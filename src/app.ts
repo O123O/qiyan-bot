@@ -11,6 +11,7 @@ export interface AppRuntimeOptions {
   phases?: readonly AppPhase[];
   weixinCredential?: WeixinCredentialHandle;
   onOperationalEvent?: OperationalEventSink;
+  requestRestart?: () => void;
 }
 
 export class TerminalInbox<T> {
@@ -34,7 +35,7 @@ interface TimerApi {
 
 export function composeApp(
   phases: readonly AppPhase[],
-  options: { maintenance?: { intervalMs: number; run(): Promise<void> }; timers?: TimerApi } = {},
+  options: { maintenance?: { intervalMs: number; run(): Promise<void>; onFailure?(error: unknown): void }; timers?: TimerApi } = {},
 ): BotApp {
   const started: AppPhase[] = [];
   const timers: TimerApi = options.timers ?? {
@@ -62,7 +63,10 @@ export function composeApp(
           }
           if (options.maintenance) {
             startingPhase = "maintenance";
-            maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().catch(() => undefined), options.maintenance.intervalMs);
+            maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().catch((error) => {
+              try { options.maintenance!.onFailure?.(error); }
+              catch { /* Maintenance failure reporting cannot escape the timer boundary. */ }
+            }), options.maintenance.intervalMs);
             hasMaintenanceTimer = true;
           }
           startingPhase = undefined;
@@ -107,5 +111,6 @@ export async function createApp(config: BotConfig, options: AppRuntimeOptions = 
   return buildProductionApp(config, {
     ...(options.weixinCredential ? { weixinCredential: options.weixinCredential } : {}),
     ...(options.onOperationalEvent ? { onOperationalEvent: options.onOperationalEvent } : {}),
+    ...(options.requestRestart ? { requestRestart: options.requestRestart } : {}),
   });
 }

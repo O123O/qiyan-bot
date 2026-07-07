@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
+import { AdvisoryLockUnavailableError, tryAcquireAdvisoryLock } from "../core/advisory-lock.ts";
 import { AppError } from "../core/errors.ts";
 import { validateTencentUrl } from "./endpoint-policy.ts";
 
@@ -503,35 +503,11 @@ function sameFilePin(left: FilePin, right: FilePin): boolean {
 }
 
 async function acquireAdvisoryLock(fd: number): Promise<boolean> {
-  for (const binary of ["/usr/bin/flock", "/bin/flock"]) {
-    const result = await runFlock(binary, fd);
-    if (result === "missing") continue;
-    if (result === "acquired") return true;
-    if (result === "busy") return false;
+  try { return await tryAcquireAdvisoryLock(fd); }
+  catch (error) {
+    if (error instanceof AdvisoryLockUnavailableError) throw managedError("safe WeChat credential locking is unavailable");
     throw managedError("cannot acquire the WeChat credential lock");
   }
-  throw managedError("safe WeChat credential locking is unavailable");
-}
-
-async function runFlock(binary: string, fd: number): Promise<"acquired" | "busy" | "missing" | "failed"> {
-  return new Promise((resolve) => {
-    const child = spawn(binary, ["--exclusive", "--nonblock", "3"], {
-      stdio: ["ignore", "ignore", "ignore", fd],
-      env: {},
-    });
-    let missing = false;
-    child.once("error", (error: NodeJS.ErrnoException) => {
-      missing = error.code === "ENOENT";
-      resolve(missing ? "missing" : "failed");
-    });
-    child.once("exit", (code, signal) => {
-      if (missing) return;
-      if (signal !== null) resolve("failed");
-      else if (code === 0) resolve("acquired");
-      else if (code === 1) resolve("busy");
-      else resolve("failed");
-    });
-  });
 }
 
 function managedError(message: string): AppError {

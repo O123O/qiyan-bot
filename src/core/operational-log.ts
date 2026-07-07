@@ -12,6 +12,8 @@ export type OperationalEventCode =
   | "assistant_submission_uncertain"
   | "assistant_turn_terminal"
   | "delivery_failed"
+  | "database_metadata_recovered"
+  | "database_metadata_recovery_required"
   | "background_task_failed";
 
 export interface OperationalEvent {

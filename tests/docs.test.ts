@@ -24,6 +24,7 @@ test("README links to all focused guides and every local guide target exists", a
   const links = [...readme.matchAll(/\]\((docs\/[^)#]+)(?:#[^)]+)?\)/gu)].map((match) => match[1]!);
   for (const expected of [
     "docs/installation.md",
+    "docs/sqlite.md",
     "docs/upgrading-to-v0.3.md",
     "docs/setup.md",
     "docs/chat-apps/telegram.md",
@@ -34,6 +35,26 @@ test("README links to all focused guides and every local guide target exists", a
     assert.equal(links.includes(expected), true, `README does not link ${expected}`);
   }
   await Promise.all(links.map((link) => access(resolve(link))));
+});
+
+test("the focused SQLite guide documents durability and automatic recovery", async () => {
+  const readme = await readFile(resolve("README.md"), "utf8");
+  assert.match(readme, /\[SQLite durability and recovery\]\(docs\/sqlite\.md\)/u);
+  assert.doesNotMatch(readme, /### SQLite durability|### Automatic dashboard-metadata recovery/u);
+
+  const guide = await readFile(resolve("docs/sqlite.md"), "utf8");
+  assert.match(guide, /rollback journal.*`journal_mode=DELETE`/isu);
+  assert.match(guide, /`synchronous=EXTRA`/u);
+  assert.match(guide, /one QiYan process.*data directory/isu);
+  assert.match(guide, /recognized QiYan database.*full `PRAGMA integrity_check`.*before.*chat adapters/isu);
+  assert.match(guide, /stop QiYan.*bot\.sqlite3.*-wal.*-shm.*-journal.*together/isu);
+  assert.match(guide, /SQLite online backup API/iu);
+  assert.doesNotMatch(guide, /recover-dashboard-metadata/u);
+  assert.match(guide, /automatically.*private backup.*rebuilds only.*dashboard metadata.*before.*chat adapters/isu);
+  assert.match(guide, /authoritative.*unreadable.*stops safely/isu);
+  assert.match(guide, /does not need periodic shutdowns/iu);
+  assert.match(guide, /NFS.*lock.*sync.*depend/isu);
+  assert.doesNotMatch(guide, /NFS (?:is|filesystem is) (?:fully |completely )?safe/iu);
 });
 
 test("SSH worker guides document supported endpoints and the source-checkout fixture", async () => {

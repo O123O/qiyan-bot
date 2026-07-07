@@ -45,6 +45,7 @@ test("formats useful top-level and command-specific help", () => {
   assert.match(root, /Usage:\n  qiyan-bot \[--home <path>\] \[--workdir <path>\]/u);
   assert.match(root, /qiyan-bot assistant-login \[--home <path>\]/u);
   assert.match(root, /qiyan-bot service <action>/u);
+  assert.doesNotMatch(root, /recover-dashboard-metadata/u);
   assert.match(root, /starts the long-lived bot in the foreground/u);
   assert.match(root, /-h, --help/u);
   assert.match(root, /Requires Node\.js 24 or newer\./u);
@@ -76,6 +77,7 @@ test("rejects missing, repeated, and unknown CLI arguments", () => {
   assert.throws(() => parseCliArgs(["service", "unknown-secret"]), /unknown service action/);
   assert.throws(() => parseCliArgs(["service", "start", "--home", "/srv/qiyan"]), /unknown argument/);
   assert.throws(() => parseCliArgs(["service", "install", "--workdir", "/srv/qiyan"]), /unknown argument/);
+  assert.throws(() => parseCliArgs(["recover-dashboard-metadata"]), /unknown argument/);
 });
 
 test("does not echo an unknown argument into a startup error", () => {

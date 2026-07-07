@@ -158,6 +158,8 @@ The assistant also does not inherit home-scoped user skills. Put assistant-only 
 
 This is the v0.3 fresh QiYan state format. State created before v0.3.0 is rejected without migration or mutation. Do not use the generic updater for that first transition: follow the [required destructive fresh-cutover guide](docs/upgrading-to-v0.3.md). Stop the process and back up the data directory plus external assistant workdir together; the assistant profile contains secrets.
 
+SQLite durability, NFS constraints, database backups, and automatic dashboard-metadata recovery are documented in [SQLite durability and recovery](docs/sqlite.md).
+
 ## Attachments and recovery
 
 Inbound files are streamed into a private quota-limited store. Outbound project files are opened beneath a managed root with Linux no-follow checks and snapshotted before upload. Absolute outbound paths, traversal, symlinks, special files, and oversized content are rejected.
