@@ -15,6 +15,7 @@ import {
 
 test("renders a secret-free foreground user unit with safely quoted paths", () => {
   const unit = renderSystemdUserUnit({
+    nodeExecutable: "/home/user/Node Runtime/node%24",
     executable: "/home/user/My Bin/qiyan%bot",
     qiyanHome: "/home/user/QiYan Home",
   });
@@ -22,14 +23,15 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   assert.match(unit, /Type=simple/u);
   assert.match(unit, /WorkingDirectory=\/home\/user\/QiYan Home/u);
   assert.doesNotMatch(unit, /WorkingDirectory="/u);
-  assert.match(unit, /ExecStart="\/home\/user\/My Bin\/qiyan%%bot" --home "\/home\/user\/QiYan Home"/u);
+  assert.match(unit, /ExecStart="\/home\/user\/Node Runtime\/node%%24" "\/home\/user\/My Bin\/qiyan%%bot" --home "\/home\/user\/QiYan Home"/u);
   assert.match(unit, /Restart=on-failure/u);
   assert.match(unit, /TimeoutStopSec=30s/u);
   assert.match(unit, /UMask=0077/u);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);
-  assert.throws(() => renderSystemdUserUnit({ executable: "relative", qiyanHome: "/home/user/.qiyan-bot" }), /absolute/u);
-  assert.throws(() => renderSystemdUserUnit({ executable: "/bin/qiyan\nExecStart=/bin/evil", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
-  assert.throws(() => renderSystemdUserUnit({ executable: "/home/user/$work/qiyan-bot", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
+  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "relative", executable: "/bin/qiyan", qiyanHome: "/home/user/.qiyan-bot" }), /absolute/u);
+  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "relative", qiyanHome: "/home/user/.qiyan-bot" }), /absolute/u);
+  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "/bin/qiyan\nExecStart=/bin/evil", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
+  assert.throws(() => renderSystemdUserUnit({ nodeExecutable: "/usr/bin/node", executable: "/home/user/$work/qiyan-bot", qiyanHome: "/home/user/.qiyan-bot" }), /unsupported characters/u);
 });
 
 test("service-effective validation removes every environment value unset by the unit", () => {
@@ -60,6 +62,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
   };
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner,
     journalRunner: async (args) => { journalCalls.push([...args]); return { code: 0, signal: null, stdout: "safe journal output\n" }; },
@@ -80,7 +83,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
   assert.equal(await service.execute("uninstall"), "Stopped and removed qiyan-bot.service.\n");
   assert.equal(writes.length, 1);
   assert.equal(writes[0]?.path, "/home/user/.config/systemd/user/qiyan-bot.service");
-  assert.match(writes[0]?.contents ?? "", /ExecStart="\/home\/user\/\.local\/bin\/qiyan-bot"/u);
+  assert.match(writes[0]?.contents ?? "", /ExecStart="\/usr\/bin\/node" "\/home\/user\/\.local\/bin\/qiyan-bot"/u);
   assert.deepEqual(removals, ["/home/user/.config/systemd/user/qiyan-bot.service"]);
   assert.deepEqual(journalCalls, [["--user", "--unit", "qiyan-bot.service", "--lines", "100", "--no-pager", "--output", "short-iso"]]);
   assert.deepEqual(calls, [
@@ -100,6 +103,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
 test("systemctl failures are actionable without returning command output", async () => {
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async () => ({ code: 1, signal: null, stdout: "secret-token\n" }),
     unitStore: { withOperationLease: async (operation) => operation(), install: async () => undefined, verifyManaged: async () => true, remove: async () => undefined },
@@ -116,6 +120,7 @@ test("read-only status and logs remain available when a stale operation lock exi
   let leaseCalls = 0;
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async (args) => args[0] === "is-active"
       ? { code: 0, signal: null, stdout: "active\n" }
@@ -136,6 +141,7 @@ test("read-only status and logs remain available when a stale operation lock exi
 test("status rejects an unrecognized failed probe instead of reporting unknown health", async () => {
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async () => ({ code: 1, signal: null, stdout: "secret-token\n" }),
     unitStore: { withOperationLease: async (operation) => operation(), install: async () => undefined, verifyManaged: async () => true, remove: async () => undefined },
@@ -150,6 +156,7 @@ test("status rejects an unrecognized failed probe instead of reporting unknown h
 test("status reports documented nonzero systemd enabled states", async () => {
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async (args) => args[0] === "is-active"
       ? { code: 3, signal: null, stdout: "inactive\n" }
@@ -163,6 +170,7 @@ test("uninstall is idempotent and reloads systemd after an already-removed unit"
   const calls: string[][] = [];
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async (args) => { calls.push([...args]); return { code: 0, signal: null, stdout: "" }; },
     unitStore: {
@@ -180,6 +188,7 @@ test("uninstall verifies unit ownership before changing systemd state", async ()
   const calls: string[][] = [];
   const service = new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     runner: async (args) => { calls.push([...args]); return { code: 0, signal: null, stdout: "" }; },
     unitStore: {
@@ -196,6 +205,7 @@ test("uninstall verifies unit ownership before changing systemd state", async ()
 test("rejects a custom XDG config home instead of writing outside systemd's search path", () => {
   assert.throws(() => new SystemdUserService({
     userHome: "/home/user",
+    nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
     env: { XDG_CONFIG_HOME: "/home/user/custom-config" },
     runner: async () => ({ code: 0, signal: null, stdout: "" }),
