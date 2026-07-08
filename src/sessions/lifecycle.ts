@@ -243,13 +243,25 @@ export class SessionLifecycle {
     }
   }
 
-  async reconcileManaged(nickname: string, expected: RegistrySession, existingLease?: EndpointWorkLease): Promise<ThreadResponse> {
+  async reconcileManaged(
+    nickname: string,
+    expected: RegistrySession,
+    existingLease?: EndpointWorkLease,
+    canPublish: () => boolean = () => true,
+  ): Promise<ThreadResponse> {
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const assertCurrent = (): void => {
+        if (!canPublish()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery generation changed before publication");
+      };
+      assertCurrent();
       const session = this.assertExact(nickname, expected, "managed");
       const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
+      assertCurrent();
       await this.assertDispatchable(session.endpoint, project, lease);
+      assertCurrent();
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
+      assertCurrent();
       if (guarded?.state === "external") {
         throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
       }
@@ -259,15 +271,25 @@ export class SessionLifecycle {
         });
       }
       const before = await this.read(session.endpoint, session.thread_id, lease);
+      assertCurrent();
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
-      if (this.ownership) await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);
+      assertCurrent();
+      if (this.ownership) {
+        await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);
+        assertCurrent();
+      }
       this.assertExact(nickname, expected, "managed");
       const resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
+      assertCurrent();
       const afterResume = this.assertExact(nickname, expected, "managed");
       const authoritative = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+      assertCurrent();
       await this.verifyCwd(session.endpoint, authoritative.thread.cwd, project.path, lease);
+      assertCurrent();
       await this.assertDispatchable(session.endpoint, project, lease);
+      assertCurrent();
       const current = this.assertExact(nickname, expected, "managed");
+      assertCurrent();
       this.runtime.setSession(current.endpoint, current.thread_id, current.mapping_id, "managed", authoritative.thread.status.type);
       if (!this.runtime.currentEpoch(current.endpoint, current.thread_id, current.mapping_id)) {
         this.runtime.beginEpoch(current.endpoint, current.thread_id, current.mapping_id, this.baseline(authoritative.thread), this.clock.now());

@@ -13,6 +13,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 import type { EndpointManager } from "../../src/endpoints/manager.ts";
+import { createManagedSessionRecoveryOwner, managedRetryKey } from "../../src/production-app.ts";
 
 class LifecycleEndpoint implements AppServerEndpoint {
   readonly id = "local";
@@ -26,6 +27,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   pathOnStart: string | null | undefined;
   failResume = false;
   onResume: (() => void) | undefined;
+  resumeBarrier: Promise<void> | undefined;
 
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
@@ -39,6 +41,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
     if (method === "thread/read") return { thread } as T;
     if (method === "thread/resume") {
       this.onResume?.();
+      await this.resumeBarrier;
       if (this.failResume) throw new Error("resume response lost");
       return { thread, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
     }
@@ -239,6 +242,70 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.equal(resumed.thread.id, "thread-1");
   assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+});
+
+test("stopping managed recovery while native resume is blocked fences every success publication", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "local", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "blocked-recovery",
+  };
+  const endpoints = {
+    withWorkLease: async <T>(
+      _endpointId: string | undefined,
+      _kind: "rpc" | "session-mutation" | "file-transfer",
+      run: (endpoint: never, current: EndpointWorkLease) => Promise<T>,
+    ): Promise<T> => run(undefined as never, lease),
+    runWithWorkLease: async <T>(
+      _endpointId: string,
+      existing: EndpointWorkLease | undefined,
+      run: (current: EndpointWorkLease | undefined) => Promise<T>,
+    ): Promise<T> => run(existing ?? lease),
+  } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">;
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture(undefined, endpoints);
+  const session = {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
+  };
+  await registry.createManaged("payments", session);
+  runtime.setSession("local", "thread-1", session.mapping_id, "unavailable", "notLoaded");
+  let signalResume!: () => void;
+  let releaseResume!: () => void;
+  const resumeStarted = new Promise<void>((resolve) => { signalResume = resolve; });
+  endpoint.resumeBarrier = new Promise<void>((resolve) => { releaseResume = resolve; });
+  endpoint.onResume = signalResume;
+  let capacityPublications = 0;
+  let dashboardPublications = 0;
+  let observationPublications = 0;
+  const key = managedRetryKey("local", "thread-1", session.mapping_id);
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys, currentLease, isCurrent) => {
+      await lifecycle.reconcileManaged("payments", required(registry), currentLease, isCurrent);
+      if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
+      capacityPublications += 1;
+      dashboardPublications += 1;
+      observationPublications += 1;
+      return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
+    },
+    beforeShared: async () => undefined,
+    wakeShared: async () => undefined,
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("stale recovery must not reach safety handling"),
+    onError: () => undefined,
+  });
+  owner.recordFailure(key, "endpoint");
+
+  const recovering = owner.endpointReady("local", lease);
+  await resumeStarted;
+  const stopping = owner.stop();
+  releaseResume();
+  assert.deepEqual(await recovering, { outcome: "pending" });
+  await stopping;
+
+  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "unavailable");
+  assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id), undefined);
+  assert.equal(capacityPublications, 0);
+  assert.equal(dashboardPublications, 0);
+  assert.equal(observationPublications, 0);
 });
 
 test("managed recovery checks an existing rollout guard before reading native history", async () => {

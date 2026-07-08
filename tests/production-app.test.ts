@@ -19,6 +19,7 @@ import {
   reconcileLifecycleTransitions,
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
+  recoverManagedEndpointReady,
   recoverRemovalOperation,
   recoverableLifecycleEndpointReferences,
   recoverableOperationActivationReferences,
@@ -529,6 +530,22 @@ test("managed recovery uses only source-specific transient and external disposit
   assert.equal(managedRecoveryManagementState("managed", "retry"), "unavailable");
 });
 
+test("managed endpoint-ready composition falls back only when no owner target supplies the shared wake", async () => {
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "ready" };
+  for (const [outcome, expectedFallbacks] of [
+    ["needs_shared_wake", 1],
+    ["pending", 0],
+    ["completed", 0],
+  ] as const) {
+    let fallbacks = 0;
+    const result = await recoverManagedEndpointReady({
+      endpointReady: async () => ({ outcome }),
+    }, "endpoint-a", lease, async () => { fallbacks += 1; });
+    assert.deepEqual(result, { outcome });
+    assert.equal(fallbacks, expectedFallbacks, outcome);
+  }
+});
+
 test("an externally owned managed recovery remains inspectable for the next ownership release tick", async () => {
   const session = {
     endpoint: "endpoint-a", thread_id: "thread-a", project_dir: "/project", mapping_id: "mapping-a", lifecycle_state: "managed" as const,
@@ -588,7 +605,10 @@ test("managed retry owner retries only exact endpoint mappings and wakes downstr
       attempts.push({ endpointId, keys, lease: actualLease });
       return { restored: keys.length > 0, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    onRestored: async (endpointId) => { restored.push(endpointId); },
+    beforeShared: async () => undefined,
+    wakeShared: async (endpointId) => { restored.push(endpointId); },
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => assert.fail("unexpected managed retry error"),
     timers: {
       setTimeout: (callback, delayMs) => {
@@ -643,7 +663,10 @@ test("managed retry owner cancels endpoint timers and fences endpoint loss, gene
       await blocked;
       return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    onRestored: async () => { downstream += 1; },
+    beforeShared: async () => undefined,
+    wakeShared: async () => { downstream += 1; },
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => undefined,
     timers: {
       setTimeout: (callback) => {
@@ -702,7 +725,10 @@ test("managed retry owner rejects a blocked old-generation success and preserves
       }
       return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    onRestored: async (_endpointId, lease) => { downstream.push(lease.leaseId); },
+    beforeShared: async () => undefined,
+    wakeShared: async (_endpointId, lease) => { downstream.push(lease.leaseId); },
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => undefined,
   });
   owner.recordFailure(key, "endpoint");
@@ -727,8 +753,10 @@ test("managed retry retains downstream-only work across failures before and afte
   const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
   const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "ready" };
   let recoveries = 0;
-  let downstream = 0;
+  let beforeCalls = 0;
   let helperCalls = 0;
+  let afterCalls = 0;
+  let fallbackCalls = 0;
   let owner!: ReturnType<typeof createManagedSessionRecoveryOwner>;
   owner = createManagedSessionRecoveryOwner({
     endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
@@ -737,12 +765,16 @@ test("managed retry retains downstream-only work across failures before and afte
       recoveries += 1;
       return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    onRestored: async () => {
-      downstream += 1;
-      if (downstream === 1) throw new RpcRequestTimeoutError("ownership-before-helper");
-      helperCalls += 1;
-      if (downstream === 2) throw new AppError("ENDPOINT_UNAVAILABLE", "ownership-after-helper");
+    beforeShared: async () => {
+      beforeCalls += 1;
+      if (beforeCalls === 1) throw new RpcRequestTimeoutError("ownership-before-helper");
     },
+    wakeShared: async () => { helperCalls += 1; },
+    afterShared: async () => {
+      afterCalls += 1;
+      if (afterCalls === 1) throw new AppError("ENDPOINT_UNAVAILABLE", "ownership-after-helper");
+    },
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => undefined,
     timers: {
       setTimeout: (callback) => {
@@ -755,19 +787,23 @@ test("managed retry retains downstream-only work across failures before and afte
   });
   owner.recordFailure(key, "endpoint");
 
-  const first = await owner.endpointReady("endpoint-a", lease);
-  assert.deepEqual(first, { restored: false });
+  const first = await recoverManagedEndpointReady(owner, "endpoint-a", lease, async () => { fallbackCalls += 1; });
+  assert.deepEqual(first, { outcome: "pending" });
   assert.equal(timers.length, 1, "a classified pre-helper timeout retains a downstream retry");
   timers[0]!.callback();
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  assert.equal(downstream, 2);
+  assert.equal(beforeCalls, 2);
+  assert.equal(helperCalls, 1);
+  assert.equal(afterCalls, 1);
   assert.equal(timers.length, 1, "endpoint loss after helper work sleeps for ready without another timer");
 
-  const final = await owner.endpointReady("endpoint-a", lease);
-  assert.deepEqual(final, { restored: true });
+  const final = await recoverManagedEndpointReady(owner, "endpoint-a", lease, async () => { fallbackCalls += 1; });
+  assert.deepEqual(final, { outcome: "completed" });
   assert.equal(recoveries, 1, "downstream retry never re-runs a healthy managed mapping");
-  assert.equal(downstream, 3);
-  assert.equal(helperCalls, 2, "the first failure precedes helper work and the second follows it");
+  assert.equal(beforeCalls, 2);
+  assert.equal(helperCalls, 1, "post-helper retry does not wake relay or observations again");
+  assert.equal(afterCalls, 2);
+  assert.equal(fallbackCalls, 0, "owner-held work never triggers a duplicate composition fallback");
   await owner.stop();
 });
 
@@ -789,13 +825,16 @@ test("endpoint loss during a blocked downstream wake retains only the downstream
       recoveries += 1;
       return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
     },
-    onRestored: async (_endpointId, lease) => {
+    beforeShared: async () => undefined,
+    wakeShared: async (_endpointId, lease) => {
       downstream.push(lease.leaseId);
       if (lease.leaseId === oldLease.leaseId) {
         signalStarted();
         await blocked;
       }
     },
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => undefined,
   });
   owner.recordFailure(key, "endpoint");
@@ -807,10 +846,65 @@ test("endpoint loss during a blocked downstream wake retains only the downstream
   currentLeaseId = newLease.leaseId;
   const replacement = owner.endpointReady("endpoint-a", newLease);
   release();
-  assert.deepEqual(await oldRun, { restored: false });
-  assert.deepEqual(await replacement, { restored: true });
+  assert.deepEqual(await oldRun, { outcome: "pending" });
+  assert.deepEqual(await replacement, { outcome: "completed" });
   assert.equal(recoveries, 1);
   assert.deepEqual(downstream, [oldLease.leaseId, newLease.leaseId]);
+  await owner.stop();
+});
+
+test("permanent post-helper failure requests safety once without polling or duplicate shared wakes", async () => {
+  type Timer = { callback: () => void };
+  const timers: Timer[] = [];
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "permanent" };
+  let recoveries = 0;
+  let sharedWakes = 0;
+  let afterCalls = 0;
+  let safetyRequests = 0;
+  let failAfter = true;
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => {
+      recoveries += 1;
+      return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
+    },
+    beforeShared: async () => undefined,
+    wakeShared: async () => { sharedWakes += 1; },
+    afterShared: async () => {
+      afterCalls += 1;
+      if (failAfter) throw new Error("permanent downstream failure");
+    },
+    onSafetyFailure: () => { safetyRequests += 1; },
+    onError: () => undefined,
+    timers: {
+      setTimeout: (callback) => {
+        const timer = { callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: () => undefined,
+    },
+  });
+  owner.recordFailure(key, "endpoint");
+
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { outcome: "pending" });
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { outcome: "pending" });
+  assert.equal(recoveries, 1);
+  assert.equal(sharedWakes, 1, "a retained post-helper phase never repeats the shared wake");
+  assert.equal(afterCalls, 2);
+  assert.equal(safetyRequests, 1, "repeated permanent failures request one controlled safety action");
+  assert.equal(timers.length, 0, "permanent downstream failures never poll");
+
+  failAfter = false;
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { outcome: "completed" });
+  owner.recordFailure(key, "endpoint");
+  failAfter = true;
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { outcome: "pending" });
+  assert.equal(safetyRequests, 2, "completion resets the one-shot safety guard for a later incident");
+  assert.equal(sharedWakes, 2);
+  assert.equal(timers.length, 0);
   await owner.stop();
 });
 
@@ -820,6 +914,7 @@ test("a partial managed restore survives another mapping entering endpoint wait"
   const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "partial" };
   const attempts: ManagedRetryKey[][] = [];
   let wakes = 0;
+  let fallbacks = 0;
   const owner = createManagedSessionRecoveryOwner({
     endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
     isLeaseCurrent: () => true,
@@ -829,17 +924,28 @@ test("a partial managed restore survives another mapping entering endpoint wait"
         ? { restored: true, restoredKeys: [keyA], settledKeys: [], failures: [{ key: keyB, disposition: "endpoint" }] }
         : { restored: true, restoredKeys: [keyB], settledKeys: [], failures: [] };
     },
-    onRestored: async () => { wakes += 1; },
+    beforeShared: async () => undefined,
+    wakeShared: async () => { wakes += 1; },
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => undefined,
   });
   owner.recordFailure(keyA, "endpoint");
   owner.recordFailure(keyB, "endpoint");
 
-  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { restored: false });
+  assert.deepEqual(
+    await recoverManagedEndpointReady(owner, "endpoint-a", lease, async () => { fallbacks += 1; }),
+    { outcome: "pending" },
+  );
   assert.equal(wakes, 0);
-  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { restored: true });
+  assert.deepEqual(
+    await recoverManagedEndpointReady(owner, "endpoint-a", lease, async () => { fallbacks += 1; }),
+    { outcome: "completed" },
+  );
   assert.deepEqual(attempts, [[keyA, keyB], [keyB]]);
   assert.equal(wakes, 1);
+  assert.equal(fallbacks, 0, "a partial owner-held restore never duplicates the shared wake");
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { outcome: "needs_shared_wake" }, "both retained keys eventually clear");
   await owner.stop();
 });
 
