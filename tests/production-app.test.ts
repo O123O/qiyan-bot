@@ -36,7 +36,6 @@ import {
   reportAssistantTerminalFailure,
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
-  runAssistantTerminalRecovery,
   settleAssistantTerminalTools,
   runOperationRecoveryTarget,
   runOperationRecoveryChains,
@@ -720,21 +719,87 @@ test("ready endpoint recovery wakes each owner once and reconciles operations af
   assert.deepEqual(calls, ["managed", "relay", "observations", "operations"]);
 });
 
-test("ready endpoint recovery isolates owner failures and still reaches later owners", async () => {
+test("ready endpoint recovery isolates downstream owner failures and still reaches later owners", async () => {
   const calls: string[] = [];
   await recoverReadyEndpointOwners({
-    recoverManaged: async () => { calls.push("managed"); throw new Error("managed failed"); },
+    recoverManaged: async () => {
+      calls.push("managed");
+      return { recovery: "none", sharedWake: "needed" };
+    },
     relay: async () => { calls.push("relay"); throw new Error("relay failed"); },
     observations: async () => { calls.push("observations"); throw new Error("observations failed"); },
     operations: async () => { calls.push("operations"); throw new Error("operations failed"); },
     onError: (owner) => { calls.push(`error:${owner}`); },
   });
   assert.deepEqual(calls, [
-    "managed", "error:managed",
+    "managed",
     "relay", "error:relay",
     "observations", "error:observations",
     "operations", "error:operations",
   ]);
+});
+
+test("ready-generation loss before managed admission escapes the ready buffer without a recovered publication", async () => {
+  const listeners = () => () => undefined;
+  let endpointState: "stopped" | "ready" | "unavailable" = "stopped";
+  const endpoint = {
+    id: "local",
+    get state() { return endpointState; },
+    start: async () => { endpointState = "ready"; },
+    closeConnection: async () => { endpointState = "stopped"; },
+    shutdownRuntime: async () => { endpointState = "stopped"; },
+    runtimeIdentity: async () => ({ kind: "local" as const, pid: 1, startTime: "1" }),
+    request: async () => ({}),
+    onNotification: listeners,
+    onReady: listeners,
+    onUnavailable: listeners,
+    onPermissionBlocked: listeners,
+  };
+  const manager = new EndpointManager({
+    localEndpoint: endpoint as never,
+    catalog: { reload: async () => undefined, require: () => { throw new Error("unexpected remote endpoint"); } },
+    createRemote: async () => { throw new Error("unexpected remote endpoint"); },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+  });
+  await manager.ensureReady("local");
+
+  let managedAdmissions = 0;
+  let recoveredPublications = 0;
+  let restarts = 0;
+  const readyBuffer = createEndpointReadyBuffer({
+    recover: async (endpointId) => {
+      try {
+        await recoverReadyEndpointOwners({
+          recoverManaged: (wakeShared) => manager.withReadyWorkLease(endpointId, async () => {
+            managedAdmissions += 1;
+            await wakeShared();
+            return { recovery: "completed", sharedWake: "completed" };
+          }),
+          relay: async () => undefined,
+          observations: async () => undefined,
+          operations: async () => undefined,
+          onError: () => undefined,
+        });
+        recoveredPublications += 1;
+      } catch (error) {
+        restarts += 1;
+        throw error;
+      }
+    },
+  });
+  readyBuffer.ready("local");
+  endpointState = "unavailable";
+
+  await assert.rejects(
+    readyBuffer.acceptAndDrain(),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE",
+  );
+  assert.deepEqual({ managedAdmissions, recoveredPublications, restarts }, {
+    managedAdmissions: 0,
+    recoveredPublications: 0,
+    restarts: 1,
+  });
 });
 
 test("endpoint loss notifies only the four local recovery owners", () => {
@@ -1621,7 +1686,7 @@ test("worker terminal reconciliation runs outside its endpoint lease after relay
   assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "lease:released", "operations"]);
 });
 
-test("tool settlement and assistant terminalization request explicit operation recovery", async () => {
+test("tool settlement requests explicit operation recovery", async () => {
   let requests = 0;
   const requested = requestOperationRecoveryForAttempt({
     listRecoverable: () => [{ attemptId: "attempt-a" }] as never,
@@ -1633,24 +1698,6 @@ test("tool settlement and assistant terminalization request explicit operation r
   assert.equal(requested, true);
   assert.equal(skipped, false);
   assert.equal(requests, 1);
-
-  const seen: string[] = [];
-  await runAssistantTerminalRecovery({
-    fenceTools: async () => { seen.push("fence"); },
-    reconcileOperations: async () => { seen.push("operations"); },
-    finalize: async () => { seen.push("finalize"); },
-    hasRecoverableOperations: () => true,
-  });
-  assert.deepEqual(seen, ["fence", "operations", "finalize", "operations"]);
-
-  seen.length = 0;
-  await runAssistantTerminalRecovery({
-    fenceTools: async () => { seen.push("fence"); },
-    reconcileOperations: async () => { seen.push("operations"); },
-    finalize: async () => { seen.push("finalize"); },
-    hasRecoverableOperations: () => false,
-  });
-  assert.deepEqual(seen, ["fence", "operations", "finalize"]);
 });
 
 test("assistant terminal tool settlement restarts on timeout and reconciles only after settlement", async () => {

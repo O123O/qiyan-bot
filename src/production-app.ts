@@ -583,18 +583,6 @@ export function requestOperationRecoveryForAttempt(
   return true;
 }
 
-export async function runAssistantTerminalRecovery(dependencies: {
-  fenceTools(): Promise<unknown>;
-  reconcileOperations(): Promise<void>;
-  finalize(): Promise<void>;
-  hasRecoverableOperations(): boolean;
-}): Promise<void> {
-  await dependencies.fenceTools();
-  await dependencies.reconcileOperations();
-  await dependencies.finalize();
-  if (dependencies.hasRecoverableOperations()) await dependencies.reconcileOperations();
-}
-
 export async function settleAssistantTerminalTools(dependencies: {
   fenceTools(): Promise<"settled" | "timed_out">;
   reconcileOperations(): Promise<void>;
@@ -825,9 +813,9 @@ export async function recoverReadyEndpointOwners(options: {
   relay(): Promise<void>;
   observations(): Promise<void>;
   operations(): Promise<void>;
-  onError(owner: "managed" | "relay" | "observations" | "operations", error: unknown): void;
+  onError(owner: "relay" | "observations" | "operations", error: unknown): void;
 }): Promise<void> {
-  const report = (owner: "managed" | "relay" | "observations" | "operations", error: unknown): void => {
+  const report = (owner: "relay" | "observations" | "operations", error: unknown): void => {
     try { options.onError(owner, error); }
     catch { /* Operational reporting must not suppress later owner wakes. */ }
   };
@@ -847,11 +835,9 @@ export async function recoverReadyEndpointOwners(options: {
     return sharedWake;
   };
 
-  let outcome: ManagedEndpointReadyOutcome | undefined;
-  try { outcome = await options.recoverManaged(wakeShared); }
-  catch (error) { report("managed", error); }
+  const outcome = await options.recoverManaged(wakeShared);
   if (sharedWake) await sharedWake;
-  else if (outcome?.sharedWake !== "completed" && outcome?.sharedWake !== "stale") await wakeShared();
+  else if (outcome.sharedWake !== "completed" && outcome.sharedWake !== "stale") await wakeShared();
   await runOwner("operations", options.operations);
 }
 
@@ -3215,10 +3201,12 @@ export async function buildProductionApp(
     if (existing) return existing;
     const recovery = (async () => {
       await reconcileLifecycleState({ endpointId });
+      let recoveredGeneration: number | undefined;
       await recoverReadyEndpointOwners({
-        recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => recoverManagedEndpointReady(
-          managedRecoveryOwner!, endpointId, lease, wakeShared,
-        )),
+        recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => {
+          recoveredGeneration = lease.endpointGeneration;
+          return recoverManagedEndpointReady(managedRecoveryOwner!, endpointId, lease, wakeShared);
+        }),
         relay: () => relay.endpointReady(endpointId),
         observations: () => observations.endpointReady(endpointId),
         operations: () => operationReconciler?.endpointReady(endpointId) ?? Promise.resolve(),
@@ -3226,14 +3214,22 @@ export async function buildProductionApp(
           level: "warn", code: "background_task_failed", component: `endpoint_ready_${owner}_recovery`,
         }),
       });
-      deliveries.prepare({
-        id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
-        kind: "system_warning",
-        binding: currentOwnerBinding(),
-        body: `[system] ${endpointId} app-server reconnected`,
-        mandatory: true,
+      if (recoveredGeneration === undefined) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint recovery did not establish a ready generation: ${endpointId}`);
+      }
+      await endpointManager.withReadyWorkLease(endpointId, async (lease) => {
+        if (lease.endpointGeneration !== recoveredGeneration || !endpointManager.validateReadyWorkLease(lease, endpointId)) {
+          throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint generation changed before recovery publication: ${endpointId}`);
+        }
+        deliveries.prepare({
+          id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
+          kind: "system_warning",
+          binding: currentOwnerBinding(),
+          body: `[system] ${endpointId} app-server reconnected`,
+          mandatory: true,
+        });
+        await renderDashboardSafely();
       });
-      await renderDashboardSafely();
     })().finally(() => { if (projectEndpointRecoveries.get(endpointId) === recovery) projectEndpointRecoveries.delete(endpointId); });
     projectEndpointRecoveries.set(endpointId, recovery);
     return recovery;
@@ -3275,55 +3271,43 @@ export async function buildProductionApp(
       incident: endpointIncident,
       createdAt: Date.now(),
     });
-    if (target.id === assistantEndpoint.id) scheduleReconnect(assistantEndpoint);
+    if (target.id === assistantEndpoint.id) scheduleAssistantReconnect();
     await renderDashboardSafely();
   }
 
-  function scheduleReconnect(target: LocalEndpoint): void {
-    if (stopping || reconnectTimers.has(target.id)) return;
-    const attempt = reconnectAttempts.get(target.id) ?? 0;
+  function scheduleAssistantReconnect(): void {
+    const endpointId = assistantEndpoint.id;
+    if (stopping || reconnectTimers.has(endpointId)) return;
+    const attempt = reconnectAttempts.get(endpointId) ?? 0;
     const delay = Math.min(1_000 * 2 ** attempt, 30_000);
-    reconnectAttempts.set(target.id, attempt + 1);
+    reconnectAttempts.set(endpointId, attempt + 1);
     const timer = setTimeout(() => {
-      reconnectTimers.delete(target.id);
-      void recoverEndpoint(target).catch(() => scheduleReconnect(target));
+      reconnectTimers.delete(endpointId);
+      void recoverAssistantEndpoint().catch(scheduleAssistantReconnect);
     }, delay);
-    reconnectTimers.set(target.id, timer);
+    reconnectTimers.set(endpointId, timer);
     timer.unref?.();
   }
 
-  async function recoverEndpoint(target: LocalEndpoint): Promise<void> {
+  async function recoverAssistantEndpoint(): Promise<void> {
     if (stopping) return;
-    if (target.id === endpoint.id) {
-      await target.start();
-      await reconcileLifecycleState({ endpointId: target.id });
-      await endpointManager.withReadyWorkLease(endpoint.id, async (lease) => {
-        await recoverManagedEndpointReady(
-          managedRecoveryOwner!, endpoint.id, lease,
-          () => wakeRestoredEndpoint(endpoint.id, lease, () => isManagedRecoveryLeaseCurrent(endpoint.id, lease)),
-        );
-      });
-      await operationReconciler?.endpointReady(target.id);
-      await renderDashboardSafely();
-    } else {
-      try {
-        await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
-      } catch (error) {
-        if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
-          recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
-        }
-        throw error;
+    try {
+      await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+    } catch (error) {
+      if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
+        recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
       }
-      await startOrResumeAssistant();
-      await dispatcher.recover();
-      await dispatcher.idle();
-      assistant.hydrateActive();
-      await operationReconciler?.endpointReady(target.id);
-      assistantToolReadiness.ready();
-      schedulerAccepting = true;
+      throw error;
     }
+    await startOrResumeAssistant();
+    await dispatcher.recover();
+    await dispatcher.idle();
+    assistant.hydrateActive();
+    await operationReconciler?.endpointReady(assistantEndpoint.id);
+    assistantToolReadiness.ready();
+    schedulerAccepting = true;
     await endpointReadyBuffer?.acceptAndDrain();
-    reconnectAttempts.set(target.id, 0);
+    reconnectAttempts.set(assistantEndpoint.id, 0);
     await enqueuePendingEvents();
   }
 
