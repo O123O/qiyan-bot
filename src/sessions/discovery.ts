@@ -51,6 +51,7 @@ export class SessionDiscovery {
       offset = cursor.offset;
       rows = JSON.parse(String(record.rows_json)) as DiscoveredSession[];
     } else {
+      this.cleanupExpired();
       rows = await this.fetchAll(query.endpointId, query.cwd, lease);
       if (query.search) {
         const needle = query.search.toLocaleLowerCase();
