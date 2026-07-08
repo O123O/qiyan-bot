@@ -70,7 +70,7 @@ export class SessionDiscovery {
     };
   }
 
-  cleanupExpired(): number {
+  private cleanupExpired(): number {
     return Number(this.db.prepare("DELETE FROM discovery_snapshots WHERE expires_at <= ?").run(this.clock.now()).changes);
   }
 

@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOperationReconciliationLoop,
+  createAttachmentCleanupOwner,
   createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
   createDurableEventWakeBoundary,
   createDurableEventSourceCallbacks,
+  createExternalOwnershipCycleReporter,
   createChatHistoryAction,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRecoveryManagementState,
   managedRetryKey,
   managedSessionNeedsRecovery,
+  markEndpointOwnersUnavailable,
   operationRecoveryAction,
   operationRecoveryFailureDisposition,
   operationRecoveryPreflight,
@@ -22,18 +25,19 @@ import {
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
   recoverManagedEndpointReady,
+  recoverReadyEndpointOwners,
   releaseRestoredOwnershipIncidents,
   recoverRemovalOperation,
   recoverableLifecycleEndpointReferences,
   recoverableOperationActivationReferences,
   recoverableOperationEndpointReferences,
   recoverableOperationTarget,
-  registryReloadPreservesWorkerMappings,
   removalRecoveryDecision,
   reportAssistantTerminalFailure,
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
   runAssistantTerminalRecovery,
+  settleAssistantTerminalTools,
   runOperationRecoveryTarget,
   runOperationRecoveryChains,
   stopRelayRecovery,
@@ -690,6 +694,116 @@ test("managed endpoint-ready composition supplies any shared wake the owner has 
     assert.deepEqual(result, { recovery, sharedWake: expectedSharedWake });
     assert.equal(fallbacks, expectedFallbacks, `${recovery}:${sharedWake}`);
   }
+});
+
+test("ready endpoint recovery wakes each owner once and reconciles operations after shared work", async () => {
+  const calls: string[] = [];
+  let readyLeaseHeld = false;
+  await recoverReadyEndpointOwners({
+    recoverManaged: async (wakeShared) => {
+      calls.push("managed");
+      readyLeaseHeld = true;
+      try {
+        await wakeShared();
+        await wakeShared();
+        return { recovery: "completed", sharedWake: "completed" };
+      } finally { readyLeaseHeld = false; }
+    },
+    relay: async () => { calls.push("relay"); },
+    observations: async () => { calls.push("observations"); },
+    operations: async () => {
+      assert.equal(readyLeaseHeld, false, "endpoint lifecycle recovery runs only after ready work releases");
+      calls.push("operations");
+    },
+    onError: () => assert.fail("unexpected endpoint owner failure"),
+  });
+  assert.deepEqual(calls, ["managed", "relay", "observations", "operations"]);
+});
+
+test("ready endpoint recovery isolates owner failures and still reaches later owners", async () => {
+  const calls: string[] = [];
+  await recoverReadyEndpointOwners({
+    recoverManaged: async () => { calls.push("managed"); throw new Error("managed failed"); },
+    relay: async () => { calls.push("relay"); throw new Error("relay failed"); },
+    observations: async () => { calls.push("observations"); throw new Error("observations failed"); },
+    operations: async () => { calls.push("operations"); throw new Error("operations failed"); },
+    onError: (owner) => { calls.push(`error:${owner}`); },
+  });
+  assert.deepEqual(calls, [
+    "managed", "error:managed",
+    "relay", "error:relay",
+    "observations", "error:observations",
+    "operations", "error:operations",
+  ]);
+});
+
+test("endpoint loss notifies only the four local recovery owners", () => {
+  const calls: string[] = [];
+  markEndpointOwnersUnavailable({
+    relay: { endpointUnavailable: (endpointId) => { calls.push(`relay:${endpointId}`); } },
+    observations: { endpointUnavailable: (endpointId) => { calls.push(`observations:${endpointId}`); } },
+    managed: { endpointUnavailable: (endpointId) => { calls.push(`managed:${endpointId}`); } },
+    operations: { endpointUnavailable: (endpointId) => { calls.push(`operations:${endpointId}`); } },
+  }, "endpoint-a");
+  assert.deepEqual(calls, [
+    "relay:endpoint-a", "observations:endpoint-a", "managed:endpoint-a", "operations:endpoint-a",
+  ]);
+});
+
+test("external ownership degradation warns on the third failed cycle and resets after success", () => {
+  const warnings: string[] = [];
+  const reportCycle = createExternalOwnershipCycleReporter({
+    runId: "ownership-test",
+    onOperational: () => undefined,
+    onDegraded: (notice) => { warnings.push(notice.id); },
+  });
+  const failed = [{ endpointId: "endpoint-a", outcome: "failed" as const }];
+  const succeeded = [{ endpointId: "endpoint-a", outcome: "succeeded" as const }];
+  const inconclusive = [{ endpointId: "endpoint-a", outcome: "inconclusive" as const }];
+
+  reportCycle(failed);
+  reportCycle(failed);
+  reportCycle(failed);
+  reportCycle(failed);
+  reportCycle(inconclusive);
+  assert.deepEqual(warnings, ["background-failure:ownership-test:1"]);
+  reportCycle(succeeded);
+  reportCycle(failed);
+  reportCycle(failed);
+  reportCycle(failed);
+  assert.deepEqual(warnings, ["background-failure:ownership-test:1", "background-failure:ownership-test:2"]);
+});
+
+test("production attachment cleanup reports bounded metadata and keeps its daily retry after a throwing sink", async () => {
+  type Timer = { callback: () => void; delay: number };
+  const timers: Timer[] = [];
+  const reports: unknown[] = [];
+  const db = createTestDatabase();
+  let attempts = 0;
+  const cleanup = createAttachmentCleanupOwner(
+    async () => { attempts += 1; throw new Error("private attachment path"); },
+    (event) => { reports.push(event); throw new Error("private reporting failure"); },
+    {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay };
+        timers.push(timer);
+        return timer as never;
+      },
+      clearTimeout: () => undefined,
+    },
+  );
+
+  await cleanup.start();
+  assert.equal(attempts, 1);
+  assert.deepEqual(reports, [{ level: "warn", code: "background_task_failed", component: "attachment_cleanup" }]);
+  assert.equal(timers[0]?.delay, 24 * 60 * 60_000);
+  timers.shift()!.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(attempts, 2);
+  assert.equal(reports.length, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM deliveries").get()!.count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events").get()!.count, 0);
+  await cleanup.stop();
 });
 
 test("managed pending failures still wake unrelated shared owners exactly once per ready generation", async () => {
@@ -1539,6 +1653,24 @@ test("tool settlement and assistant terminalization request explicit operation r
   assert.deepEqual(seen, ["fence", "operations", "finalize"]);
 });
 
+test("assistant terminal tool settlement restarts on timeout and reconciles only after settlement", async () => {
+  const timedOut: string[] = [];
+  assert.equal(await settleAssistantTerminalTools({
+    fenceTools: async () => { timedOut.push("fence"); return "timed_out"; },
+    reconcileOperations: async () => { timedOut.push("operations"); },
+    requestRestartOnce: () => { timedOut.push("restart"); },
+  }), false);
+  assert.deepEqual(timedOut, ["fence", "restart"]);
+
+  const settled: string[] = [];
+  assert.equal(await settleAssistantTerminalTools({
+    fenceTools: async () => { settled.push("fence"); return "settled"; },
+    reconcileOperations: async () => { settled.push("operations"); },
+    requestRestartOnce: () => { settled.push("restart"); },
+  }), true);
+  assert.deepEqual(settled, ["fence", "operations"]);
+});
+
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
   assert.equal(isUncertainAssistantTransportFailure(new Error("ordinary failure"), "ready"), false);
@@ -1598,24 +1730,6 @@ test("removal recovery follows the checkpointed mapping generation across crash 
   assert.equal(removalRecoveryDecision("archive_session", archived, undefined), "succeeded");
   assert.equal(removalRecoveryDecision("archive_session", archived, { ...saved, mapping_id: "mapping-new", lifecycle_state: "managed" }), "succeeded");
   assert.equal(removalRecoveryDecision("archive_session", undefined, undefined), "no_effect");
-});
-
-test("live registry reload permits metadata edits but rejects every worker lifecycle mutation", () => {
-  const worker = { endpoint: "local", thread_id: "t1", project_dir: "/project", mapping_id: "mapping-1", lifecycle_state: "managed" as const };
-  const current = { version: 3 as const, assistant: { endpoint: "assistant", thread_id: "a1", project_dir: "/assistant" }, sessions: { worker } };
-  assert.equal(registryReloadPreservesWorkerMappings(current, {
-    ...current,
-    assistant: { ...current.assistant, description: "updated metadata" },
-  }), true);
-  assert.equal(registryReloadPreservesWorkerMappings(current, { ...current, sessions: {} }), false);
-  assert.equal(registryReloadPreservesWorkerMappings(current, {
-    ...current,
-    sessions: { worker: { ...worker, lifecycle_state: "archiving" } },
-  }), false);
-  assert.equal(registryReloadPreservesWorkerMappings(current, {
-    ...current,
-    sessions: { worker: { ...worker, mapping_id: "mapping-2" } },
-  }), false);
 });
 
 test("production chat history resolves the immutable assistant-attempt binding", async () => {
@@ -1765,7 +1879,7 @@ test("recovery-owner cleanup settles later owners after an earlier cleanup fails
   assert.deepEqual(seen, ["relay", "observations", "operations", "dispatcher", "dashboard"]);
 });
 
-test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {
+test("lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {
   const seen: unknown[] = [];
   const onError = async () => undefined;
   await reconcileLifecycleTransitions({
@@ -1828,7 +1942,7 @@ test("startup and reconnect reconciliation hold one endpoint generation lease ac
   ]);
 });
 
-test("periodic managed recovery retries a session left unavailable by a transient ownership boundary", () => {
+test("managed recovery retains a session left unavailable by a transient ownership boundary", () => {
   assert.equal(managedSessionNeedsRecovery({ managementState: "unavailable" }, true), true);
   assert.equal(managedSessionNeedsRecovery({ managementState: "managed" }, true), false);
   assert.equal(managedSessionNeedsRecovery(undefined, true), false);

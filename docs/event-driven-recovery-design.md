@@ -2,7 +2,7 @@
 
 ## Status
 
-Deep-review approved; pending user review.
+Implemented; final review and live verification pending.
 
 ## Problem
 

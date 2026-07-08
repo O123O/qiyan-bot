@@ -4,6 +4,7 @@ import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
+import { AttachmentCleanup, type CleanupTimers } from "./attachments/cleanup.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
 import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
 import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
@@ -45,13 +46,15 @@ import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, ToolReadinessGate } from "./mcp/server.ts";
-import { SessionRegistry, type RegistryDocument, type RegistrySession } from "./registry/session-registry.ts";
+import { SessionRegistry, type RegistrySession } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
 import {
+  ExternalOwnershipMonitor,
   SessionOwnershipWatcher,
+  type ExternalOwnershipCycleResult,
   type ExternalOwnershipReleaseStatus,
   type ExternalTurnIncident,
 } from "./sessions/ownership-watcher.ts";
@@ -68,7 +71,7 @@ import { ConversationStore, type ChatAcceptanceEffects } from "./storage/convers
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore, type RecoverableOperation } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
-import { isDashboardMetadataRecoveryRequired, SessionDashboardStore } from "./storage/session-dashboard-store.ts";
+import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
 import { SlackChatAdapter } from "./slack/chat-adapter.ts";
@@ -100,9 +103,7 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
 const scheduledFailureThreshold = 3;
-const maintenanceFailureEpisode = "maintenance";
-const projectReconciliationFailureEpisode = "periodic-project-reconciliation";
-const managedRecoveryFailureEpisode = "periodic-managed-session-recovery";
+const externalOwnershipFailureEpisode = "external-ownership-detection";
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
@@ -114,6 +115,49 @@ export function reportAssistantTerminalFailure(
 ): void {
   try { report(); }
   finally { dispatcher?.requestRecovery(); }
+}
+
+export function createAttachmentCleanupOwner(
+  cleanup: () => Promise<number>,
+  report: OperationalEventSink,
+  timers?: CleanupTimers,
+): AttachmentCleanup {
+  return new AttachmentCleanup(
+    cleanup,
+    () => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "attachment_cleanup",
+    }),
+    timers,
+  );
+}
+
+export function createExternalOwnershipCycleReporter(options: {
+  runId?: string;
+  onOperational(): void;
+  onDegraded(notice: BackgroundFailureNotice): void;
+}): (results: readonly ExternalOwnershipCycleResult[]) => void {
+  const reporter = createBackgroundFailureReporter({
+    ...(options.runId ? { runId: options.runId } : {}),
+    onOperational: () => { options.onOperational(); },
+    onDurable: options.onDegraded,
+  });
+  return (results) => {
+    const cycle = createFailureCycle({
+      onFailed: () => {
+        reporter.report("external session ownership detection", {
+          episode: externalOwnershipFailureEpisode,
+          notifyAfter: scheduledFailureThreshold,
+        });
+      },
+      onResolved: () => { reporter.resolve(externalOwnershipFailureEpisode); },
+    });
+    for (const result of results) {
+      if (result.outcome === "failed") cycle.failed();
+      else if (result.outcome === "inconclusive") cycle.inconclusive();
+      else cycle.succeeded();
+    }
+    cycle.finish();
+  };
 }
 
 export type OperationRecoveryAction = "wait_for_tool" | "attempt";
@@ -551,6 +595,31 @@ export async function runAssistantTerminalRecovery(dependencies: {
   if (dependencies.hasRecoverableOperations()) await dependencies.reconcileOperations();
 }
 
+export async function settleAssistantTerminalTools(dependencies: {
+  fenceTools(): Promise<"settled" | "timed_out">;
+  reconcileOperations(): Promise<void>;
+  requestRestartOnce(): void;
+}): Promise<boolean> {
+  if (await dependencies.fenceTools() === "timed_out") {
+    dependencies.requestRestartOnce();
+    return false;
+  }
+  await dependencies.reconcileOperations();
+  return true;
+}
+
+export function markEndpointOwnersUnavailable(dependencies: {
+  relay: Pick<EventRelay, "endpointUnavailable">;
+  observations: Pick<SessionObservationProcessor, "endpointUnavailable">;
+  managed: Pick<ManagedSessionRecoveryOwner, "endpointUnavailable">;
+  operations: { endpointUnavailable(endpointId: string): void };
+}, endpointId: string): void {
+  dependencies.relay.endpointUnavailable(endpointId);
+  dependencies.observations.endpointUnavailable(endpointId);
+  dependencies.managed.endpointUnavailable(endpointId);
+  dependencies.operations.endpointUnavailable(endpointId);
+}
+
 export interface DurableEventWakeBoundary {
   wakeAfterDurableCommit(inserted: boolean): Promise<void>;
   requestRestartOnce(): void;
@@ -694,10 +763,6 @@ export async function recoverRemovalOperation(options: {
   return decision;
 }
 
-export function registryReloadPreservesWorkerMappings(current: RegistryDocument, candidate: RegistryDocument): boolean {
-  return isDeepStrictEqual(current.sessions, candidate.sessions);
-}
-
 export function managedSessionNeedsRecovery(
   state: { managementState: ManagementState } | undefined,
   unavailableOnly: boolean,
@@ -753,6 +818,41 @@ export interface ManagedSessionRecoveryBatchResult {
 export interface ManagedEndpointReadyOutcome {
   recovery: "none" | "pending" | "completed";
   sharedWake: "needed" | "completed" | "stale";
+}
+
+export async function recoverReadyEndpointOwners(options: {
+  recoverManaged(wakeShared: () => Promise<void>): Promise<ManagedEndpointReadyOutcome>;
+  relay(): Promise<void>;
+  observations(): Promise<void>;
+  operations(): Promise<void>;
+  onError(owner: "managed" | "relay" | "observations" | "operations", error: unknown): void;
+}): Promise<void> {
+  const report = (owner: "managed" | "relay" | "observations" | "operations", error: unknown): void => {
+    try { options.onError(owner, error); }
+    catch { /* Operational reporting must not suppress later owner wakes. */ }
+  };
+  const runOwner = async (
+    owner: "relay" | "observations" | "operations",
+    action: () => Promise<void>,
+  ): Promise<void> => {
+    try { await action(); }
+    catch (error) { report(owner, error); }
+  };
+  let sharedWake: Promise<void> | undefined;
+  const wakeShared = (): Promise<void> => {
+    sharedWake ??= (async () => {
+      await runOwner("relay", options.relay);
+      await runOwner("observations", options.observations);
+    })();
+    return sharedWake;
+  };
+
+  let outcome: ManagedEndpointReadyOutcome | undefined;
+  try { outcome = await options.recoverManaged(wakeShared); }
+  catch (error) { report("managed", error); }
+  if (sharedWake) await sharedWake;
+  else if (outcome?.sharedWake !== "completed" && outcome?.sharedWake !== "stale") await wakeShared();
+  await runOwner("operations", options.operations);
 }
 
 export type ManagedOwnershipIncidentReceipt = ExternalTurnIncident;
@@ -1179,25 +1279,6 @@ export async function reconcileLifecycleAndOwnership(
   return ownershipEvents.reconcileReleased(registry);
 }
 
-export function createMaintenanceFailureHandler(options: {
-  requestRestart(): void;
-  reportRecoveryRequired(): void;
-  reportRetryableFailure(): void;
-}): (error: unknown) => void {
-  let restartRequested = false;
-  return (error) => {
-    if (!isDashboardMetadataRecoveryRequired(error)) {
-      options.reportRetryableFailure();
-      return;
-    }
-    if (restartRequested) return;
-    restartRequested = true;
-    try { options.reportRecoveryRequired(); }
-    catch { /* Operational reporting cannot prevent a required restart. */ }
-    options.requestRestart();
-  };
-}
-
 export async function reconcileOwnershipBeforeRelay(
   ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">,
   relay: Pick<EventRelay, "reconcileEndpoint">,
@@ -1311,6 +1392,7 @@ export async function buildProductionApp(
   let dashboard!: SessionDashboard;
   let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
+  let attachmentCleanup!: AttachmentCleanup;
   let operations!: OperationStore;
   let deliveries!: DeliveryStore;
   let backgroundFailures!: BackgroundFailureStore;
@@ -1327,6 +1409,7 @@ export async function buildProductionApp(
   let ownership!: SessionOwnershipGuard;
   let ownershipEvents!: OwnershipEventStore;
   let ownershipWatcher!: SessionOwnershipWatcher;
+  let externalOwnershipMonitor!: ExternalOwnershipMonitor;
   let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
   let workspaceRouter!: WorkspaceRouter;
@@ -1362,7 +1445,6 @@ export async function buildProductionApp(
   const assistantToolReadiness = new ToolReadinessGate();
   let endpointIncident = 0;
   let stopping = false;
-  let registryInvalid = false;
   let endpointsCommitted = false;
   let operationReconciler: OperationReconciliationLoop | undefined;
   let managedRecoveryOwner: ManagedSessionRecoveryOwner | undefined;
@@ -1413,10 +1495,21 @@ export async function buildProductionApp(
     },
     onDurable: durableEventSources.backgroundFailure,
   });
-  const handleMaintenanceFailure = createMaintenanceFailureHandler({
-    requestRestart: requestRestartOnce,
-    reportRecoveryRequired: () => { report({ level: "warn", code: "database_metadata_recovery_required" }); },
-    reportRetryableFailure: () => { recordScheduledBackgroundFailure("maintenance", maintenanceFailureEpisode); },
+  const reportExternalOwnershipCycle = createExternalOwnershipCycleReporter({
+    onOperational: () => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "external_ownership_detection",
+    }),
+    onDegraded: (notice) => {
+      const identity = registry.snapshot().assistant;
+      backgroundFailures.recordExternalOwnershipDegraded({
+        id: notice.id,
+        incident: notice.incident,
+        endpointId: identity.endpoint,
+        threadId: identity.thread_id,
+        binding: currentOwnerBinding(),
+      });
+      void wakeAfterDurableCommit(true);
+    },
   });
   const acquireStateLease = options.storage?.acquireDatabaseLease ?? acquireDatabaseLease;
   const openStateDatabase = options.storage?.openDatabase ?? openDatabase;
@@ -1566,7 +1659,9 @@ export async function buildProductionApp(
       start: async () => {
         attachments = new AttachmentStore(db, join(dataDir, "attachments"), { maxFileBytes: config.attachmentMaxBytes, maxStoreBytes: config.attachmentStoreMaxBytes });
         await attachments.initialize();
-      }, stop: async () => undefined,
+        attachmentCleanup = createAttachmentCleanupOwner(() => attachments.cleanupExpired(), report);
+        await attachmentCleanup.start();
+      }, stop: async () => { await attachmentCleanup.stop(); },
     },
     {
       name: "chat-adapters",
@@ -1863,6 +1958,30 @@ export async function buildProductionApp(
             await renderDashboardSafely();
           },
         }, threadGate);
+        externalOwnershipMonitor = new ExternalOwnershipMonitor({
+          endpointIds: () => [...new Set([
+            ...Object.values(registry.snapshot().sessions)
+              .filter((session) => session.lifecycle_state === "managed" || session.lifecycle_state === "unadopting")
+              .map((session) => session.endpoint),
+            ...ownershipEvents.pending().map((incident) => incident.endpoint),
+          ])],
+          pending: (endpointId) => ownershipEvents.pending(endpointId),
+          withReadyEndpointWorkLease: (endpointId, run) => endpointManager.withReadyWorkLease(endpointId, run),
+          resumeRemoval: async (incident, lease) => {
+            const current = registry.get(incident.nickname);
+            const exact = current?.endpoint === incident.endpoint
+              && current.thread_id === incident.thread_id
+              && current.mapping_id === incident.mapping_id;
+            if (exact && current.lifecycle_state === "managed") {
+              await ownershipWatcher.release([incident], lease);
+            } else if (exact && current.lifecycle_state === "unadopting") {
+              await lifecycle.reconcileRemoval(incident.nickname, current, lease);
+            }
+            await durableEventSources.reconcileOwnership();
+          },
+          inspectAndRelease: (endpointId, lease) => ownershipWatcher.reconcileEndpoint(endpointId, lease),
+          onCycle: reportExternalOwnershipCycle,
+        });
         managedRecoveryOwner = createManagedSessionRecoveryOwner({
           endpoints: endpointManager,
           isLeaseCurrent: isManagedRecoveryLeaseCurrent,
@@ -2018,9 +2137,9 @@ export async function buildProductionApp(
         assistantToolReadiness.stop();
         schedulerAccepting = false;
         assistant.fenceToolAdmission();
+        await assistant.waitForTools();
         const active = assistant.current();
         if (active && !active.turnId.startsWith("pending:")) {
-          await assistant.fenceTools(active.attemptId, 1_000);
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([
             pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined),
@@ -2028,7 +2147,6 @@ export async function buildProductionApp(
           ]);
           if (interruptTimer) clearTimeout(interruptTimer);
         }
-        await assistant.waitForTools();
         await dispatcher.stop();
       },
     },
@@ -2050,7 +2168,11 @@ export async function buildProductionApp(
       },
       stop: async () => { await deliveryWorker.stop(); },
     },
-    { name: "maintenance", start: async () => undefined, stop: async () => undefined },
+    {
+      name: "external-ownership-watcher",
+      start: async () => { await externalOwnershipMonitor.start(); },
+      stop: async () => { await externalOwnershipMonitor.stop(); },
+    },
     {
       name: "chat-ingress",
       start: async () => {
@@ -2496,7 +2618,12 @@ export async function buildProductionApp(
     const requestReadyRecovery = (): void => {
       if (!current()) return;
       const recovery = endpointReadyBuffer?.ready(target.id);
-      if (recovery) runBackground(() => recovery, () => recordBackgroundFailure("project ready reconciliation"));
+      if (recovery) runBackground(() => recovery, () => {
+        reportOperationalSafely(report, {
+          level: "warn", code: "background_task_failed", component: "project_ready_safety",
+        });
+        requestRestartOnce();
+      });
     };
     const subscriptions = [
       target.onNotification((method, params) => {
@@ -2562,24 +2689,26 @@ export async function buildProductionApp(
     if (conversations.membersForAttempt(attemptBefore.attemptId)
       .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state))) return;
     assistant.beginTerminalizing(params.turn.id);
-    await runAssistantTerminalRecovery({
+    const settled = await settleAssistantTerminalTools({
       fenceTools: () => assistant.fenceTools(attemptBefore.attemptId, 1_000),
       reconcileOperations,
-      finalize: async () => {
-        const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-        const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
-        const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
-        const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
-        assistant.handleTerminal(
-          turn.id,
-          isTerminalStatus(turn.status) ? turn.status : "failed",
-          messages.map((message) => message.body).join("\n") || undefined,
-          turn.error,
-        );
-        for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
-      },
-      hasRecoverableOperations: () => operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId),
+      requestRestartOnce,
     });
+    if (!settled) return;
+    const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
+    const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
+    const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
+    const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
+    assistant.handleTerminal(
+      turn.id,
+      isTerminalStatus(turn.status) ? turn.status : "failed",
+      messages.map((message) => message.body).join("\n") || undefined,
+      turn.error,
+    );
+    for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
+    if (operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId)) {
+      await reconcileOperations();
+    }
     await enqueuePendingEvents();
     await dispatcher.enqueueInternal("terminal");
   }
@@ -3086,13 +3215,17 @@ export async function buildProductionApp(
     if (existing) return existing;
     const recovery = (async () => {
       await reconcileLifecycleState({ endpointId });
-      await endpointManager.withReadyWorkLease(endpointId, async (lease) => {
-        await recoverManagedEndpointReady(
-          managedRecoveryOwner!, endpointId, lease,
-          () => wakeRestoredEndpoint(endpointId, lease, () => isManagedRecoveryLeaseCurrent(endpointId, lease)),
-        );
+      await recoverReadyEndpointOwners({
+        recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => recoverManagedEndpointReady(
+          managedRecoveryOwner!, endpointId, lease, wakeShared,
+        )),
+        relay: () => relay.endpointReady(endpointId),
+        observations: () => observations.endpointReady(endpointId),
+        operations: () => operationReconciler?.endpointReady(endpointId) ?? Promise.resolve(),
+        onError: (owner) => reportOperationalSafely(report, {
+          level: "warn", code: "background_task_failed", component: `endpoint_ready_${owner}_recovery`,
+        }),
       });
-      await operationReconciler?.endpointReady(endpointId);
       deliveries.prepare({
         id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
         kind: "system_warning",
@@ -3108,13 +3241,15 @@ export async function buildProductionApp(
 
   async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
-    relay.endpointUnavailable(target.id);
-    observations.endpointUnavailable(target.id);
-    managedRecoveryOwner?.endpointUnavailable(target.id);
+    markEndpointOwnersUnavailable({
+      relay,
+      observations,
+      managed: managedRecoveryOwner!,
+      operations: operationReconciler!,
+    }, target.id);
     endpointIncident += 1;
     if (target.id === assistantEndpoint.id) endpointReadyBuffer?.pause();
     pool.markEndpointUnavailable(target.id, kind);
-    operationReconciler?.endpointUnavailable(target.id);
     for (const session of runtime.listSessions()) {
       if (session.endpointId === target.id && session.managementState === "managed") {
         runtime.setSession(session.endpointId, session.threadId, session.mappingId, "unavailable", "notLoaded");
@@ -3244,95 +3379,7 @@ export async function buildProductionApp(
     backgroundFailureReporter.report(label);
   }
 
-  function recordScheduledBackgroundFailure(label: string, episode: string): void {
-    backgroundFailureReporter.report(label, { episode, notifyAfter: scheduledFailureThreshold });
-  }
-
-  return composeApp(phases, {
-    maintenance: {
-      intervalMs: 60_000,
-      run: runMaintenance,
-      onFailure: handleMaintenanceFailure,
-      onSuccess: () => { backgroundFailureReporter.resolve(maintenanceFailureEpisode); },
-    },
-  });
-
-  async function runMaintenance(): Promise<void> {
-    dashboardStore.assertMetadataHealthy();
-    await attachments.cleanupExpired();
-    discovery.cleanupExpired();
-    await reconcileDeliveryEvents();
-    await reconcileOperations();
-    const managedEndpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))];
-    const projectCycle = createFailureCycle({
-      onFailed: () => { recordScheduledBackgroundFailure("periodic project reconciliation", projectReconciliationFailureEpisode); },
-      onResolved: () => { backgroundFailureReporter.resolve(projectReconciliationFailureEpisode); },
-    });
-    for (const endpointId of managedEndpointIds) {
-      let target: ManagedAppServerEndpoint;
-      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { projectCycle.inconclusive(); continue; }
-      if (target.state !== "ready") { projectCycle.inconclusive(); continue; }
-      try {
-        await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
-          await observations.drain(endpointId);
-        });
-        projectCycle.succeeded();
-      } catch { projectCycle.failed(); }
-    }
-    projectCycle.finish();
-    await renderDashboardSafely();
-    if (assistantEndpoint.state === "ready") {
-      await dispatcher.recover();
-      await enqueuePendingEvents();
-    }
-    if (endpoint.state !== "ready") return;
-    const accepted = await registry.reload(validateRegistryDocument);
-    if (!accepted) {
-      if (!registryInvalid) {
-        deliveries.prepare({
-          id: `registry-invalid:${Date.now()}`,
-          kind: "system_warning",
-          binding: currentOwnerBinding(),
-          body: "[system] sessions.json replacement was rejected; the last valid registry remains active",
-          mandatory: true,
-        });
-      }
-      registryInvalid = true;
-      return;
-    }
-    registryInvalid = false;
-    await reconcileLifecycleState();
-    const managedRecoveryCycle = createFailureCycle({
-      onFailed: () => { recordScheduledBackgroundFailure("periodic managed session recovery", managedRecoveryFailureEpisode); },
-      onResolved: () => { backgroundFailureReporter.resolve(managedRecoveryFailureEpisode); },
-    });
-    for (const endpointId of managedEndpointIds) {
-      let target: ManagedAppServerEndpoint;
-      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { managedRecoveryCycle.inconclusive(); continue; }
-      if (target.state !== "ready") { managedRecoveryCycle.inconclusive(); continue; }
-      try {
-        const result = await resumeManagedSessions(endpointId, { unavailableOnly: true });
-        if (result.restored) await reconcileRestoredEndpoint(endpointId);
-        managedRecoveryCycle.succeeded();
-      }
-      catch { managedRecoveryCycle.failed(); }
-    }
-    managedRecoveryCycle.finish();
-    await reconcileDashboard();
-  }
-
-  async function validateRegistryDocument(document: RegistryDocument): Promise<void> {
-    const currentDocument = registry.snapshot();
-    const currentAssistant = currentDocument.assistant;
-    if (document.assistant.endpoint !== currentAssistant.endpoint || document.assistant.thread_id !== currentAssistant.thread_id || document.assistant.project_dir !== currentAssistant.project_dir) {
-      throw new Error("the live assistant mapping cannot be externally repointed");
-    }
-    if (!registryReloadPreservesWorkerMappings(currentDocument, document)) {
-      throw new Error("worker mappings and lifecycle state are managed by QiYan tools and cannot be edited live");
-    }
-  }
+  return composeApp(phases);
 }
 
 export function createChatHistoryAction(

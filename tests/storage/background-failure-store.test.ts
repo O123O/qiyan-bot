@@ -24,17 +24,17 @@ test("a fresh reporter creates a matching durable pair despite retained incident
     },
   });
 
-  reporter.report("maintenance", { episode: "maintenance" });
-  reporter.report("maintenance", { episode: "maintenance" });
+  reporter.report("example capability", { episode: "example" });
+  reporter.report("example capability", { episode: "example" });
 
   const id = "background-failure:new-run:1";
-  assert.equal(deliveries.get(id)?.body, "[system] maintenance failed; durable reconciliation will retry");
+  assert.equal(deliveries.get(id)?.body, "[system] example capability failed; durable reconciliation will retry");
   const event = db.prepare("SELECT endpoint_id, thread_id, kind, payload_json FROM events WHERE id = ?").get(id) as
     { endpoint_id: string; thread_id: string; kind: string; payload_json: string };
   assert.deepEqual({ endpointId: event.endpoint_id, threadId: event.thread_id, kind: event.kind }, {
     endpointId: "local", threadId: "assistant", kind: "background_failure",
   });
-  assert.deepEqual(JSON.parse(event.payload_json), { label: "maintenance", incident: 1 });
+  assert.deepEqual(JSON.parse(event.payload_json), { label: "example capability", incident: 1 });
   assert.equal(deliveries.get("background-failure:new-run:2"), undefined);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM deliveries").get()!.count, 3);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind = 'background_failure'").get()!.count, 3);
@@ -56,14 +56,43 @@ test("a failed event insert rolls back its delivery and remains retryable with a
     },
   });
 
-  reporter.report("maintenance", { episode: "maintenance" });
+  reporter.report("example capability", { episode: "example" });
   assert.equal(deliveries.get("background-failure:rollback-run:1"), undefined);
   assert.equal(db.prepare("SELECT 1 FROM events WHERE id = 'background-failure:rollback-run:1'").get(), undefined);
 
   db.exec("DROP TRIGGER reject_first_background_event");
-  reporter.report("maintenance", { episode: "maintenance" });
+  reporter.report("example capability", { episode: "example" });
   assert.ok(deliveries.get("background-failure:rollback-run:2"));
   assert.ok(db.prepare("SELECT 1 FROM events WHERE id = 'background-failure:rollback-run:2'").get());
-  reporter.report("maintenance", { episode: "maintenance" });
+  reporter.report("example capability", { episode: "example" });
   assert.equal(deliveries.get("background-failure:rollback-run:3"), undefined);
+});
+
+test("external ownership degradation uses one fixed warning and metadata-only event", () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new BackgroundFailureStore(db, deliveries);
+  store.recordExternalOwnershipDegraded({
+    id: "background-failure:ownership-run:1",
+    incident: 1,
+    endpointId: "local",
+    threadId: "assistant",
+    binding,
+  });
+
+  const id = "background-failure:ownership-run:1";
+  assert.equal(
+    deliveries.get(id)?.body,
+    "[system] external session ownership detection is degraded; automatic release will retry",
+  );
+  const event = db.prepare("SELECT kind, payload_json FROM events WHERE id = ?").get(id) as {
+    kind: string;
+    payload_json: string;
+  };
+  assert.equal(event.kind, "external_ownership_degraded");
+  assert.deepEqual(JSON.parse(event.payload_json), {
+    event: "external_ownership_degraded",
+    incident: 1,
+  });
+  assert.equal(event.payload_json.includes("automatic release"), false);
 });

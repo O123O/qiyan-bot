@@ -6,7 +6,7 @@ import type { WeixinCredentialHandle } from "../src/weixin/credential-store.ts";
 
 test("composition starts in order, starts each worker once, and stops in reverse", async () => {
   const events: string[] = [];
-  const phases: AppPhase[] = ["storage", "registry", "attachments", "mcp", "subscriptions", "endpoint", "reconciliation", "assistant", "scheduler", "delivery", "maintenance", "polling"].map((name) => ({
+  const phases: AppPhase[] = ["storage", "registry", "attachments", "mcp", "subscriptions", "endpoint", "reconciliation", "assistant", "scheduler", "delivery", "polling"].map((name) => ({
     name, start: async () => { events.push(`start:${name}`); }, stop: async () => { events.push(`stop:${name}`); },
   }));
   const app = composeApp(phases);
@@ -32,77 +32,9 @@ test("startup failure cleans already started resources in reverse order", async 
   await app.stop();
 });
 
-test("maintenance scheduling is deterministic and stops cleanly", async () => {
-  let callback: (() => void) | undefined;
-  let clears = 0;
-  const events: string[] = [];
-  const app = composeApp([], {
-    maintenance: { intervalMs: 100, run: async () => { events.push("maintain"); } },
-    timers: { setInterval: (fn) => { callback = fn; return 1 as any; }, clearInterval: () => { clears += 1; } },
-  });
-  await app.start();
-  callback?.();
-  await new Promise((resolve) => setImmediate(resolve));
-  await app.stop();
-  assert.deepEqual(events, ["maintain"]);
-  assert.equal(clears, 1);
-});
-
-test("maintenance forwards a rejected run to its failure boundary", async () => {
-  let callback: (() => void) | undefined;
-  const failure = new Error("maintenance failed");
-  const observed: unknown[] = [];
-  const app = composeApp([], {
-    maintenance: {
-      intervalMs: 100,
-      run: async () => { throw failure; },
-      onFailure: (error) => { observed.push(error); },
-    },
-    timers: { setInterval: (fn) => { callback = fn; return 1 as any; }, clearInterval: () => undefined },
-  });
-  await app.start();
-  callback?.();
-  await new Promise((resolve) => setImmediate(resolve));
-  await app.stop();
-  assert.deepEqual(observed, [failure]);
-});
-
-test("maintenance reports success only after a resolved run and contains reporting failures", async () => {
-  let callback: (() => void) | undefined;
-  let runs = 0;
-  const events: string[] = [];
-  const app = composeApp([], {
-    maintenance: {
-      intervalMs: 100,
-      run: async () => {
-        runs += 1;
-        if (runs === 1) throw new Error("maintenance failed");
-      },
-      onFailure: () => { events.push("failure"); throw new Error("failure reporter failed"); },
-      onSuccess: () => { events.push("success"); throw new Error("success reporter failed"); },
-    },
-    timers: { setInterval: (fn) => { callback = fn; return 1 as any; }, clearInterval: () => undefined },
-  });
-  await app.start();
-
-  callback?.();
-  await new Promise((resolve) => setImmediate(resolve));
-  callback?.();
-  await new Promise((resolve) => setImmediate(resolve));
-  await app.stop();
-
-  assert.deepEqual(events, ["failure", "success"]);
-});
-
-test("maintenance timer setup failures retain a safe startup phase", async () => {
-  const app = composeApp([], {
-    maintenance: { intervalMs: 100, run: async () => undefined },
-    timers: { setInterval: () => { throw new Error("timer failed"); }, clearInterval: () => undefined },
-  });
-  let failure: unknown;
-  try { await app.start(); } catch (error) { failure = error; }
-  assert.ok(failure instanceof StartupPhaseError);
-  assert.equal(failure.phase, "maintenance");
+test("composition accepts phases without a scheduler option", () => {
+  // @ts-expect-error Generic maintenance is intentionally not part of the composition API.
+  void composeApp([], { maintenance: { intervalMs: 60_000, run: async () => undefined } });
 });
 
 test("terminal inbox preserves a completion that precedes attempt registration", () => {

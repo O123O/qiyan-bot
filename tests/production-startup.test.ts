@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { BotConfig } from "../src/config.ts";
-import { assistantAccessWarning, buildProductionApp, createMaintenanceFailureHandler } from "../src/production-app.ts";
+import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
 import type { ChatAdapter } from "../src/chat/contracts.ts";
 import { StartupPhaseError } from "../src/app.ts";
 import { createTestDatabase, openDatabase, type Database } from "../src/storage/database.ts";
@@ -17,21 +17,6 @@ test("only full-access assistant mode emits the structural startup warning", () 
   assert.match(assistantAccessWarning("danger-full-access") ?? "", /non-interactively with full filesystem access/);
   assert.equal(assistantAccessWarning("workspace-write"), undefined);
   assert.equal(assistantAccessWarning("read-only"), undefined);
-});
-
-test("maintenance requests one restart only for exact recoverable metadata failure", () => {
-  const events: string[] = [];
-  const handle = createMaintenanceFailureHandler({
-    requestRestart: () => { events.push("restart"); },
-    reportRecoveryRequired: () => { events.push("recovery-required"); },
-    reportRetryableFailure: () => { events.push("retry"); },
-  });
-
-  handle(new DashboardMetadataRecoveryRequiredError());
-  handle(new DashboardMetadataRecoveryRequiredError());
-  handle(new Error("ordinary maintenance failure"));
-
-  assert.deepEqual(events, ["recovery-required", "restart", "retry"]);
 });
 
 test("production storage contention blocks adapters and the same app retries after release", async (t) => {

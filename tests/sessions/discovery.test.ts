@@ -66,7 +66,6 @@ test("discovery exhausts both archives and returns stable filtered snapshot page
   await assert.rejects(discovery.list({ endpointId: "local", limit: 2, cursor: `${first.nextCursor}x` }));
   now += 101;
   await assert.rejects(discovery.list({ endpointId: "local", limit: 2, cursor: first.nextCursor! }));
-  assert.equal(discovery.cleanupExpired(), 1);
 });
 
 test("discovery search filters the combined snapshot by id, cwd, or preview", async () => {

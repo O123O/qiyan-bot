@@ -11,21 +11,21 @@ test("an episode notifies once at its threshold and resets after resolution", ()
     onDurable: (notice) => { durable.push(notice); },
   });
 
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
   assert.equal(durable.length, 0);
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
   assert.deepEqual(durable, [{
     id: "background-failure:test-run:1",
-    label: "periodic project reconciliation",
+    label: "capability reconciliation",
     incident: 1,
   }]);
 
   reporter.resolve("project");
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
-  reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
+  reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 });
   assert.deepEqual(durable.map((notice) => notice.id), [
     "background-failure:test-run:1",
     "background-failure:test-run:2",
@@ -46,13 +46,13 @@ test("callback failures are contained and a failed durable attempt remains retry
     },
   });
 
-  assert.doesNotThrow(() => reporter.report("maintenance", { episode: "maintenance" }));
-  assert.doesNotThrow(() => reporter.report("maintenance", { episode: "maintenance" }));
-  reporter.report("maintenance", { episode: "maintenance" });
+  assert.doesNotThrow(() => reporter.report("example capability", { episode: "example" }));
+  assert.doesNotThrow(() => reporter.report("example capability", { episode: "example" }));
+  reporter.report("example capability", { episode: "example" });
 
   assert.deepEqual(attempted, [
-    { id: "background-failure:retry-run:1", label: "maintenance", incident: 1 },
-    { id: "background-failure:retry-run:2", label: "maintenance", incident: 2 },
+    { id: "background-failure:retry-run:1", label: "example capability", incident: 1 },
+    { id: "background-failure:retry-run:2", label: "example capability", incident: 2 },
   ]);
 });
 
@@ -89,11 +89,11 @@ test("invalid reporter configuration and thresholds are rejected", () => {
     onDurable: () => undefined,
   });
   for (const notifyAfter of [0, -1, 1.5, Number.NaN]) {
-    assert.throws(() => reporter.report("maintenance", { episode: "maintenance", notifyAfter }), /notification threshold/u);
+    assert.throws(() => reporter.report("example capability", { episode: "example", notifyAfter }), /notification threshold/u);
   }
-  reporter.report("maintenance", { episode: "maintenance", notifyAfter: 2 });
+  reporter.report("example capability", { episode: "example", notifyAfter: 2 });
   assert.throws(
-    () => reporter.report("different label", { episode: "maintenance", notifyAfter: 2 }),
+    () => reporter.report("different label", { episode: "example", notifyAfter: 2 }),
     /episode configuration changed/u,
   );
 });
@@ -143,7 +143,7 @@ test("a cycle resolves only after conclusive success or no applicable endpoints"
   assert.deepEqual(events, ["resolved", "resolved"]);
 });
 
-test("three failed maintenance cycles notify once regardless of endpoint count and reset after success", () => {
+test("three failed capability cycles notify once regardless of endpoint count and reset after success", () => {
   const durable: BackgroundFailureAttempt[] = [];
   const reporter = createBackgroundFailureReporter({
     runId: "cycle-run",
@@ -152,7 +152,7 @@ test("three failed maintenance cycles notify once regardless of endpoint count a
   });
   const runCycle = (outcomes: Array<"failed" | "succeeded" | "inconclusive">) => {
     const cycle = createFailureCycle({
-      onFailed: () => reporter.report("periodic project reconciliation", { episode: "project", notifyAfter: 3 }),
+      onFailed: () => reporter.report("capability reconciliation", { episode: "project", notifyAfter: 3 }),
       onResolved: () => reporter.resolve("project"),
     });
     for (const outcome of outcomes) cycle[outcome]();

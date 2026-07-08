@@ -136,6 +136,6 @@ const startupPhaseReasons: ReadonlyMap<string, string> = new Map([
   ["assistant", "assistant session initialization failed"],
   ["scheduler", "assistant scheduler startup failed"],
   ["delivery", "delivery recovery startup failed"],
-  ["maintenance", "maintenance scheduler startup failed"],
+  ["external-ownership-watcher", "external ownership watcher startup failed"],
   ["chat-ingress", "chat connection startup failed; verify credentials and network access"],
 ]);
