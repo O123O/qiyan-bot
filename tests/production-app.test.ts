@@ -261,6 +261,62 @@ test("ready recovery is single-flight per endpoint and coalesces one dirty follo
   assert.equal(pausedAttempts, 2);
 });
 
+test("ready recovery reports only the latest dirty pass and retains a latest failure", async () => {
+  let signalStaleStarted!: () => void;
+  let releaseStale!: () => void;
+  const staleStarted = new Promise<void>((resolve) => { signalStaleStarted = resolve; });
+  const staleBlock = new Promise<void>((resolve) => { releaseStale = resolve; });
+  let staleAttempts = 0;
+  const staleFailure = createEndpointReadyBuffer({
+    recover: async () => {
+      staleAttempts += 1;
+      if (staleAttempts === 1) {
+        signalStaleStarted();
+        await staleBlock;
+        throw new Error("obsolete recovery failure");
+      }
+    },
+  });
+  await staleFailure.acceptAndDrain();
+  const superseded = staleFailure.ready("devbox");
+  assert.ok(superseded);
+  await staleStarted;
+  staleFailure.ready("devbox");
+  releaseStale();
+  await superseded;
+  staleFailure.pause();
+  await staleFailure.acceptAndDrain();
+  assert.equal(staleAttempts, 2, "a successful latest pass does not remain pending");
+
+  let signalLatestStarted!: () => void;
+  let releaseLatest!: () => void;
+  const latestStarted = new Promise<void>((resolve) => { signalLatestStarted = resolve; });
+  const latestBlock = new Promise<void>((resolve) => { releaseLatest = resolve; });
+  let latestAttempts = 0;
+  let failLatest = true;
+  const latestFailure = createEndpointReadyBuffer({
+    recover: async () => {
+      latestAttempts += 1;
+      if (latestAttempts === 1) {
+        signalLatestStarted();
+        await latestBlock;
+      } else if (failLatest) {
+        throw new Error("latest recovery failure");
+      }
+    },
+  });
+  await latestFailure.acceptAndDrain();
+  const terminal = latestFailure.ready("devbox");
+  assert.ok(terminal);
+  await latestStarted;
+  latestFailure.ready("devbox");
+  releaseLatest();
+  await assert.rejects(terminal, /latest recovery failure/u);
+  failLatest = false;
+  await latestFailure.acceptAndDrain();
+  assert.equal(latestAttempts, 3, "a failed latest pass remains pending for the next drain");
+});
+
 test("production-style endpoint recovery starts a dirty pass after the current generation is removed", async () => {
   const owners = ["lifecycle", "managed", "claims", "relay", "observations", "operations"] as const;
   const seen: string[] = [];

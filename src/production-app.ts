@@ -157,15 +157,20 @@ export function createEndpointReadyBuffer(options: {
         recoveries.delete(endpointId);
         return;
       }
-      let firstError: unknown;
+      let terminalResult: { ok: true } | { ok: false; error: unknown } = { ok: true };
       do {
         state.dirty = false;
-        try { await options.recover(endpointId); }
-        catch (error) { firstError ??= error; }
+        try {
+          await options.recover(endpointId);
+          terminalResult = { ok: true };
+        } catch (error) {
+          terminalResult = { ok: false, error };
+        }
       } while (state.dirty && accepting && !stopped);
       if (state.dirty && !accepting && !stopped) pending.add(endpointId);
+      if (!terminalResult.ok && !stopped) pending.add(endpointId);
       if (recoveries.get(endpointId) === state) recoveries.delete(endpointId);
-      if (firstError) throw firstError;
+      if (!terminalResult.ok) throw terminalResult.error;
     });
     return state.running;
   };
