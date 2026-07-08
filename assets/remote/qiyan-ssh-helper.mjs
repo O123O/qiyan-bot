@@ -214,6 +214,7 @@ function createRolloutParser(baseOffset, collectStarts) {
   const starts = [];
   let current;
   let parsedEnd = baseOffset;
+  let malformedOffset;
   function report(turn) {
     if (!collectStarts) return;
     if (starts.length >= 1024) throw new Error("rollout ownership scan contains too many turns");
@@ -222,10 +223,20 @@ function createRolloutParser(baseOffset, collectStarts) {
   function consume(raw, lineStart, lineEnd) {
     parsedEnd = lineEnd;
     if (raw.byteLength === 0) return;
-    const value = JSON.parse(raw.toString("utf8"));
-    if (value?.type !== "event_msg" || !value.payload) return;
-    const type = value.payload.type;
-    const turnId = typeof value.payload.turn_id === "string" ? value.payload.turn_id : undefined;
+    let value;
+    try { value = JSON.parse(raw.toString("utf8")); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      malformedOffset ??= lineStart;
+      if (current?.sawUserMessage) report(current);
+      current = undefined;
+      return;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const payload = value.payload;
+    if (value.type !== "event_msg" || typeof payload !== "object" || payload === null || Array.isArray(payload)) return;
+    const type = payload.type;
+    const turnId = typeof payload.turn_id === "string" ? payload.turn_id : undefined;
     if ((type === "task_started" || type === "turn_started") && turnId) {
       if (current) report(current);
       current = { turnId, startOffset: lineStart, sawUserMessage: false };
@@ -233,7 +244,7 @@ function createRolloutParser(baseOffset, collectStarts) {
     }
     if (type === "user_message" && current) {
       current.sawUserMessage = true;
-      if (typeof value.payload.client_id === "string" && value.payload.client_id.length > 0) current.clientId = value.payload.client_id;
+      if (typeof payload.client_id === "string" && payload.client_id.length > 0) current.clientId = payload.client_id;
       return;
     }
     if ((type === "task_complete" || type === "turn_complete" || type === "turn_aborted")
@@ -244,11 +255,13 @@ function createRolloutParser(baseOffset, collectStarts) {
   }
   function result(identity) {
     if (current?.sawUserMessage) report(current);
-    const cursorOffset = current && !current.sawUserMessage ? current.startOffset : parsedEnd;
+    const semanticOffset = current && !current.sawUserMessage ? current.startOffset : parsedEnd;
+    const cursorOffset = malformedOffset === undefined ? semanticOffset : Math.min(semanticOffset, malformedOffset);
     return {
       cursor: { ...identity, offset: cursorOffset },
       starts,
       ...(current ? { openTurn: publicRolloutStart(current) } : {}),
+      ...(malformedOffset === undefined ? {} : { malformed: true }),
     };
   }
   return { consume, result };

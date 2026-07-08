@@ -67,6 +67,33 @@ test("maintenance forwards a rejected run to its failure boundary", async () => 
   assert.deepEqual(observed, [failure]);
 });
 
+test("maintenance reports success only after a resolved run and contains reporting failures", async () => {
+  let callback: (() => void) | undefined;
+  let runs = 0;
+  const events: string[] = [];
+  const app = composeApp([], {
+    maintenance: {
+      intervalMs: 100,
+      run: async () => {
+        runs += 1;
+        if (runs === 1) throw new Error("maintenance failed");
+      },
+      onFailure: () => { events.push("failure"); throw new Error("failure reporter failed"); },
+      onSuccess: () => { events.push("success"); throw new Error("success reporter failed"); },
+    },
+    timers: { setInterval: (fn) => { callback = fn; return 1 as any; }, clearInterval: () => undefined },
+  });
+  await app.start();
+
+  callback?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  callback?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.stop();
+
+  assert.deepEqual(events, ["failure", "success"]);
+});
+
 test("maintenance timer setup failures retain a safe startup phase", async () => {
   const app = composeApp([], {
     maintenance: { intervalMs: 100, run: async () => undefined },

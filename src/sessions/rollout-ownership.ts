@@ -23,6 +23,7 @@ export interface RolloutScanResult {
   cursor: RolloutCursor;
   starts: RolloutTurnStart[];
   openTurn?: RolloutTurnStart;
+  malformed?: true;
 }
 
 export interface RolloutAccess {
@@ -56,6 +57,7 @@ export class SessionOwnershipGuard {
     if (!result) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership scan returned no result");
     const owned = result.openTurn && this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
     const external = result.openTurn && !owned ? result.openTurn : undefined;
+    if (result.malformed && !external) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       this.db.prepare(`INSERT INTO session_rollout_ownership
         (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, external_turn_id, updated_at)
@@ -89,6 +91,7 @@ export class SessionOwnershipGuard {
     const classified = candidates.map((turn) => ({ turn, owned: this.operations.ownsWorkerTurn(turn) }));
     const external = classified.find((item) => !item.owned)?.turn;
     const incidentTurnId = existing.externalTurnId ?? external?.turnId;
+    if (result.malformed && !incidentTurnId) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       for (const item of classified) if (item.owned) this.recordOwnedTurn(identity, item.turn.turnId);
       this.updateCursor(identity, existing, result.cursor, external?.turnId);
@@ -189,16 +192,30 @@ class RolloutParser {
   private readonly starts: RolloutTurnStart[] = [];
   private current: PendingTurn | undefined;
   private parsedEnd: number;
+  private malformedOffset: number | undefined;
 
   constructor(baseOffset: number, private readonly collectStarts: boolean) { this.parsedEnd = baseOffset; }
 
   consume(raw: Buffer, lineStart: number, lineEnd: number): void {
     this.parsedEnd = lineEnd;
     if (raw.byteLength === 0) return;
-    const value = JSON.parse(raw.toString("utf8")) as { type?: unknown; payload?: Record<string, unknown> };
-    if (value.type !== "event_msg" || !value.payload) return;
-    const type = value.payload.type;
-    const turnId = typeof value.payload.turn_id === "string" ? value.payload.turn_id : undefined;
+    let value: unknown;
+    try {
+      value = JSON.parse(raw.toString("utf8")) as unknown;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      this.malformedOffset ??= lineStart;
+      if (this.current?.sawUserMessage) this.report(this.current);
+      this.current = undefined;
+      return;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const record = value as Record<string, unknown>;
+    const payload = record.payload;
+    if (record.type !== "event_msg" || typeof payload !== "object" || payload === null || Array.isArray(payload)) return;
+    const event = payload as Record<string, unknown>;
+    const type = event.type;
+    const turnId = typeof event.turn_id === "string" ? event.turn_id : undefined;
     if ((type === "task_started" || type === "turn_started") && turnId) {
       if (this.current) this.report(this.current);
       this.current = { turnId, startOffset: lineStart, sawUserMessage: false };
@@ -206,7 +223,7 @@ class RolloutParser {
     }
     if (type === "user_message" && this.current) {
       this.current.sawUserMessage = true;
-      if (typeof value.payload.client_id === "string" && value.payload.client_id.length > 0) this.current.clientId = value.payload.client_id;
+      if (typeof event.client_id === "string" && event.client_id.length > 0) this.current.clientId = event.client_id;
       return;
     }
     if ((type === "task_complete" || type === "turn_complete" || type === "turn_aborted")
@@ -218,11 +235,13 @@ class RolloutParser {
 
   result(identity: RolloutCursor): RolloutScanResult {
     if (this.current?.sawUserMessage) this.report(this.current);
-    const cursorOffset = this.current && !this.current.sawUserMessage ? this.current.startOffset : this.parsedEnd;
+    const semanticOffset = this.current && !this.current.sawUserMessage ? this.current.startOffset : this.parsedEnd;
+    const cursorOffset = this.malformedOffset === undefined ? semanticOffset : Math.min(semanticOffset, this.malformedOffset);
     return {
       cursor: { ...identity, offset: cursorOffset },
       starts: this.starts,
       ...(this.current ? { openTurn: publicStart(this.current) } : {}),
+      ...(this.malformedOffset === undefined ? {} : { malformed: true }),
     };
   }
 

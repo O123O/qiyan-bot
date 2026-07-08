@@ -136,3 +136,92 @@ test("the remote helper scans rollout ownership without returning message bodies
   assert.equal(body.includes(secret), false);
   assert.deepEqual(JSON.parse(body).results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call" }]);
 });
+
+test("the remote helper reports a malformed boundary and later independent external evidence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-remote-malformed.jsonl");
+  const secret = "remote body after malformed boundary";
+  await writeFile(path, "\n");
+  const baselineArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-malformed" }] }));
+  const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  await appendFile(path, Buffer.from([0x00, 0x00, 0x0a]));
+  await appendFile(path, [
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "external-remote" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message", message: secret, client_id: "ctx:remote" } }),
+    "",
+  ].join("\n"));
+  const argument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-malformed", cursor }] }));
+
+  const scanned = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  const stdout = scanned.stdout.toString("utf8");
+  const stderr = scanned.stderr.toString("utf8");
+  assert.equal(stdout.includes(secret), false);
+  assert.equal(stderr.includes(secret), false);
+  assert.deepEqual(JSON.parse(stdout).results[0], {
+    cursor,
+    starts: [{ turnId: "external-remote", clientId: "ctx:remote" }],
+    openTurn: { turnId: "external-remote", clientId: "ctx:remote" },
+    malformed: true,
+  });
+});
+
+test("the remote helper does not correlate turn records across a malformed boundary", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-remote-reset.jsonl");
+  await writeFile(path, "\n");
+  const baselineArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-reset" }] }));
+  const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  const start = `${JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "not-correlated" } })}\n`;
+  await appendFile(path, start);
+  const malformedOffset = cursor.offset + Buffer.byteLength(start);
+  await appendFile(path, Buffer.from([0x00, 0x0a]));
+  await appendFile(path, `${JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message" } })}\n`);
+  const argument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-reset", cursor }] }));
+
+  const scanned = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  assert.deepEqual(JSON.parse(scanned.stdout.toString("utf8")).results[0], {
+    cursor: { ...cursor, offset: malformedOffset },
+    starts: [],
+    malformed: true,
+  });
+});
+
+test("the remote helper ignores syntactically valid non-object JSON records", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-remote-values.jsonl");
+  await writeFile(path, "\n");
+  const baselineArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-values" }] }));
+  const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  await appendFile(path, [
+    "null", JSON.stringify("ignored"), "1", "true", "[]", "{}",
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "after-values" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message" } }),
+    "",
+  ].join("\n"));
+  const argument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote-values", cursor }] }));
+
+  const scanned = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+  const result = JSON.parse(scanned.stdout.toString("utf8")).results[0];
+  assert.equal(result.malformed, undefined);
+  assert.deepEqual(result.starts, [{ turnId: "after-values" }]);
+  assert.deepEqual(result.openTurn, { turnId: "after-values" });
+  assert.equal(result.cursor.offset, (await stat(path)).size);
+});

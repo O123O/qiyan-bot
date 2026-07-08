@@ -35,7 +35,7 @@ interface TimerApi {
 
 export function composeApp(
   phases: readonly AppPhase[],
-  options: { maintenance?: { intervalMs: number; run(): Promise<void>; onFailure?(error: unknown): void }; timers?: TimerApi } = {},
+  options: { maintenance?: { intervalMs: number; run(): Promise<void>; onFailure?(error: unknown): void; onSuccess?(): void }; timers?: TimerApi } = {},
 ): BotApp {
   const started: AppPhase[] = [];
   const timers: TimerApi = options.timers ?? {
@@ -63,10 +63,16 @@ export function composeApp(
           }
           if (options.maintenance) {
             startingPhase = "maintenance";
-            maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().catch((error) => {
-              try { options.maintenance!.onFailure?.(error); }
-              catch { /* Maintenance failure reporting cannot escape the timer boundary. */ }
-            }), options.maintenance.intervalMs);
+            maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().then(
+              () => {
+                try { options.maintenance!.onSuccess?.(); }
+                catch { /* Maintenance success reporting cannot escape the timer boundary. */ }
+              },
+              (error) => {
+                try { options.maintenance!.onFailure?.(error); }
+                catch { /* Maintenance failure reporting cannot escape the timer boundary. */ }
+              },
+            ), options.maintenance.intervalMs);
             hasMaintenanceTimer = true;
           }
           startingPhase = undefined;

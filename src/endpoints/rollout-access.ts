@@ -19,6 +19,7 @@ const resultSchema = z.object({
   cursor: cursorSchema,
   starts: z.array(startSchema).max(1024),
   openTurn: startSchema.optional(),
+  malformed: z.literal(true).optional(),
 }).strict();
 const responseSchema = z.object({ results: z.array(resultSchema).max(128) }).strict();
 
@@ -57,6 +58,7 @@ export class RolloutAccessRouter implements RolloutAccess {
       ...(result.openTurn === undefined ? {} : {
         openTurn: { turnId: result.openTurn.turnId, ...(result.openTurn.clientId === undefined ? {} : { clientId: result.openTurn.clientId }) },
       }),
+      ...(result.malformed === undefined ? {} : { malformed: true }),
     }));
   }
 

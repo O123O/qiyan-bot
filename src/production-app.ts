@@ -23,6 +23,7 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
+import { createBackgroundFailureReporter, createFailureCycle } from "./core/background-failure-reporter.ts";
 import type { OperationalEventSink } from "./core/operational-log.ts";
 import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
@@ -53,6 +54,7 @@ import { openDatabase, type Database } from "./storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lease.ts";
 import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
+import { BackgroundFailureStore } from "./storage/background-failure-store.ts";
 import { ConversationStore, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
 import { OperationStore } from "./storage/operation-store.ts";
@@ -88,6 +90,10 @@ const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
+const scheduledFailureThreshold = 3;
+const maintenanceFailureEpisode = "maintenance";
+const projectReconciliationFailureEpisode = "periodic-project-reconciliation";
+const managedRecoveryFailureEpisode = "periodic-managed-session-recovery";
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
@@ -252,6 +258,7 @@ export async function buildProductionApp(
   let attachments!: AttachmentStore;
   let operations!: OperationStore;
   let deliveries!: DeliveryStore;
+  let backgroundFailures!: BackgroundFailureStore;
   let runtime!: RuntimeStore;
   let finals!: FinalMessageStore;
   let endpoint!: LocalEndpoint;
@@ -301,13 +308,31 @@ export async function buildProductionApp(
   let stopping = false;
   let registryInvalid = false;
   let endpointsCommitted = false;
-  let backgroundIncident = 0;
   let operationReconciliationTail: Promise<void> = Promise.resolve();
   const report = options.onOperationalEvent ?? (() => undefined);
+  const backgroundFailureReporter = createBackgroundFailureReporter({
+    runId: randomUUID(),
+    onOperational: (label) => {
+      report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
+    },
+    onDurable: (notice) => {
+      const identity = registry.snapshot().assistant;
+      backgroundFailures.record({
+        ...notice,
+        endpointId: identity.endpoint,
+        threadId: identity.thread_id,
+        binding: currentOwnerBinding(),
+      });
+      if (schedulerAccepting) {
+        try { enqueuePendingEvents(); }
+        catch { /* Durable state remains pending for the next scheduler pass. */ }
+      }
+    },
+  });
   const handleMaintenanceFailure = createMaintenanceFailureHandler({
     requestRestart: options.requestRestart ?? (() => undefined),
     reportRecoveryRequired: () => { report({ level: "warn", code: "database_metadata_recovery_required" }); },
-    reportRetryableFailure: () => { recordBackgroundFailure("maintenance"); },
+    reportRetryableFailure: () => { recordScheduledBackgroundFailure("maintenance", maintenanceFailureEpisode); },
   });
   const acquireStateLease = options.storage?.acquireDatabaseLease ?? acquireDatabaseLease;
   const openStateDatabase = options.storage?.openDatabase ?? openDatabase;
@@ -376,6 +401,7 @@ export async function buildProductionApp(
           openedDb = opened.database;
           const openedOperations = new OperationStore(openedDb);
           const openedDeliveries = new DeliveryStore(openedDb);
+          const openedBackgroundFailures = new BackgroundFailureStore(openedDb, openedDeliveries);
           const openedRuntime = new RuntimeStore(openedDb);
           const openedFinals = new FinalMessageStore(openedDb);
           const openedOwnershipEvents = new OwnershipEventStore(openedDb);
@@ -387,6 +413,7 @@ export async function buildProductionApp(
           db = openedDb;
           operations = openedOperations;
           deliveries = openedDeliveries;
+          backgroundFailures = openedBackgroundFailures;
           runtime = openedRuntime;
           finals = openedFinals;
           ownershipEvents = openedOwnershipEvents;
@@ -1860,20 +1887,21 @@ export async function buildProductionApp(
   }
 
   function recordBackgroundFailure(label: string): void {
-    report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
-    try {
-      backgroundIncident += 1;
-      const id = `background-failure:${backgroundIncident}`;
-      deliveries.prepare({ id, kind: "system_warning", binding: currentOwnerBinding(), body: `[system] ${label} failed; durable reconciliation will retry`, mandatory: true });
-      const identity = registry.snapshot().assistant;
-      db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
-        VALUES (?, ?, ?, 'background_failure', ?, 'pending', ?)`)
-        .run(id, identity.endpoint, identity.thread_id, JSON.stringify({ label, incident: backgroundIncident }), Date.now());
-      if (schedulerAccepting) enqueuePendingEvents();
-    } catch { /* containment path cannot safely escalate */ }
+    backgroundFailureReporter.report(label);
   }
 
-  return composeApp(phases, { maintenance: { intervalMs: 60_000, run: runMaintenance, onFailure: handleMaintenanceFailure } });
+  function recordScheduledBackgroundFailure(label: string, episode: string): void {
+    backgroundFailureReporter.report(label, { episode, notifyAfter: scheduledFailureThreshold });
+  }
+
+  return composeApp(phases, {
+    maintenance: {
+      intervalMs: 60_000,
+      run: runMaintenance,
+      onFailure: handleMaintenanceFailure,
+      onSuccess: () => { backgroundFailureReporter.resolve(maintenanceFailureEpisode); },
+    },
+  });
 
   async function runMaintenance(): Promise<void> {
     dashboardStore.assertMetadataHealthy();
@@ -1882,17 +1910,23 @@ export async function buildProductionApp(
     reconcileDeliveryEvents();
     await reconcileOperations();
     const managedEndpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))];
+    const projectCycle = createFailureCycle({
+      onFailed: () => { recordScheduledBackgroundFailure("periodic project reconciliation", projectReconciliationFailureEpisode); },
+      onResolved: () => { backgroundFailureReporter.resolve(projectReconciliationFailureEpisode); },
+    });
     for (const endpointId of managedEndpointIds) {
       let target: ManagedAppServerEndpoint;
       try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { continue; }
-      if (target.state !== "ready") continue;
+      catch { projectCycle.inconclusive(); continue; }
+      if (target.state !== "ready") { projectCycle.inconclusive(); continue; }
       try {
         await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
           await observations.drain(endpointId);
         });
-      } catch { recordBackgroundFailure("periodic project reconciliation"); }
+        projectCycle.succeeded();
+      } catch { projectCycle.failed(); }
     }
+    projectCycle.finish();
     await renderDashboardSafely();
     if (assistantEndpoint.state === "ready") {
       await dispatcher.recover();
@@ -1915,14 +1949,19 @@ export async function buildProductionApp(
     }
     registryInvalid = false;
     await reconcileLifecycleState();
+    const managedRecoveryCycle = createFailureCycle({
+      onFailed: () => { recordScheduledBackgroundFailure("periodic managed session recovery", managedRecoveryFailureEpisode); },
+      onResolved: () => { backgroundFailureReporter.resolve(managedRecoveryFailureEpisode); },
+    });
     for (const endpointId of managedEndpointIds) {
       let target: ManagedAppServerEndpoint;
       try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { continue; }
-      if (target.state !== "ready") continue;
-      try { await resumeManagedSessions(endpointId, true); }
-      catch { recordBackgroundFailure("periodic managed session recovery"); }
+      catch { managedRecoveryCycle.inconclusive(); continue; }
+      if (target.state !== "ready") { managedRecoveryCycle.inconclusive(); continue; }
+      try { await resumeManagedSessions(endpointId, true); managedRecoveryCycle.succeeded(); }
+      catch { managedRecoveryCycle.failed(); }
     }
+    managedRecoveryCycle.finish();
     await reconcileDashboard();
   }
 
