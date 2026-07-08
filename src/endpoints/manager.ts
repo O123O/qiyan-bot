@@ -1,4 +1,5 @@
 import { AppError } from "../core/errors.ts";
+import { RpcRequestTimeoutError } from "../app-server/rpc-client.ts";
 import type { SshEndpointDefinition } from "./catalog.ts";
 import { EndpointAdmissionGate, type EndpointDesiredState } from "./admission-gate.ts";
 import type { PendingDestinationBinding } from "./ssh-config.ts";
@@ -75,6 +76,31 @@ export class EndpointManager {
     }
   }
 
+  async withReadyWorkLease<T>(
+    id: string | undefined,
+    run: (lease: EndpointWorkLease) => Promise<T>,
+  ): Promise<T> {
+    const endpointId = this.normalize(id);
+    if (this.closing) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down");
+    const record = this.records.get(endpointId);
+    const endpoint = record?.endpoint;
+    if (!record || !endpoint || record.generation === 0 || endpoint.state !== "ready") {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is unavailable: ${endpointId}`);
+    }
+    const generation = record.generation;
+    const lease = record.gate.acquire(generation);
+    try {
+      if (this.records.get(endpointId) !== record || record.endpoint !== endpoint
+        || record.generation !== generation || endpoint.state !== "ready"
+        || !record.gate.validate(lease, generation)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint generation changed before work began: ${endpointId}`);
+      }
+      return await run(lease);
+    } finally {
+      record.gate.release(lease);
+    }
+  }
+
   async runWithWorkLease<T>(
     endpointId: string,
     existing: EndpointWorkLease | undefined,
@@ -87,9 +113,29 @@ export class EndpointManager {
     return this.withWorkLease(endpointId, "rpc", (_endpoint, lease) => run(lease));
   }
 
+  async runWithReadyWorkLease<T>(
+    endpointId: string,
+    existing: EndpointWorkLease | undefined,
+    run: (lease: EndpointWorkLease | undefined) => Promise<T>,
+  ): Promise<T> {
+    if (existing) {
+      if (!this.validateReadyWorkLease(existing, endpointId)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is unavailable for existing work lease: ${endpointId}`);
+      }
+      return run(existing);
+    }
+    return this.withWorkLease(endpointId, "rpc", (_endpoint, lease) => run(lease));
+  }
+
   validateWorkLease(lease: EndpointWorkLease, endpointId: string): boolean {
     const record = this.records.get(endpointId);
     return record !== undefined && record.generation === lease.endpointGeneration && record.gate.validate(lease, record.generation);
+  }
+
+  validateReadyWorkLease(lease: EndpointWorkLease, endpointId: string): boolean {
+    const record = this.records.get(endpointId);
+    return record?.endpoint?.state === "ready" && record.generation === lease.endpointGeneration
+      && record.gate.validate(lease, record.generation);
   }
 
   endpointGeneration(id: string): { endpoint: ManagedAppServerEndpoint; generation: number } {
@@ -318,7 +364,10 @@ export class EndpointManager {
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
       let response: { thread?: { status?: string | { type?: string } } };
       try { response = await endpoint.request("thread/read", { threadId, includeTurns: true }); }
-      catch (error) { throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error }); }
+      catch (error) {
+        if (error instanceof RpcRequestTimeoutError) throw error;
+        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });
+      }
       const status = typeof response.thread?.status === "string" ? response.thread.status : response.thread?.status?.type;
       if (status !== "idle") throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
     }

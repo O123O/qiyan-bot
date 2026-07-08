@@ -28,22 +28,8 @@ export class TerminalInbox<T> {
   }
 }
 
-interface TimerApi {
-  setInterval(callback: () => void, ms: number): unknown;
-  clearInterval(handle: any): void;
-}
-
-export function composeApp(
-  phases: readonly AppPhase[],
-  options: { maintenance?: { intervalMs: number; run(): Promise<void>; onFailure?(error: unknown): void; onSuccess?(): void }; timers?: TimerApi } = {},
-): BotApp {
+export function composeApp(phases: readonly AppPhase[]): BotApp {
   const started: AppPhase[] = [];
-  const timers: TimerApi = options.timers ?? {
-    setInterval: (callback, ms) => setInterval(callback, ms),
-    clearInterval: (handle) => clearInterval(handle),
-  };
-  let maintenanceTimer: unknown;
-  let hasMaintenanceTimer = false;
   let state: "stopped" | "starting" | "running" | "stopping" = "stopped";
   let transition: Promise<void> | undefined;
 
@@ -60,20 +46,6 @@ export function composeApp(
             startingPhase = phase.name;
             await phase.start();
             started.push(phase);
-          }
-          if (options.maintenance) {
-            startingPhase = "maintenance";
-            maintenanceTimer = timers.setInterval(() => void options.maintenance!.run().then(
-              () => {
-                try { options.maintenance!.onSuccess?.(); }
-                catch { /* Maintenance success reporting cannot escape the timer boundary. */ }
-              },
-              (error) => {
-                try { options.maintenance!.onFailure?.(error); }
-                catch { /* Maintenance failure reporting cannot escape the timer boundary. */ }
-              },
-            ), options.maintenance.intervalMs);
-            hasMaintenanceTimer = true;
           }
           startingPhase = undefined;
           state = "running";
@@ -92,7 +64,6 @@ export function composeApp(
       if (state === "stopped") return;
       state = "stopping";
       transition = (async () => {
-        if (hasMaintenanceTimer) { timers.clearInterval(maintenanceTimer); maintenanceTimer = undefined; hasMaintenanceTimer = false; }
         let firstError: unknown;
         for (const phase of started.splice(0).reverse()) {
           try { await phase.stop(); } catch (error) { firstError ??= error; }

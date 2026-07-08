@@ -61,3 +61,53 @@ test("a replacement mapping proves the pending generation was released", () => {
     } }),
   }), 1);
 });
+
+test("pending incidents are ordered, endpoint-filtered, and disappear after completion", () => {
+  const db = createTestDatabase();
+  let now = 100;
+  const store = new OwnershipEventStore(db, { now: () => now++ });
+  const remoteIncident = {
+    ...incident,
+    nickname: "remote-worker",
+    endpoint: "devbox",
+    thread_id: "thread-2",
+    mapping_id: "mapping-2",
+    turnId: "external-turn-2",
+  };
+
+  assert.equal(store.record(incident, "pending"), true);
+  assert.equal(store.record(remoteIncident, "pending"), true);
+  assert.deepEqual(store.pending(), [incident, remoteIncident]);
+  assert.deepEqual(store.pending("local"), [incident]);
+  assert.deepEqual(store.pending("devbox"), [remoteIncident]);
+  assert.deepEqual(store.pending("other"), []);
+
+  assert.equal(store.record(incident, "completed"), true);
+  assert.deepEqual(store.pending("local"), []);
+  assert.deepEqual(store.pending(), [remoteIncident]);
+});
+
+test("pending rejects malformed persisted metadata with a fixed payload-free error", () => {
+  const db = createTestDatabase();
+  const store = new OwnershipEventStore(db);
+  const secretPayload = "sensitive-message-body";
+  db.prepare(`INSERT INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`).run(
+    "external-turn:local:thread-1:mapping-1:external-turn",
+    "local",
+    "thread-1",
+    "external-turn",
+    "external_worker_turn_detected",
+    secretPayload,
+    1,
+  );
+
+  assert.throws(
+    () => store.pending(),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "invalid persisted external ownership event");
+      assert.equal((error as Error).message.includes(secretPayload), false);
+      return true;
+    },
+  );
+});

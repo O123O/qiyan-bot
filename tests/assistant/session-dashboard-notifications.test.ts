@@ -1,13 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
+import { RpcRequestTimeoutError } from "../../src/app-server/rpc-client.ts";
+import { AppError } from "../../src/core/errors.ts";
+import { reportOperationalSafely } from "../../src/production-app.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
+import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 
 const mappingId = "mapping-1";
 
-function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Promise<any> } = {}) {
+function fixture(options: {
+  readThread?: (endpointId: string, threadId: string, lease?: EndpointWorkLease) => Promise<any>;
+  readGoal?: () => Promise<any>;
+  classifyFailure?: (error: unknown) => "retry" | "endpoint" | "sleep";
+  retryMs?: number;
+  timers?: {
+    setTimeout(callback: () => void, delayMs: number): unknown;
+    clearTimeout(handle: any): void;
+  };
+  onError?: (error: unknown) => void;
+} = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
   const runtime = new RuntimeStore(db);
@@ -24,9 +38,41 @@ function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Pr
     readThread: options.readThread ?? (async () => ({ turns: [] })),
     readGoal: options.readGoal ?? (async () => ({ goal: null })),
     onChanged: () => { changes += 1; },
-    onError: (error) => { errors.push(error); },
+    onError: (error) => {
+      errors.push(error);
+      options.onError?.(error);
+    },
+    ...(options.classifyFailure ? { classifyFailure: options.classifyFailure } : {}),
+    ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
+    ...(options.timers ? { timers: options.timers } : {}),
   });
   return { db, store, runtime, processor, changes: () => changes, errors };
+}
+
+interface FakeTimer {
+  callback: () => void;
+  delayMs: number;
+  cleared: boolean;
+}
+
+function fakeTimers(): { timers: FakeTimer[]; api: { setTimeout(callback: () => void, delayMs: number): FakeTimer; clearTimeout(timer: FakeTimer): void } } {
+  const timers: FakeTimer[] = [];
+  return {
+    timers,
+    api: {
+      setTimeout: (callback, delayMs) => {
+        const timer = { callback, delayMs, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { timer.cleared = true; },
+    },
+  };
+}
+
+async function settleTimer(timer: FakeTimer): Promise<void> {
+  timer.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
 }
 
 const usage = {
@@ -143,6 +189,240 @@ test("idle waits for a blocked handler and leaves endpoint failures pending for 
   assert.equal(value.errors.length, 1);
 });
 
+test("observation retries only classified RPC timeouts and clears the durable row after success", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) throw new RpcRequestTimeoutError("thread/goal/get");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    retryMs: 25,
+    timers: clock.api,
+  });
+
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  assert.equal(value.store.pendingNotifications().length, 1);
+  assert.equal(clock.timers.length, 1);
+  assert.equal(clock.timers[0]!.delayMs, 25);
+
+  await settleTimer(clock.timers[0]!);
+  await value.processor.idle();
+  assert.equal(reads, 2);
+  assert.equal(value.store.pendingNotifications().length, 0);
+});
+
+test("endpoint loss or stop before queued observation work fences native reads and projection", async () => {
+  for (const action of ["loss", "stop"] as const) {
+    let reads = 0;
+    const value = fixture({ readGoal: async () => { reads += 1; return { goal: null }; } });
+    value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+    if (action === "loss") value.processor.endpointUnavailable("local");
+    else await value.processor.stop();
+    await value.processor.idle();
+    assert.equal(reads, 0, action);
+    assert.equal(value.store.pendingNotifications().length, 1, action);
+    assert.equal(value.changes(), 0, action);
+  }
+});
+
+test("endpoint loss during an observation RPC cannot project or complete the stale row", async () => {
+  let signalStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) {
+        signalStarted();
+        await blocked;
+        return { goal: { objective: "stale", status: "active", tokenBudget: null, updatedAt: 2 } };
+      }
+      return { goal: null };
+    },
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  value.processor.accept("local", "thread/settings/updated", {
+    threadId: "thread-1", threadSettings: { model: "new-model", effort: "high" },
+  });
+  await started;
+  value.processor.endpointUnavailable("local");
+  release();
+  await value.processor.idle();
+
+  assert.equal(value.store.pendingNotifications().length, 2);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).goal, null);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, null);
+  assert.equal(value.changes(), 0);
+  await value.processor.endpointReady("local");
+  assert.equal(reads, 2);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "new-model");
+});
+
+test("ordinary observation success clears only its still-current retry timer", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) throw new RpcRequestTimeoutError("thread/goal/get");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    timers: clock.api,
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  const stale = clock.timers[0]!;
+  value.processor.accept("local", "thread/settings/updated", {
+    threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" },
+  });
+  await value.processor.idle();
+  assert.equal(stale.cleared, true);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(reads, 2);
+});
+
+test("throwing operational reporting cannot suppress repeated observation retries or create user-visible rows", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  let reports = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads <= 3) throw new RpcRequestTimeoutError("thread/goal/get");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    timers: clock.api,
+    onError: () => reportOperationalSafely(() => {
+      reports += 1;
+      throw new Error("operational sink failed");
+    }, { level: "warn", code: "background_task_failed", component: "session_observation" }),
+  });
+
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  for (let index = 0; index < 3; index += 1) {
+    assert.ok(clock.timers[index]);
+    await settleTimer(clock.timers[index]!);
+    await value.processor.idle();
+  }
+  assert.equal(reads, 4);
+  assert.equal(reports, 3);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS count FROM deliveries").get() as { count: number }).count, 0);
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS count FROM events").get() as { count: number }).count, 0);
+});
+
+test("endpoint failures and deferred observations sleep until an explicit endpoint-ready wake", async () => {
+  const endpointClock = fakeTimers();
+  let endpointReads = 0;
+  const endpoint = fixture({
+    readGoal: async () => {
+      endpointReads += 1;
+      if (endpointReads === 1) throw new AppError("ENDPOINT_UNAVAILABLE", "offline");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" ? "endpoint" : "sleep",
+    timers: endpointClock.api,
+  });
+  endpoint.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await endpoint.processor.idle();
+  assert.equal(endpointClock.timers.length, 0);
+  assert.equal(endpoint.store.pendingNotifications().length, 1);
+  await endpoint.processor.endpointReady("local");
+  assert.equal(endpointReads, 2);
+  assert.equal(endpoint.store.pendingNotifications().length, 0);
+
+  const deferredClock = fakeTimers();
+  const deferred = fixture({ readThread: async () => ({ turns: [] }), timers: deferredClock.api });
+  deferred.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "not-visible-yet", tokenUsage: usage });
+  await deferred.processor.idle();
+  assert.equal(deferredClock.timers.length, 0);
+  assert.equal(deferred.store.pendingNotifications().length, 1);
+});
+
+test("unknown and permanent observation failures remain asleep", async () => {
+  for (const error of [new Error("unknown"), new AppError("CWD_MISMATCH", "permanent")]) {
+    const clock = fakeTimers();
+    const value = fixture({
+      readGoal: async () => { throw error; },
+      classifyFailure: () => "sleep",
+      timers: clock.api,
+    });
+    value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+    await value.processor.idle();
+    assert.equal(clock.timers.length, 0);
+    assert.equal(value.store.pendingNotifications().length, 1);
+  }
+});
+
+test("endpoint loss cancels observation retry and ready drains immediately", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) throw new RpcRequestTimeoutError("thread/goal/get");
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    timers: clock.api,
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  const stale = clock.timers[0]!;
+  value.processor.endpointUnavailable("local");
+  assert.equal(stale.cleared, true);
+  await settleTimer(stale);
+  assert.equal(reads, 1);
+
+  await value.processor.endpointReady("local");
+  assert.equal(reads, 2);
+  assert.equal(value.store.pendingNotifications().length, 0);
+});
+
+test("observation stop cancels timers, awaits tails, and fences stale callbacks", async () => {
+  const clock = fakeTimers();
+  let reads = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const value = fixture({
+    readGoal: async () => {
+      reads += 1;
+      if (reads === 1) throw new RpcRequestTimeoutError("thread/goal/get");
+      await blocked;
+      return { goal: null };
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    timers: clock.api,
+  });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
+  await value.processor.idle();
+  const stale = clock.timers[0]!;
+  const live = value.processor.endpointReady("local");
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  let stopped = false;
+  const stopping = value.processor.stop().then(() => { stopped = true; });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(stopped, false);
+  release();
+  await Promise.all([live, stopping]);
+  assert.equal(value.store.pendingNotifications().length, 1);
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(reads, 2);
+});
+
 test("defers observations for an unavailable session that will be restored as managed", async () => {
   const value = fixture();
   value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
@@ -158,7 +438,8 @@ test("defers observations for an unavailable session that will be restored as ma
 });
 
 test("quarantines an invalid durable observation without starving later rows", async () => {
-  const value = fixture();
+  const clock = fakeTimers();
+  const value = fixture({ timers: clock.api });
   assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
     threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: { totalTokens: -1 } },
   }), true);
@@ -168,6 +449,7 @@ test("quarantines an invalid durable observation without starving later rows", a
   assert.equal(value.store.pendingNotifications().length, 0);
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
   assert.equal(value.errors.length, 1);
+  assert.equal(clock.timers.length, 0);
   const invalid = value.db.prepare("SELECT state, error_json FROM session_dashboard_notifications WHERE sequence = 1").get() as { state: string; error_json: string };
   assert.equal(invalid.state, "failed");
   assert.deepEqual(JSON.parse(invalid.error_json), { message: "invalid thread/tokenUsage/updated notification" });
@@ -191,4 +473,29 @@ test("terminal observation stores only metadata and cannot clear a newer active 
   assert.deepEqual(value.store.facts({ endpointId: "local", threadId: "thread-1" }).lastWorkerEvent, {
     message_id: "message-1", turn_id: "old", status: "completed", at: "1970-01-01T00:00:02.000Z",
   });
+});
+
+test("terminal ordinal hydration passes through an existing endpoint lease", async () => {
+  const existingLease: EndpointWorkLease = {
+    endpointId: "local", lifecycleGeneration: 2, endpointGeneration: 3, leaseId: "terminal-observation",
+  };
+  const seen: Array<EndpointWorkLease | undefined> = [];
+  const value = fixture({
+    readThread: async (_endpointId, _threadId, lease) => {
+      seen.push(lease);
+      return { turns: [{ id: "terminal", startedAt: 1 }] };
+    },
+  });
+
+  await value.processor.observeTerminal({
+    endpointId: "local",
+    threadId: "thread-1",
+    turnId: "terminal",
+    status: "completed",
+    startedAt: 1,
+    completedAt: 2,
+    finalMessageId: "message-terminal",
+  }, existingLease);
+
+  assert.deepEqual(seen, [existingLease]);
 });

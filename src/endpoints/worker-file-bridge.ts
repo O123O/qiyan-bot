@@ -30,7 +30,7 @@ export class WorkerFileBridge {
   constructor(private readonly options: {
     attachments: AttachmentStore;
     registry: Pick<SessionRegistry, "getByIdentity">;
-    endpoints: Pick<EndpointManager, "validateWorkLease" | "withWorkLease">;
+    endpoints: Pick<EndpointManager, "validateWorkLease" | "withWorkLease" | "runWithWorkLease">;
     workspaces: Pick<WorkspaceRouter, "prepareExisting" | "assertDispatchable">;
     remote(endpointId: string): RemoteFileContext | undefined;
     maxFileBytes: number;
@@ -70,6 +70,7 @@ export class WorkerFileBridge {
     endpointId: string;
     projectRoot: string;
     mapping: MappingIdentity;
+    lease?: EndpointWorkLease;
     scopeId: string;
     relativePath: string;
     requestedId: FileHandleId;
@@ -79,7 +80,7 @@ export class WorkerFileBridge {
     const existing = this.options.attachments.get(input.scopeId, input.requestedId);
     if (existing) return existing;
     if (input.endpointId === "local") {
-      return this.options.endpoints.withWorkLease(input.endpointId, "file-transfer", async (_endpoint, lease) => {
+      return this.withFileLease(input.endpointId, input.lease, async (lease) => {
         this.assertCurrent(input.mapping, input.projectRoot);
         this.assertLease(lease, input.endpointId);
         const project = await this.prepareProject(input.endpointId, input.projectRoot, lease);
@@ -94,7 +95,7 @@ export class WorkerFileBridge {
         );
       });
     }
-    return this.options.endpoints.withWorkLease(input.endpointId, "file-transfer", async (_endpoint, lease) => {
+    return this.withFileLease(input.endpointId, input.lease, async (lease) => {
       this.assertCurrent(input.mapping, input.projectRoot);
       this.assertLease(lease, input.endpointId);
       const project = await this.prepareProject(input.endpointId, input.projectRoot, lease);
@@ -133,6 +134,18 @@ export class WorkerFileBridge {
     if (!found || found.session.mapping_id !== mapping.mapping_id || found.session.lifecycle_state !== "managed" || found.session.project_dir !== projectRoot) {
       throw new AppError("SESSION_DETACHED", "managed session mapping changed during file transfer");
     }
+  }
+
+  private withFileLease<T>(
+    endpointId: string,
+    existing: EndpointWorkLease | undefined,
+    run: (lease: EndpointWorkLease) => Promise<T>,
+  ): Promise<T> {
+    if (!existing) return this.options.endpoints.withWorkLease(endpointId, "file-transfer", (_endpoint, lease) => run(lease));
+    return this.options.endpoints.runWithWorkLease(endpointId, existing, (lease) => {
+      if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint file recovery lease is unavailable");
+      return run(lease);
+    });
   }
 
   private assertLease(lease: EndpointWorkLease, endpointId: string): void {

@@ -82,7 +82,6 @@ const chat = (id: string, conversationKey = "chat-1", attachmentIds: readonly st
 });
 
 function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
-  stopWaitMs?: number;
   onDeferredTerminal?: (turn: TurnSnapshot) => void;
   onOperationalEvent?: (event: "assistant_turn_started" | "assistant_turn_steered" | "assistant_submission_uncertain" | "assistant_turn_terminal") => void;
 } = {}) {
@@ -101,16 +100,16 @@ function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
   return { db, deliveries, store, pool, runner, dispatcher };
 }
 
-test("stop durably marks an unresolved native submission and returns within its bound", async () => {
-  const { db, runner, dispatcher } = fixture(1, { stopWaitMs: 5 });
+test("stop durably marks an unresolved native submission and awaits its handler", async () => {
+  const { db, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
-  await Promise.race([
-    dispatcher.stop(),
-    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("dispatcher stop hung")), 200)),
-  ]);
+  let stopped = false;
+  const stopping = dispatcher.stop().then(() => { stopped = true; });
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'first'").get()!.state, "uncertain");
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.equal(stopped, false);
   runner.starts[0]!.result.resolve({ turn: { id: "late", status: "inProgress", itemsView: "full", items: [] } });
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await stopping;
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'first'").get()!.state, "uncertain");
 });
 
@@ -197,11 +196,62 @@ test("startup recovery retries a terminal lease until authoritative history is a
   await recoveredDispatcher.stop();
 });
 
+test("requested recovery coalesces on the existing timer and stop cancels a pending wake", async () => {
+  const { runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "terminal", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.terminal({ id: "terminal", status: "completed", itemsView: "full", items: [] });
+  runner.history = {
+    status: "idle",
+    turns: [{ id: "terminal", status: "completed", itemsView: "full", items: [] }],
+  };
+
+  dispatcher.requestRecovery();
+  dispatcher.requestRecovery();
+  await waitFor(() => runner.historyReads === 1);
+  await dispatcher.idle();
+  assert.equal(runner.historyReads, 1);
+
+  dispatcher.requestRecovery();
+  await dispatcher.stop();
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.equal(runner.historyReads, 1);
+});
+
+test("stop awaits an active authoritative recovery read without a time bound", async () => {
+  const { runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "terminal", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.terminal({ id: "terminal", status: "completed", itemsView: "full", items: [] });
+  const history = deferred<ThreadSnapshot>();
+  runner.readThread = () => {
+    runner.historyReads += 1;
+    return history.promise;
+  };
+
+  dispatcher.requestRecovery();
+  await waitFor(() => runner.historyReads === 1);
+  let stopped = false;
+  const stopping = dispatcher.stop().then(() => { stopped = true; });
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.equal(stopped, false);
+  history.resolve({
+    status: "idle",
+    turns: [{ id: "terminal", status: "completed", itemsView: "full", items: [] }],
+  });
+  await stopping;
+  assert.equal(stopped, true);
+});
+
 test("startup recovery retries an uncertain submission after a transient history failure", async () => {
-  const { store, pool, runner, dispatcher } = fixture(1, { stopWaitMs: 0 });
+  const { store, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
-  await dispatcher.stop();
+  const stopping = dispatcher.stop();
+  runner.starts[0]!.result.reject(new Error("transport stopped"));
+  await stopping;
   assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "uncertain");
 
   const recoveryRunner = new FakeRunner();
@@ -231,10 +281,12 @@ test("startup recovery retries an uncertain submission after a transient history
 });
 
 test("a stale overlapping recovery read cannot overwrite newer authoritative correlation", async () => {
-  const { store, pool, runner, dispatcher } = fixture(1, { stopWaitMs: 0 });
+  const { store, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
-  await dispatcher.stop();
+  const stopping = dispatcher.stop();
+  runner.starts[0]!.result.reject(new Error("transport stopped"));
+  await stopping;
 
   const older = deferred<ThreadSnapshot>();
   const newer = deferred<ThreadSnapshot>();

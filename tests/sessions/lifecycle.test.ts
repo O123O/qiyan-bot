@@ -11,6 +11,9 @@ import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
+import type { EndpointManager } from "../../src/endpoints/manager.ts";
+import { createManagedSessionRecoveryOwner, managedRetryKey } from "../../src/production-app.ts";
 
 class LifecycleEndpoint implements AppServerEndpoint {
   readonly id = "local";
@@ -24,6 +27,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   pathOnStart: string | null | undefined;
   failResume = false;
   onResume: (() => void) | undefined;
+  resumeBarrier: Promise<void> | undefined;
 
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
@@ -37,6 +41,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
     if (method === "thread/read") return { thread } as T;
     if (method === "thread/resume") {
       this.onResume?.();
+      await this.resumeBarrier;
       if (this.failResume) throw new Error("resume response lost");
       return { thread, cwd: this.cwd, model: "gpt-5", reasoningEffort: "high" } as T;
     }
@@ -46,9 +51,11 @@ class LifecycleEndpoint implements AppServerEndpoint {
 
 async function fixture(ownership?: {
   initialize(identity: { endpoint: string; thread_id: string; mapping_id: string }, path: string): Promise<void>;
-  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<{ state: "uninitialized" | "owned" } | { state: "external"; turnId: string }>;
+  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<
+    { state: "uninitialized" | "owned" } | { state: "external" | "unclassified"; turnId: string }
+  >;
   release(identity: { endpoint: string; thread_id: string; mapping_id: string }): void;
-}) {
+}, endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-life-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3,
@@ -71,7 +78,7 @@ async function fixture(ownership?: {
       assertDispatchable: async (prepared) => { checked.push(prepared.path); },
     },
     gate,
-    undefined,
+    endpoints,
     ownership,
   );
   return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate };
@@ -237,6 +244,70 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
 });
 
+test("stopping managed recovery while native resume is blocked fences every success publication", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "local", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "blocked-recovery",
+  };
+  const endpoints = {
+    withWorkLease: async <T>(
+      _endpointId: string | undefined,
+      _kind: "rpc" | "session-mutation" | "file-transfer",
+      run: (endpoint: never, current: EndpointWorkLease) => Promise<T>,
+    ): Promise<T> => run(undefined as never, lease),
+    runWithWorkLease: async <T>(
+      _endpointId: string,
+      existing: EndpointWorkLease | undefined,
+      run: (current: EndpointWorkLease | undefined) => Promise<T>,
+    ): Promise<T> => run(existing ?? lease),
+  } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">;
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture(undefined, endpoints);
+  const session = {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
+  };
+  await registry.createManaged("payments", session);
+  runtime.setSession("local", "thread-1", session.mapping_id, "unavailable", "notLoaded");
+  let signalResume!: () => void;
+  let releaseResume!: () => void;
+  const resumeStarted = new Promise<void>((resolve) => { signalResume = resolve; });
+  endpoint.resumeBarrier = new Promise<void>((resolve) => { releaseResume = resolve; });
+  endpoint.onResume = signalResume;
+  let capacityPublications = 0;
+  let dashboardPublications = 0;
+  let observationPublications = 0;
+  const key = managedRetryKey("local", "thread-1", session.mapping_id);
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys, currentLease, isCurrent) => {
+      await lifecycle.reconcileManaged("payments", required(registry), currentLease, isCurrent);
+      if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
+      capacityPublications += 1;
+      dashboardPublications += 1;
+      observationPublications += 1;
+      return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
+    },
+    beforeShared: async () => [],
+    wakeShared: async () => undefined,
+    afterShared: async () => undefined,
+    onSafetyFailure: () => assert.fail("stale recovery must not reach safety handling"),
+    onError: () => undefined,
+  });
+  owner.recordFailure(key, "endpoint");
+
+  const recovering = owner.endpointReady("local", lease);
+  await resumeStarted;
+  const stopping = owner.stop();
+  releaseResume();
+  assert.deepEqual(await recovering, { recovery: "none", sharedWake: "stale" });
+  await stopping;
+
+  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "unavailable");
+  assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id), undefined);
+  assert.equal(capacityPublications, 0);
+  assert.equal(dashboardPublications, 0);
+  assert.equal(observationPublications, 0);
+});
+
 test("managed recovery checks an existing rollout guard before reading native history", async () => {
   const seen: string[] = [];
   const { dir, registry, endpoint, lifecycle } = await fixture({
@@ -248,10 +319,27 @@ test("managed recovery checks an existing rollout guard before reading native hi
 
   await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    assert.equal((error as AppError).details?.recovery, "external_turn");
     return true;
   });
 
   assert.deepEqual(seen, ["ownership"]);
+  assert.deepEqual(endpoint.calls, []);
+});
+
+test("managed recovery retry-tags only an unclassified ownership boundary", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => undefined,
+    inspectIfInitialized: async () => ({ state: "unclassified", turnId: "not-classified" }),
+    release: () => undefined,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" });
+
+  await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
+    assert.equal((error as AppError).code, "OPERATION_UNCERTAIN");
+    assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
+    return true;
+  });
   assert.deepEqual(endpoint.calls, []);
 });
 
@@ -335,6 +423,45 @@ test("startup completes exact unadopting and archiving mappings before managed r
   assert.equal(registry.get("billing"), undefined);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), true);
+});
+
+test("external removal reuses one existing endpoint lease through unadopt and resumption", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "local",
+    lifecycleGeneration: 1,
+    endpointGeneration: 2,
+    leaseId: "external-monitor",
+  };
+  const seen: Array<EndpointWorkLease | undefined> = [];
+  const endpoints = {
+    withWorkLease: async () => { assert.fail("an existing lease must not acquire a replacement"); },
+    runWithWorkLease: async <T>(endpointId: string, existing: EndpointWorkLease | undefined, run: (value: EndpointWorkLease | undefined) => Promise<T>) => {
+      assert.equal(endpointId, "local");
+      seen.push(existing);
+      return run(existing);
+    },
+  } as Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">;
+  const { dir, registry, endpoint, lifecycle } = await fixture(undefined, endpoints);
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-1",
+  });
+
+  await lifecycle.unadopt("payments", undefined, lease);
+  assert.equal(registry.get("payments"), undefined);
+
+  endpoint.threadId = "thread-2";
+  const removing = {
+    endpoint: "local", thread_id: "thread-2", project_dir: dir, mapping_id: "mapping-2", lifecycle_state: "unadopting" as const,
+  };
+  const adopting: RegistrySession = { ...removing, lifecycle_state: "adopting" };
+  const managed: RegistrySession = { ...removing, lifecycle_state: "managed" };
+  await registry.reserve("billing", adopting);
+  await registry.promote("billing", adopting);
+  await registry.transition("billing", managed, "unadopting");
+
+  await lifecycle.reconcileRemoval("billing", removing, lease);
+  assert.equal(registry.get("billing"), undefined);
+  assert.deepEqual(seen, [lease, lease]);
 });
 
 test("a rename waiting on the gate cannot rename a reused nickname generation", async () => {

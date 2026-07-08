@@ -43,7 +43,6 @@ interface DispatcherOptions {
   onDeferredTerminal?: (turn: TurnSnapshot) => void;
   scheduler?: AssistantScheduler;
   retryMs?: number;
-  stopWaitMs?: number;
   onOperationalEvent?: (event: DispatcherOperationalEvent) => void;
 }
 
@@ -169,6 +168,10 @@ export class ConversationDispatcher {
     });
   }
 
+  requestRecovery(): void {
+    this.scheduleRecovery();
+  }
+
   async idle(): Promise<void> {
     while (true) {
       await this.tail;
@@ -196,12 +199,7 @@ export class ConversationDispatcher {
         this.options.membershipObserver?.notifyMembership(unresolved.contextId);
       }
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      this.idle(),
-      new Promise<void>((resolve) => { timer = setTimeout(resolve, this.options.stopWaitMs ?? 1_000); }),
-    ]);
-    if (timer) clearTimeout(timer);
+    await this.idle();
   }
 
   private pump(): void {

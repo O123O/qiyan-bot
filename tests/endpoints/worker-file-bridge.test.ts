@@ -5,6 +5,7 @@ import test from "node:test";
 import type { FileHandleId, StoredAttachment } from "../../src/attachments/store.ts";
 import { WorkerFileBridge } from "../../src/endpoints/worker-file-bridge.ts";
 import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
+import { runOperationRecoveryTarget } from "../../src/production-app.ts";
 
 const mapping = { endpoint: "devbox", thread_id: "thread-1", mapping_id: "mapping-1" };
 const lease: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
@@ -50,6 +51,9 @@ function fixture() {
   let mutateDuringPromote = false;
   let rejectWorkspace = false;
   let remoteReads = 0;
+  let activatingLeaseCalls = 0;
+  let existingLeaseCalls = 0;
+  let existingLeaseValid = true;
   const remote = {
     invokeTransfer: async <T>(operation: string, _args: readonly string[], options: { input?: AsyncIterable<Uint8Array | string> }) => {
       if (operation === "write-file") {
@@ -73,7 +77,14 @@ function fixture() {
     registry: { getByIdentity: () => ({ nickname: "novel", session: { ...current } }) } as never,
     endpoints: {
       validateWorkLease: (candidate: EndpointWorkLease, endpointId: string) => candidate === lease && endpointId === "devbox",
-      withWorkLease: async (_id: string, _kind: "file-transfer", run: (endpoint: unknown, value: EndpointWorkLease) => Promise<unknown>) => run({}, lease),
+      withWorkLease: async (_id: string, _kind: "file-transfer", run: (endpoint: unknown, value: EndpointWorkLease) => Promise<unknown>) => {
+        activatingLeaseCalls += 1;
+        return run({}, lease);
+      },
+      runWithWorkLease: async (_id: string, existing: EndpointWorkLease | undefined, run: (value: EndpointWorkLease | undefined) => Promise<unknown>) => {
+        existingLeaseCalls += 1;
+        return run(existingLeaseValid ? existing : undefined);
+      },
     } as never,
     workspaces: {
       prepareExisting: async () => {
@@ -92,6 +103,8 @@ function fixture() {
     mutateDuringPromote: () => { mutateDuringPromote = true; },
     replaceWorkspace: () => { rejectWorkspace = true; },
     remoteReads: () => remoteReads,
+    leaseCalls: () => ({ activating: activatingLeaseCalls, existing: existingLeaseCalls }),
+    invalidateExistingLease: () => { existingLeaseValid = false; },
   };
 }
 
@@ -118,6 +131,31 @@ test("downloads a selected remote project file and promotes it only for the same
     scopeId: "scope", relativePath: "out/report.txt", requestedId: "file_raced",
   }), /mapping changed/u);
   assert.equal(raced.ingested.length, 0);
+});
+
+test("recovery reuses its exact ready lease without activating after endpoint loss", async () => {
+  const value = fixture();
+  let outerAcquisitions = 0;
+  await runOperationRecoveryTarget({ policy: "ready_endpoint", endpointId: "devbox" }, {
+    withReadyWorkLease: async (endpointId: string | undefined, run: (lease: EndpointWorkLease) => Promise<unknown>) => {
+      outerAcquisitions += 1;
+      assert.equal(endpointId, "devbox");
+      return run(lease);
+    },
+  } as never, async (actual) => value.bridge.prepareProjectFile({
+    endpointId: "devbox", projectRoot: "/home/xin/project", mapping, lease: actual!,
+    scopeId: "scope", relativePath: "out/report.txt", requestedId: "file_recovery",
+  }));
+  assert.equal(outerAcquisitions, 1);
+  assert.deepEqual(value.leaseCalls(), { activating: 0, existing: 1 });
+
+  const lost = fixture();
+  lost.invalidateExistingLease();
+  await assert.rejects(lost.bridge.prepareProjectFile({
+    endpointId: "devbox", projectRoot: "/home/xin/project", mapping, lease,
+    scopeId: "scope", relativePath: "out/report.txt", requestedId: "file_lost",
+  }), /lease|unavailable/u);
+  assert.deepEqual(lost.leaseCalls(), { activating: 0, existing: 1 });
 });
 
 test("rejects a mapping change at the attachment database promotion fence", async () => {

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { BotConfig } from "../src/config.ts";
-import { assistantAccessWarning, buildProductionApp, createMaintenanceFailureHandler } from "../src/production-app.ts";
+import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
 import type { ChatAdapter } from "../src/chat/contracts.ts";
 import { StartupPhaseError } from "../src/app.ts";
 import { createTestDatabase, openDatabase, type Database } from "../src/storage/database.ts";
@@ -17,21 +17,6 @@ test("only full-access assistant mode emits the structural startup warning", () 
   assert.match(assistantAccessWarning("danger-full-access") ?? "", /non-interactively with full filesystem access/);
   assert.equal(assistantAccessWarning("workspace-write"), undefined);
   assert.equal(assistantAccessWarning("read-only"), undefined);
-});
-
-test("maintenance requests one restart only for exact recoverable metadata failure", () => {
-  const events: string[] = [];
-  const handle = createMaintenanceFailureHandler({
-    requestRestart: () => { events.push("restart"); },
-    reportRecoveryRequired: () => { events.push("recovery-required"); },
-    reportRetryableFailure: () => { events.push("retry"); },
-  });
-
-  handle(new DashboardMetadataRecoveryRequiredError());
-  handle(new DashboardMetadataRecoveryRequiredError());
-  handle(new Error("ordinary maintenance failure"));
-
-  assert.deepEqual(events, ["recovery-required", "restart", "retry"]);
 });
 
 test("production storage contention blocks adapters and the same app retries after release", async (t) => {
@@ -104,6 +89,43 @@ test("production repairs dashboard metadata inside one startup lease before adap
   ]);
   const probe = await acquireDatabaseLease(join(config.dataDir, "bot.sqlite3"));
   await probe.release();
+});
+
+test("production requests one restart for runtime metadata loss even when fixed-code reporting throws", async (t) => {
+  const { config } = await productionFixture(t);
+  const invalid = createTestDatabase();
+  invalid.prepare("DELETE FROM session_dashboard_meta").run();
+  const repaired = createTestDatabase();
+  const databases = [invalid, repaired];
+  const events: string[] = [];
+  let restarts = 0;
+  const app = await buildProductionApp(config, {
+    chdir: () => undefined,
+    requestRestart: () => { restarts += 1; },
+    onOperationalEvent: (event) => {
+      events.push(event.code);
+      if (event.code === "database_metadata_recovered") {
+        repaired.prepare("DELETE FROM session_dashboard_meta").run();
+      } else if (event.code === "database_metadata_recovery_required") {
+        throw new Error("private operational sink failure");
+      }
+    },
+    storage: {
+      openDatabase: () => databases.shift()!,
+      recoverDatabase: async () => undefined,
+    },
+  });
+
+  await assert.rejects(app.start(), (error: unknown) => {
+    assert.equal(error instanceof StartupPhaseError && error.phase === "dashboard", true);
+    assert.equal(
+      error instanceof StartupPhaseError && error.cause instanceof DashboardMetadataRecoveryRequiredError,
+      true,
+    );
+    return true;
+  });
+  assert.equal(restarts, 1);
+  assert.deepEqual(events, ["database_metadata_recovered", "database_metadata_recovery_required"]);
 });
 
 test("failed pre-recovery database close retains the lease and never starts recovery", async (t) => {

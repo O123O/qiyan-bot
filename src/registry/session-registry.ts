@@ -160,18 +160,6 @@ export class SessionRegistry {
     });
   }
 
-  async reload(validate?: (document: RegistryDocument) => Promise<void>): Promise<boolean> {
-    return this.lock(async () => {
-      try {
-        const document = normalize(JSON.parse(await readFile(this.path, "utf8")) as RegistryDocument);
-        await validate?.(structuredClone(document));
-        this.document = document;
-        await atomicWriteOne(`${this.path}.last-good`, document);
-        return true;
-      } catch { return false; }
-    });
-  }
-
   private assertAvailable(nickname: string, session: RegistrySession): void {
     if (this.document.sessions[nickname]) throw new Error(`nickname already exists: ${nickname}`);
     if (Object.values(this.document.sessions).some((candidate) => candidate.endpoint === session.endpoint && candidate.thread_id === session.thread_id)) {

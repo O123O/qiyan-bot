@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { DeliveryStore } from "../../src/storage/delivery-store.ts";
+import { AssistantRuntime } from "../../src/assistant/runtime.ts";
+import { operationRecoveryAction } from "../../src/production-app.ts";
 
 test("an identical operation replay returns its stored receipt", () => {
   const db = createTestDatabase();
@@ -68,6 +71,21 @@ test("recoverable operations retain their canonical arguments and stable call id
   assert.deepEqual(store.listRecoverable().map(({ contextId, attemptId, callId, kind, args, state }) => ({ contextId, attemptId, callId, kind, args, state })), [{
     contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" }, state: "dispatched",
   }]);
+});
+
+test("a durable current attempt is actionable after process-local tool handlers are lost", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  store.createSourceContext({ id: "ctx", kind: "event_batch", sourceId: "batch", rawText: "", attachmentIds: [] });
+  const beforeRestart = new AssistantRuntime(db, store, new DeliveryStore(db), { binding: { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } });
+  beforeRestart.prepareAttempt("ctx", "attempt", "internal");
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: {} });
+  store.markDispatched(operation.id);
+
+  const afterRestart = new AssistantRuntime(db, store, new DeliveryStore(db), { binding: { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } });
+  assert.equal(afterRestart.hydrateActive()?.attemptId, "attempt");
+  assert.equal(afterRestart.hasActiveTools("attempt"), false);
+  assert.equal(operationRecoveryAction({ state: store.listRecoverable()[0]!.state, activeHandler: afterRestart.hasActiveTools("attempt") }), "attempt");
 });
 
 test("failing an operation and releasing its directive are one transaction", () => {

@@ -59,6 +59,7 @@ export class LoopbackMcpServer {
       token: string;
       allowedClientProcess?: () => LinuxProcessIdentity | undefined;
       beforeToolCall?: () => Promise<void>;
+      afterToolCall?: (attemptId: string) => void;
     },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
@@ -144,6 +145,8 @@ export class LoopbackMcpServer {
           return { content: [{ type: "text" as const, text: JSON.stringify(result ?? null) }] };
         } finally {
           this.contexts.finishTool?.(active.attemptId);
+          try { this.options.afterToolCall?.(active.attemptId); }
+          catch { /* Recovery wake failures are contained at the MCP boundary. */ }
         }
       });
     }

@@ -51,6 +51,7 @@ export class SessionDiscovery {
       offset = cursor.offset;
       rows = JSON.parse(String(record.rows_json)) as DiscoveredSession[];
     } else {
+      this.cleanupExpired();
       rows = await this.fetchAll(query.endpointId, query.cwd, lease);
       if (query.search) {
         const needle = query.search.toLocaleLowerCase();
@@ -69,7 +70,7 @@ export class SessionDiscovery {
     };
   }
 
-  cleanupExpired(): number {
+  private cleanupExpired(): number {
     return Number(this.db.prepare("DELETE FROM discovery_snapshots WHERE expires_at <= ?").run(this.clock.now()).changes);
   }
 

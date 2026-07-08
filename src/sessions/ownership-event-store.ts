@@ -36,16 +36,20 @@ export class OwnershipEventStore {
     ).changes === 1;
   }
 
-  reconcileReleased(registry: OwnershipRegistry): number {
+  pending(endpointId?: string): ExternalTurnIncident[] {
+    const endpointFilter = endpointId === undefined ? "" : " AND pending.endpoint_id = ?";
     const rows = this.db.prepare(`SELECT pending.id, pending.endpoint_id, pending.thread_id, pending.turn_id, pending.payload_json
       FROM events pending
       LEFT JOIN events completed
         ON completed.id = 'external-release:' || substr(pending.id, length('external-turn:') + 1)
-      WHERE pending.kind = 'external_worker_turn_detected' AND completed.id IS NULL
-      ORDER BY pending.created_at, pending.id`).all() as unknown as PendingEventRow[];
+      WHERE pending.kind = 'external_worker_turn_detected' AND completed.id IS NULL${endpointFilter}
+      ORDER BY pending.created_at, pending.id`).all(...(endpointId === undefined ? [] : [endpointId])) as unknown as PendingEventRow[];
+    return rows.map(parsePendingIncident);
+  }
+
+  reconcileReleased(registry: OwnershipRegistry): number {
     let inserted = 0;
-    for (const row of rows) {
-      const incident = parsePendingIncident(row);
+    for (const incident of this.pending()) {
       const current = registry.getByIdentity(incident.endpoint, incident.thread_id);
       if (current?.session.mapping_id === incident.mapping_id) continue;
       if (this.record(incident, "completed")) inserted += 1;

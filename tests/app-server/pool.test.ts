@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppServerPool, type AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
-import type { ManagedAppServerEndpoint } from "../../src/endpoints/types.ts";
+import { EndpointManager } from "../../src/endpoints/manager.ts";
+import type { PermissionBlockedEvent } from "../../src/app-server/local-endpoint.ts";
+import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 class FakeEndpoint implements AppServerEndpoint {
   readonly id: string = "local";
@@ -17,6 +19,34 @@ class FakeEndpoint implements AppServerEndpoint {
     }
     return {} as T;
   }
+}
+
+class AdmissionRaceEndpoint implements ManagedAppServerEndpoint {
+  private currentState: ManagedAppServerEndpoint["state"] = "stopped";
+  private armedRead: number | undefined;
+  private stateReads = 0;
+  starts = 0;
+  requests = 0;
+  constructor(readonly id: string) {}
+  get state(): ManagedAppServerEndpoint["state"] {
+    if (this.armedRead !== undefined && ++this.stateReads >= this.armedRead) this.currentState = "unavailable";
+    return this.currentState;
+  }
+  armUnavailableOnStateRead(read: number): void { this.armedRead = read; this.stateReads = 0; }
+  async start(): Promise<void> { this.starts += 1; this.currentState = "ready"; this.armedRead = undefined; }
+  async closeConnection(): Promise<void> { this.currentState = "stopped"; }
+  async shutdownRuntime(): Promise<void> { this.currentState = "stopped"; }
+  async runtimeIdentity(): Promise<RuntimeIdentity> {
+    return { kind: "ssh", token: "a".repeat(32), pid: 1, linuxStartTime: "1", processGroupId: 1 };
+  }
+  async request<T>(): Promise<T> {
+    this.requests += 1;
+    return { thread: { status: "active", turns: [] } } as T;
+  }
+  onNotification(): () => void { return () => undefined; }
+  onReady(): () => void { return () => undefined; }
+  onUnavailable(_listener: (kind: EndpointLossKind) => void): () => void { return () => undefined; }
+  onPermissionBlocked(_listener: (event: PermissionBlockedEvent) => void): () => void { return () => undefined; }
 }
 
 test("turn permits remain reserved until terminal completion", async () => {
@@ -373,6 +403,91 @@ test("connection loss retains and coalesces cold active and provisional claims",
   assert.equal(pool.activeTurnCount, 0);
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 0);
+});
+
+test("claim reconciliation stops after endpoint loss and reuses its exact lease without activation", async () => {
+  const lease: EndpointWorkLease = {
+    endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "claim-recovery",
+  };
+  let firstReadStarted!: () => void;
+  let releaseFirstRead!: () => void;
+  const started = new Promise<void>((resolve) => { firstReadStarted = resolve; });
+  const blocked = new Promise<void>((resolve) => { releaseFirstRead = resolve; });
+  const reads: string[] = [];
+  let activations = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "devbox",
+    state: "ready",
+    request: async <T>(_method: string, params: any) => {
+      reads.push(params.threadId);
+      if (reads.length === 1) {
+        firstReadStarted();
+        await blocked;
+      }
+      return { thread: { status: "active", turns: [{
+        id: `turn-${params.threadId}`, status: "inProgress", itemsView: "full", items: [],
+      }] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], {
+    maxConcurrentTurns: 2,
+    workLeaseProvider: async (_endpointId, existingLease, run) => {
+      if (!existingLease) activations += 1;
+      return run(existingLease);
+    },
+  });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-thread-a");
+  pool.restoreObservedActiveTurn("devbox", "thread-b", "turn-thread-b");
+  let current = true;
+
+  const reconciling = pool.reconcileEndpointClaims("devbox", lease, () => current);
+  await started;
+  current = false;
+  releaseFirstRead();
+  await reconciling;
+
+  assert.deepEqual(reads, ["thread-a"]);
+  assert.equal(activations, 0);
+  assert.equal(pool.activeTurnCount, 2);
+});
+
+test("real ready-lease admission cannot activate after loss between predicate and request", async () => {
+  const local = new AdmissionRaceEndpoint("local");
+  const remote = new AdmissionRaceEndpoint("devbox");
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id) => ({ id, type: "ssh" as const, projectsRoot: "~/projects" }),
+    },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+  });
+  const published = await manager.ensureReady("devbox");
+  let resolveCalls = 0;
+  const pool = new AppServerPool([published], {
+    maxConcurrentTurns: 2,
+    resolveEndpoint: async (id) => {
+      resolveCalls += 1;
+      return manager.ensureReady(id);
+    },
+    workLeaseProvider: (id, existing, run) => manager.runWithReadyWorkLease(id, existing, run),
+  });
+  pool.restoreObservedActiveTurn("devbox", "thread-a", "turn-a");
+  pool.restoreObservedActiveTurn("devbox", "thread-b", "turn-b");
+
+  await manager.withReadyWorkLease("devbox", async (lease) => {
+    remote.armUnavailableOnStateRead(3);
+    await pool.reconcileEndpointClaims(
+      "devbox", lease, () => manager.validateReadyWorkLease(lease, "devbox"),
+    );
+  });
+
+  assert.equal(resolveCalls, 0);
+  assert.equal(remote.starts, 1, "the published runtime is never restarted by stale claim recovery");
+  assert.equal(remote.requests, 0, "the unavailable endpoint is rejected at final admission before its RPC");
+  assert.equal(pool.activeTurnCount, 2, "no later claim is reconciled after the loss");
 });
 
 test("a provisional claim bound during recovery stays resolved after its turn terminates", async () => {

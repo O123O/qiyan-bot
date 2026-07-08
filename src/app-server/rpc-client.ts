@@ -20,6 +20,13 @@ export class JsonRpcResponseError extends Error {
   }
 }
 
+export class RpcRequestTimeoutError extends Error {
+  constructor(method: string) {
+    super(`app-server request timed out: ${method}`);
+    this.name = "RpcRequestTimeoutError";
+  }
+}
+
 export class RpcClient {
   private nextId = 1;
   private readonly pending = new Map<number | string, Pending>();
@@ -46,7 +53,7 @@ export class RpcClient {
         signal?.removeEventListener("abort", abort);
         reject(error);
       };
-      const timeout = setTimeout(() => finishReject(new Error(`app-server request timed out: ${method}`)), this.options.requestTimeoutMs);
+      const timeout = setTimeout(() => finishReject(new RpcRequestTimeoutError(method)), this.options.requestTimeoutMs);
       const abort = () => finishReject(signal?.reason instanceof Error ? signal.reason : new Error("request aborted"));
       if (signal?.aborted) { clearTimeout(timeout); reject(signal.reason instanceof Error ? signal.reason : new Error("request aborted")); return; }
       signal?.addEventListener("abort", abort, { once: true });

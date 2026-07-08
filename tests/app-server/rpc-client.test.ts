@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { RpcClient, type RpcWire } from "../../src/app-server/rpc-client.ts";
+import { RpcClient, RpcRequestTimeoutError, type RpcWire } from "../../src/app-server/rpc-client.ts";
 
 class MemoryWire implements RpcWire {
   sent: string[] = [];
@@ -39,7 +39,12 @@ test("generic RPC client rejects aborts, timeouts, and wire closure", async () =
   const aborted = client.request("abort", {}, controller.signal);
   controller.abort(new Error("stop"));
   await assert.rejects(aborted, /stop/u);
-  await assert.rejects(client.request("timeout", {}), /timed out/u);
+  await assert.rejects(client.request("timeout", { private: "must not be retained" }), (error) => {
+    assert.equal(error instanceof RpcRequestTimeoutError, true);
+    assert.equal(error instanceof Error ? error.message : "", "app-server request timed out: timeout");
+    assert.equal(JSON.stringify(error).includes("must not be retained"), false);
+    return true;
+  });
   const closed = client.request("close", {});
   wire.emitClose(new Error("wire lost"));
   await assert.rejects(closed, /wire lost/u);

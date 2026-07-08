@@ -4,6 +4,7 @@ import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
+import { AttachmentCleanup, type CleanupTimers } from "./attachments/cleanup.ts";
 import type { ChatAdapter } from "./chat/contracts.ts";
 import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
 import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
@@ -18,13 +19,18 @@ import {
 } from "./chat/output-actions.ts";
 import { LocalEndpoint } from "./app-server/local-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
+import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
-import { createBackgroundFailureReporter, createFailureCycle } from "./core/background-failure-reporter.ts";
-import type { OperationalEventSink } from "./core/operational-log.ts";
+import {
+  createBackgroundFailureReporter,
+  createFailureCycle,
+  type BackgroundFailureNotice,
+} from "./core/background-failure-reporter.ts";
+import type { OperationalEvent, OperationalEventSink } from "./core/operational-log.ts";
 import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
@@ -40,12 +46,18 @@ import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, ToolReadinessGate } from "./mcp/server.ts";
-import { SessionRegistry, type RegistryDocument, type RegistrySession } from "./registry/session-registry.ts";
+import { SessionRegistry, type RegistrySession } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
-import { SessionOwnershipWatcher } from "./sessions/ownership-watcher.ts";
+import {
+  ExternalOwnershipMonitor,
+  SessionOwnershipWatcher,
+  type ExternalOwnershipCycleResult,
+  type ExternalOwnershipReleaseStatus,
+  type ExternalTurnIncident,
+} from "./sessions/ownership-watcher.ts";
 import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
@@ -57,9 +69,9 @@ import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts"
 import { BackgroundFailureStore } from "./storage/background-failure-store.ts";
 import { ConversationStore, type ChatAcceptanceEffects } from "./storage/conversation-store.ts";
 import { finalizeConversationCutover, preflightConversationCutover, runConversationRoutingBackfill } from "./storage/conversation-cutover.ts";
-import { OperationStore } from "./storage/operation-store.ts";
+import { OperationStore, type RecoverableOperation } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
-import { isDashboardMetadataRecoveryRequired, SessionDashboardStore } from "./storage/session-dashboard-store.ts";
+import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
 import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
 import type { SlackContextService } from "./slack/context-service.ts";
 import { SlackChatAdapter } from "./slack/chat-adapter.ts";
@@ -91,12 +103,604 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
 const scheduledFailureThreshold = 3;
-const maintenanceFailureEpisode = "maintenance";
-const projectReconciliationFailureEpisode = "periodic-project-reconciliation";
-const managedRecoveryFailureEpisode = "periodic-managed-session-recovery";
+const externalOwnershipFailureEpisode = "external-ownership-detection";
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
+}
+
+export function reportAssistantTerminalFailure(
+  dispatcher: Pick<ConversationDispatcher, "requestRecovery"> | undefined,
+  report: () => void,
+): void {
+  try { report(); }
+  finally { dispatcher?.requestRecovery(); }
+}
+
+export function createAttachmentCleanupOwner(
+  cleanup: () => Promise<number>,
+  report: OperationalEventSink,
+  timers?: CleanupTimers,
+): AttachmentCleanup {
+  return new AttachmentCleanup(
+    cleanup,
+    () => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "attachment_cleanup",
+    }),
+    timers,
+  );
+}
+
+export function createExternalOwnershipCycleReporter(options: {
+  runId?: string;
+  onOperational(): void;
+  onDegraded(notice: BackgroundFailureNotice): void;
+}): (results: readonly ExternalOwnershipCycleResult[]) => void {
+  const reporter = createBackgroundFailureReporter({
+    ...(options.runId ? { runId: options.runId } : {}),
+    onOperational: () => { options.onOperational(); },
+    onDurable: options.onDegraded,
+  });
+  return (results) => {
+    const cycle = createFailureCycle({
+      onFailed: () => {
+        reporter.report("external session ownership detection", {
+          episode: externalOwnershipFailureEpisode,
+          notifyAfter: scheduledFailureThreshold,
+        });
+      },
+      onResolved: () => { reporter.resolve(externalOwnershipFailureEpisode); },
+    });
+    for (const result of results) {
+      if (result.outcome === "failed") cycle.failed();
+      else if (result.outcome === "inconclusive") cycle.inconclusive();
+      else cycle.succeeded();
+    }
+    cycle.finish();
+  };
+}
+
+export type OperationRecoveryAction = "wait_for_tool" | "attempt";
+
+export function operationRecoveryAction(input: {
+  state: RecoverableOperation["state"];
+  activeHandler: boolean;
+}): OperationRecoveryAction {
+  return input.activeHandler ? "wait_for_tool" : "attempt";
+}
+
+export type OperationRecoveryTarget =
+  | { policy: "local" }
+  | { policy: "ready_endpoint"; endpointId: string }
+  | { policy: "endpoint_lifecycle"; endpointId: string }
+  | { policy: "unknown" };
+
+export interface EndpointReadyBuffer {
+  ready(endpointId: string): Promise<void> | undefined;
+  acknowledge(endpointId: string): void;
+  pause(): void;
+  acceptAndDrain(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export function createEndpointReadyBuffer(options: {
+  recover(endpointId: string): Promise<void>;
+  maxPendingEndpoints?: number;
+}): EndpointReadyBuffer {
+  const maxPendingEndpoints = options.maxPendingEndpoints ?? 65_536;
+  if (!Number.isSafeInteger(maxPendingEndpoints) || maxPendingEndpoints < 1) {
+    throw new RangeError("maxPendingEndpoints must be a positive safe integer");
+  }
+  const pending = new Set<string>();
+  const recoveries = new Map<string, { dirty: boolean; running: Promise<void> }>();
+  let accepting = false;
+  let stopped = false;
+
+  const requestRecovery = (endpointId: string): Promise<void> => {
+    const existing = recoveries.get(endpointId);
+    if (existing) {
+      existing.dirty = true;
+      return existing.running;
+    }
+    const state = { dirty: false, running: undefined as unknown as Promise<void> };
+    recoveries.set(endpointId, state);
+    state.running = Promise.resolve().then(async () => {
+      if (stopped) {
+        recoveries.delete(endpointId);
+        return;
+      }
+      let terminalResult: { ok: true } | { ok: false; error: unknown } = { ok: true };
+      do {
+        state.dirty = false;
+        try {
+          await options.recover(endpointId);
+          terminalResult = { ok: true };
+        } catch (error) {
+          terminalResult = { ok: false, error };
+        }
+      } while (state.dirty && accepting && !stopped);
+      if (state.dirty && !accepting && !stopped) pending.add(endpointId);
+      if (!terminalResult.ok && !stopped) pending.add(endpointId);
+      if (recoveries.get(endpointId) === state) recoveries.delete(endpointId);
+      if (!terminalResult.ok) throw terminalResult.error;
+    });
+    return state.running;
+  };
+
+  return {
+    ready: (endpointId) => {
+      if (stopped) return undefined;
+      if (accepting) {
+        pending.delete(endpointId);
+        return requestRecovery(endpointId);
+      }
+      if (pending.has(endpointId)) return undefined;
+      if (pending.size >= maxPendingEndpoints) {
+        return Promise.reject(new AppError("CAPACITY_EXCEEDED", "too many endpoint-ready events are pending"));
+      }
+      pending.add(endpointId);
+      return undefined;
+    },
+    acknowledge: (endpointId) => { pending.delete(endpointId); },
+    pause: () => { if (!stopped) accepting = false; },
+    acceptAndDrain: async () => {
+      if (stopped) return;
+      accepting = true;
+      for (const endpointId of [...pending].sort()) {
+        if (stopped || !accepting) break;
+        pending.delete(endpointId);
+        try { await requestRecovery(endpointId); }
+        catch (error) {
+          if (!stopped) pending.add(endpointId);
+          throw error;
+        }
+      }
+    },
+    stop: async () => {
+      stopped = true;
+      accepting = false;
+      pending.clear();
+      await Promise.allSettled([...recoveries.values()].map((state) => state.running));
+    },
+  };
+}
+
+export async function runOperationRecoveryChains<
+  T extends { operation: { id: string; sequence: number } },
+>(
+  entries: readonly T[],
+  targetOf: (entry: T) => OperationRecoveryTarget,
+  attempt: (entry: T, target: OperationRecoveryTarget) => Promise<boolean>,
+): Promise<ReadonlySet<string>> {
+  const ordered = [...entries].sort((left, right) => left.operation.sequence - right.operation.sequence
+    || left.operation.id.localeCompare(right.operation.id));
+  const blockedEndpoints = new Set<string>();
+  for (const entry of ordered) {
+    const target = targetOf(entry);
+    if (target.policy !== "endpoint_lifecycle" || blockedEndpoints.has(target.endpointId)) continue;
+    if (await attempt(entry, target)) blockedEndpoints.add(target.endpointId);
+  }
+  for (const entry of ordered) {
+    const target = targetOf(entry);
+    if (target.policy === "endpoint_lifecycle") continue;
+    if (target.policy === "ready_endpoint" && blockedEndpoints.has(target.endpointId)) continue;
+    await attempt(entry, target);
+  }
+  return blockedEndpoints;
+}
+
+interface OperationRecoveryTargetResolver {
+  readonly defaultProjectEndpointId: string;
+  session(nickname: string): RegistrySession | undefined;
+}
+
+function stringField(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "string" && field.length > 0 ? field : undefined;
+}
+
+export function recoverableOperationTarget(
+  operation: Pick<RecoverableOperation, "kind" | "args" | "receipt">,
+  resolver: OperationRecoveryTargetResolver,
+): OperationRecoveryTarget {
+  const args = operation.args && typeof operation.args === "object" ? operation.args as Record<string, unknown> : {};
+  const sessionTarget = (nickname: unknown): OperationRecoveryTarget => {
+    if (typeof nickname !== "string") return { policy: "unknown" };
+    const endpointId = resolver.session(nickname)?.endpoint;
+    return endpointId ? { policy: "ready_endpoint", endpointId } : { policy: "unknown" };
+  };
+  const projectTarget = (): OperationRecoveryTarget => ({
+    policy: "ready_endpoint",
+    endpointId: stringField(operation.receipt, "endpoint") ?? stringField(args, "endpoint") ?? resolver.defaultProjectEndpointId,
+  });
+  switch (operation.kind) {
+    case "update_session_notes":
+    case "send_chat_message":
+    case "send_chat_attachment":
+    case "collect_messages":
+    case "set_session_model":
+    case "set_reasoning_effort":
+    case "rename_session":
+      return { policy: "local" };
+    case "prepare_chat_attachment":
+      return args.owner === "assistant" ? { policy: "local" } : sessionTarget(args.owner);
+    case "create_session":
+    case "adopt_session":
+      return projectTarget();
+    case "send_to_session":
+    case "set_goal":
+    case "pause_goal":
+    case "resume_goal":
+    case "cancel_goal":
+    case "interrupt_session":
+      return sessionTarget(args.nickname);
+    case "unadopt_session":
+    case "archive_session": {
+      const saved = operation.receipt as (Partial<RegistrySession> & { step?: string; nickname?: string }) | undefined;
+      const nickname = saved?.nickname ?? args.nickname;
+      if (typeof nickname !== "string") return { policy: "unknown" };
+      const current = resolver.session(nickname);
+      const decision = removalRecoveryDecision(operation.kind, saved, current);
+      if (decision === "succeeded" || decision === "no_effect") return { policy: "local" };
+      if (decision !== "reconcile") return { policy: "unknown" };
+      const endpointId = stringField(saved, "endpoint") ?? current?.endpoint;
+      return endpointId ? { policy: "ready_endpoint", endpointId } : { policy: "unknown" };
+    }
+    case "disconnect_endpoint":
+    case "restart_endpoint":
+      return {
+        policy: "endpoint_lifecycle",
+        endpointId: stringField(operation.receipt, "endpoint") ?? stringField(args, "endpoint") ?? resolver.defaultProjectEndpointId,
+      };
+    default:
+      return { policy: "unknown" };
+  }
+}
+
+export function recoverableOperationEndpointReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if ((target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle")
+      && target.endpointId !== resolver.defaultProjectEndpointId) references.add(target.endpointId);
+  }
+  return [...references].sort();
+}
+
+export function recoverableOperationActivationReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if (target.policy === "ready_endpoint" && target.endpointId !== resolver.defaultProjectEndpointId) references.add(target.endpointId);
+  }
+  return [...references].sort();
+}
+
+export function recoverableLifecycleEndpointReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if (target.policy === "endpoint_lifecycle") references.add(target.endpointId);
+  }
+  return [...references].sort();
+}
+
+export type OperationRecoveryPreflight = "attempt" | "wait_for_endpoint" | "sleep";
+
+export function operationRecoveryPreflight(
+  target: OperationRecoveryTarget,
+  isEndpointReady: (endpointId: string) => boolean,
+): OperationRecoveryPreflight {
+  if (target.policy === "unknown") return "sleep";
+  if (target.policy === "ready_endpoint" && !isEndpointReady(target.endpointId)) return "wait_for_endpoint";
+  return "attempt";
+}
+
+export function runOperationRecoveryTarget<T>(
+  target: OperationRecoveryTarget,
+  endpoints: Pick<EndpointManager, "withReadyWorkLease">,
+  recover: (lease?: EndpointWorkLease) => Promise<T>,
+): Promise<T> {
+  return target.policy === "ready_endpoint" ? endpoints.withReadyWorkLease(target.endpointId, recover) : recover();
+}
+
+export type OperationRecoveryFailureDisposition = "retry" | "wait_for_endpoint" | "sleep";
+
+export function operationRecoveryFailureDisposition(
+  error: unknown,
+  target?: OperationRecoveryTarget,
+): OperationRecoveryFailureDisposition {
+  if (error instanceof RpcRequestTimeoutError
+    || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) return "retry";
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") {
+    return target?.policy === "endpoint_lifecycle" ? "retry" : "wait_for_endpoint";
+  }
+  return "sleep";
+}
+
+export interface OperationReconciliationOutcome {
+  attempted: boolean;
+  transientRetry: boolean;
+  waitingForEndpoint: boolean;
+}
+
+export interface OperationReconciliationPass {
+  outcome: OperationReconciliationOutcome;
+  transientTargets: ReadonlyMap<string, OperationRecoveryTarget>;
+}
+
+interface OperationTimerApi {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: any): void;
+}
+
+export interface OperationReconciliationLoop {
+  request(): Promise<void>;
+  endpointReady(endpointId: string): Promise<void>;
+  endpointUnavailable(endpointId: string): void;
+  stop(): Promise<void>;
+}
+
+export function createOperationReconciliationLoop(options: {
+  reconcileOnce(): Promise<OperationReconciliationPass>;
+  isEndpointReady(endpointId: string): boolean;
+  timers?: OperationTimerApi;
+}): OperationReconciliationLoop {
+  let operationReconciliationTail: Promise<void> = Promise.resolve();
+  let running: Promise<void> | undefined;
+  let followupRequested = false;
+  let retryTimer: unknown;
+  let retryTimerActive = false;
+  let retryAttempt = 0;
+  let timerGeneration = 0;
+  let stopped = false;
+  let transientTargets = new Map<string, OperationRecoveryTarget>();
+
+  const isActionable = (target: OperationRecoveryTarget): boolean => target.policy === "local" || target.policy === "endpoint_lifecycle"
+    || (target.policy === "ready_endpoint" && options.isEndpointReady(target.endpointId));
+
+  const clearRetryTimer = (resetAttempt: boolean): void => {
+    timerGeneration += 1;
+    if (retryTimerActive) (options.timers ?? defaultOperationTimers).clearTimeout(retryTimer);
+    retryTimer = undefined;
+    retryTimerActive = false;
+    if (resetAttempt) retryAttempt = 0;
+  };
+
+  let request!: () => Promise<void>;
+  const armRetryTimer = (): void => {
+    if (stopped || retryTimerActive) return;
+    const timers = options.timers ?? defaultOperationTimers;
+    const generation = ++timerGeneration;
+    const delay = Math.min(1_000 * 2 ** retryAttempt, 30_000);
+    retryAttempt += 1;
+    retryTimer = timers.setTimeout(() => {
+      if (stopped || generation !== timerGeneration) return;
+      retryTimer = undefined;
+      retryTimerActive = false;
+      void request().catch(() => undefined);
+    }, delay);
+    retryTimerActive = true;
+    (retryTimer as { unref?: () => void } | undefined)?.unref?.();
+  };
+
+  const runCoalesced = async (): Promise<void> => {
+    let finalPass: OperationReconciliationPass;
+    let queuedBeforeFirstPass = followupRequested;
+    do {
+      followupRequested = false;
+      finalPass = await options.reconcileOnce();
+      if (queuedBeforeFirstPass) {
+        queuedBeforeFirstPass = false;
+        followupRequested = true;
+      }
+    } while (followupRequested && !stopped);
+    if (stopped) return;
+    transientTargets = new Map(finalPass.transientTargets);
+    if (finalPass.outcome.transientRetry && [...transientTargets.values()].some(isActionable)) armRetryTimer();
+    else clearRetryTimer(true);
+  };
+
+  request = (): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    if (running) {
+      followupRequested = true;
+      return running;
+    }
+    clearRetryTimer(false);
+    followupRequested = false;
+    const scheduled = operationReconciliationTail.then(runCoalesced, runCoalesced);
+    operationReconciliationTail = scheduled.catch(() => undefined);
+    const current = scheduled.finally(() => { if (running === current) running = undefined; });
+    running = current;
+    return current;
+  };
+
+  return {
+    request,
+    endpointReady: () => request(),
+    endpointUnavailable: () => {
+      if (![...transientTargets.values()].some(isActionable)) clearRetryTimer(false);
+    },
+    stop: async () => {
+      if (!stopped) {
+        stopped = true;
+        followupRequested = false;
+        transientTargets.clear();
+        clearRetryTimer(true);
+      }
+      await running;
+      await operationReconciliationTail;
+    },
+  };
+}
+
+const defaultOperationTimers: OperationTimerApi = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle),
+};
+
+export async function processWorkerTerminalNotification(
+  dependencies: {
+    endpoints: Pick<EndpointManager, "withReadyWorkLease">;
+    ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">;
+    relay: Pick<EventRelay, "handleNotification">;
+    reconcileOperations(): Promise<void>;
+  },
+  endpointId: string,
+  method: string,
+  params: unknown,
+): Promise<void> {
+  try {
+    await dependencies.endpoints.withReadyWorkLease(endpointId, async (lease) => {
+      const before = await dependencies.ownership.detectEndpoint(endpointId, lease);
+      await dependencies.relay.handleNotification(endpointId, method, params, lease);
+      const after = await dependencies.ownership.detectEndpoint(endpointId, lease);
+      await dependencies.ownership.release([...before, ...after], lease);
+    });
+  } finally {
+    await dependencies.reconcileOperations();
+  }
+}
+
+export function requestOperationRecoveryForAttempt(
+  operations: Pick<OperationStore, "listRecoverable">,
+  attemptId: string,
+  request: () => Promise<void>,
+): boolean {
+  if (!operations.listRecoverable().some((operation) => operation.attemptId === attemptId)) return false;
+  void request().catch(() => undefined);
+  return true;
+}
+
+export async function settleAssistantTerminalTools(dependencies: {
+  fenceTools(): Promise<"settled" | "timed_out">;
+  reconcileOperations(): Promise<void>;
+  requestRestartOnce(): void;
+}): Promise<boolean> {
+  if (await dependencies.fenceTools() === "timed_out") {
+    dependencies.requestRestartOnce();
+    return false;
+  }
+  await dependencies.reconcileOperations();
+  return true;
+}
+
+export function markEndpointOwnersUnavailable(dependencies: {
+  relay: Pick<EventRelay, "endpointUnavailable">;
+  observations: Pick<SessionObservationProcessor, "endpointUnavailable">;
+  managed: Pick<ManagedSessionRecoveryOwner, "endpointUnavailable">;
+  operations: { endpointUnavailable(endpointId: string): void };
+}, endpointId: string): void {
+  dependencies.relay.endpointUnavailable(endpointId);
+  dependencies.observations.endpointUnavailable(endpointId);
+  dependencies.managed.endpointUnavailable(endpointId);
+  dependencies.operations.endpointUnavailable(endpointId);
+}
+
+export interface DurableEventWakeBoundary {
+  wakeAfterDurableCommit(inserted: boolean): Promise<void>;
+  requestRestartOnce(): void;
+}
+
+export function createDurableEventWakeBoundary(options: {
+  schedulerAccepting(): boolean;
+  stopping(): boolean;
+  enqueuePendingEvents(): Promise<void>;
+  requestRestart(): void;
+}): DurableEventWakeBoundary {
+  let restartRequested = false;
+  const requestRestartOnce = (): void => {
+    if (restartRequested) return;
+    restartRequested = true;
+    options.requestRestart();
+  };
+  return {
+    requestRestartOnce,
+    wakeAfterDurableCommit: async (inserted) => {
+      if (!inserted || !options.schedulerAccepting() || options.stopping()) return;
+      try { await options.enqueuePendingEvents(); }
+      catch { requestRestartOnce(); }
+    },
+  };
+}
+
+export interface EndpointUnavailableEvent {
+  id: string;
+  endpointId: string;
+  threadId: string;
+  incident: number;
+  createdAt: number;
+}
+
+export interface DurableEventSourceCallbacks {
+  relayCommitted(): Promise<void>;
+  deliveryState(delivery: DeliveryRecord): Promise<boolean>;
+  reconcileDeliveryStates(): Promise<number>;
+  ownership(incident: ExternalTurnIncident, status: ExternalOwnershipReleaseStatus): Promise<boolean>;
+  reconcileOwnership(): Promise<number>;
+  endpointUnavailable(event: EndpointUnavailableEvent): Promise<boolean>;
+  backgroundFailure(notice: BackgroundFailureNotice): void;
+  reconcileLifecycle(filter: { endpointId?: string; nickname?: string }): Promise<number>;
+}
+
+export function createDurableEventSourceCallbacks(options: {
+  wakeAfterDurableCommit(inserted: boolean): Promise<void>;
+  persistDeliveryState(delivery: DeliveryRecord): boolean;
+  reconcileDeliveryStates(): number;
+  recordOwnership(incident: ExternalTurnIncident, status: ExternalOwnershipReleaseStatus): boolean;
+  reconcileOwnership(): number;
+  persistEndpointUnavailable(event: EndpointUnavailableEvent): boolean;
+  recordBackgroundFailure(notice: BackgroundFailureNotice): void;
+  reconcileLifecycle(filter: { endpointId?: string; nickname?: string }): Promise<number>;
+}): DurableEventSourceCallbacks {
+  return {
+    relayCommitted: () => options.wakeAfterDurableCommit(true),
+    deliveryState: async (delivery) => {
+      const inserted = options.persistDeliveryState(delivery);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    reconcileDeliveryStates: async () => {
+      const inserted = options.reconcileDeliveryStates();
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
+    },
+    ownership: async (incident, status) => {
+      const inserted = options.recordOwnership(incident, status);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    reconcileOwnership: async () => {
+      const inserted = options.reconcileOwnership();
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
+    },
+    endpointUnavailable: async (event) => {
+      const inserted = options.persistEndpointUnavailable(event);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    backgroundFailure: (notice) => {
+      options.recordBackgroundFailure(notice);
+      void options.wakeAfterDurableCommit(true);
+    },
+    reconcileLifecycle: async (filter) => {
+      const inserted = await options.reconcileLifecycle(filter);
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
+    },
+  };
 }
 
 export type RemovalRecoveryDecision = "pending" | "no_effect" | "reconcile" | "succeeded";
@@ -121,8 +725,30 @@ export function removalRecoveryDecision(
   return "pending";
 }
 
-export function registryReloadPreservesWorkerMappings(current: RegistryDocument, candidate: RegistryDocument): boolean {
-  return isDeepStrictEqual(current.sessions, candidate.sessions);
+export async function recoverRemovalOperation(options: {
+  operation: Pick<RecoverableOperation, "id" | "kind" | "args" | "receipt">;
+  registry: Pick<SessionRegistry, "get">;
+  lifecycle: Pick<SessionLifecycle, "reconcileRemoval">;
+  lease?: EndpointWorkLease;
+  succeed(receipt: unknown): void | Promise<void>;
+  failNoEffect(): void;
+}): Promise<RemovalRecoveryDecision> {
+  if (options.operation.kind !== "unadopt_session" && options.operation.kind !== "archive_session") return "pending";
+  const saved = options.operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
+  const args = options.operation.args && typeof options.operation.args === "object" ? options.operation.args as Record<string, unknown> : {};
+  const nickname = saved?.nickname ?? args.nickname;
+  if (typeof nickname !== "string") return "pending";
+  let current = options.registry.get(nickname);
+  let decision = removalRecoveryDecision(options.operation.kind, saved, current);
+  if (decision === "reconcile") {
+    if (!options.lease) throw new AppError("ENDPOINT_UNAVAILABLE", "removal recovery requires a ready endpoint lease");
+    await options.lifecycle.reconcileRemoval(nickname, current!, options.lease);
+    current = options.registry.get(nickname);
+    decision = removalRecoveryDecision(options.operation.kind, saved, current);
+  }
+  if (decision === "succeeded") await options.succeed({ nickname, mapping_id: saved!.mapping_id });
+  else if (decision === "no_effect") options.failNoEffect();
+  return decision;
 }
 
 export function managedSessionNeedsRecovery(
@@ -130,6 +756,481 @@ export function managedSessionNeedsRecovery(
   unavailableOnly: boolean,
 ): boolean {
   return unavailableOnly ? state?.managementState === "unavailable" : true;
+}
+
+export type ManagedRecoveryDisposition = "retry" | "endpoint" | "external" | "permanent";
+
+export function managedRecoveryDisposition(error: unknown): ManagedRecoveryDisposition {
+  if (error instanceof RpcRequestTimeoutError
+    || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) return "retry";
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return "endpoint";
+  if (error instanceof AppError && error.code === "SESSION_BUSY" && error.details?.recovery === "external_turn") return "external";
+  return "permanent";
+}
+
+export function managedRecoveryManagementState(
+  current: ManagementState | undefined,
+  disposition: ManagedRecoveryDisposition,
+): ManagementState {
+  if (disposition !== "external") return "unavailable";
+  return current === "unadopting" ? "unadopting" : "managed";
+}
+
+export type ManagedRetryKey = `${string}\0${string}\0${string}`;
+
+export function managedRetryKey(endpointId: string, threadId: string, mappingId: string): ManagedRetryKey {
+  return `${endpointId}\0${threadId}\0${mappingId}`;
+}
+
+function managedRetryEndpoint(key: ManagedRetryKey): string {
+  return key.slice(0, key.indexOf("\0"));
+}
+
+interface ManagedRecoveryTimers {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: any): void;
+}
+
+const nodeManagedRecoveryTimers: ManagedRecoveryTimers = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle),
+};
+
+export interface ManagedSessionRecoveryBatchResult {
+  restored: boolean;
+  restoredKeys: readonly ManagedRetryKey[];
+  settledKeys: readonly ManagedRetryKey[];
+  failures: readonly { key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }[];
+}
+
+export interface ManagedEndpointReadyOutcome {
+  recovery: "none" | "pending" | "completed";
+  sharedWake: "needed" | "completed" | "stale";
+}
+
+export async function recoverReadyEndpointOwners(options: {
+  recoverManaged(wakeShared: () => Promise<void>): Promise<ManagedEndpointReadyOutcome>;
+  relay(): Promise<void>;
+  observations(): Promise<void>;
+  operations(): Promise<void>;
+  onError(owner: "relay" | "observations" | "operations", error: unknown): void;
+}): Promise<void> {
+  const report = (owner: "relay" | "observations" | "operations", error: unknown): void => {
+    try { options.onError(owner, error); }
+    catch { /* Operational reporting must not suppress later owner wakes. */ }
+  };
+  const runOwner = async (
+    owner: "relay" | "observations" | "operations",
+    action: () => Promise<void>,
+  ): Promise<void> => {
+    try { await action(); }
+    catch (error) { report(owner, error); }
+  };
+  let sharedWake: Promise<void> | undefined;
+  const wakeShared = (): Promise<void> => {
+    sharedWake ??= (async () => {
+      await runOwner("relay", options.relay);
+      await runOwner("observations", options.observations);
+    })();
+    return sharedWake;
+  };
+
+  const outcome = await options.recoverManaged(wakeShared);
+  if (sharedWake) await sharedWake;
+  else if (outcome.sharedWake !== "completed" && outcome.sharedWake !== "stale") await wakeShared();
+  await runOwner("operations", options.operations);
+}
+
+export type ManagedOwnershipIncidentReceipt = ExternalTurnIncident;
+
+export interface ManagedSessionRecoveryOwner {
+  recordFailure(key: ManagedRetryKey, disposition: ManagedRecoveryDisposition): void;
+  endpointReady(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    wakeShared?: () => Promise<void>,
+  ): Promise<ManagedEndpointReadyOutcome>;
+  endpointUnavailable(endpointId: string): void;
+  stop(): Promise<void>;
+}
+
+export async function recoverManagedEndpointReady(
+  owner: Pick<ManagedSessionRecoveryOwner, "endpointReady">,
+  endpointId: string,
+  lease: EndpointWorkLease,
+  wakeShared: () => Promise<void>,
+): Promise<ManagedEndpointReadyOutcome> {
+  const result = await owner.endpointReady(endpointId, lease, wakeShared);
+  if (result.sharedWake !== "needed") return result;
+  await wakeShared();
+  return { ...result, sharedWake: "completed" };
+}
+
+export function createManagedSessionRecoveryOwner(options: {
+  endpoints: Pick<EndpointManager, "withReadyWorkLease">;
+  isLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean;
+  recover(
+    endpointId: string,
+    keys: readonly ManagedRetryKey[],
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<ManagedSessionRecoveryBatchResult>;
+  beforeShared(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<readonly ManagedOwnershipIncidentReceipt[]>;
+  wakeShared(endpointId: string, lease: EndpointWorkLease, isCurrent: () => boolean): Promise<void>;
+  afterShared(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    beforeIncidents: readonly ManagedOwnershipIncidentReceipt[],
+    isCurrent: () => boolean,
+  ): Promise<void>;
+  onSafetyFailure(error: unknown): void;
+  onError(error: unknown): void;
+  timers?: ManagedRecoveryTimers;
+  retryMs?: number;
+}): ManagedSessionRecoveryOwner {
+  type PendingTarget = {
+    disposition: "retry" | "endpoint" | "safety";
+    stage: "managed" | "before_shared" | "after_shared";
+    incidents: readonly ManagedOwnershipIncidentReceipt[] | undefined;
+    sharedWakeEpoch: number | undefined;
+  };
+  const pending = new Map<ManagedRetryKey, PendingTarget>();
+  const unavailableEndpoints = new Set<string>();
+  const safetyReported = new Set<string>();
+  const timers = new Map<string, { handle: unknown; generation: number; epoch: number }>();
+  const timerGenerations = new Map<string, number>();
+  const endpointEpochs = new Map<string, number>();
+  const tails = new Map<string, Promise<void>>();
+  const fallbackWakes = new Map<string, { epoch: number; barrier: Promise<void> }>();
+  let stopped = false;
+
+  const report = (error: unknown): void => {
+    try { options.onError(error); }
+    catch { /* operational reporting must not change recovery ownership */ }
+  };
+  const endpointEpoch = (endpointId: string): number => endpointEpochs.get(endpointId) ?? 0;
+  const advanceEndpointEpoch = (endpointId: string): number => {
+    const next = endpointEpoch(endpointId) + 1;
+    endpointEpochs.set(endpointId, next);
+    return next;
+  };
+  const clearTimer = (endpointId: string): void => {
+    timerGenerations.set(endpointId, (timerGenerations.get(endpointId) ?? 0) + 1);
+    const timer = timers.get(endpointId);
+    if (timer) (options.timers ?? nodeManagedRecoveryTimers).clearTimeout(timer.handle);
+    timers.delete(endpointId);
+  };
+  const targetsFor = (endpointId: string, selection: "retry" | "all"): Array<[ManagedRetryKey, PendingTarget]> => [...pending]
+    .filter(([key, target]) => managedRetryEndpoint(key) === endpointId && (selection === "all" || target.disposition === "retry"));
+  const markEndpointWaiting = (endpointId: string): void => {
+    unavailableEndpoints.add(endpointId);
+    for (const [key, target] of pending) {
+      if (managedRetryEndpoint(key) === endpointId) pending.set(key, { ...target, disposition: "endpoint" });
+    }
+    clearTimer(endpointId);
+  };
+  const applyFailure = (keys: readonly ManagedRetryKey[], error: unknown, stage: PendingTarget["stage"]): void => {
+    const disposition = managedRecoveryDisposition(error);
+    for (const key of keys) {
+      const current = pending.get(key);
+      const incidents = current?.stage === stage ? current.incidents : undefined;
+      const sharedWakeEpoch = current?.stage === stage ? current.sharedWakeEpoch : undefined;
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, {
+        disposition, stage, incidents, sharedWakeEpoch,
+      });
+      else if (stage === "managed") pending.delete(key);
+      else pending.set(key, { disposition: "safety", stage, incidents, sharedWakeEpoch });
+    }
+    if (disposition === "endpoint" && keys.length > 0) markEndpointWaiting(managedRetryEndpoint(keys[0]!));
+    if (disposition !== "retry" && disposition !== "endpoint" && stage !== "managed" && keys.length > 0) {
+      const endpointId = managedRetryEndpoint(keys[0]!);
+      if (!safetyReported.has(endpointId)) {
+        safetyReported.add(endpointId);
+        try { options.onSafetyFailure(error); }
+        catch { /* A safety callback must not change recovery ownership. */ }
+      }
+    }
+    report(error);
+  };
+  const generationIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => !stopped
+    && endpointEpoch(endpointId) === epoch
+    && options.isLeaseCurrent(endpointId, lease);
+  const runIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => generationIsCurrent(endpointId, epoch, lease)
+    && !unavailableEndpoints.has(endpointId);
+  const dedupeIncidents = (incidents: readonly ManagedOwnershipIncidentReceipt[]): ManagedOwnershipIncidentReceipt[] => {
+    const seen = new Set<string>();
+    return incidents.filter((incident) => {
+      const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}\0${incident.turnId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+
+  let schedule!: (endpointId: string) => void;
+  const run = async (endpointId: string, selection: "retry" | "all", epoch: number, existingLease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
+    if (stopped) return { recovery: "pending", sharedWake: "stale" };
+    const fallbackWake = fallbackWakes.get(endpointId);
+    if (fallbackWake) await fallbackWake.barrier;
+    if (stopped || endpointEpoch(endpointId) !== epoch) return { recovery: "pending", sharedWake: "stale" };
+    const targets = targetsFor(endpointId, selection);
+    if (targets.length === 0) {
+      safetyReported.delete(endpointId);
+      return { recovery: "none", sharedWake: "needed" };
+    }
+    const targetKeys = targets.map(([key]) => key);
+    const recover = async (lease: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
+      let sharedWakeCompleted = targets.some(([, target]) => target.sharedWakeEpoch === epoch);
+      const isCurrent = (): boolean => runIsCurrent(endpointId, epoch, lease);
+      const isGenerationCurrent = (): boolean => generationIsCurrent(endpointId, epoch, lease);
+      const recovery = (completed = false): ManagedEndpointReadyOutcome["recovery"] => targetsFor(endpointId, "all").length > 0
+        ? "pending"
+        : completed ? "completed" : "none";
+      const pendingWake = (): ManagedEndpointReadyOutcome => ({
+        recovery: recovery(),
+        sharedWake: isGenerationCurrent() ? "needed" : "stale",
+      });
+      if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
+      const managedKeys = targets.filter(([, target]) => target.stage === "managed").map(([key]) => key);
+      let batch: ManagedSessionRecoveryBatchResult = { restored: false, restoredKeys: [], settledKeys: [], failures: [] };
+      try {
+        if (managedKeys.length > 0) batch = await options.recover(endpointId, managedKeys, lease, isCurrent);
+      } catch (error) {
+        if (isCurrent()) applyFailure(managedKeys, error, "managed");
+        return pendingWake();
+      }
+      if (!isCurrent()) return pendingWake();
+      const managedSet = new Set(managedKeys);
+      const returnedKeys = [...batch.restoredKeys, ...batch.settledKeys, ...batch.failures.map(({ key }) => key)];
+      if (returnedKeys.some((key) => !managedSet.has(key))) {
+        applyFailure(managedKeys, new Error("managed recovery returned an unexpected mapping"), "managed");
+        return pendingWake();
+      }
+      for (const key of batch.restoredKeys) {
+        const current = pending.get(key);
+        if (current) pending.set(key, {
+          ...current, stage: "before_shared", incidents: undefined, sharedWakeEpoch: undefined,
+        });
+      }
+      for (const key of batch.settledKeys) pending.delete(key);
+      for (const failure of batch.failures) {
+        if (failure.disposition === "retry" || failure.disposition === "endpoint") {
+          pending.set(failure.key, {
+            disposition: failure.disposition, stage: "managed", incidents: undefined, sharedWakeEpoch: undefined,
+          });
+        } else pending.delete(failure.key);
+      }
+      if (batch.failures.some(({ disposition }) => disposition === "endpoint")) markEndpointWaiting(endpointId);
+      if (!isCurrent()) return pendingWake();
+
+      const beforeKeys = targetKeys.filter((key) => pending.get(key)?.stage === "before_shared");
+      if (beforeKeys.length > 0) {
+        const needsBefore = beforeKeys.filter((key) => pending.get(key)?.incidents === undefined);
+        const needsSharedWake = beforeKeys.some((key) => pending.get(key)?.sharedWakeEpoch !== epoch);
+        try {
+          if (needsBefore.length > 0) {
+            const discovered = dedupeIncidents(await options.beforeShared(endpointId, lease, isCurrent));
+            if (!isCurrent()) return pendingWake();
+            const accumulated = dedupeIncidents([
+              ...beforeKeys.flatMap((key) => pending.get(key)?.incidents ?? []),
+              ...discovered,
+            ]);
+            for (const key of beforeKeys) {
+              const current = pending.get(key);
+              if (current?.stage === "before_shared") pending.set(key, { ...current, incidents: accumulated });
+            }
+          }
+          if (!isCurrent()) return pendingWake();
+          if (needsSharedWake) {
+            await options.wakeShared(endpointId, lease, isCurrent);
+            sharedWakeCompleted = true;
+          }
+        } catch (error) {
+          if (isCurrent()) applyFailure(beforeKeys, error, "before_shared");
+          return pendingWake();
+        }
+        if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
+        const beforeIncidents = dedupeIncidents(beforeKeys.flatMap((key) => pending.get(key)?.incidents ?? []));
+        for (const key of beforeKeys) {
+          const current = pending.get(key);
+          if (current?.stage === "before_shared") pending.set(key, {
+            ...current, stage: "after_shared", incidents: beforeIncidents, sharedWakeEpoch: epoch,
+          });
+        }
+      }
+
+      const afterKeys = targetKeys.filter((key) => pending.get(key)?.stage === "after_shared");
+      if (afterKeys.length > 0) {
+        const beforeIncidents = dedupeIncidents(afterKeys.flatMap((key) => pending.get(key)?.incidents ?? []));
+        try { await options.afterShared(endpointId, lease, beforeIncidents, isCurrent); }
+        catch (error) {
+          if (isCurrent()) applyFailure(afterKeys, error, "after_shared");
+          return {
+            recovery: recovery(),
+            sharedWake: isGenerationCurrent() ? sharedWakeCompleted ? "completed" : "needed" : "stale",
+          };
+        }
+        if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
+        for (const key of afterKeys) pending.delete(key);
+      }
+      if (beforeKeys.length > 0 || afterKeys.length > 0) {
+        safetyReported.delete(endpointId);
+        return { recovery: recovery(true), sharedWake: sharedWakeCompleted ? "completed" : "needed" };
+      }
+      return { recovery: recovery(), sharedWake: sharedWakeCompleted ? "completed" : "needed" };
+    };
+    let result: ManagedEndpointReadyOutcome;
+    if (existingLease) result = await recover(existingLease);
+    else {
+      try { result = await options.endpoints.withReadyWorkLease(endpointId, recover); }
+      catch (error) {
+        if (!stopped && endpointEpoch(endpointId) === epoch) {
+          for (const stage of ["managed", "before_shared", "after_shared"] as const) {
+            const keys = targets.filter(([, target]) => target.stage === stage).map(([key]) => key);
+            if (keys.length > 0) applyFailure(keys, error, stage);
+          }
+        }
+        result = {
+          recovery: targetsFor(endpointId, "all").length > 0 ? "pending" : "none",
+          sharedWake: !stopped && endpointEpoch(endpointId) === epoch ? "needed" : "stale",
+        };
+      }
+    }
+    if (!stopped && !unavailableEndpoints.has(endpointId) && targetsFor(endpointId, "retry").length > 0) schedule(endpointId);
+    return result;
+  };
+  const enqueue = (endpointId: string, selection: "retry" | "all", epoch: number, lease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
+    if (stopped) return Promise.resolve({ recovery: "pending", sharedWake: "stale" });
+    const previous = tails.get(endpointId) ?? Promise.resolve();
+    let result: ManagedEndpointReadyOutcome = { recovery: "pending", sharedWake: "stale" };
+    const scheduled = previous.then(async () => { result = await run(endpointId, selection, epoch, lease); }, async () => { result = await run(endpointId, selection, epoch, lease); });
+    const contained = scheduled.catch(report);
+    tails.set(endpointId, contained);
+    void contained.finally(() => { if (tails.get(endpointId) === contained) tails.delete(endpointId); });
+    return contained.then(() => result);
+  };
+  schedule = (endpointId: string): void => {
+    if (stopped || unavailableEndpoints.has(endpointId) || timers.has(endpointId) || targetsFor(endpointId, "retry").length === 0) return;
+    const generation = (timerGenerations.get(endpointId) ?? 0) + 1;
+    const epoch = endpointEpoch(endpointId);
+    timerGenerations.set(endpointId, generation);
+    const timerApi = options.timers ?? nodeManagedRecoveryTimers;
+    const handle = timerApi.setTimeout(() => {
+      const timer = timers.get(endpointId);
+      if (stopped || unavailableEndpoints.has(endpointId) || timer?.generation !== generation || timer.epoch !== epoch
+        || endpointEpoch(endpointId) !== epoch) return;
+      timers.delete(endpointId);
+      void enqueue(endpointId, "retry", epoch);
+    }, options.retryMs ?? 1_000);
+    timers.set(endpointId, { handle, generation, epoch });
+    (handle as { unref?: () => void } | undefined)?.unref?.();
+  };
+  const completeIndependentSharedWake = async (
+    endpointId: string,
+    lease: EndpointWorkLease,
+    epoch: number,
+    wakeShared: () => Promise<void>,
+    result: ManagedEndpointReadyOutcome,
+  ): Promise<ManagedEndpointReadyOutcome> => {
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+    const record = { epoch, barrier };
+    fallbackWakes.set(endpointId, record);
+    try {
+      await wakeShared();
+      if (!generationIsCurrent(endpointId, epoch, lease)) return { ...result, sharedWake: "stale" };
+      for (const [key, target] of pending) {
+        if (managedRetryEndpoint(key) !== endpointId || target.stage !== "before_shared") continue;
+        pending.set(key, { ...target, sharedWakeEpoch: epoch });
+      }
+      return { ...result, sharedWake: "completed" };
+    } finally {
+      releaseBarrier();
+      if (fallbackWakes.get(endpointId) === record) fallbackWakes.delete(endpointId);
+    }
+  };
+
+  return {
+    recordFailure: (key, disposition) => {
+      if (stopped) return;
+      const current = pending.get(key);
+      if (disposition === "retry" || disposition === "endpoint") pending.set(key, current && current.stage !== "managed"
+        ? { ...current, disposition }
+        : { disposition, stage: "managed", incidents: undefined, sharedWakeEpoch: undefined });
+      else pending.delete(key);
+      const endpointId = managedRetryEndpoint(key);
+      if (disposition === "endpoint") markEndpointWaiting(endpointId);
+      else if (disposition === "retry") schedule(endpointId);
+      else if (targetsFor(endpointId, "retry").length === 0) clearTimer(endpointId);
+    },
+    endpointReady: async (endpointId, lease, wakeShared) => {
+      const epoch = advanceEndpointEpoch(endpointId);
+      unavailableEndpoints.delete(endpointId);
+      clearTimer(endpointId);
+      const result = await enqueue(endpointId, "all", epoch, lease);
+      if (!wakeShared || result.sharedWake !== "needed") return result;
+      return completeIndependentSharedWake(endpointId, lease, epoch, wakeShared, result);
+    },
+    endpointUnavailable: (endpointId) => {
+      if (stopped) return;
+      advanceEndpointEpoch(endpointId);
+      markEndpointWaiting(endpointId);
+    },
+    stop: async () => {
+      if (!stopped) {
+        stopped = true;
+        pending.clear();
+        for (const endpointId of [...timers.keys()]) clearTimer(endpointId);
+      }
+      while (tails.size > 0 || fallbackWakes.size > 0) {
+        await Promise.all([...tails.values(), ...[...fallbackWakes.values()].map(({ barrier }) => barrier)]);
+      }
+    },
+  };
+}
+
+export async function wakeRestoredSessionOwners(dependencies: {
+  relay: Pick<EventRelay, "endpointReady">;
+  observations: Pick<SessionObservationProcessor, "endpointReady">;
+  onError(owner: "relay" | "observations", error: unknown): void;
+}, endpointId: string, lease?: EndpointWorkLease, isCurrent: () => boolean = () => true): Promise<void> {
+  if (!isCurrent()) return;
+  try { await dependencies.relay.endpointReady(endpointId, lease); }
+  catch (error) { if (isCurrent()) dependencies.onError("relay", error); }
+  if (!isCurrent()) return;
+  try { await dependencies.observations.endpointReady(endpointId); }
+  catch (error) { if (isCurrent()) dependencies.onError("observations", error); }
+  if (!isCurrent()) return;
+}
+
+export async function releaseRestoredOwnershipIncidents(dependencies: {
+  ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">;
+}, endpointId: string, lease: EndpointWorkLease, beforeIncidents: readonly ManagedOwnershipIncidentReceipt[], isCurrent: () => boolean): Promise<void> {
+  const assertCurrent = (): void => {
+    if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery generation changed during ownership release");
+  };
+  assertCurrent();
+  const afterIncidents = await dependencies.ownership.detectEndpoint(endpointId, lease, isCurrent);
+  assertCurrent();
+  const seen = new Set<string>();
+  const incidents = [...beforeIncidents, ...afterIncidents].filter((incident) => {
+    const key = `${incident.endpoint}\0${incident.thread_id}\0${incident.mapping_id}\0${incident.turnId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  assertCurrent();
+  await dependencies.ownership.release(incidents, lease, isCurrent);
+  assertCurrent();
+}
+
+export function reportOperationalSafely(sink: OperationalEventSink, event: OperationalEvent): void {
+  try { sink(event); }
+  catch { /* operational logging must not change runtime behavior */ }
 }
 
 export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity: RuntimeIdentity } | undefined {
@@ -140,14 +1241,6 @@ export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: st
   try {
     return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
   } catch { return undefined; }
-}
-
-export function withRecoveredSessionLease<T>(
-  endpoints: Pick<EndpointManager, "withWorkLease">,
-  endpointId: string,
-  recover: (lease: EndpointWorkLease) => Promise<T>,
-): Promise<T> {
-  return endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => recover(lease));
 }
 
 type LifecycleRecoveryFailure = (nickname: string, session: RegistrySession, error: unknown) => void | Promise<void>;
@@ -172,25 +1265,6 @@ export async function reconcileLifecycleAndOwnership(
   return ownershipEvents.reconcileReleased(registry);
 }
 
-export function createMaintenanceFailureHandler(options: {
-  requestRestart(): void;
-  reportRecoveryRequired(): void;
-  reportRetryableFailure(): void;
-}): (error: unknown) => void {
-  let restartRequested = false;
-  return (error) => {
-    if (!isDashboardMetadataRecoveryRequired(error)) {
-      options.reportRetryableFailure();
-      return;
-    }
-    if (restartRequested) return;
-    restartRequested = true;
-    try { options.reportRecoveryRequired(); }
-    catch { /* Operational reporting cannot prevent a required restart. */ }
-    options.requestRestart();
-  };
-}
-
 export async function reconcileOwnershipBeforeRelay(
   ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">,
   relay: Pick<EventRelay, "reconcileEndpoint">,
@@ -202,7 +1276,7 @@ export async function reconcileOwnershipBeforeRelay(
   await beforeRelay?.(lease);
   await relay.reconcileEndpoint(endpointId, lease);
   const after = await ownership.detectEndpoint(endpointId, lease);
-  await ownership.release([...before, ...after]);
+  await ownership.release([...before, ...after], lease);
 }
 
 export function reconcileOwnershipBeforeRelayWithLease(
@@ -215,6 +1289,54 @@ export function reconcileOwnershipBeforeRelayWithLease(
   return endpoints.withWorkLease(endpointId, "rpc", (_endpoint, lease) => reconcileOwnershipBeforeRelay(
     ownership, relay, endpointId, lease, beforeRelay ? () => beforeRelay(lease) : undefined,
   ));
+}
+
+export function withRelayEndpointWorkLease<T>(
+  endpoints: Pick<EndpointManager, "runWithWorkLease" | "withReadyWorkLease">,
+  endpointId: string,
+  existingLease: EndpointWorkLease | undefined,
+  run: (lease: EndpointWorkLease) => Promise<T>,
+): Promise<T> {
+  if (!existingLease) return endpoints.withReadyWorkLease(endpointId, run);
+  return endpoints.runWithWorkLease(endpointId, existingLease, (lease) => {
+    if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint work lease is unavailable");
+    return run(lease);
+  });
+}
+
+export async function stopRelayRecovery(
+  relay: Pick<EventRelay, "stop">,
+  observations: Pick<SessionObservationProcessor, "idle">,
+  finishDashboard: () => Promise<void>,
+): Promise<void> {
+  await relay.stop();
+  await observations.idle();
+  await finishDashboard();
+}
+
+export async function stopRecoveryOwnerSet(dependencies: {
+  ready?: Pick<EndpointReadyBuffer, "stop">;
+  managed?: Pick<ManagedSessionRecoveryOwner, "stop">;
+  operations?: Pick<OperationReconciliationLoop, "stop">;
+  dispatcher?: Pick<ConversationDispatcher, "stop">;
+  relay?: Pick<EventRelay, "stop">;
+  observations?: Pick<SessionObservationProcessor, "stop">;
+  finishDashboard?(): Promise<void>;
+}): Promise<void> {
+  let firstError: unknown;
+  for (const stop of [
+    () => dependencies.ready?.stop(),
+    () => dependencies.managed?.stop(),
+    () => dependencies.relay?.stop(),
+    () => dependencies.observations?.stop(),
+    () => dependencies.operations?.stop(),
+    () => dependencies.dispatcher?.stop(),
+    () => dependencies.finishDashboard?.(),
+  ]) {
+    try { await stop(); }
+    catch (error) { firstError ??= error; }
+  }
+  if (firstError) throw firstError;
 }
 
 export async function buildProductionApp(
@@ -256,6 +1378,7 @@ export async function buildProductionApp(
   let dashboard!: SessionDashboard;
   let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
+  let attachmentCleanup!: AttachmentCleanup;
   let operations!: OperationStore;
   let deliveries!: DeliveryStore;
   let backgroundFailures!: BackgroundFailureStore;
@@ -272,6 +1395,7 @@ export async function buildProductionApp(
   let ownership!: SessionOwnershipGuard;
   let ownershipEvents!: OwnershipEventStore;
   let ownershipWatcher!: SessionOwnershipWatcher;
+  let externalOwnershipMonitor!: ExternalOwnershipMonitor;
   let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
   let workspaceRouter!: WorkspaceRouter;
@@ -286,13 +1410,14 @@ export async function buildProductionApp(
   let weixinIncidents: WeixinIncidentRouter | undefined;
   let attemptScope!: AttemptScope;
   let dispatcher!: ConversationDispatcher;
+  let dispatcherAvailable = false;
   let scheduler!: AssistantScheduler;
   let mcp!: LoopbackMcpServer;
   let chats: ChatAdapter[] = [];
   let chatRegistry!: ChatAdapterRegistry;
   let slackContextService: SlackContextService | undefined;
   let deliveryWorker!: DeliveryWorker;
-  let acceptingReadyEvents = false;
+  let endpointReadyBuffer: EndpointReadyBuffer | undefined;
   let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
@@ -306,16 +1431,33 @@ export async function buildProductionApp(
   const assistantToolReadiness = new ToolReadinessGate();
   let endpointIncident = 0;
   let stopping = false;
-  let registryInvalid = false;
   let endpointsCommitted = false;
-  let operationReconciliationTail: Promise<void> = Promise.resolve();
+  let operationReconciler: OperationReconciliationLoop | undefined;
+  let managedRecoveryOwner: ManagedSessionRecoveryOwner | undefined;
+  let recoveryOwnersStop: Promise<void> | undefined;
   const report = options.onOperationalEvent ?? (() => undefined);
-  const backgroundFailureReporter = createBackgroundFailureReporter({
-    runId: randomUUID(),
-    onOperational: (label) => {
-      report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
-    },
-    onDurable: (notice) => {
+  const eventWakeBoundary = createDurableEventWakeBoundary({
+    schedulerAccepting: () => schedulerAccepting,
+    stopping: () => stopping,
+    enqueuePendingEvents,
+    requestRestart: options.requestRestart ?? (() => undefined),
+  });
+  const { requestRestartOnce, wakeAfterDurableCommit } = eventWakeBoundary;
+  const durableEventSources = createDurableEventSourceCallbacks({
+    wakeAfterDurableCommit,
+    persistDeliveryState: (delivery) => persistDeliveryStateEvent(db, delivery),
+    reconcileDeliveryStates: () => reconcileDeliveryStateEvents(db, deliveries),
+    recordOwnership: (incident, status) => ownershipEvents.record(incident, status),
+    reconcileOwnership: () => ownershipEvents.reconcileReleased(registry),
+    persistEndpointUnavailable: (event) => db.prepare(`INSERT OR IGNORE INTO events
+      (id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+      VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
+      .run(event.id, event.endpointId, event.threadId, JSON.stringify({
+        endpointId: event.endpointId,
+        status: "unavailable",
+        incident: event.incident,
+      }), event.createdAt).changes === 1,
+    recordBackgroundFailure: (notice) => {
       const identity = registry.snapshot().assistant;
       backgroundFailures.record({
         ...notice,
@@ -323,16 +1465,37 @@ export async function buildProductionApp(
         threadId: identity.thread_id,
         binding: currentOwnerBinding(),
       });
-      if (schedulerAccepting) {
-        try { enqueuePendingEvents(); }
-        catch { /* Durable state remains pending for the next scheduler pass. */ }
-      }
     },
+    reconcileLifecycle: (filter) => reconcileLifecycleAndOwnership(
+      lifecycle,
+      isolateLifecycleRecoveryFailure,
+      ownershipEvents,
+      registry,
+      filter,
+    ),
   });
-  const handleMaintenanceFailure = createMaintenanceFailureHandler({
-    requestRestart: options.requestRestart ?? (() => undefined),
-    reportRecoveryRequired: () => { report({ level: "warn", code: "database_metadata_recovery_required" }); },
-    reportRetryableFailure: () => { recordScheduledBackgroundFailure("maintenance", maintenanceFailureEpisode); },
+  const backgroundFailureReporter = createBackgroundFailureReporter({
+    runId: randomUUID(),
+    onOperational: (label) => {
+      report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
+    },
+    onDurable: durableEventSources.backgroundFailure,
+  });
+  const reportExternalOwnershipCycle = createExternalOwnershipCycleReporter({
+    onOperational: () => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "external_ownership_detection",
+    }),
+    onDegraded: (notice) => {
+      const identity = registry.snapshot().assistant;
+      backgroundFailures.recordExternalOwnershipDegraded({
+        id: notice.id,
+        incident: notice.incident,
+        endpointId: identity.endpoint,
+        threadId: identity.thread_id,
+        binding: currentOwnerBinding(),
+      });
+      void wakeAfterDurableCommit(true);
+    },
   });
   const acquireStateLease = options.storage?.acquireDatabaseLease ?? acquireDatabaseLease;
   const openStateDatabase = options.storage?.openDatabase ?? openDatabase;
@@ -387,6 +1550,12 @@ export async function buildProductionApp(
         try {
           const opened = await openStateDatabaseWithAutomaticRecovery(databasePath, {
             beforeOpen: () => { preflightConversationCutover(databasePath, telegramBinding !== undefined); },
+            dashboardStoreOptions: {
+              onMetadataRecoveryRequired: () => {
+                try { report({ level: "warn", code: "database_metadata_recovery_required" }); }
+                finally { requestRestartOnce(); }
+              },
+            },
             openDatabase: (path) => {
               const database = openStateDatabase(path);
               openedDb = database;
@@ -476,7 +1645,9 @@ export async function buildProductionApp(
       start: async () => {
         attachments = new AttachmentStore(db, join(dataDir, "attachments"), { maxFileBytes: config.attachmentMaxBytes, maxStoreBytes: config.attachmentStoreMaxBytes });
         await attachments.initialize();
-      }, stop: async () => undefined,
+        attachmentCleanup = createAttachmentCleanupOwner(() => attachments.cleanupExpired(), report);
+        await attachmentCleanup.start();
+      }, stop: async () => { await attachmentCleanup.stop(); },
     },
     {
       name: "chat-adapters",
@@ -604,6 +1775,7 @@ export async function buildProductionApp(
           token,
           allowedClientProcess: () => assistantEndpoint?.mcpClientIdentity,
           beforeToolCall: () => assistantToolReadiness.wait(),
+          afterToolCall: (attemptId) => { requestOperationRecoveryForAttempt(operations, attemptId, reconcileOperations); },
         });
         await mcp.start();
       }, stop: async () => { await mcp.stop(); },
@@ -611,6 +1783,8 @@ export async function buildProductionApp(
     {
       name: "subscriptions",
       start: async () => {
+        recoveryOwnersStop = undefined;
+        try {
         endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION });
         assistantEndpoint = new LocalEndpoint({
           id: "assistant-local",
@@ -658,7 +1832,7 @@ export async function buildProductionApp(
         pool = new AppServerPool([endpoint, assistantEndpoint], {
           maxConcurrentTurns: config.maxConcurrentTurns,
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
-          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithWorkLease(id, lease, run),
+          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
         });
         recoveredEndpointIds = new EndpointCapacityRecovery({
           runtime,
@@ -718,15 +1892,33 @@ export async function buildProductionApp(
         sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
-          readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
+          readThread: async (endpointId, threadId, lease) => (await pool.request<any>(
+            endpointId,
+            "thread/read",
+            { threadId, includeTurns: true },
+            undefined,
+            lease,
+          )).thread,
           readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
           onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
-          onError: () => recordBackgroundFailure("session observation"),
+          classifyFailure: (error) => error instanceof RpcRequestTimeoutError
+            ? "retry"
+            : error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" ? "endpoint" : "sleep",
+          onError: () => reportOperationalSafely(report, {
+            level: "warn", code: "background_task_failed", component: "session_observation",
+          }),
         });
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, {
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
-          onTerminal: (event) => observations.observeTerminal(event),
+          onTerminal: (event, lease) => observations.observeTerminal(event, lease),
+          onEventCommitted: durableEventSources.relayCommitted,
+          withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
+            endpointManager,
+            endpointId,
+            existingLease,
+            run,
+          ),
         }, attachments, ownership, threadGate);
         ownershipWatcher = new SessionOwnershipWatcher(registry, ownership, lifecycle, {
           isInspectable: (identity) => {
@@ -742,30 +1934,78 @@ export async function buildProductionApp(
               body: `[${incident.nickname}] another Codex client started a turn; QiYan is releasing this session`,
               mandatory: true,
             });
-            ownershipEvents.record(incident, "pending");
+            await durableEventSources.ownership(incident, "pending");
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
-            if (schedulerAccepting) enqueuePendingEvents();
           },
           onReleased: async (incident) => {
-            ownershipEvents.record(incident, "completed");
+            await durableEventSources.ownership(incident, "completed");
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
-            if (schedulerAccepting) enqueuePendingEvents();
           },
         }, threadGate);
+        externalOwnershipMonitor = new ExternalOwnershipMonitor({
+          endpointIds: () => [...new Set([
+            ...Object.values(registry.snapshot().sessions)
+              .filter((session) => session.lifecycle_state === "managed" || session.lifecycle_state === "unadopting")
+              .map((session) => session.endpoint),
+            ...ownershipEvents.pending().map((incident) => incident.endpoint),
+          ])],
+          pending: (endpointId) => ownershipEvents.pending(endpointId),
+          withReadyEndpointWorkLease: (endpointId, run) => endpointManager.withReadyWorkLease(endpointId, run),
+          resumeRemoval: async (incident, lease) => {
+            const current = registry.get(incident.nickname);
+            const exact = current?.endpoint === incident.endpoint
+              && current.thread_id === incident.thread_id
+              && current.mapping_id === incident.mapping_id;
+            if (exact && current.lifecycle_state === "managed") {
+              await ownershipWatcher.release([incident], lease);
+            } else if (exact && current.lifecycle_state === "unadopting") {
+              await lifecycle.reconcileRemoval(incident.nickname, current, lease);
+            }
+            await durableEventSources.reconcileOwnership();
+          },
+          inspectAndRelease: (endpointId, lease) => ownershipWatcher.reconcileEndpoint(endpointId, lease),
+          onCycle: reportExternalOwnershipCycle,
+        });
+        managedRecoveryOwner = createManagedSessionRecoveryOwner({
+          endpoints: endpointManager,
+          isLeaseCurrent: isManagedRecoveryLeaseCurrent,
+          recover: (endpointId, keys, lease, isCurrent) => resumeManagedSessions(endpointId, {
+            unavailableOnly: true, keys, lease, isCurrent,
+          }),
+          beforeShared: beforeRestoredEndpoint,
+          wakeShared: wakeRestoredEndpoint,
+          afterShared: afterRestoredEndpoint,
+          onSafetyFailure: requestRestartOnce,
+          onError: () => reportOperationalSafely(report, {
+            level: "warn", code: "background_task_failed", component: "managed_session_recovery",
+          }),
+        });
+        operationReconciler = createOperationReconciliationLoop({
+          reconcileOnce: reconcileOperationsOnce,
+          isEndpointReady: isRecoveryEndpointReady,
+        });
+        endpointReadyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
-        unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(() => onNotification(assistantEndpoint.id, method, params), () => recordBackgroundFailure("assistant notification"))));
+        unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(
+          () => onNotification(assistantEndpoint.id, method, params),
+          // Before construction, the assistant phase's initial dispatcher.recover() is the recovery boundary.
+          () => reportAssistantTerminalFailure(dispatcherAvailable ? dispatcher : undefined, () => recordBackgroundFailure("assistant notification")),
+        )));
         unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
           assistantToolReadiness.block();
           runBackground(() => handleEndpointUnavailable(assistantEndpoint, kind), () => recordBackgroundFailure("assistant unavailable handling"));
         }));
+        } catch (error) {
+          await stopRecoveryOwners().catch(() => undefined);
+          throw error;
+        }
       }, stop: async () => {
         for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
         for (const subscriptions of projectEndpointSubscriptions.values()) for (const unsubscribe of subscriptions) unsubscribe();
         projectEndpointSubscriptions.clear();
-        await observations.idle();
       },
     },
     {
@@ -774,14 +2014,18 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          await endpointManager.ensureReady("local");
+          const lifecycleOwned = lifecycleOwnedEndpointIds();
+          if (!lifecycleOwned.has("local")) await endpointManager.ensureReady("local");
           await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
-          if (endpoint.state !== "ready" || assistantEndpoint.state !== "ready") throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          if ((!lifecycleOwned.has("local") && endpoint.state !== "ready") || assistantEndpoint.state !== "ready") {
+            throw new AppError("ENDPOINT_UNAVAILABLE", "an app-server became unavailable during initial startup");
+          }
           endpointsCommitted = true;
         } catch (error) {
           stopping = true;
           for (const timer of reconnectTimers.values()) clearTimeout(timer);
           reconnectTimers.clear();
+          await stopRecoveryOwners().catch(() => undefined);
           await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]).catch(() => undefined);
           throw error;
         }
@@ -795,9 +2039,9 @@ export async function buildProductionApp(
       },
     },
     {
-      name: "reconciliation",
-      start: async () => { acceptingReadyEvents = false; },
-      stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
+      name: "recovery-owners",
+      start: async () => { endpointReadyBuffer?.pause(); },
+      stop: stopRecoveryOwners,
     },
     {
       name: "assistant",
@@ -837,30 +2081,37 @@ export async function buildProductionApp(
           onOperationalEvent: (code) => { report({ level: code === "assistant_submission_uncertain" ? "warn" : "info", code }); },
           onDeferredTerminal: (turn) => runBackground(
             () => processAssistantTerminal({ threadId: identity.thread_id, turn }),
-            () => recordBackgroundFailure("deferred assistant terminal"),
+            () => reportAssistantTerminalFailure(dispatcher, () => recordBackgroundFailure("deferred assistant terminal")),
           ),
         });
+        dispatcherAvailable = true;
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
+        const lifecycleOwned = lifecycleOwnedEndpointIds();
         const referencedEndpoints = [...new Set([
           ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
           ...recoveredEndpointIds,
-        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id);
+          ...recoverableActivationReferences(),
+        ])].filter((id) => id !== "local" && id !== assistantEndpoint.id && !lifecycleOwned.has(id));
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
         conversations.repairQueueNotices();
-        await reconcileLifecycleState();
-        await resumeManagedSessions();
+        await reconcileStartupLifecycleState();
+        await resumeStartupManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
-          if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)) continue;
-          await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
-            await pool.reconcileEndpointClaims(endpointId);
+          if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)
+            || lifecycleOwnedEndpointIds().has(endpointId) || endpointManager.desiredState(endpointId) !== "automatic") continue;
+          await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async (lease) => {
+            await pool.reconcileEndpointClaims(
+              endpointId, lease, () => endpointManager.validateReadyWorkLease(lease, endpointId),
+            );
           });
+          endpointReadyBuffer?.acknowledge(endpointId);
         }
         deliveries.recoverAfterCrash();
-        reconcileDeliveryEvents();
-        acceptingReadyEvents = true;
+        await reconcileDeliveryEvents();
+        await endpointReadyBuffer?.acceptAndDrain();
         assistantToolReadiness.ready();
       }, stop: async () => undefined,
     },
@@ -871,10 +2122,10 @@ export async function buildProductionApp(
         stopping = true;
         assistantToolReadiness.stop();
         schedulerAccepting = false;
+        assistant.fenceToolAdmission();
+        await assistant.waitForTools();
         const active = assistant.current();
         if (active && !active.turnId.startsWith("pending:")) {
-          assistant.beginTerminalizing(active.turnId);
-          await assistant.fenceTools(active.attemptId, 1_000);
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([
             pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined),
@@ -893,14 +2144,21 @@ export async function buildProductionApp(
           chatRegistry,
           attachments,
           undefined,
-          (delivery) => { persistDeliveryState(delivery); },
+          async (delivery) => {
+            try { await durableEventSources.deliveryState(delivery); }
+            catch { requestRestartOnce(); }
+          },
           (delivery) => { report({ level: "warn", code: "delivery_failed", adapter: delivery.binding.adapterId }); },
         );
         deliveryWorker.start();
       },
       stop: async () => { await deliveryWorker.stop(); },
     },
-    { name: "maintenance", start: async () => undefined, stop: async () => undefined },
+    {
+      name: "external-ownership-watcher",
+      start: async () => { await externalOwnershipMonitor.start(); },
+      stop: async () => { await externalOwnershipMonitor.stop(); },
+    },
     {
       name: "chat-ingress",
       start: async () => {
@@ -910,6 +2168,22 @@ export async function buildProductionApp(
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
   ];
+
+  function stopRecoveryOwners(): Promise<void> {
+    if (recoveryOwnersStop) return recoveryOwnersStop;
+    recoveryOwnersStop = stopRecoveryOwnerSet({
+      ...(endpointReadyBuffer ? { ready: endpointReadyBuffer } : {}),
+      ...(managedRecoveryOwner ? { managed: managedRecoveryOwner } : {}),
+      ...(operationReconciler ? { operations: operationReconciler } : {}),
+      ...(dispatcherAvailable ? { dispatcher } : {}),
+      ...(relay ? { relay } : {}),
+      ...(observations ? { observations } : {}),
+      ...(relay && observations ? { finishDashboard: renderDashboardSafely } : {}),
+    }).finally(() => {
+      dispatcherAvailable = false;
+    });
+    return recoveryOwnersStop;
+  }
 
   function buildActions(): Partial<Record<AssistantToolName, (args: any, context: any) => Promise<any>>> {
     return {
@@ -980,7 +2254,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
-        reconcileExternalOwnershipReleases();
+        await reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -989,7 +2263,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.archive(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
-        reconcileExternalOwnershipReleases();
+        await reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -1290,7 +2564,30 @@ export async function buildProductionApp(
   function hasEndpointIdentityReferences(endpointId: string): boolean {
     return Object.values(registry.snapshot().sessions).some((session) => session.endpoint === endpointId)
       || Boolean(pool?.hasClaims(endpointId))
-      || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId));
+      || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId))
+      || recoverableEndpointReferences().includes(endpointId);
+  }
+
+  function recoverableEndpointReferences(): string[] {
+    if (!operations || !registry) return [];
+    return recoverableOperationEndpointReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }).filter((endpointId) => endpointId !== assistantEndpoint?.id);
+  }
+
+  function recoverableActivationReferences(): string[] {
+    return recoverableOperationActivationReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }).filter((endpointId) => endpointId !== assistantEndpoint.id);
+  }
+
+  function lifecycleOwnedEndpointIds(): Set<string> {
+    return new Set(recoverableLifecycleEndpointReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }));
   }
 
   function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
@@ -1304,6 +2601,16 @@ export async function buildProductionApp(
     const remoteContext = remoteCandidateContexts.get(target);
     if (remoteContext) remoteContexts.set(target.id, remoteContext);
     pool.replaceEndpoint(target);
+    const requestReadyRecovery = (): void => {
+      if (!current()) return;
+      const recovery = endpointReadyBuffer?.ready(target.id);
+      if (recovery) runBackground(() => recovery, () => {
+        reportOperationalSafely(report, {
+          level: "warn", code: "background_task_failed", component: "project_ready_safety",
+        });
+        requestRestartOnce();
+      });
+    };
     const subscriptions = [
       target.onNotification((method, params) => {
         if (!current()) return;
@@ -1320,14 +2627,13 @@ export async function buildProductionApp(
             dashboardStore.observeLifecycle({ endpointId: target.id, threadId: event.threadId }, Date.now());
             await renderDashboardSafely();
           }
-          enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"));
       }),
-      target.onReady(() => { if (current() && acceptingReadyEvents) runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation")); }),
+      target.onReady(requestReadyRecovery),
       target.onUnavailable((kind) => { if (current()) runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling")); }),
     ];
     projectEndpointSubscriptions.set(target.id, subscriptions);
-    if (acceptingReadyEvents && target.state === "ready") runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation"));
+    if (target.state === "ready") requestReadyRecovery();
   }
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
@@ -1337,16 +2643,16 @@ export async function buildProductionApp(
       return;
     }
     if (method === "turn/completed") {
-      await endpointManager.withWorkLease(endpointId, "rpc", async (_endpoint, lease) => {
-        const before = await ownershipWatcher.detectEndpoint(endpointId, lease);
-        await relay.handleNotification(endpointId, method, params, lease);
-        const after = await ownershipWatcher.detectEndpoint(endpointId, lease);
-        await ownershipWatcher.release([...before, ...after]);
-      });
+      await processWorkerTerminalNotification({
+        endpoints: endpointManager,
+        ownership: ownershipWatcher,
+        relay,
+        reconcileOperations,
+      }, endpointId, method, params);
+      return;
     } else {
       await relay.handleNotification(endpointId, method, params);
     }
-    await enqueuePendingEvents();
   }
 
   function processAssistantTerminal(params: any): Promise<void> {
@@ -1369,12 +2675,16 @@ export async function buildProductionApp(
     if (conversations.membersForAttempt(attemptBefore.attemptId)
       .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state))) return;
     assistant.beginTerminalizing(params.turn.id);
-    await assistant.fenceTools(attemptBefore.attemptId, 1_000);
+    const settled = await settleAssistantTerminalTools({
+      fenceTools: () => assistant.fenceTools(attemptBefore.attemptId, 1_000),
+      reconcileOperations,
+      requestRestartOnce,
+    });
+    if (!settled) return;
     const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
     const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
     const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
-    if (turn.status !== "completed") await reconcileOperations({ includeActiveAttempt: true });
-    const memberIds = attemptBefore ? conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId) : [];
+    const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
     assistant.handleTerminal(
       turn.id,
       isTerminalStatus(turn.status) ? turn.status : "failed",
@@ -1382,11 +2692,14 @@ export async function buildProductionApp(
       turn.error,
     );
     for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
+    if (operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId)) {
+      await reconcileOperations();
+    }
     await enqueuePendingEvents();
     await dispatcher.enqueueInternal("terminal");
   }
 
-  function enqueuePendingEvents(): void {
+  async function enqueuePendingEvents(): Promise<void> {
     if (!schedulerAccepting || stopping) return;
     const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json, created_at FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
@@ -1404,7 +2717,7 @@ export async function buildProductionApp(
       }
       scheduler.enqueueEvent({ id, sessionKey, payload, queuedAt: Number(row.created_at) });
     }
-    void dispatcher?.enqueueInternal("events");
+    await dispatcher?.enqueueInternal("events");
   }
 
   function isTerminalStatus(status: unknown): boolean {
@@ -1429,21 +2742,38 @@ export async function buildProductionApp(
     runtime.setSession(assistantEndpoint.id, resumed.threadId, assistantMappingId, "managed", resumed.nativeStatus);
   }
 
-  function reconcileOperations(options: { includeActiveAttempt?: boolean } = {}): Promise<void> {
-    const run = operationReconciliationTail.then(
-      () => reconcileOperationsOnce(options),
-      () => reconcileOperationsOnce(options),
-    );
-    operationReconciliationTail = run.catch(() => undefined);
-    return run;
+  function isRecoveryEndpointReady(endpointId: string): boolean {
+    if (endpointId === assistantEndpoint.id) return assistantEndpoint.state === "ready";
+    try { return endpointManager.endpointGeneration(endpointId).endpoint.state === "ready"; }
+    catch { return false; }
   }
 
-  async function reconcileOperationsOnce(options: { includeActiveAttempt?: boolean }): Promise<void> {
-    const liveAttemptId = assistant.current()?.attemptId;
-    for (const operation of operations.listRecoverable()) {
-      if (!options.includeActiveAttempt && operation.attemptId === liveAttemptId) continue;
+  function reconcileOperations(): Promise<void> {
+    return operationReconciler?.request() ?? Promise.resolve();
+  }
+
+  async function reconcileOperationsOnce(): Promise<OperationReconciliationPass> {
+    let attempted = false;
+    let waitingForEndpoint = false;
+    const transientTargets = new Map<string, OperationRecoveryTarget>();
+    const entries = operations.listRecoverable().map((operation) => ({ operation }));
+    const resolveTarget = ({ operation }: { operation: RecoverableOperation }): OperationRecoveryTarget =>
+      recoverableOperationTarget(operation, {
+        defaultProjectEndpointId: endpoint.id,
+        session: (nickname) => registry.get(nickname),
+      });
+    await runOperationRecoveryChains(entries, resolveTarget, async ({ operation }, target) => {
+      if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") return true;
+      const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
+      if (preflight === "sleep") return true;
+      if (preflight === "wait_for_endpoint") {
+        waitingForEndpoint = true;
+        return true;
+      }
+      attempted = true;
       const args = operation.args as any;
       try {
+        const recover = async (recoveryLease?: EndpointWorkLease): Promise<void> => {
         if (operation.kind === "update_session_notes") {
           const result = dashboardStore.noteOperationResult(operation.id);
           if (result) await succeedRecovered(operation, result);
@@ -1460,15 +2790,15 @@ export async function buildProductionApp(
           const id = chatAttachmentFileHandle(operation.contextId, operation.attemptId, operation.callId);
           let prepared = attachments.get(operation.contextId, id);
           if (!prepared) {
-            prepared = await prepareChatAttachment(args.owner, args.relative_path, operation.contextId, id);
+            prepared = await prepareChatAttachment(args.owner, args.relative_path, operation.contextId, id, recoveryLease);
           }
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "disconnect_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
-          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
+          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
           if (saved) {
-            if (saved.phase === "runtime_started") continue;
+            if (saved.phase === "runtime_started") return;
             await endpointManager.recoverDisconnect(endpointId, saved.phase, saved.identity,
               (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           }
@@ -1477,7 +2807,7 @@ export async function buildProductionApp(
         } else if (operation.kind === "restart_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
-          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) continue;
+          if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
           if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
             (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
@@ -1496,8 +2826,8 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
         } else if (operation.kind === "send_to_session") {
           const session = registry.get(args.nickname);
-          if (!session) continue;
-          const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+          if (!session) return;
+          const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
           const clientId = `${operation.contextId}:${operation.callId}`;
           const turn = history.thread.turns.find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === clientId));
           const holds = (args.attachment_ids as string[]).map((id, index) => {
@@ -1540,58 +2870,60 @@ export async function buildProductionApp(
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
-          await withRecoveredSessionLease(endpointManager, recoveryEndpointId, async (lease) => {
-            let session = registry.get(args.nickname);
-            if (project) {
-              await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
-            }
-            const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
-            const expectedDir = project?.path;
-            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
-              failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+          if (!recoveryLease || recoveryLease.endpointId !== recoveryEndpointId) {
+            throw new AppError("ENDPOINT_UNAVAILABLE", "session recovery endpoint lease changed");
+          }
+          const lease = recoveryLease;
+          let session = registry.get(args.nickname);
+          if (project) {
+            await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
+          }
+          const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
+          const expectedDir = project?.path;
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
+            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+            return;
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
+            const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
+              .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
+            if (candidates.length === 0) {
+              failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
               return;
             }
-            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
-              const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
-                .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
-              if (candidates.length === 0) {
-                failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
-                return;
-              }
-              if (candidates.length !== 1) return;
-              checkpoint.threadId = candidates[0]!.id;
-              operations.checkpoint(operation.id, checkpoint);
-            }
-            if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
-              if (!checkpoint.mappingId) return;
-              await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
-                if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
-                hydrateThreadOrder(recoveryEndpointId, thread);
-              }, checkpoint.mappingId, lease);
-              session = registry.get(args.nickname);
-            }
-            if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
-              await lifecycle.reconcileAdopting({ nickname: args.nickname, endpointId: recoveryEndpointId, existingLease: lease });
-              session = registry.get(args.nickname);
-            }
-            if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
-              && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
-              const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-              const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
-                ? await lifecycle.reconcileManaged(args.nickname, session, lease)
-                : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
-              await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
-              hydrateThreadOrder(session.endpoint, native.thread);
-              await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
-                advanceNativeWatermark(args.nickname);
-                observeLifecycle(args.nickname);
-                const currentSettings = (checkpoint as any)?.currentSettings;
-                if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
-              });
-            } else if (!session && operation.kind !== "create_session") {
-              failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
-            }
-          });
+            if (candidates.length !== 1) return;
+            checkpoint.threadId = candidates[0]!.id;
+            operations.checkpoint(operation.id, checkpoint);
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
+            if (!checkpoint.mappingId) return;
+            await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+              hydrateThreadOrder(recoveryEndpointId, thread);
+            }, checkpoint.mappingId, lease);
+            session = registry.get(args.nickname);
+          }
+          if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
+            await lifecycle.reconcileAdopting({ nickname: args.nickname, endpointId: recoveryEndpointId, existingLease: lease });
+            session = registry.get(args.nickname);
+          }
+          if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
+            && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+            const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+            const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
+              ? await lifecycle.reconcileManaged(args.nickname, session, lease)
+              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
+            await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
+            hydrateThreadOrder(session.endpoint, native.thread);
+            await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
+              advanceNativeWatermark(args.nickname);
+              observeLifecycle(args.nickname);
+              const currentSettings = (checkpoint as any)?.currentSettings;
+              if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+            });
+          } else if (!session && operation.kind !== "create_session") {
+            failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
+          }
         } else if (operation.kind === "rename_session") {
           const saved = operation.receipt as Partial<RegistrySession> | undefined;
           const oldMapping = registry.get(args.old_nickname);
@@ -1602,22 +2934,18 @@ export async function buildProductionApp(
             failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
           }
         } else if (operation.kind === "unadopt_session" || operation.kind === "archive_session") {
-          const saved = operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
-          const nickname = saved?.nickname ?? args.nickname;
-          let current = registry.get(nickname);
-          let decision = removalRecoveryDecision(operation.kind, saved, current);
-          if (decision === "reconcile") {
-            await lifecycle.reconcileRemoval(nickname, current!);
-            current = registry.get(nickname);
-            decision = removalRecoveryDecision(operation.kind, saved, current);
-          }
-          if (decision === "succeeded") {
-            await succeedRecovered(operation, { nickname, mapping_id: saved!.mapping_id }, () => dashboardStore.markDirty());
-          } else if (decision === "no_effect") {
-            failRecoveredNoEffect(operation.id, "durable removal transition was not committed");
-          }
+          await recoverRemovalOperation({
+            operation,
+            registry,
+            lifecycle,
+            ...(recoveryLease ? { lease: recoveryLease } : {}),
+            succeed: (receipt) => succeedRecovered(operation, receipt, () => dashboardStore.markDirty()),
+            failNoEffect: () => failRecoveredNoEffect(operation.id, "durable removal transition was not committed"),
+          });
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
-          const current = await sessions.getGoal(args.nickname) as any;
+          const session = registry.get(args.nickname);
+          if (!session) return;
+          const current = await pool.request<any>(session.endpoint, "thread/goal/get", { threadId: session.thread_id }, undefined, recoveryLease);
           const goal = current?.goal;
           const actualBudget = goal?.tokenBudget ?? goal?.token_budget ?? null;
           let cancelInterruptProven = true;
@@ -1625,11 +2953,8 @@ export async function buildProductionApp(
             const checkpoint = operation.receipt as { turnId?: string | null } | undefined;
             cancelInterruptProven = checkpoint !== undefined && checkpoint.turnId === null;
             if (checkpoint?.turnId) {
-              const session = registry.get(args.nickname);
-              if (session) {
-                const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
-                cancelInterruptProven = history.thread.turns.some((turn: any) => turn.id === checkpoint.turnId && isTerminalStatus(turn.status));
-              }
+              const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
+              cancelInterruptProven = history.thread.turns.some((turn: any) => turn.id === checkpoint.turnId && isTerminalStatus(turn.status));
             }
           }
           const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
@@ -1642,33 +2967,49 @@ export async function buildProductionApp(
           });
         } else if (operation.kind === "interrupt_session") {
           const session = registry.get(args.nickname);
-          if (!session) continue;
+          if (!session) return;
           const turnId = args.turn_id ?? (operation.receipt as { turnId?: string } | undefined)?.turnId;
-          if (!turnId) continue;
-          const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+          if (!turnId) return;
+          const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
           const turn = history.thread.turns.find((candidate: any) => candidate.id === turnId);
           if (turn && isTerminalStatus(turn.status)) await succeedRecovered(operation, { interrupted: true, turnId }, () => {
             advanceNativeWatermark(args.nickname);
             observeLifecycle(args.nickname);
           });
         }
-      } catch {
+        };
+        await runOperationRecoveryTarget(target, endpointManager, recover);
+      } catch (error) {
+        const disposition = operationRecoveryFailureDisposition(error, target);
+        const current = operations.get(operation.id);
+        if (disposition === "retry" && current && (current.state === "dispatched" || current.state === "uncertain")) {
+          transientTargets.set(operation.id, target);
+        }
+        else if (disposition === "wait_for_endpoint") waitingForEndpoint = true;
         // Leave the operation uncertain unless authoritative state proves its exact outcome.
       }
-    }
+      const current = operations.get(operation.id);
+      return current?.state === "dispatched" || current?.state === "uncertain";
+    });
+    return {
+      outcome: { attempted, transientRetry: transientTargets.size > 0, waitingForEndpoint },
+      transientTargets,
+    };
   }
 
-  async function prepareChatAttachment(owner: string, relativePath: string, scopeId: string, requestedId: FileHandleId) {
+  async function prepareChatAttachment(owner: string, relativePath: string, scopeId: string, requestedId: FileHandleId, recoveryLease?: EndpointWorkLease) {
     if (owner === "assistant") {
       return attachments.prepareOutbound(scopeId, assistantDir, relativePath, undefined, undefined, requestedId);
     }
     const session = registry.get(owner);
     if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${owner}`);
     if (session.lifecycle_state !== "managed") throw new AppError("SESSION_DETACHED", `${owner} is not managed`);
+    if (recoveryLease && recoveryLease.endpointId !== session.endpoint) throw new AppError("ENDPOINT_UNAVAILABLE", "worker endpoint changed during attachment recovery");
     return workerFiles.prepareProjectFile({
       endpointId: session.endpoint,
       projectRoot: session.project_dir,
       mapping: session,
+      ...(recoveryLease ? { lease: recoveryLease } : {}),
       scopeId,
       relativePath,
       requestedId,
@@ -1685,8 +3026,36 @@ export async function buildProductionApp(
     };
   }
 
-  async function resumeManagedSessions(endpointFilter?: string, unavailableOnly = false): Promise<void> {
-    if (!unavailableOnly) {
+  async function reconcileStartupLifecycleState(): Promise<void> {
+    const excluded = lifecycleOwnedEndpointIds();
+    const endpointIds = [...new Set(Object.values(registry.snapshot().sessions).map((session) => session.endpoint))]
+      .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
+    if (endpointIds.length === 0) {
+      await reconcileExternalOwnershipReleases();
+      return;
+    }
+    for (const endpointId of endpointIds) await reconcileLifecycleState({ endpointId });
+  }
+
+  async function resumeStartupManagedSessions(): Promise<void> {
+    const excluded = lifecycleOwnedEndpointIds();
+    const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
+      .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
+    for (const endpointId of endpointIds) {
+      const result = await resumeManagedSessions(endpointId);
+      if (result.restored) await reconcileRestoredEndpoint(endpointId);
+      endpointReadyBuffer?.acknowledge(endpointId);
+    }
+  }
+
+  async function resumeManagedSessions(endpointFilter?: string, options: {
+    unavailableOnly?: boolean;
+    keys?: readonly ManagedRetryKey[];
+    lease?: EndpointWorkLease;
+    isCurrent?: () => boolean;
+  } = {}): Promise<ManagedSessionRecoveryBatchResult> {
+    const exactKeys = options.keys ? new Set(options.keys) : undefined;
+    if (!options.unavailableOnly && !exactKeys) {
       for (const session of Object.values(registry.managedSnapshot().sessions)) {
         if (endpointFilter && session.endpoint !== endpointFilter) continue;
         const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
@@ -1695,46 +3064,136 @@ export async function buildProductionApp(
         }
       }
     }
-    const reconciledEndpoints = new Set<string>();
+    const restoredKeys: ManagedRetryKey[] = [];
+    const settledKeys: ManagedRetryKey[] = [];
+    const failures: Array<{ key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }> = [];
+    const seenKeys = new Set<ManagedRetryKey>();
     for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
+      if (options.isCurrent && !options.isCurrent()) break;
       if (endpointFilter && session.endpoint !== endpointFilter) continue;
-      if (!managedSessionNeedsRecovery(runtime.getSession(session.endpoint, session.thread_id, session.mapping_id), unavailableOnly)) continue;
-      reconciledEndpoints.add(session.endpoint);
+      const key = managedRetryKey(session.endpoint, session.thread_id, session.mapping_id);
+      if (exactKeys && !exactKeys.has(key)) continue;
+      seenKeys.add(key);
+      const stateBefore = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      if (options.unavailableOnly && stateBefore?.managementState !== "unavailable") {
+        settledKeys.push(key);
+        continue;
+      }
       try {
-        const response = await lifecycle.reconcileManaged(nickname, session);
+        const response = await lifecycle.reconcileManaged(nickname, session, options.lease, options.isCurrent);
+        if ((options.isCurrent && !options.isCurrent())
+          || (options.lease && !isManagedRecoveryLeaseCurrent(session.endpoint, options.lease))) {
+          throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery endpoint generation changed");
+        }
         const activeTurn = [...(response.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status));
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         if (activeTurn) pool.restoreObservedActiveTurn(session.endpoint, session.thread_id, activeTurn.id);
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         const resumeObservationSequence = dashboardStore.allocateObservationSequence();
         const nativeObservationSequence = dashboardStore.allocateObservationSequence();
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         hydrateThreadOrder(session.endpoint, response.thread);
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         observations.observeResume(session.endpoint, session.thread_id, response, Date.now(), {
           settings: resumeObservationSequence,
           native: nativeObservationSequence,
         });
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
-      } catch {
+        if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
+        restoredKeys.push(key);
+      } catch (error) {
+        if (options.isCurrent && !options.isCurrent()) throw error;
+        const disposition = managedRecoveryDisposition(error);
+        failures.push({ key, disposition });
+        if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
         const current = registry.get(nickname);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed") {
           const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-          if (state?.managementState !== "unadopting") {
-            runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", "notLoaded");
-            warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
+          const recoveryState = managedRecoveryManagementState(state?.managementState, disposition);
+          if (recoveryState !== "unadopting") {
+            runtime.setSession(
+              session.endpoint,
+              session.thread_id,
+              session.mapping_id,
+              recoveryState,
+              disposition === "external" ? state?.nativeStatus ?? "notLoaded" : "notLoaded",
+            );
+            if (disposition === "permanent") warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
           }
           dashboardStore.observeLifecycle({ endpointId: session.endpoint, threadId: session.thread_id }, Date.now());
         }
       }
     }
-    if (!unavailableOnly && endpointFilter && !reconciledEndpoints.has(endpointFilter)
-      && !Object.values(registry.managedSnapshot().sessions).some((session) => session.endpoint === endpointFilter)) {
-      reconciledEndpoints.add(endpointFilter);
-    }
-    for (const endpointId of reconciledEndpoints) {
-      await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
-        await pool.reconcileEndpointClaims(endpointId);
-        await observations.drain(endpointId);
+    if (exactKeys) for (const key of exactKeys) if (!seenKeys.has(key)) settledKeys.push(key);
+    return { restored: restoredKeys.length > 0, restoredKeys, settledKeys, failures };
+  }
+
+  function isManagedRecoveryLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean {
+    try {
+      const current = endpointManager.endpointGeneration(endpointId);
+      return current.generation === lease.endpointGeneration && endpointManager.validateReadyWorkLease(lease, endpointId);
+    } catch { return false; }
+  }
+
+  async function reconcileRestoredEndpoint(endpointId: string, existingLease?: EndpointWorkLease): Promise<void> {
+    const reconcile = async (lease: EndpointWorkLease): Promise<void> => {
+      const isCurrent = (): boolean => isManagedRecoveryLeaseCurrent(endpointId, lease);
+      const beforeIncidents = await beforeRestoredEndpoint(endpointId, lease, isCurrent);
+      await wakeRestoredEndpoint(endpointId, lease, isCurrent);
+      await afterRestoredEndpoint(endpointId, lease, beforeIncidents, isCurrent);
+    };
+    if (existingLease) {
+      await endpointManager.runWithWorkLease(endpointId, existingLease, async (lease) => {
+        if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery endpoint lease is unavailable");
+        await reconcile(lease);
       });
+      return;
     }
+    await endpointManager.withReadyWorkLease(endpointId, reconcile);
+  }
+
+  function assertManagedRecoveryCurrent(isCurrent: () => boolean): void {
+    if (!isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery generation changed during downstream work");
+  }
+
+  async function beforeRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<readonly ManagedOwnershipIncidentReceipt[]> {
+    assertManagedRecoveryCurrent(isCurrent);
+    const incidents = await ownershipWatcher.detectEndpoint(endpointId, lease, isCurrent);
+    assertManagedRecoveryCurrent(isCurrent);
+    await pool.reconcileEndpointClaims(endpointId, lease, isCurrent);
+    assertManagedRecoveryCurrent(isCurrent);
+    return incidents;
+  }
+
+  async function wakeRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    assertManagedRecoveryCurrent(isCurrent);
+    await wakeRestoredSessionOwners({
+      relay,
+      observations,
+      onError: (owner) => reportOperationalSafely(report, {
+        level: "warn", code: "background_task_failed", component: `managed_${owner}_recovery`,
+      }),
+    }, endpointId, lease, isCurrent);
+    assertManagedRecoveryCurrent(isCurrent);
+  }
+
+  async function afterRestoredEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease,
+    beforeIncidents: readonly ManagedOwnershipIncidentReceipt[],
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    await releaseRestoredOwnershipIncidents({ ownership: ownershipWatcher }, endpointId, lease, beforeIncidents, isCurrent);
   }
 
   function recoverProjectEndpoint(endpointId: string): Promise<void> {
@@ -1742,16 +3201,35 @@ export async function buildProductionApp(
     if (existing) return existing;
     const recovery = (async () => {
       await reconcileLifecycleState({ endpointId });
-      await resumeManagedSessions(endpointId);
-      await reconcileOperations();
-      deliveries.prepare({
-        id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
-        kind: "system_warning",
-        binding: currentOwnerBinding(),
-        body: `[system] ${endpointId} app-server reconnected`,
-        mandatory: true,
+      let recoveredGeneration: number | undefined;
+      await recoverReadyEndpointOwners({
+        recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => {
+          recoveredGeneration = lease.endpointGeneration;
+          return recoverManagedEndpointReady(managedRecoveryOwner!, endpointId, lease, wakeShared);
+        }),
+        relay: () => relay.endpointReady(endpointId),
+        observations: () => observations.endpointReady(endpointId),
+        operations: () => operationReconciler?.endpointReady(endpointId) ?? Promise.resolve(),
+        onError: (owner) => reportOperationalSafely(report, {
+          level: "warn", code: "background_task_failed", component: `endpoint_ready_${owner}_recovery`,
+        }),
       });
-      await renderDashboardSafely();
+      if (recoveredGeneration === undefined) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint recovery did not establish a ready generation: ${endpointId}`);
+      }
+      await endpointManager.withReadyWorkLease(endpointId, async (lease) => {
+        if (lease.endpointGeneration !== recoveredGeneration || !endpointManager.validateReadyWorkLease(lease, endpointId)) {
+          throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint generation changed before recovery publication: ${endpointId}`);
+        }
+        deliveries.prepare({
+          id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
+          kind: "system_warning",
+          binding: currentOwnerBinding(),
+          body: `[system] ${endpointId} app-server reconnected`,
+          mandatory: true,
+        });
+        await renderDashboardSafely();
+      });
     })().finally(() => { if (projectEndpointRecoveries.get(endpointId) === recovery) projectEndpointRecoveries.delete(endpointId); });
     projectEndpointRecoveries.set(endpointId, recovery);
     return recovery;
@@ -1759,12 +3237,19 @@ export async function buildProductionApp(
 
   async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
+    markEndpointOwnersUnavailable({
+      relay,
+      observations,
+      managed: managedRecoveryOwner!,
+      operations: operationReconciler!,
+    }, target.id);
     endpointIncident += 1;
-    if (target.id === assistantEndpoint.id) acceptingReadyEvents = false;
+    if (target.id === assistantEndpoint.id) endpointReadyBuffer?.pause();
     pool.markEndpointUnavailable(target.id, kind);
     for (const session of runtime.listSessions()) {
       if (session.endpointId === target.id && session.managementState === "managed") {
         runtime.setSession(session.endpointId, session.threadId, session.mappingId, "unavailable", "notLoaded");
+        managedRecoveryOwner?.recordFailure(managedRetryKey(session.endpointId, session.threadId, session.mappingId), "endpoint");
         dashboardStore.observeLifecycle({ endpointId: session.endpointId, threadId: session.threadId }, Date.now());
       }
     }
@@ -1779,53 +3264,50 @@ export async function buildProductionApp(
       body: `[system] ${target.id} app-server is unavailable; reconnecting`,
       mandatory: true,
     });
-    db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
-      VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
-      .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now());
-    if (target.id === assistantEndpoint.id) scheduleReconnect(assistantEndpoint);
+    await durableEventSources.endpointUnavailable({
+      id: `endpoint-unavailable:${target.id}:${endpointIncident}`,
+      endpointId: target.id,
+      threadId: identity.thread_id,
+      incident: endpointIncident,
+      createdAt: Date.now(),
+    });
+    if (target.id === assistantEndpoint.id) scheduleAssistantReconnect();
     await renderDashboardSafely();
   }
 
-  function scheduleReconnect(target: LocalEndpoint): void {
-    if (stopping || reconnectTimers.has(target.id)) return;
-    const attempt = reconnectAttempts.get(target.id) ?? 0;
+  function scheduleAssistantReconnect(): void {
+    const endpointId = assistantEndpoint.id;
+    if (stopping || reconnectTimers.has(endpointId)) return;
+    const attempt = reconnectAttempts.get(endpointId) ?? 0;
     const delay = Math.min(1_000 * 2 ** attempt, 30_000);
-    reconnectAttempts.set(target.id, attempt + 1);
+    reconnectAttempts.set(endpointId, attempt + 1);
     const timer = setTimeout(() => {
-      reconnectTimers.delete(target.id);
-      void recoverEndpoint(target).catch(() => scheduleReconnect(target));
+      reconnectTimers.delete(endpointId);
+      void recoverAssistantEndpoint().catch(scheduleAssistantReconnect);
     }, delay);
-    reconnectTimers.set(target.id, timer);
+    reconnectTimers.set(endpointId, timer);
     timer.unref?.();
   }
 
-  async function recoverEndpoint(target: LocalEndpoint): Promise<void> {
+  async function recoverAssistantEndpoint(): Promise<void> {
     if (stopping) return;
-    if (target.id === endpoint.id) {
-      await target.start();
-      await reconcileLifecycleState({ endpointId: target.id });
-      await resumeManagedSessions(endpoint.id);
-      await reconcileOperations();
-      await renderDashboardSafely();
-    } else {
-      try {
-        await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
-      } catch (error) {
-        if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
-          recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
-        }
-        throw error;
+    try {
+      await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+    } catch (error) {
+      if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
+        recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
       }
-      await startOrResumeAssistant();
-      await dispatcher.recover();
-      await dispatcher.idle();
-      assistant.hydrateActive();
-      await reconcileOperations();
-      assistantToolReadiness.ready();
-      schedulerAccepting = true;
+      throw error;
     }
-    acceptingReadyEvents = true;
-    reconnectAttempts.set(target.id, 0);
+    await startOrResumeAssistant();
+    await dispatcher.recover();
+    await dispatcher.idle();
+    assistant.hydrateActive();
+    await operationReconciler?.endpointReady(assistantEndpoint.id);
+    assistantToolReadiness.ready();
+    schedulerAccepting = true;
+    await endpointReadyBuffer?.acceptAndDrain();
+    reconnectAttempts.set(assistantEndpoint.id, 0);
     await enqueuePendingEvents();
   }
 
@@ -1855,25 +3337,16 @@ export async function buildProductionApp(
     });
   }
 
-  function persistDeliveryState(delivery: DeliveryRecord, schedule = true): boolean {
-    const inserted = persistDeliveryStateEvent(db, delivery);
-    if (inserted && schedule && schedulerAccepting) enqueuePendingEvents();
-    return inserted;
+  async function reconcileDeliveryEvents(): Promise<void> {
+    await durableEventSources.reconcileDeliveryStates();
   }
 
-  function reconcileDeliveryEvents(): void {
-    if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) enqueuePendingEvents();
-  }
-
-  function reconcileExternalOwnershipReleases(): number {
-    const inserted = ownershipEvents.reconcileReleased(registry);
-    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
-    return inserted;
+  async function reconcileExternalOwnershipReleases(): Promise<number> {
+    return durableEventSources.reconcileOwnership();
   }
 
   async function reconcileLifecycleState(filter: { endpointId?: string; nickname?: string } = {}): Promise<void> {
-    const inserted = await reconcileLifecycleAndOwnership(lifecycle, isolateLifecycleRecoveryFailure, ownershipEvents, registry, filter);
-    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
+    await durableEventSources.reconcileLifecycle(filter);
   }
 
   function failRecoveredNoEffect(operationId: string, message: string): void {
@@ -1890,91 +3363,7 @@ export async function buildProductionApp(
     backgroundFailureReporter.report(label);
   }
 
-  function recordScheduledBackgroundFailure(label: string, episode: string): void {
-    backgroundFailureReporter.report(label, { episode, notifyAfter: scheduledFailureThreshold });
-  }
-
-  return composeApp(phases, {
-    maintenance: {
-      intervalMs: 60_000,
-      run: runMaintenance,
-      onFailure: handleMaintenanceFailure,
-      onSuccess: () => { backgroundFailureReporter.resolve(maintenanceFailureEpisode); },
-    },
-  });
-
-  async function runMaintenance(): Promise<void> {
-    dashboardStore.assertMetadataHealthy();
-    await attachments.cleanupExpired();
-    discovery.cleanupExpired();
-    reconcileDeliveryEvents();
-    await reconcileOperations();
-    const managedEndpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))];
-    const projectCycle = createFailureCycle({
-      onFailed: () => { recordScheduledBackgroundFailure("periodic project reconciliation", projectReconciliationFailureEpisode); },
-      onResolved: () => { backgroundFailureReporter.resolve(projectReconciliationFailureEpisode); },
-    });
-    for (const endpointId of managedEndpointIds) {
-      let target: ManagedAppServerEndpoint;
-      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { projectCycle.inconclusive(); continue; }
-      if (target.state !== "ready") { projectCycle.inconclusive(); continue; }
-      try {
-        await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
-          await observations.drain(endpointId);
-        });
-        projectCycle.succeeded();
-      } catch { projectCycle.failed(); }
-    }
-    projectCycle.finish();
-    await renderDashboardSafely();
-    if (assistantEndpoint.state === "ready") {
-      await dispatcher.recover();
-      await enqueuePendingEvents();
-    }
-    if (endpoint.state !== "ready") return;
-    const accepted = await registry.reload(validateRegistryDocument);
-    if (!accepted) {
-      if (!registryInvalid) {
-        deliveries.prepare({
-          id: `registry-invalid:${Date.now()}`,
-          kind: "system_warning",
-          binding: currentOwnerBinding(),
-          body: "[system] sessions.json replacement was rejected; the last valid registry remains active",
-          mandatory: true,
-        });
-      }
-      registryInvalid = true;
-      return;
-    }
-    registryInvalid = false;
-    await reconcileLifecycleState();
-    const managedRecoveryCycle = createFailureCycle({
-      onFailed: () => { recordScheduledBackgroundFailure("periodic managed session recovery", managedRecoveryFailureEpisode); },
-      onResolved: () => { backgroundFailureReporter.resolve(managedRecoveryFailureEpisode); },
-    });
-    for (const endpointId of managedEndpointIds) {
-      let target: ManagedAppServerEndpoint;
-      try { target = endpointManager.endpointGeneration(endpointId).endpoint; }
-      catch { managedRecoveryCycle.inconclusive(); continue; }
-      if (target.state !== "ready") { managedRecoveryCycle.inconclusive(); continue; }
-      try { await resumeManagedSessions(endpointId, true); managedRecoveryCycle.succeeded(); }
-      catch { managedRecoveryCycle.failed(); }
-    }
-    managedRecoveryCycle.finish();
-    await reconcileDashboard();
-  }
-
-  async function validateRegistryDocument(document: RegistryDocument): Promise<void> {
-    const currentDocument = registry.snapshot();
-    const currentAssistant = currentDocument.assistant;
-    if (document.assistant.endpoint !== currentAssistant.endpoint || document.assistant.thread_id !== currentAssistant.thread_id || document.assistant.project_dir !== currentAssistant.project_dir) {
-      throw new Error("the live assistant mapping cannot be externally repointed");
-    }
-    if (!registryReloadPreservesWorkerMappings(currentDocument, document)) {
-      throw new Error("worker mappings and lifecycle state are managed by QiYan tools and cannot be edited live");
-    }
-  }
+  return composeApp(phases);
 }
 
 export function createChatHistoryAction(

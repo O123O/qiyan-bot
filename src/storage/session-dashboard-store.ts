@@ -48,8 +48,17 @@ export function isDashboardMetadataRecoveryRequired(error: unknown): error is Da
   return error instanceof DashboardMetadataRecoveryRequiredError;
 }
 
+export interface SessionDashboardStoreOptions {
+  onMetadataRecoveryRequired?: () => void;
+}
+
 export class SessionDashboardStore {
-  constructor(private readonly db: Database) {}
+  private recoveryRequested = false;
+
+  constructor(
+    private readonly db: Database,
+    private readonly options: SessionDashboardStoreOptions = {},
+  ) {}
 
   assertMetadataHealthy(): void {
     const rows = this.db.prepare("SELECT * FROM session_dashboard_meta").all() as Array<Record<string, unknown>>;
@@ -67,10 +76,12 @@ export class SessionDashboardStore {
   }
 
   allocateObservationSequence(): number {
+    this.guardMetadata();
     return inTransaction(this.db, () => this.nextObservationSequence());
   }
 
   acceptNotification(endpointId: string, method: string, normalizedParams: unknown, receivedAt: number): number {
+    this.guardMetadata();
     return inTransaction(this.db, () => {
       const sequence = this.nextObservationSequence();
       this.db.prepare(`INSERT INTO session_dashboard_notifications
@@ -174,6 +185,7 @@ export class SessionDashboardStore {
   }
 
   observeLifecycle(identity: DashboardIdentity, observedAt: number): boolean {
+    this.guardMetadata();
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
     if (row.lifecycle_observed_at !== null && Number(row.lifecycle_observed_at) >= observedAt) return false;
@@ -185,6 +197,7 @@ export class SessionDashboardStore {
   }
 
   observeLastSent(identity: DashboardIdentity, value: LastSent, operationSequence: number): boolean {
+    this.guardMetadata();
     const parsed = LastSentSchema.parse(value);
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
@@ -198,6 +211,7 @@ export class SessionDashboardStore {
   }
 
   observeLastWorkerEvent(identity: DashboardIdentity, value: LastWorkerEvent, turnOrdinal: number): boolean {
+    this.guardMetadata();
     const parsed = LastWorkerEventSchema.parse(value);
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
@@ -215,6 +229,7 @@ export class SessionDashboardStore {
     value: { model?: string | null; effort?: string | null; observedAt: number },
     observationSequence: number,
   ): { valueChanged: boolean; watermarkAdvanced: boolean } {
+    this.guardMetadata();
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
     const currentSequence = Number(row.current_settings_observation_sequence ?? 0);
@@ -236,6 +251,7 @@ export class SessionDashboardStore {
   }
 
   observeTokenUsage(identity: DashboardIdentity, turnId: string, value: DashboardTokenUsage, turnOrdinal: number, observationSequence: number): boolean {
+    this.guardMetadata();
     const parsed = DashboardTokenUsageSchema.parse(value);
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
@@ -251,6 +267,7 @@ export class SessionDashboardStore {
   }
 
   observeGoal(identity: DashboardIdentity, value: DashboardGoal | null, sourceTime: number, observationSequence: number, observedAt: number): boolean {
+    this.guardMetadata();
     const parsed = value === null ? null : DashboardGoalSchema.parse(value);
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
@@ -272,6 +289,7 @@ export class SessionDashboardStore {
   }
 
   updateNotes(identity: DashboardIdentity, operationId: string, patch: SessionNotesPatch, now: number): ManagerNotes {
+    this.guardMetadata();
     const parsedPatch = SessionNotesPatchSchema.parse(patch);
     const patchJson = JSON.stringify(parsedPatch);
     return inTransaction(this.db, () => {
@@ -347,6 +365,7 @@ export class SessionDashboardStore {
   }
 
   claimAssistantRoot(canonicalRoot: string): void {
+    this.guardMetadata();
     inTransaction(this.db, () => {
       const row = this.meta();
       if (row.assistant_root !== null && String(row.assistant_root) !== canonicalRoot) {
@@ -357,11 +376,13 @@ export class SessionDashboardStore {
   }
 
   markDirty(): number {
+    this.guardMetadata();
     this.advanceRevision();
     return Number(this.meta().revision);
   }
 
   renderState(): { dirty: boolean; revision: number; lastError: string | null; failureGeneration: number } {
+    this.guardMetadata();
     const row = this.meta();
     return {
       dirty: Number(row.dirty) === 1,
@@ -372,11 +393,13 @@ export class SessionDashboardStore {
   }
 
   markRenderSucceeded(renderedRevision: number): void {
+    this.guardMetadata();
     this.db.prepare(`UPDATE session_dashboard_meta SET dirty = 0, last_render_error = NULL
       WHERE singleton = 1 AND revision = ?`).run(renderedRevision);
   }
 
   markRenderFailed(safeMessage: string): { warningRequired: boolean; generation: number } {
+    this.guardMetadata();
     return inTransaction(this.db, () => {
       const before = this.meta();
       const warningRequired = before.last_render_error === null;
@@ -418,6 +441,18 @@ export class SessionDashboardStore {
 
   private meta(): Record<string, unknown> {
     return this.db.prepare("SELECT * FROM session_dashboard_meta WHERE singleton = 1").get() as Record<string, unknown>;
+  }
+
+  private guardMetadata(): void {
+    try { this.assertMetadataHealthy(); }
+    catch (error) {
+      if (isDashboardMetadataRecoveryRequired(error) && !this.recoveryRequested) {
+        this.recoveryRequested = true;
+        try { this.options.onMetadataRecoveryRequired?.(); }
+        catch { /* Recovery callback failure cannot replace the metadata error. */ }
+      }
+      throw error;
+    }
   }
 }
 

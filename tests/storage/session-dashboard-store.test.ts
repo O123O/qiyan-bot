@@ -40,6 +40,63 @@ test("dashboard metadata health validation identifies only invalid metadata", ()
   }
 });
 
+test("metadata-dependent boundaries request recovery once before mutating durable state", () => {
+  const db = createTestDatabase();
+  let recoveryRequests = 0;
+  const store = new SessionDashboardStore(db, {
+    onMetadataRecoveryRequired: () => {
+      recoveryRequests += 1;
+      throw new Error("private restart failure");
+    },
+  });
+  store.observeLifecycle(identity, 1);
+  store.updateNotes(identity, "notes-before-loss", { project_summary: "preserved" }, 1);
+  store.acceptNotification("local", "thread/settings/updated", { threadId: identity.threadId }, 1);
+  const factsBefore = store.facts(identity);
+  const notesBefore = store.notes(identity);
+  const noteOperationsBefore = db.prepare("SELECT * FROM session_note_operations ORDER BY operation_id").all();
+  const notificationsBefore = db.prepare("SELECT * FROM session_dashboard_notifications ORDER BY sequence").all();
+  db.prepare("DELETE FROM session_dashboard_meta").run();
+
+  const usage = {
+    total: { total_tokens: 10, input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 },
+    last_turn: { total_tokens: 2, input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+    model_context_window: 100,
+    context_remaining: 90,
+    context_used_percent: 10,
+    observed_at: "1970-01-01T00:00:02.000Z",
+  };
+  const boundaries: Array<() => unknown> = [
+    () => store.allocateObservationSequence(),
+    () => store.acceptNotification("local", "thread/settings/updated", { threadId: identity.threadId }, 2),
+    () => store.observeLifecycle(identity, 2),
+    () => store.observeLastSent(identity, {
+      text: "new", mode: "start", attachment_ids: [], turn_id: "turn-1", at: "1970-01-01T00:00:02.000Z",
+    }, 1),
+    () => store.observeLastWorkerEvent(identity, {
+      message_id: "message-1", turn_id: "turn-1", status: "completed", at: "1970-01-01T00:00:02.000Z",
+    }, 1),
+    () => store.observeCurrentSettings(identity, { model: "gpt-5", observedAt: 2 }, 1),
+    () => store.observeTokenUsage(identity, "turn-1", usage, 1, 1),
+    () => store.observeGoal(identity, { objective: "new", status: "active", token_budget: null }, 2, 1, 2),
+    () => store.updateNotes(identity, "notes-after-loss", { project_summary: "changed" }, 2),
+    () => store.claimAssistantRoot("/assistant"),
+    () => store.markDirty(),
+    () => store.renderState(),
+    () => store.markRenderSucceeded(1),
+    () => store.markRenderFailed("render failed"),
+  ];
+
+  for (const boundary of boundaries) {
+    assert.throws(boundary, (error: unknown) => isDashboardMetadataRecoveryRequired(error));
+  }
+  assert.equal(recoveryRequests, 1);
+  assert.deepEqual(store.facts(identity), factsBefore);
+  assert.deepEqual(store.notes(identity), notesBefore);
+  assert.deepEqual(db.prepare("SELECT * FROM session_note_operations ORDER BY operation_id").all(), noteOperationsBefore);
+  assert.deepEqual(db.prepare("SELECT * FROM session_dashboard_notifications ORDER BY sequence").all(), notificationsBefore);
+});
+
 test("manager notes are stable by thread identity and operation-idempotent", () => {
   const store = new SessionDashboardStore(createTestDatabase());
   const first = store.updateNotes(identity, "op-1", { project_summary: "Payments", pending_follow_up: "check migration" }, 1_000);

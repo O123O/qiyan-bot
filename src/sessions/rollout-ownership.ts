@@ -39,6 +39,14 @@ const rolloutReadChunkBytes = 64 * 1024;
 const maxRolloutLineBytes = 64 * 1024 * 1024;
 const maxReportedStarts = 1024;
 
+function ownershipUnclassified(message: string): AppError {
+  return new AppError("OPERATION_UNCERTAIN", message, { recovery: "ownership_unclassified" });
+}
+
+function externalTurn(threadId: string): AppError {
+  return new AppError("SESSION_BUSY", `thread ${threadId} has an externally started turn`, { recovery: "external_turn" });
+}
+
 export class SessionOwnershipGuard {
   constructor(
     private readonly db: Database,
@@ -54,10 +62,10 @@ export class SessionOwnershipGuard {
       return;
     }
     const [result] = await this.access.scan(identity.endpoint, [{ path, threadId: identity.thread_id }], lease);
-    if (!result) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership scan returned no result");
+    if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
     const owned = result.openTurn && this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
     const external = result.openTurn && !owned ? result.openTurn : undefined;
-    if (result.malformed && !external) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership is temporarily uncertain");
+    if (result.malformed && !external) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       this.db.prepare(`INSERT INTO session_rollout_ownership
         (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, external_turn_id, updated_at)
@@ -71,18 +79,18 @@ export class SessionOwnershipGuard {
         if (state) this.runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "unadopting", state.nativeStatus);
       }
     });
-    if (external) throw new AppError("SESSION_BUSY", `thread ${identity.thread_id} has an externally started turn`);
+    if (external) throw externalTurn(identity.thread_id);
   }
 
   async inspect(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<OwnershipInspection> {
     const existing = this.row(identity);
-    if (!existing) throw new AppError("OPERATION_UNCERTAIN", "session ownership guard is not initialized");
+    if (!existing) throw ownershipUnclassified("session ownership guard is not initialized");
     const [result] = await this.access.scan(identity.endpoint, [{
       path: existing.rolloutPath,
       threadId: identity.thread_id,
       cursor: { device: existing.device, inode: existing.inode, offset: existing.byteOffset },
     }], lease);
-    if (!result) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership scan returned no result");
+    if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
     const unclassified = result.openTurn && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
       && !this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
     const candidates = [...result.starts];
@@ -91,7 +99,7 @@ export class SessionOwnershipGuard {
     const classified = candidates.map((turn) => ({ turn, owned: this.operations.ownsWorkerTurn(turn) }));
     const external = classified.find((item) => !item.owned)?.turn;
     const incidentTurnId = existing.externalTurnId ?? external?.turnId;
-    if (result.malformed && !incidentTurnId) throw new AppError("OPERATION_UNCERTAIN", "rollout ownership is temporarily uncertain");
+    if (result.malformed && !incidentTurnId) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       for (const item of classified) if (item.owned) this.recordOwnedTurn(identity, item.turn.turnId);
       this.updateCursor(identity, existing, result.cursor, external?.turnId);

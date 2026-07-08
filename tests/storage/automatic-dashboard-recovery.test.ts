@@ -24,10 +24,20 @@ test("startup automatically rebuilds invalid dashboard metadata under the caller
 
   const lease = await acquireDatabaseLease(databasePath);
   try {
-    const opened = await openStateDatabaseWithAutomaticRecovery(databasePath);
+    let recoveryRequests = 0;
+    const opened = await openStateDatabaseWithAutomaticRecovery(databasePath, {
+      dashboardStoreOptions: {
+        onMetadataRecoveryRequired: () => { recoveryRequests += 1; },
+      },
+    });
     assert.equal(opened.recovered, true);
+    assert.equal(recoveryRequests, 0, "startup validation and automatic repair do not request a runtime restart");
     opened.dashboardStore.assertMetadataHealthy();
     assert.equal(opened.database.prepare("SELECT COUNT(*) AS count FROM session_dashboard_facts WHERE thread_id = 'preserved-thread'").get()!.count, 1);
+    opened.database.prepare("DELETE FROM session_dashboard_meta").run();
+    assert.throws(() => opened.dashboardStore.renderState(), (error: unknown) => isDashboardMetadataRecoveryRequired(error));
+    assert.throws(() => opened.dashboardStore.markDirty(), (error: unknown) => isDashboardMetadataRecoveryRequired(error));
+    assert.equal(recoveryRequests, 1, "the returned runtime store requests recovery once after later corruption");
     opened.database.close();
   } finally {
     await lease.release();

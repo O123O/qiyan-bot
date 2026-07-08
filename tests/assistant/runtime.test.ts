@@ -219,13 +219,45 @@ test("terminal tool fencing rejects new dispatch and prevents late success from 
   }).finally(() => runtime.finishTool(lease.attemptId));
   await new Promise<void>((resolve) => setImmediate(resolve));
   runtime.beginTerminalizing("turn");
-  await runtime.fenceTools(lease.attemptId, 1);
+  assert.equal(await runtime.fenceTools(lease.attemptId, 1), "timed_out");
   assert.throws(() => runtime.registerTool(lease.attemptId), /terminal/u);
   release();
   await assert.rejects(call, /uncertain|terminal/u);
   const operation = operations.listForAttempt(lease.attemptId).find((item) => item.callId === "held")!;
   assert.equal(operation.state, "uncertain");
   assert.equal(operation.receipt, undefined);
+});
+
+test("tool settlement is observable and the global drain waits for every attempt", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
+  for (const [contextId, attemptId, turnId] of [
+    ["ctx-one", "attempt-one", "turn-one"],
+    ["ctx-two", "attempt-two", "turn-two"],
+  ] as const) {
+    operations.createSourceContext({ id: contextId, kind: "event_batch", sourceId: contextId, rawText: "", attachmentIds: [] });
+    runtime.beginInternalAttempt(contextId, attemptId, turnId);
+    runtime.registerTool(attemptId);
+  }
+
+  assert.equal(runtime.hasActiveTools("attempt-one"), true);
+  let drained = false;
+  const draining = runtime.waitForTools().then(() => { drained = true; });
+  runtime.finishTool("attempt-one");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(runtime.hasActiveTools("attempt-one"), false);
+  assert.equal(drained, false);
+
+  const settled = runtime.fenceTools("attempt-two", 100);
+  runtime.finishTool("attempt-two");
+  assert.equal(await settled, "settled");
+  await draining;
+  assert.equal(drained, true);
+
+  runtime.fenceToolAdmission();
+  assert.throws(() => runtime.registerTool("attempt-one"), /terminal/u);
+  assert.throws(() => runtime.registerTool("attempt-two"), /terminal/u);
 });
 
 test("causal finals retain the attempt binding while destinationless internal recovery stays unbound", () => {

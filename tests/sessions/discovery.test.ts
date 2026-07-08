@@ -36,11 +36,14 @@ test("discovery exhausts both archives and returns stable filtered snapshot page
   endpoint.pages.set("false:first", { data: [row("b", 20), row("child", 99, { parentThreadId: "p" })], nextCursor: "n2" });
   endpoint.pages.set("false:n2", { data: [row("a", 20), row("temp", 100, { ephemeral: true })], nextCursor: null });
   endpoint.pages.set("true:first", { data: [row("old", 10)], nextCursor: null });
-  const discovery = new SessionDiscovery(createTestDatabase(), new AppServerPool([endpoint], { maxConcurrentTurns: 2 }), {
+  const db = createTestDatabase();
+  const discovery = new SessionDiscovery(db, new AppServerPool([endpoint], { maxConcurrentTurns: 2 }), {
     clock: { now: () => now }, snapshotTtlMs: 100,
   });
 
+  db.prepare("INSERT INTO discovery_snapshots(id, query_hash, rows_json, expires_at) VALUES ('expired', 'x', '[]', ?)").run(now - 1);
   const first = await discovery.list({ endpointId: "local", limit: 2 });
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM discovery_snapshots WHERE id = 'expired'").get() as { count: number }).count, 0);
   assert.deepEqual(first.sessions.map((item) => item.id), ["a", "b"]);
   assert.ok(first.nextCursor);
   assert.equal(endpoint.calls.length, 3);
@@ -63,7 +66,6 @@ test("discovery exhausts both archives and returns stable filtered snapshot page
   await assert.rejects(discovery.list({ endpointId: "local", limit: 2, cursor: `${first.nextCursor}x` }));
   now += 101;
   await assert.rejects(discovery.list({ endpointId: "local", limit: 2, cursor: first.nextCursor! }));
-  assert.equal(discovery.cleanupExpired(), 1);
 });
 
 test("discovery search filters the combined snapshot by id, cwd, or preview", async () => {
