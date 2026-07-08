@@ -1471,6 +1471,12 @@ export async function buildProductionApp(
         try {
           const opened = await openStateDatabaseWithAutomaticRecovery(databasePath, {
             beforeOpen: () => { preflightConversationCutover(databasePath, telegramBinding !== undefined); },
+            dashboardStoreOptions: {
+              onMetadataRecoveryRequired: () => {
+                try { report({ level: "warn", code: "database_metadata_recovery_required" }); }
+                finally { requestRestartOnce(); }
+              },
+            },
             openDatabase: (path) => {
               const database = openStateDatabase(path);
               openedDb = database;

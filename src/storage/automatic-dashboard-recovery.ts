@@ -15,6 +15,7 @@ import { isDatabaseIntegrityFailure, openDatabase, type Database } from "./datab
 import {
   isDashboardMetadataRecoveryRequired,
   SessionDashboardStore,
+  type SessionDashboardStoreOptions,
 } from "./session-dashboard-store.ts";
 
 interface AutomaticDashboardRecoveryOptions {
@@ -22,6 +23,7 @@ interface AutomaticDashboardRecoveryOptions {
   openDatabase?: (path: string) => Database;
   closeDatabase?: (database: Database) => void;
   recoverDatabase?: (path: string) => Promise<unknown>;
+  dashboardStoreOptions?: SessionDashboardStoreOptions;
 }
 
 const incompleteRecovery = "QiYan Bot state database has an incomplete automatic recovery; retained state requires support";
@@ -39,13 +41,16 @@ export async function openStateDatabaseWithAutomaticRecovery(
   const recover = options.recoverDatabase ?? recoverDashboardMetadataUnderLease;
 
   try {
-    return { ...openAndValidate(databasePath, beforeOpen, open, close), recovered: false };
+    return {
+      ...openAndValidate(databasePath, beforeOpen, open, close, options.dashboardStoreOptions),
+      recovered: false,
+    };
   } catch (error) {
     if (!isAutomaticRecoveryCandidate(error)) throw error;
   }
 
   await recover(databasePath);
-  const opened = openAndValidate(databasePath, beforeOpen, open, close);
+  const opened = openAndValidate(databasePath, beforeOpen, open, close, options.dashboardStoreOptions);
   return { ...opened, recovered: true };
 }
 
@@ -54,14 +59,15 @@ function openAndValidate(
   beforeOpen: () => void,
   open: (path: string) => Database,
   close: (database: Database) => void,
+  dashboardStoreOptions: SessionDashboardStoreOptions | undefined,
 ): { database: Database; dashboardStore: SessionDashboardStore } {
   assertAutomaticRecoveryReady(databasePath);
   beforeOpen();
   const database = open(databasePath);
   try {
-    const dashboardStore = new SessionDashboardStore(database);
-    dashboardStore.assertMetadataHealthy();
-    return { database, dashboardStore };
+    const validationStore = new SessionDashboardStore(database);
+    validationStore.assertMetadataHealthy();
+    return { database, dashboardStore: new SessionDashboardStore(database, dashboardStoreOptions) };
   } catch (error) {
     try { close(database); }
     catch { throw new AppError("CONFIGURATION_ERROR", "state database cleanup failed during automatic recovery"); }
