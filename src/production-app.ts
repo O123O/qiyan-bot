@@ -24,7 +24,11 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
-import { createBackgroundFailureReporter, createFailureCycle } from "./core/background-failure-reporter.ts";
+import {
+  createBackgroundFailureReporter,
+  createFailureCycle,
+  type BackgroundFailureNotice,
+} from "./core/background-failure-reporter.ts";
 import type { OperationalEvent, OperationalEventSink } from "./core/operational-log.ts";
 import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
@@ -46,7 +50,11 @@ import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
-import { SessionOwnershipWatcher, type ExternalTurnIncident } from "./sessions/ownership-watcher.ts";
+import {
+  SessionOwnershipWatcher,
+  type ExternalOwnershipReleaseStatus,
+  type ExternalTurnIncident,
+} from "./sessions/ownership-watcher.ts";
 import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
@@ -566,6 +574,74 @@ export function createDurableEventWakeBoundary(options: {
       if (!inserted || !options.schedulerAccepting() || options.stopping()) return;
       try { await options.enqueuePendingEvents(); }
       catch { requestRestartOnce(); }
+    },
+  };
+}
+
+export interface EndpointUnavailableEvent {
+  id: string;
+  endpointId: string;
+  threadId: string;
+  incident: number;
+  createdAt: number;
+}
+
+export interface DurableEventSourceCallbacks {
+  relayCommitted(): Promise<void>;
+  deliveryState(delivery: DeliveryRecord): Promise<boolean>;
+  reconcileDeliveryStates(): Promise<number>;
+  ownership(incident: ExternalTurnIncident, status: ExternalOwnershipReleaseStatus): Promise<boolean>;
+  reconcileOwnership(): Promise<number>;
+  endpointUnavailable(event: EndpointUnavailableEvent): Promise<boolean>;
+  backgroundFailure(notice: BackgroundFailureNotice): void;
+  reconcileLifecycle(filter: { endpointId?: string; nickname?: string }): Promise<number>;
+}
+
+export function createDurableEventSourceCallbacks(options: {
+  wakeAfterDurableCommit(inserted: boolean): Promise<void>;
+  persistDeliveryState(delivery: DeliveryRecord): boolean;
+  reconcileDeliveryStates(): number;
+  recordOwnership(incident: ExternalTurnIncident, status: ExternalOwnershipReleaseStatus): boolean;
+  reconcileOwnership(): number;
+  persistEndpointUnavailable(event: EndpointUnavailableEvent): boolean;
+  recordBackgroundFailure(notice: BackgroundFailureNotice): void;
+  reconcileLifecycle(filter: { endpointId?: string; nickname?: string }): Promise<number>;
+}): DurableEventSourceCallbacks {
+  return {
+    relayCommitted: () => options.wakeAfterDurableCommit(true),
+    deliveryState: async (delivery) => {
+      const inserted = options.persistDeliveryState(delivery);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    reconcileDeliveryStates: async () => {
+      const inserted = options.reconcileDeliveryStates();
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
+    },
+    ownership: async (incident, status) => {
+      const inserted = options.recordOwnership(incident, status);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    reconcileOwnership: async () => {
+      const inserted = options.reconcileOwnership();
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
+    },
+    endpointUnavailable: async (event) => {
+      const inserted = options.persistEndpointUnavailable(event);
+      await options.wakeAfterDurableCommit(inserted);
+      return inserted;
+    },
+    backgroundFailure: (notice) => {
+      options.recordBackgroundFailure(notice);
+      void options.wakeAfterDurableCommit(true);
+    },
+    reconcileLifecycle: async (filter) => {
+      const inserted = await options.reconcileLifecycle(filter);
+      await options.wakeAfterDurableCommit(inserted > 0);
+      return inserted;
     },
   };
 }
@@ -1299,12 +1375,21 @@ export async function buildProductionApp(
     requestRestart: options.requestRestart ?? (() => undefined),
   });
   const { requestRestartOnce, wakeAfterDurableCommit } = eventWakeBoundary;
-  const backgroundFailureReporter = createBackgroundFailureReporter({
-    runId: randomUUID(),
-    onOperational: (label) => {
-      report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
-    },
-    onDurable: (notice) => {
+  const durableEventSources = createDurableEventSourceCallbacks({
+    wakeAfterDurableCommit,
+    persistDeliveryState: (delivery) => persistDeliveryStateEvent(db, delivery),
+    reconcileDeliveryStates: () => reconcileDeliveryStateEvents(db, deliveries),
+    recordOwnership: (incident, status) => ownershipEvents.record(incident, status),
+    reconcileOwnership: () => ownershipEvents.reconcileReleased(registry),
+    persistEndpointUnavailable: (event) => db.prepare(`INSERT OR IGNORE INTO events
+      (id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+      VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
+      .run(event.id, event.endpointId, event.threadId, JSON.stringify({
+        endpointId: event.endpointId,
+        status: "unavailable",
+        incident: event.incident,
+      }), event.createdAt).changes === 1,
+    recordBackgroundFailure: (notice) => {
       const identity = registry.snapshot().assistant;
       backgroundFailures.record({
         ...notice,
@@ -1312,8 +1397,21 @@ export async function buildProductionApp(
         threadId: identity.thread_id,
         binding: currentOwnerBinding(),
       });
-      void wakeAfterDurableCommit(true);
     },
+    reconcileLifecycle: (filter) => reconcileLifecycleAndOwnership(
+      lifecycle,
+      isolateLifecycleRecoveryFailure,
+      ownershipEvents,
+      registry,
+      filter,
+    ),
+  });
+  const backgroundFailureReporter = createBackgroundFailureReporter({
+    runId: randomUUID(),
+    onOperational: (label) => {
+      report({ level: "warn", code: "background_task_failed", component: label.replaceAll(" ", "_") });
+    },
+    onDurable: durableEventSources.backgroundFailure,
   });
   const handleMaintenanceFailure = createMaintenanceFailureHandler({
     requestRestart: requestRestartOnce,
@@ -1727,7 +1825,7 @@ export async function buildProductionApp(
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event, lease) => observations.observeTerminal(event, lease),
-          onEventCommitted: () => wakeAfterDurableCommit(true),
+          onEventCommitted: durableEventSources.relayCommitted,
           withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
             endpointManager,
             endpointId,
@@ -1749,14 +1847,12 @@ export async function buildProductionApp(
               body: `[${incident.nickname}] another Codex client started a turn; QiYan is releasing this session`,
               mandatory: true,
             });
-            const inserted = ownershipEvents.record(incident, "pending");
-            await wakeAfterDurableCommit(inserted);
+            await durableEventSources.ownership(incident, "pending");
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
           },
           onReleased: async (incident) => {
-            const inserted = ownershipEvents.record(incident, "completed");
-            await wakeAfterDurableCommit(inserted);
+            await durableEventSources.ownership(incident, "completed");
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
           },
@@ -1939,7 +2035,7 @@ export async function buildProductionApp(
           attachments,
           undefined,
           async (delivery) => {
-            try { await persistDeliveryState(delivery); }
+            try { await durableEventSources.deliveryState(delivery); }
             catch { requestRestartOnce(); }
           },
           (delivery) => { report({ level: "warn", code: "delivery_failed", adapter: delivery.binding.adapterId }); },
@@ -3031,10 +3127,13 @@ export async function buildProductionApp(
       body: `[system] ${target.id} app-server is unavailable; reconnecting`,
       mandatory: true,
     });
-    const inserted = db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
-      VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
-      .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now()).changes === 1;
-    await wakeAfterDurableCommit(inserted);
+    await durableEventSources.endpointUnavailable({
+      id: `endpoint-unavailable:${target.id}:${endpointIncident}`,
+      endpointId: target.id,
+      threadId: identity.thread_id,
+      incident: endpointIncident,
+      createdAt: Date.now(),
+    });
     if (target.id === assistantEndpoint.id) scheduleReconnect(assistantEndpoint);
     await renderDashboardSafely();
   }
@@ -3113,25 +3212,16 @@ export async function buildProductionApp(
     });
   }
 
-  async function persistDeliveryState(delivery: DeliveryRecord, schedule = true): Promise<boolean> {
-    const inserted = persistDeliveryStateEvent(db, delivery);
-    if (schedule) await wakeAfterDurableCommit(inserted);
-    return inserted;
-  }
-
   async function reconcileDeliveryEvents(): Promise<void> {
-    await wakeAfterDurableCommit(reconcileDeliveryStateEvents(db, deliveries) > 0);
+    await durableEventSources.reconcileDeliveryStates();
   }
 
   async function reconcileExternalOwnershipReleases(): Promise<number> {
-    const inserted = ownershipEvents.reconcileReleased(registry);
-    await wakeAfterDurableCommit(inserted > 0);
-    return inserted;
+    return durableEventSources.reconcileOwnership();
   }
 
   async function reconcileLifecycleState(filter: { endpointId?: string; nickname?: string } = {}): Promise<void> {
-    const inserted = await reconcileLifecycleAndOwnership(lifecycle, isolateLifecycleRecoveryFailure, ownershipEvents, registry, filter);
-    await wakeAfterDurableCommit(inserted > 0);
+    await durableEventSources.reconcileLifecycle(filter);
   }
 
   function failRecoveredNoEffect(operationId: string, message: string): void {

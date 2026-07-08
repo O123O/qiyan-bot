@@ -5,6 +5,7 @@ import {
   createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
   createDurableEventWakeBoundary,
+  createDurableEventSourceCallbacks,
   createChatHistoryAction,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
@@ -54,48 +55,122 @@ import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
 
-test("durable event commits await an asynchronous scheduler wake and restart once on loss", async () => {
+test("every production durable event source forwards only successful inserts to one wake boundary", async () => {
   let accepting = false;
   let stopping = false;
   let enqueues = 0;
   let restarts = 0;
-  let releaseEnqueue!: () => void;
-  const enqueueBarrier = new Promise<void>((resolve) => { releaseEnqueue = resolve; });
   const boundary = createDurableEventWakeBoundary({
     schedulerAccepting: () => accepting,
     stopping: () => stopping,
-    enqueuePendingEvents: async () => {
-      enqueues += 1;
-      await enqueueBarrier;
-      throw new Error("asynchronous scheduler rejection");
-    },
+    enqueuePendingEvents: async () => { enqueues += 1; },
     requestRestart: () => { restarts += 1; },
   });
+  const next = <T>(values: T[]) => (): T => {
+    const value = values.shift();
+    assert.notEqual(value, undefined);
+    return value!;
+  };
+  const ownershipStatuses: string[] = [];
+  const nextOwnership = next([true, false, true, false]);
+  const nextLifecycle = next([1, 0]);
+  const sources = createDurableEventSourceCallbacks({
+    wakeAfterDurableCommit: boundary.wakeAfterDurableCommit,
+    persistDeliveryState: next([true, true, false]),
+    reconcileDeliveryStates: next([1, 0]),
+    recordOwnership: (_incident, status) => {
+      ownershipStatuses.push(status);
+      return nextOwnership();
+    },
+    reconcileOwnership: next([1, 0]),
+    persistEndpointUnavailable: next([true, false]),
+    recordBackgroundFailure: () => undefined,
+    reconcileLifecycle: async () => nextLifecycle(),
+  });
+  const delivery = { id: "delivery" } as never;
+  const incident = { endpoint: "project", thread_id: "thread", mapping_id: "mapping", turnId: "turn", nickname: "worker" };
+  const endpointEvent = { id: "endpoint:1", endpointId: "project", threadId: "assistant", incident: 1, createdAt: 1 };
 
-  await boundary.wakeAfterDurableCommit(false);
-  await boundary.wakeAfterDurableCommit(true);
+  await sources.deliveryState(delivery);
   assert.equal(enqueues, 0, "startup enqueue owns commits made before scheduler acceptance");
   assert.equal(restarts, 0);
 
   accepting = true;
-  const relayEvent = boundary.wakeAfterDurableCommit(true);
-  try {
-    await Promise.resolve();
-    assert.equal(enqueues, 1);
-    assert.equal(restarts, 0);
-  } finally {
-    releaseEnqueue();
+  const awaitedSources: Array<() => Promise<unknown>> = [
+    () => sources.relayCommitted(),
+    () => sources.deliveryState(delivery),
+    () => sources.deliveryState(delivery),
+    () => sources.reconcileDeliveryStates(),
+    () => sources.reconcileDeliveryStates(),
+    () => sources.ownership(incident, "pending"),
+    () => sources.ownership(incident, "pending"),
+    () => sources.ownership(incident, "completed"),
+    () => sources.ownership(incident, "completed"),
+    () => sources.reconcileOwnership(),
+    () => sources.reconcileOwnership(),
+    () => sources.endpointUnavailable(endpointEvent),
+    () => sources.endpointUnavailable(endpointEvent),
+    () => sources.reconcileLifecycle({ endpointId: "project" }),
+    () => sources.reconcileLifecycle({ endpointId: "project" }),
+  ];
+  const expectedEnqueues = [1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8];
+  for (const [index, invoke] of awaitedSources.entries()) {
+    await invoke();
+    assert.equal(enqueues, expectedEnqueues[index], `source ${index} forwards its exact insertion result`);
   }
-  await relayEvent;
-  assert.equal(restarts, 1);
-
-  for (const source of ["delivery", "external-ownership", "endpoint-unavailable", "background-failure"]) {
-    await boundary.wakeAfterDurableCommit(true);
-    assert.equal(restarts, 1, `${source} reuses the same one-shot restart boundary`);
-  }
+  sources.backgroundFailure({ id: "background:1", label: "fixed", incident: 1 });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(enqueues, 9);
+  assert.deepEqual(ownershipStatuses, ["pending", "pending", "completed", "completed"]);
   stopping = true;
-  await boundary.wakeAfterDurableCommit(true);
-  assert.equal(enqueues, 5);
+  await sources.relayCommitted();
+  assert.equal(enqueues, 9);
+  assert.equal(restarts, 0);
+});
+
+test("all production event sources share one restart after asynchronous wake loss", async () => {
+  let restarts = 0;
+  let dispatcherCalls = 0;
+  const dispatcher = {
+    enqueueInternal: async (kind: string): Promise<void> => {
+      assert.equal(kind, "events");
+      dispatcherCalls += 1;
+      await Promise.resolve();
+      throw new Error("asynchronous dispatcher rejection");
+    },
+  };
+  const boundary = createDurableEventWakeBoundary({
+    schedulerAccepting: () => true,
+    stopping: () => false,
+    enqueuePendingEvents: () => dispatcher.enqueueInternal("events"),
+    requestRestart: () => { restarts += 1; },
+  });
+  const sources = createDurableEventSourceCallbacks({
+    wakeAfterDurableCommit: boundary.wakeAfterDurableCommit,
+    persistDeliveryState: () => true,
+    reconcileDeliveryStates: () => 1,
+    recordOwnership: () => true,
+    reconcileOwnership: () => 1,
+    persistEndpointUnavailable: () => true,
+    recordBackgroundFailure: () => undefined,
+    reconcileLifecycle: async () => 1,
+  });
+  const delivery = { id: "delivery" } as never;
+  const incident = { endpoint: "project", thread_id: "thread", mapping_id: "mapping", turnId: "turn", nickname: "worker" };
+  const endpointEvent = { id: "endpoint:1", endpointId: "project", threadId: "assistant", incident: 1, createdAt: 1 };
+
+  await sources.relayCommitted();
+  assert.equal(restarts, 1, "the first lost wake requests restart without later traffic");
+  await sources.deliveryState(delivery);
+  await sources.reconcileDeliveryStates();
+  await sources.ownership(incident, "pending");
+  await sources.ownership(incident, "completed");
+  await sources.reconcileOwnership();
+  await sources.endpointUnavailable(endpointEvent);
+  await sources.reconcileLifecycle({ endpointId: "project" });
+  sources.backgroundFailure({ id: "background:1", label: "fixed", incident: 1 });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(dispatcherCalls, 9);
   assert.equal(restarts, 1);
 });
 
