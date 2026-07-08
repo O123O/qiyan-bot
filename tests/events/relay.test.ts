@@ -59,6 +59,8 @@ async function fixture(
   },
   relayOptions: {
     timers?: RelayTimers;
+    onEventCommitted?: () => void | Promise<void>;
+    attachments?: { releaseTurn(endpointId: string, threadId: string, turnId: string): void };
     withEndpointWorkLease?<T>(
       endpointId: string,
       existingLease: EndpointWorkLease | undefined,
@@ -98,7 +100,8 @@ async function fixture(
     withEndpointWorkLease: relayOptions.withEndpointWorkLease
       ?? (async (_endpointId, existingLease, run) => run(existingLease ?? workLease)),
     ...(onTerminal ? { onTerminal } : {}),
-  }, undefined, ownership, new ThreadGate(), relayOptions.timers);
+    ...(relayOptions.onEventCommitted ? { onEventCommitted: relayOptions.onEventCommitted } : {}),
+  }, relayOptions.attachments, ownership, new ThreadGate(), relayOptions.timers);
   return { db, endpoint, pool, registry, runtime, deliveries, relay, conversations, routes };
 }
 
@@ -132,6 +135,107 @@ test("reports terminal metadata after final persistence without copying the body
     finalMessageId: "final:local:worker:turn-1:turn-1-final",
   }]);
   assert.equal(JSON.stringify(observed).includes("done"), false);
+});
+
+test("a final terminal projection wakes once only after the inserted event is ready", async () => {
+  let releaseTerminal!: () => void;
+  const terminalBarrier = new Promise<void>((resolve) => { releaseTerminal = resolve; });
+  let terminalEntered = false;
+  const sequence: string[] = [];
+  let readyDeliveryIds = (): string[] => [];
+  const value = await fixture(async () => {
+    terminalEntered = true;
+    await terminalBarrier;
+    sequence.push("terminal");
+  }, undefined, {
+    attachments: {
+      releaseTurn: () => { sequence.push("attachments"); },
+    },
+    onEventCommitted: async (...args: unknown[]) => {
+      assert.deepEqual(args, [], "the wake receives no event payload or message body");
+      assert.deepEqual(readyDeliveryIds(), ["worker:local:worker:turn-1:turn-1-final"]);
+      sequence.push("wake");
+    },
+  });
+  readyDeliveryIds = () => value.deliveries.listReady().map((delivery) => delivery.id);
+  value.endpoint.turns = [terminal("baseline"), terminal()];
+
+  const projecting = value.relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal() },
+  );
+  try {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(terminalEntered, true);
+    assert.equal((value.db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n, 0);
+    assert.deepEqual(sequence, []);
+  } finally {
+    releaseTerminal();
+  }
+  assert.equal(await projecting, "handled");
+  assert.deepEqual(sequence, ["terminal", "attachments", "wake"]);
+
+  assert.equal(await value.relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal() },
+  ), "handled");
+  assert.deepEqual(sequence, ["terminal", "attachments", "wake", "terminal", "attachments"],
+    "replaying an ignored insert does not wake again");
+});
+
+test("a rejected terminal observer leaves no terminal event and does not wake", async () => {
+  let wakes = 0;
+  const { db, endpoint, relay } = await fixture(async () => {
+    throw new Error("observation failed");
+  }, undefined, {
+    onEventCommitted: async () => { wakes += 1; },
+  });
+  endpoint.turns = [terminal("baseline"), terminal()];
+
+  assert.equal(await relay.handleNotification(
+    "local", "turn/completed", { threadId: "worker", turn: terminal() },
+  ), "retry");
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n, 0);
+  assert.equal(wakes, 0);
+});
+
+test("permission projection commits delivery and runtime before the event wake", async () => {
+  let releaseWake!: () => void;
+  const wakeBarrier = new Promise<void>((resolve) => { releaseWake = resolve; });
+  let wakeEntered = false;
+  const value = await fixture(undefined, undefined, {
+    onEventCommitted: async () => {
+      wakeEntered = true;
+      await wakeBarrier;
+    },
+  });
+
+  const projecting = value.relay.handlePermissionBlocked(
+    "local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} },
+  );
+  try {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(wakeEntered, true);
+    assert.deepEqual(value.deliveries.listReady().map((delivery) => delivery.id), [
+      "permission:local:worker:blocked:approval",
+    ]);
+    assert.equal(value.runtime.getSession("local", "worker", mappingId)?.nativeStatus, "permissionBlocked");
+  } finally {
+    releaseWake();
+  }
+  await projecting;
+});
+
+test("permission runtime projection failure inserts no event and does not wake", async () => {
+  let wakes = 0;
+  const value = await fixture(undefined, undefined, {
+    onEventCommitted: async () => { wakes += 1; },
+  });
+  value.runtime.setSession = () => { throw new Error("runtime projection failed"); };
+
+  await assert.rejects(value.relay.handlePermissionBlocked(
+    "local", { threadId: "worker", turnId: "blocked", method: "approval", params: {} },
+  ), /runtime projection failed/u);
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n, 0);
+  assert.equal(wakes, 0);
 });
 
 test("managed worker finals create automatic delivery and metadata-only assistant event exactly once", async () => {

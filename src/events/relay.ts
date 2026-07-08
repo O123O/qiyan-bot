@@ -85,6 +85,7 @@ export class EventRelay {
       binding(): ConversationBinding;
       clock: Clock;
       onTerminal?(event: TerminalObservation, lease: EndpointWorkLease): void | Promise<void>;
+      onEventCommitted?(): void | Promise<void>;
       withEndpointWorkLease<T>(
         endpointId: string,
         existingLease: EndpointWorkLease | undefined,
@@ -136,12 +137,13 @@ export class EventRelay {
       body: `[${nickname}] blocked by a permission request`,
       mandatory: true,
     });
-    this.persistEvent(key, endpointId, event.threadId, event.turnId, "permission_blocked", {
+    this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
+    const inserted = this.persistEvent(key, endpointId, event.threadId, event.turnId, "permission_blocked", {
       nickname,
       turnId: event.turnId ?? null,
       method: event.method,
     });
-    this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
+    if (inserted) await this.options.onEventCommitted?.();
   }
 
   reconcileEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<void> {
@@ -358,17 +360,6 @@ export class EventRelay {
     this.pool.markTurnTerminal(target.endpointId, target.threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(target.endpointId, target.threadId, turn, this.options.clock.now());
     const eventId = `terminal:${target.endpointId}:${target.threadId}:${turn.id}`;
-    this.persistEvent(eventId, target.endpointId, target.threadId, turn.id, "turn_terminal", {
-      final: true,
-      nickname,
-      endpointId: target.endpointId,
-      threadId: target.threadId,
-      turnId: turn.id,
-      completedAt: turn.completedAt ?? this.options.clock.now(),
-      status: turn.status,
-      finalMessageIds: messages.map((message) => message.id),
-      deliveryState: "prepared",
-    });
     await this.options.onTerminal?.({
       endpointId: target.endpointId,
       threadId: target.threadId,
@@ -398,6 +389,18 @@ export class EventRelay {
       });
     }
     this.attachments?.releaseTurn(target.endpointId, target.threadId, turn.id);
+    const inserted = this.persistEvent(eventId, target.endpointId, target.threadId, turn.id, "turn_terminal", {
+      final: true,
+      nickname,
+      endpointId: target.endpointId,
+      threadId: target.threadId,
+      turnId: turn.id,
+      completedAt: turn.completedAt ?? this.options.clock.now(),
+      status: turn.status,
+      finalMessageIds: messages.map((message) => message.id),
+      deliveryState: "prepared",
+    });
+    if (inserted) await this.options.onEventCommitted?.();
     return "handled";
   }
 
@@ -548,10 +551,10 @@ export class EventRelay {
     turnId: string | undefined,
     kind: string,
     payload: unknown,
-  ): void {
-    this.db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
+  ): boolean {
+    return this.db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(id, endpointId, threadId, turnId ?? null, kind, JSON.stringify(payload), this.options.clock.now());
+      .run(id, endpointId, threadId, turnId ?? null, kind, JSON.stringify(payload), this.options.clock.now()).changes === 1;
   }
 
   private mapping(endpointId: string, threadId: string) {

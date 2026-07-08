@@ -504,7 +504,6 @@ export async function processWorkerTerminalNotification(
     ownership: Pick<SessionOwnershipWatcher, "detectEndpoint" | "release">;
     relay: Pick<EventRelay, "handleNotification">;
     reconcileOperations(): Promise<void>;
-    enqueuePendingEvents(): void | Promise<void>;
   },
   endpointId: string,
   method: string,
@@ -520,7 +519,6 @@ export async function processWorkerTerminalNotification(
   } finally {
     await dependencies.reconcileOperations();
   }
-  await dependencies.enqueuePendingEvents();
 }
 
 export function requestOperationRecoveryForAttempt(
@@ -543,6 +541,33 @@ export async function runAssistantTerminalRecovery(dependencies: {
   await dependencies.reconcileOperations();
   await dependencies.finalize();
   if (dependencies.hasRecoverableOperations()) await dependencies.reconcileOperations();
+}
+
+export interface DurableEventWakeBoundary {
+  wakeAfterDurableCommit(inserted: boolean): Promise<void>;
+  requestRestartOnce(): void;
+}
+
+export function createDurableEventWakeBoundary(options: {
+  schedulerAccepting(): boolean;
+  stopping(): boolean;
+  enqueuePendingEvents(): Promise<void>;
+  requestRestart(): void;
+}): DurableEventWakeBoundary {
+  let restartRequested = false;
+  const requestRestartOnce = (): void => {
+    if (restartRequested) return;
+    restartRequested = true;
+    options.requestRestart();
+  };
+  return {
+    requestRestartOnce,
+    wakeAfterDurableCommit: async (inserted) => {
+      if (!inserted || !options.schedulerAccepting() || options.stopping()) return;
+      try { await options.enqueuePendingEvents(); }
+      catch { requestRestartOnce(); }
+    },
+  };
 }
 
 export type RemovalRecoveryDecision = "pending" | "no_effect" | "reconcile" | "succeeded";
@@ -1267,6 +1292,13 @@ export async function buildProductionApp(
   let managedRecoveryOwner: ManagedSessionRecoveryOwner | undefined;
   let recoveryOwnersStop: Promise<void> | undefined;
   const report = options.onOperationalEvent ?? (() => undefined);
+  const eventWakeBoundary = createDurableEventWakeBoundary({
+    schedulerAccepting: () => schedulerAccepting,
+    stopping: () => stopping,
+    enqueuePendingEvents,
+    requestRestart: options.requestRestart ?? (() => undefined),
+  });
+  const { requestRestartOnce, wakeAfterDurableCommit } = eventWakeBoundary;
   const backgroundFailureReporter = createBackgroundFailureReporter({
     runId: randomUUID(),
     onOperational: (label) => {
@@ -1280,14 +1312,11 @@ export async function buildProductionApp(
         threadId: identity.thread_id,
         binding: currentOwnerBinding(),
       });
-      if (schedulerAccepting) {
-        try { enqueuePendingEvents(); }
-        catch { /* Durable state remains pending for the next scheduler pass. */ }
-      }
+      void wakeAfterDurableCommit(true);
     },
   });
   const handleMaintenanceFailure = createMaintenanceFailureHandler({
-    requestRestart: options.requestRestart ?? (() => undefined),
+    requestRestart: requestRestartOnce,
     reportRecoveryRequired: () => { report({ level: "warn", code: "database_metadata_recovery_required" }); },
     reportRetryableFailure: () => { recordScheduledBackgroundFailure("maintenance", maintenanceFailureEpisode); },
   });
@@ -1698,6 +1727,7 @@ export async function buildProductionApp(
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event, lease) => observations.observeTerminal(event, lease),
+          onEventCommitted: () => wakeAfterDurableCommit(true),
           withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
             endpointManager,
             endpointId,
@@ -1719,16 +1749,16 @@ export async function buildProductionApp(
               body: `[${incident.nickname}] another Codex client started a turn; QiYan is releasing this session`,
               mandatory: true,
             });
-            ownershipEvents.record(incident, "pending");
+            const inserted = ownershipEvents.record(incident, "pending");
+            await wakeAfterDurableCommit(inserted);
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
-            if (schedulerAccepting) enqueuePendingEvents();
           },
           onReleased: async (incident) => {
-            ownershipEvents.record(incident, "completed");
+            const inserted = ownershipEvents.record(incident, "completed");
+            await wakeAfterDurableCommit(inserted);
             dashboardStore.observeLifecycle({ endpointId: incident.endpoint, threadId: incident.thread_id }, Date.now());
             await renderDashboardSafely();
-            if (schedulerAccepting) enqueuePendingEvents();
           },
         }, threadGate);
         managedRecoveryOwner = createManagedSessionRecoveryOwner({
@@ -1740,7 +1770,7 @@ export async function buildProductionApp(
           beforeShared: beforeRestoredEndpoint,
           wakeShared: wakeRestoredEndpoint,
           afterShared: afterRestoredEndpoint,
-          onSafetyFailure: () => { options.requestRestart?.(); },
+          onSafetyFailure: requestRestartOnce,
           onError: () => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "managed_session_recovery",
           }),
@@ -1873,7 +1903,7 @@ export async function buildProductionApp(
           endpointReadyBuffer?.acknowledge(endpointId);
         }
         deliveries.recoverAfterCrash();
-        reconcileDeliveryEvents();
+        await reconcileDeliveryEvents();
         await endpointReadyBuffer?.acceptAndDrain();
         assistantToolReadiness.ready();
       }, stop: async () => undefined,
@@ -1908,7 +1938,10 @@ export async function buildProductionApp(
           chatRegistry,
           attachments,
           undefined,
-          (delivery) => { persistDeliveryState(delivery); },
+          async (delivery) => {
+            try { await persistDeliveryState(delivery); }
+            catch { requestRestartOnce(); }
+          },
           (delivery) => { report({ level: "warn", code: "delivery_failed", adapter: delivery.binding.adapterId }); },
         );
         deliveryWorker.start();
@@ -2011,7 +2044,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
-        reconcileExternalOwnershipReleases();
+        await reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -2020,7 +2053,7 @@ export async function buildProductionApp(
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
         await lifecycle.archive(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
-        reconcileExternalOwnershipReleases();
+        await reconcileExternalOwnershipReleases();
         await reconcileDashboard();
         return { nickname: args.nickname, mapping_id: session.mapping_id };
       },
@@ -2379,7 +2412,6 @@ export async function buildProductionApp(
             dashboardStore.observeLifecycle({ endpointId: target.id, threadId: event.threadId }, Date.now());
             await renderDashboardSafely();
           }
-          enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"));
       }),
       target.onReady(requestReadyRecovery),
@@ -2401,13 +2433,11 @@ export async function buildProductionApp(
         ownership: ownershipWatcher,
         relay,
         reconcileOperations,
-        enqueuePendingEvents,
       }, endpointId, method, params);
       return;
     } else {
       await relay.handleNotification(endpointId, method, params);
     }
-    await enqueuePendingEvents();
   }
 
   function processAssistantTerminal(params: any): Promise<void> {
@@ -2452,7 +2482,7 @@ export async function buildProductionApp(
     await dispatcher.enqueueInternal("terminal");
   }
 
-  function enqueuePendingEvents(): void {
+  async function enqueuePendingEvents(): Promise<void> {
     if (!schedulerAccepting || stopping) return;
     const rows = db.prepare("SELECT id, endpoint_id, thread_id, payload_json, created_at FROM events WHERE state = 'pending' ORDER BY created_at, id").all() as Array<Record<string, unknown>>;
     const latestTransient = new Map<string, string>();
@@ -2470,7 +2500,7 @@ export async function buildProductionApp(
       }
       scheduler.enqueueEvent({ id, sessionKey, payload, queuedAt: Number(row.created_at) });
     }
-    void dispatcher?.enqueueInternal("events");
+    await dispatcher?.enqueueInternal("events");
   }
 
   function isTerminalStatus(status: unknown): boolean {
@@ -2784,7 +2814,7 @@ export async function buildProductionApp(
     const endpointIds = [...new Set(Object.values(registry.snapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
     if (endpointIds.length === 0) {
-      reconcileExternalOwnershipReleases();
+      await reconcileExternalOwnershipReleases();
       return;
     }
     for (const endpointId of endpointIds) await reconcileLifecycleState({ endpointId });
@@ -3001,9 +3031,10 @@ export async function buildProductionApp(
       body: `[system] ${target.id} app-server is unavailable; reconnecting`,
       mandatory: true,
     });
-    db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+    const inserted = db.prepare(`INSERT OR IGNORE INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
       VALUES (?, ?, ?, 'endpoint_unavailable', ?, 'pending', ?)`)
-      .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now());
+      .run(`endpoint-unavailable:${target.id}:${endpointIncident}`, target.id, identity.thread_id, JSON.stringify({ endpointId: target.id, status: "unavailable", incident: endpointIncident }), Date.now()).changes === 1;
+    await wakeAfterDurableCommit(inserted);
     if (target.id === assistantEndpoint.id) scheduleReconnect(assistantEndpoint);
     await renderDashboardSafely();
   }
@@ -3082,25 +3113,25 @@ export async function buildProductionApp(
     });
   }
 
-  function persistDeliveryState(delivery: DeliveryRecord, schedule = true): boolean {
+  async function persistDeliveryState(delivery: DeliveryRecord, schedule = true): Promise<boolean> {
     const inserted = persistDeliveryStateEvent(db, delivery);
-    if (inserted && schedule && schedulerAccepting) enqueuePendingEvents();
+    if (schedule) await wakeAfterDurableCommit(inserted);
     return inserted;
   }
 
-  function reconcileDeliveryEvents(): void {
-    if (reconcileDeliveryStateEvents(db, deliveries) > 0 && schedulerAccepting) enqueuePendingEvents();
+  async function reconcileDeliveryEvents(): Promise<void> {
+    await wakeAfterDurableCommit(reconcileDeliveryStateEvents(db, deliveries) > 0);
   }
 
-  function reconcileExternalOwnershipReleases(): number {
+  async function reconcileExternalOwnershipReleases(): Promise<number> {
     const inserted = ownershipEvents.reconcileReleased(registry);
-    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
+    await wakeAfterDurableCommit(inserted > 0);
     return inserted;
   }
 
   async function reconcileLifecycleState(filter: { endpointId?: string; nickname?: string } = {}): Promise<void> {
     const inserted = await reconcileLifecycleAndOwnership(lifecycle, isolateLifecycleRecoveryFailure, ownershipEvents, registry, filter);
-    if (inserted > 0 && schedulerAccepting) enqueuePendingEvents();
+    await wakeAfterDurableCommit(inserted > 0);
   }
 
   function failRecoveredNoEffect(operationId: string, message: string): void {
@@ -3134,7 +3165,7 @@ export async function buildProductionApp(
     dashboardStore.assertMetadataHealthy();
     await attachments.cleanupExpired();
     discovery.cleanupExpired();
-    reconcileDeliveryEvents();
+    await reconcileDeliveryEvents();
     await reconcileOperations();
     const managedEndpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))];
     const projectCycle = createFailureCycle({

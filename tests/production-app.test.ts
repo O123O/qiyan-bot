@@ -4,6 +4,7 @@ import {
   createOperationReconciliationLoop,
   createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
+  createDurableEventWakeBoundary,
   createChatHistoryAction,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
@@ -52,6 +53,73 @@ import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
+
+test("durable event commits await an asynchronous scheduler wake and restart once on loss", async () => {
+  let accepting = false;
+  let stopping = false;
+  let enqueues = 0;
+  let restarts = 0;
+  let releaseEnqueue!: () => void;
+  const enqueueBarrier = new Promise<void>((resolve) => { releaseEnqueue = resolve; });
+  const boundary = createDurableEventWakeBoundary({
+    schedulerAccepting: () => accepting,
+    stopping: () => stopping,
+    enqueuePendingEvents: async () => {
+      enqueues += 1;
+      await enqueueBarrier;
+      throw new Error("asynchronous scheduler rejection");
+    },
+    requestRestart: () => { restarts += 1; },
+  });
+
+  await boundary.wakeAfterDurableCommit(false);
+  await boundary.wakeAfterDurableCommit(true);
+  assert.equal(enqueues, 0, "startup enqueue owns commits made before scheduler acceptance");
+  assert.equal(restarts, 0);
+
+  accepting = true;
+  const relayEvent = boundary.wakeAfterDurableCommit(true);
+  try {
+    await Promise.resolve();
+    assert.equal(enqueues, 1);
+    assert.equal(restarts, 0);
+  } finally {
+    releaseEnqueue();
+  }
+  await relayEvent;
+  assert.equal(restarts, 1);
+
+  for (const source of ["delivery", "external-ownership", "endpoint-unavailable", "background-failure"]) {
+    await boundary.wakeAfterDurableCommit(true);
+    assert.equal(restarts, 1, `${source} reuses the same one-shot restart boundary`);
+  }
+  stopping = true;
+  await boundary.wakeAfterDurableCommit(true);
+  assert.equal(enqueues, 5);
+  assert.equal(restarts, 1);
+});
+
+test("successful durable event wake settles only after enqueueInternal settles", async () => {
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let settled = false;
+  const boundary = createDurableEventWakeBoundary({
+    schedulerAccepting: () => true,
+    stopping: () => false,
+    enqueuePendingEvents: async () => { await barrier; },
+    requestRestart: () => { throw new Error("unexpected restart"); },
+  });
+
+  const waking = boundary.wakeAfterDurableCommit(true).then(() => { settled = true; });
+  try {
+    await Promise.resolve();
+    assert.equal(settled, false);
+  } finally {
+    release();
+  }
+  await waking;
+  assert.equal(settled, true);
+});
 
 test("operation recovery waits only for the exact in-process tool handler", () => {
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true }), "wait_for_tool");
@@ -1326,7 +1394,7 @@ test("operation retry backoff is capped at thirty seconds", async () => {
   await loop.stop();
 });
 
-test("worker terminal reconciliation runs outside its endpoint lease and preserves enqueue ordering", async () => {
+test("worker terminal reconciliation runs outside its endpoint lease after relay projection", async () => {
   const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "terminal" };
   const seen: string[] = [];
   let leaseHeld = false;
@@ -1343,9 +1411,8 @@ test("worker terminal reconciliation runs outside its endpoint lease and preserv
     },
     relay: { handleNotification: async () => { seen.push("relay"); return "retry" as const; } },
     reconcileOperations: async () => { assert.equal(leaseHeld, false); seen.push("operations"); },
-    enqueuePendingEvents: async () => { seen.push("events"); },
   }, "endpoint-a", "turn/completed", { threadId: "thread-a", turn: { id: "turn-a" } });
-  assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "ownership", "ownership:released", "lease:released", "operations", "events"]);
+  assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "ownership", "ownership:released", "lease:released", "operations"]);
 
   seen.length = 0;
   await assert.rejects(processWorkerTerminalNotification({
@@ -1361,7 +1428,6 @@ test("worker terminal reconciliation runs outside its endpoint lease and preserv
     },
     relay: { handleNotification: async () => { seen.push("relay"); throw new Error("retry"); } },
     reconcileOperations: async () => { assert.equal(leaseHeld, false); seen.push("operations"); },
-    enqueuePendingEvents: async () => { seen.push("events"); },
   }, "endpoint-a", "turn/completed", { threadId: "thread-a", turn: { id: "turn-a" } }), /retry/u);
   assert.deepEqual(seen, ["lease:acquired", "ownership", "relay", "lease:released", "operations"]);
 });

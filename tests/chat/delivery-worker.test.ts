@@ -31,6 +31,33 @@ test("delivery worker routes by adapter and persists opaque binding and receipt"
   assert.equal(telegram.sent.length, 0);
 });
 
+test("a confirmed delivery stays confirmed when projection requests restart and throws", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const adapter = new FakeAdapter("telegram", { messageId: 7 });
+  const delivery = store.prepare({
+    id: "confirmed-before-projection",
+    kind: "chat",
+    binding: { adapterId: "telegram", conversationKey: "owner", destination: { chatId: "owner" } },
+    body: "private body",
+    mandatory: true,
+  });
+  let restarts = 0;
+  const worker = new DeliveryWorker(
+    store,
+    new ChatAdapterRegistry([{ delivery: adapter }]),
+    undefined,
+    undefined,
+    () => {
+      restarts += 1;
+      throw new Error("projection failed");
+    },
+  );
+
+  await worker.processOne(delivery.id);
+  assert.equal(store.get(delivery.id)?.state, "confirmed");
+  assert.equal(restarts, 1);
+});
+
 test("adapter-specific retry proof overrides generic HTTP status handling", async () => {
   const store = new DeliveryStore(createTestDatabase());
   const binding = { adapterId: "slack", conversationKey: "slack:C1", destination: { channel: "C1" } } as const;
