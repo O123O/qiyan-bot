@@ -10,6 +10,7 @@ const nodeCleanupTimers: CleanupTimers = {
 
 export class AttachmentCleanup {
   private stopped = true;
+  private generation = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<void> | undefined;
 
@@ -23,7 +24,8 @@ export class AttachmentCleanup {
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;
-    await this.run();
+    this.generation += 1;
+    await this.run(this.generation);
   }
 
   async stop(): Promise<void> {
@@ -33,25 +35,29 @@ export class AttachmentCleanup {
     await this.running;
   }
 
-  private run(): Promise<void> {
+  private run(generation: number): Promise<void> {
+    if (this.stopped || generation !== this.generation) return Promise.resolve();
     if (this.running) return this.running;
-    const running = this.runOnce();
+    const running = this.runOnce(generation);
     this.running = running.finally(() => {
       this.running = undefined;
     });
     return this.running;
   }
 
-  private async runOnce(): Promise<void> {
+  private async runOnce(generation: number): Promise<void> {
     try {
       await this.cleanup();
     } catch {
       this.onError();
     }
-    if (this.stopped) return;
-    this.timer = this.timers.setTimeout(() => {
+    if (this.stopped || generation !== this.generation) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    timer = this.timers.setTimeout(() => {
+      if (this.stopped || generation !== this.generation || timer === undefined || this.timer !== timer) return;
       this.timer = undefined;
-      void this.run();
+      void this.run(generation);
     }, this.intervalMs);
+    this.timer = timer;
   }
 }

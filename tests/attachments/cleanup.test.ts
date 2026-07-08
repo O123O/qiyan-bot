@@ -33,6 +33,12 @@ class FakeCleanupTimers implements CleanupTimers {
     assert.ok(next);
     return next;
   }
+
+  peekNext(): ScheduledCleanup {
+    const next = this.scheduled[0];
+    assert.ok(next);
+    return next;
+  }
 }
 
 test("attachment cleanup runs at startup, schedules daily without overlap, and waits on stop", async () => {
@@ -97,4 +103,46 @@ test("attachment cleanup reports metadata-only failure and retries the next day"
   await cleanup.stop();
   assert.equal(timers.scheduled.length, 0);
   assert.equal(timers.cleared.length, 1);
+});
+
+test("a captured cleanup callback is inert after stop", async () => {
+  const timers = new FakeCleanupTimers();
+  let calls = 0;
+  const cleanup = new AttachmentCleanup(async () => {
+    calls += 1;
+    return 0;
+  }, () => { assert.fail("unexpected cleanup failure"); }, timers);
+
+  await cleanup.start();
+  const stale = timers.peekNext();
+  await cleanup.stop();
+
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(calls, 1);
+  assert.equal(timers.scheduled.length, 0);
+});
+
+test("a callback from an old generation cannot disturb a restarted cleanup timer", async () => {
+  const timers = new FakeCleanupTimers();
+  let calls = 0;
+  const cleanup = new AttachmentCleanup(async () => {
+    calls += 1;
+    return 0;
+  }, () => { assert.fail("unexpected cleanup failure"); }, timers);
+
+  await cleanup.start();
+  const stale = timers.peekNext();
+  await cleanup.stop();
+  await cleanup.start();
+  const current = timers.peekNext();
+
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(calls, 2);
+  assert.deepEqual(timers.scheduled.map(({ handle }) => handle), [current.handle]);
+
+  await cleanup.stop();
+  assert.equal(timers.scheduled.length, 0);
+  assert.deepEqual(timers.cleared, [stale.handle, current.handle]);
 });
