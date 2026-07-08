@@ -178,7 +178,10 @@ export function createEndpointReadyBuffer(options: {
   return {
     ready: (endpointId) => {
       if (stopped) return undefined;
-      if (accepting) return requestRecovery(endpointId);
+      if (accepting) {
+        pending.delete(endpointId);
+        return requestRecovery(endpointId);
+      }
       if (pending.has(endpointId)) return undefined;
       if (pending.size >= maxPendingEndpoints) {
         return Promise.reject(new AppError("CAPACITY_EXCEEDED", "too many endpoint-ready events are pending"));

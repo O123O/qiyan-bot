@@ -315,6 +315,27 @@ test("ready recovery reports only the latest dirty pass and retains a latest fai
   failLatest = false;
   await latestFailure.acceptAndDrain();
   assert.equal(latestAttempts, 3, "a failed latest pass remains pending for the next drain");
+
+  let retainedAttempts = 0;
+  let failRetained = true;
+  const retainedFailure = createEndpointReadyBuffer({
+    recover: async () => {
+      retainedAttempts += 1;
+      if (failRetained) throw new Error("retained recovery failure");
+      if (retainedAttempts > 2) throw new Error("stale pending recovery reactivated the endpoint");
+    },
+  });
+  await retainedFailure.acceptAndDrain();
+  const failedLive = retainedFailure.ready("devbox");
+  assert.ok(failedLive);
+  await assert.rejects(failedLive, /retained recovery failure/u);
+  failRetained = false;
+  const recoveredLive = retainedFailure.ready("devbox");
+  assert.ok(recoveredLive);
+  await recoveredLive;
+  retainedFailure.pause();
+  await retainedFailure.acceptAndDrain();
+  assert.equal(retainedAttempts, 2, "a later live success claims the retained pending recovery");
 });
 
 test("production-style endpoint recovery starts a dirty pass after the current generation is removed", async () => {
