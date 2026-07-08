@@ -15,7 +15,20 @@ interface ObserverOptions {
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
+  classifyFailure?(error: unknown): "retry" | "endpoint" | "sleep";
+  retryMs?: number;
+  timers?: ObservationTimers;
 }
+
+interface ObservationTimers {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: any): void;
+}
+
+const nodeObservationTimers: ObservationTimers = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle),
+};
 
 const supportedMethods = new Set([
   "turn/started",
@@ -28,6 +41,10 @@ const supportedMethods = new Set([
 
 export class SessionObservationProcessor {
   private tails = new Map<string, Promise<void>>();
+  private retryTimers = new Map<string, { handle: unknown; generation: number }>();
+  private retryGenerations = new Map<string, number>();
+  private unavailableEndpoints = new Set<string>();
+  private stopped = false;
 
   constructor(
     private readonly store: SessionDashboardStore,
@@ -55,7 +72,28 @@ export class SessionObservationProcessor {
   }
 
   async idle(): Promise<void> {
-    await Promise.all([...this.tails.values()]);
+    while (this.tails.size > 0) await Promise.all([...this.tails.values()]);
+  }
+
+  endpointUnavailable(endpointId: string): void {
+    if (this.stopped) return;
+    this.unavailableEndpoints.add(endpointId);
+    this.clearRetry(endpointId);
+  }
+
+  async endpointReady(endpointId: string): Promise<void> {
+    if (this.stopped) return;
+    this.unavailableEndpoints.delete(endpointId);
+    this.clearRetry(endpointId);
+    await this.enqueue(endpointId);
+  }
+
+  async stop(): Promise<void> {
+    if (!this.stopped) {
+      this.stopped = true;
+      for (const endpointId of [...this.retryTimers.keys()]) this.clearRetry(endpointId);
+    }
+    await this.idle();
   }
 
   observeResume(
@@ -122,12 +160,39 @@ export class SessionObservationProcessor {
   }
 
   private enqueue(endpointId: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     const previous = this.tails.get(endpointId) ?? Promise.resolve();
     const run = previous.then(() => this.processPending(endpointId), () => this.processPending(endpointId));
-    const contained = run.catch((error) => { this.options.onError(error); });
+    const contained = run.catch((error) => {
+      try { this.options.onError(error); }
+      catch { /* operational reporting must not change retry ownership */ }
+      if ((this.options.classifyFailure?.(error) ?? "sleep") === "retry") this.scheduleRetry(endpointId);
+    });
     this.tails.set(endpointId, contained);
     void contained.finally(() => { if (this.tails.get(endpointId) === contained) this.tails.delete(endpointId); });
     return contained;
+  }
+
+  private scheduleRetry(endpointId: string): void {
+    if (this.stopped || this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
+    const generation = (this.retryGenerations.get(endpointId) ?? 0) + 1;
+    this.retryGenerations.set(endpointId, generation);
+    const timers = this.options.timers ?? nodeObservationTimers;
+    const handle = timers.setTimeout(() => {
+      const current = this.retryTimers.get(endpointId);
+      if (this.stopped || this.unavailableEndpoints.has(endpointId) || current?.generation !== generation) return;
+      this.retryTimers.delete(endpointId);
+      void this.enqueue(endpointId);
+    }, this.options.retryMs ?? 1_000);
+    this.retryTimers.set(endpointId, { handle, generation });
+    (handle as { unref?: () => void } | undefined)?.unref?.();
+  }
+
+  private clearRetry(endpointId: string): void {
+    this.retryGenerations.set(endpointId, (this.retryGenerations.get(endpointId) ?? 0) + 1);
+    const timer = this.retryTimers.get(endpointId);
+    if (timer) (this.options.timers ?? nodeObservationTimers).clearTimeout(timer.handle);
+    this.retryTimers.delete(endpointId);
   }
 
   private async processPending(endpointId: string): Promise<void> {

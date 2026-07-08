@@ -3,6 +3,7 @@ import { appendFile, mkdtemp, open, readFile, rename, stat, writeFile } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
@@ -215,6 +216,7 @@ test("the guard rejects malformed scans without external proof or durable state 
   await assert.rejects(guard.inspect(identity), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "OPERATION_UNCERTAIN");
     assert.equal((error as Error).message, "rollout ownership is temporarily uncertain");
+    assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
     return true;
   });
 
@@ -272,6 +274,7 @@ test("initialization accepts only positive active external evidence from a malfo
 
   await assert.rejects(uncertainGuard.initialize(uncertainIdentity, "/tmp/rollout-thread-init-uncertain.jsonl"), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "OPERATION_UNCERTAIN");
+    assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
     return true;
   });
   const uncertainRows = uncertainDb.prepare(`SELECT COUNT(*) AS count FROM session_rollout_ownership
@@ -295,6 +298,7 @@ test("initialization accepts only positive active external evidence from a malfo
 
   await assert.rejects(externalGuard.initialize(externalIdentity, "/tmp/rollout-thread-init-external.jsonl"), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    assert.equal((error as AppError).details?.recovery, "external_turn");
     return true;
   });
   assert.deepEqual(await externalGuard.inspect(externalIdentity), { state: "external", turnId: "external-active" });
@@ -436,9 +440,35 @@ test("initialization durably fences an already active external turn for managed-
 
   await assert.rejects(guard.initialize(identity, "/tmp/rollout-thread-recovery.jsonl"), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    assert.equal((error as AppError).details?.recovery, "external_turn");
     return true;
   });
 
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-active" });
   assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
+});
+
+test("only incomplete ownership evidence is retry-tagged while rollout identity drift is permanent", async () => {
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const operations = new OperationStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-tags", mapping_id: "mapping-tags" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const cursor = { device: "1", inode: "2", offset: 0 };
+  let scanResult: any = undefined;
+  const guard = new SessionOwnershipGuard(db, runtime, operations, {
+    scan: async () => scanResult === undefined ? [] : [scanResult],
+  });
+
+  await assert.rejects(guard.initialize(identity, "/tmp/rollout-thread-tags.jsonl"), (error: unknown) => {
+    assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
+    return true;
+  });
+  scanResult = { cursor, starts: [] };
+  await guard.initialize(identity, "/tmp/rollout-thread-tags.jsonl");
+  await assert.rejects(guard.initialize(identity, "/tmp/rollout-thread-tags-changed.jsonl"), (error: unknown) => {
+    assert.equal((error as AppError).code, "OPERATION_UNCERTAIN");
+    assert.equal((error as AppError).details?.recovery, undefined);
+    return true;
+  });
 });

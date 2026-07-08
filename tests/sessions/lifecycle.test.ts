@@ -48,7 +48,9 @@ class LifecycleEndpoint implements AppServerEndpoint {
 
 async function fixture(ownership?: {
   initialize(identity: { endpoint: string; thread_id: string; mapping_id: string }, path: string): Promise<void>;
-  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<{ state: "uninitialized" | "owned" } | { state: "external"; turnId: string }>;
+  inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<
+    { state: "uninitialized" | "owned" } | { state: "external" | "unclassified"; turnId: string }
+  >;
   release(identity: { endpoint: string; thread_id: string; mapping_id: string }): void;
 }, endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-life-")));
@@ -250,10 +252,27 @@ test("managed recovery checks an existing rollout guard before reading native hi
 
   await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
     assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    assert.equal((error as AppError).details?.recovery, "external_turn");
     return true;
   });
 
   assert.deepEqual(seen, ["ownership"]);
+  assert.deepEqual(endpoint.calls, []);
+});
+
+test("managed recovery retry-tags only an unclassified ownership boundary", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture({
+    initialize: async () => undefined,
+    inspectIfInitialized: async () => ({ state: "unclassified", turnId: "not-classified" }),
+    release: () => undefined,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" });
+
+  await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
+    assert.equal((error as AppError).code, "OPERATION_UNCERTAIN");
+    assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
+    return true;
+  });
   assert.deepEqual(endpoint.calls, []);
 });
 

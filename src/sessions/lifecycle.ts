@@ -250,8 +250,14 @@ export class SessionLifecycle {
       await this.assertDispatchable(session.endpoint, project, lease);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
-      if (guarded?.state === "external") throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`);
-      if (guarded?.state === "unclassified") throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has a turn whose ownership is not yet classified`);
+      if (guarded?.state === "external") {
+        throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
+      }
+      if (guarded?.state === "unclassified") {
+        throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} has a turn whose ownership is not yet classified`, {
+          recovery: "ownership_unclassified",
+        });
+      }
       const before = await this.read(session.endpoint, session.thread_id, lease);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       if (this.ownership) await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);

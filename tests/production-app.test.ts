@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOperationReconciliationLoop,
+  createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
   createChatHistoryAction,
   isUncertainAssistantTransportFailure,
+  managedRecoveryDisposition,
+  managedRecoveryManagementState,
+  managedRetryKey,
   managedSessionNeedsRecovery,
   operationRecoveryAction,
   operationRecoveryFailureDisposition,
@@ -23,17 +27,20 @@ import {
   registryReloadPreservesWorkerMappings,
   removalRecoveryDecision,
   reportAssistantTerminalFailure,
+  reportOperationalSafely,
   requestOperationRecoveryForAttempt,
   runAssistantTerminalRecovery,
   runOperationRecoveryTarget,
   runOperationRecoveryChains,
   stopRelayRecovery,
   stopRecoveryOwnerSet,
+  wakeRestoredSessionOwners,
   withRelayEndpointWorkLease,
   type OperationReconciliationPass,
   type OperationRecoveryTarget,
 } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
+import type { ManagementState } from "../src/core/types.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
@@ -41,6 +48,7 @@ import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
 import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
+import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
 
 test("operation recovery waits only for the exact in-process tool handler", () => {
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true }), "wait_for_tool");
@@ -507,6 +515,186 @@ test("operation recovery retries only source-classified transient proof failures
   assert.equal(operationRecoveryFailureDisposition(new Error("unknown")), "sleep");
 });
 
+test("managed recovery uses only source-specific transient and external dispositions", () => {
+  assert.equal(managedRecoveryDisposition(new RpcRequestTimeoutError("thread/read")), "retry");
+  assert.equal(managedRecoveryDisposition(new AppError("ENDPOINT_UNAVAILABLE", "x")), "endpoint");
+  assert.equal(managedRecoveryDisposition(new AppError("OPERATION_UNCERTAIN", "x", { recovery: "ownership_unclassified" })), "retry");
+  assert.equal(managedRecoveryDisposition(new AppError("SESSION_BUSY", "x", { recovery: "external_turn" })), "external");
+  assert.equal(managedRecoveryDisposition(new AppError("OPERATION_UNCERTAIN", "changed rollout path")), "permanent");
+  assert.equal(managedRecoveryDisposition(new AppError("CWD_MISMATCH", "x")), "permanent");
+  assert.equal(managedRecoveryDisposition(new Error("unknown")), "permanent");
+  assert.equal(managedRecoveryManagementState("unavailable", "external"), "managed");
+  assert.equal(managedRecoveryManagementState("unadopting", "external"), "unadopting");
+  assert.equal(managedRecoveryManagementState("managed", "retry"), "unavailable");
+});
+
+test("an externally owned managed recovery remains inspectable for the next ownership release tick", async () => {
+  const session = {
+    endpoint: "endpoint-a", thread_id: "thread-a", project_dir: "/project", mapping_id: "mapping-a", lifecycle_state: "managed" as const,
+  };
+  let runtimeState: ManagementState | "released" = "unavailable";
+  runtimeState = managedRecoveryManagementState(runtimeState, "external");
+  const seen: string[] = [];
+  const watcher = new SessionOwnershipWatcher(
+    {
+      snapshot: () => ({ version: 3 as const, assistant: { endpoint: "assistant", thread_id: "assistant", project_dir: "/assistant" }, sessions: { worker: session } }),
+      get: () => session,
+    } as never,
+    {
+      inspect: async () => {
+        seen.push(`inspect:${runtimeState}`);
+        runtimeState = "unadopting";
+        return { state: "external", turnId: "external-turn" } as const;
+      },
+    },
+    {
+      unadopt: async () => {
+        seen.push(`release:${runtimeState}`);
+        runtimeState = "released";
+      },
+    },
+    {
+      isInspectable: () => runtimeState === "managed" || runtimeState === "unadopting",
+      onExternal: async () => { seen.push("external"); },
+      onReleased: async () => { seen.push("released"); },
+    },
+  );
+
+  await watcher.reconcileEndpoint("endpoint-a");
+  assert.equal(runtimeState, "released");
+  assert.deepEqual(seen, ["inspect:managed", "external", "release:unadopting", "released"]);
+});
+
+test("managed retry owner retries only exact endpoint mappings and wakes downstream once after restoration", async () => {
+  type Timer = { callback: () => void; delayMs: number; cleared: boolean };
+  const timers: Timer[] = [];
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "managed-retry" };
+  const keyA = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const healthyA = managedRetryKey("endpoint-a", "thread-healthy", "mapping-healthy");
+  const keyB = managedRetryKey("endpoint-b", "thread-b", "mapping-b");
+  const attempts: Array<{ endpointId: string; keys: readonly string[]; lease: EndpointWorkLease }> = [];
+  const restored: string[] = [];
+  let owner!: ReturnType<typeof createManagedSessionRecoveryOwner>;
+  owner = createManagedSessionRecoveryOwner({
+    endpoints: {
+      withReadyWorkLease: async (endpointId, run) => {
+        assert.equal(endpointId, "endpoint-a");
+        return run(lease);
+      },
+    },
+    recover: async (endpointId, keys, actualLease) => {
+      attempts.push({ endpointId, keys, lease: actualLease });
+      for (const key of keys) owner.recordSuccess(key);
+      return { restored: keys.length > 0 };
+    },
+    onRestored: async (endpointId) => { restored.push(endpointId); },
+    onError: () => assert.fail("unexpected managed retry error"),
+    timers: {
+      setTimeout: (callback, delayMs) => {
+        const timer = { callback, delayMs, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer: Timer) => { timer.cleared = true; },
+    },
+    retryMs: 50,
+  });
+
+  owner.recordFailure(keyA, "retry");
+  owner.recordFailure(keyB, "endpoint");
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0]!.delayMs, 50);
+  timers[0]!.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(attempts, [{ endpointId: "endpoint-a", keys: [keyA], lease }]);
+  assert.equal(attempts[0]!.keys.includes(healthyA), false);
+  assert.deepEqual(restored, ["endpoint-a"]);
+
+  const leaseB: EndpointWorkLease = { ...lease, endpointId: "endpoint-b", leaseId: "ready-b" };
+  await owner.endpointReady("endpoint-b", leaseB);
+  assert.deepEqual(attempts[1], { endpointId: "endpoint-b", keys: [keyB], lease: leaseB });
+  assert.deepEqual(restored, ["endpoint-a", "endpoint-b"]);
+  await owner.stop();
+});
+
+test("managed retry owner cancels endpoint timers and fences endpoint loss, generation failure, and shutdown", async () => {
+  type Timer = { callback: () => void; cleared: boolean };
+  const timers: Timer[] = [];
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "ready-a" };
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let attempts = 0;
+  let downstream = 0;
+  let endpointLeaseCalls = 0;
+  let owner!: ReturnType<typeof createManagedSessionRecoveryOwner>;
+  owner = createManagedSessionRecoveryOwner({
+    endpoints: {
+      withReadyWorkLease: async (_endpointId, run) => {
+        endpointLeaseCalls += 1;
+        return run(lease);
+      },
+    },
+    recover: async (_endpointId, keys) => {
+      attempts += 1;
+      if (attempts === 1) throw new AppError("ENDPOINT_UNAVAILABLE", "generation changed");
+      await blocked;
+      for (const actual of keys) owner.recordSuccess(actual);
+      return { restored: true };
+    },
+    onRestored: async () => { downstream += 1; },
+    onError: () => undefined,
+    timers: {
+      setTimeout: (callback) => {
+        const timer = { callback, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer: Timer) => { timer.cleared = true; },
+    },
+  });
+
+  owner.recordFailure(key, "retry");
+  const stale = timers[0]!;
+  owner.endpointUnavailable("endpoint-a");
+  assert.equal(stale.cleared, true);
+  stale.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(attempts, 0);
+
+  await owner.endpointReady("endpoint-a", lease);
+  assert.equal(attempts, 1);
+  assert.equal(downstream, 0, "a generation failure cannot publish restoration");
+  assert.equal(endpointLeaseCalls, 0, "an existing ready lease is reused without reacquisition");
+
+  const live = owner.endpointReady("endpoint-a", lease);
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  let stopped = false;
+  const stopping = owner.stop().then(() => { stopped = true; });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(stopped, false);
+  release();
+  await Promise.all([live, stopping]);
+  assert.equal(downstream, 0, "shutdown suppresses a late success publication");
+});
+
+test("restored-session downstream owners are isolated and operational reporting cannot throw", async () => {
+  const calls: string[] = [];
+  await wakeRestoredSessionOwners({
+    relay: { endpointReady: async () => { calls.push("relay"); throw new Error("relay failed"); } },
+    observations: { endpointReady: async () => { calls.push("observations"); throw new Error("observation failed"); } },
+    onError: (owner) => { calls.push(`error:${owner}`); },
+  }, "endpoint-a");
+  assert.deepEqual(calls, ["relay", "error:relay", "observations", "error:observations"]);
+
+  let reports = 0;
+  assert.doesNotThrow(() => reportOperationalSafely(() => {
+    reports += 1;
+    throw new Error("sink failed");
+  }, { level: "warn", code: "background_task_failed", component: "session_observation" }));
+  assert.equal(reports, 1);
+});
+
 test("classified operation retry is single-flight, capped, endpoint-scoped, and stopped safely", async () => {
   type Timer = { callback: () => void; delay: number; cleared: boolean };
   const timers: Timer[] = [];
@@ -834,10 +1022,11 @@ test("production shutdown drains live ready recovery before every owner and endp
       start: async () => undefined,
       stop: () => stopRecoveryOwnerSet({
         ready: readyBuffer,
+        managed: { stop: async () => { seen.push("managed"); } },
         operations: { stop: async () => { seen.push("operations"); } },
         dispatcher: { stop: async () => { seen.push("dispatcher"); } },
         relay: { stop: async () => { seen.push("relay"); } },
-        observations: { idle: async () => { seen.push("observations"); } },
+        observations: { stop: async () => { seen.push("observations"); } },
       }),
     },
   ]);
@@ -852,7 +1041,7 @@ test("production shutdown drains live ready recovery before every owner and endp
   release();
   await live;
   await stopping;
-  assert.deepEqual(seen, ["ready:start", "ready:end", "operations", "dispatcher", "relay", "observations", "endpoint"]);
+  assert.deepEqual(seen, ["ready:start", "ready:end", "managed", "relay", "observations", "operations", "dispatcher", "endpoint"]);
 });
 
 test("assistant startup failure drains every recovery owner before endpoint teardown", async () => {
@@ -865,10 +1054,11 @@ test("assistant startup failure drains every recovery owner before endpoint tear
       name: "recovery-owners",
       start: async () => undefined,
       stop: () => stopRecoveryOwnerSet({
+        managed: { stop: async () => { seen.push("managed"); } },
         operations: { stop: async () => { seen.push("operations:start"); await blocked; seen.push("operations:end"); } },
         dispatcher: { stop: async () => { seen.push("dispatcher"); } },
         relay: { stop: async () => { seen.push("relay"); } },
-        observations: { idle: async () => { seen.push("observations"); } },
+        observations: { stop: async () => { seen.push("observations"); } },
         finishDashboard: async () => { seen.push("dashboard"); },
       }),
     },
@@ -876,10 +1066,10 @@ test("assistant startup failure drains every recovery owner before endpoint tear
   ]);
   const starting = app.start();
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  assert.deepEqual(seen, ["operations:start"]);
+  assert.deepEqual(seen, ["managed", "relay", "observations", "operations:start"]);
   release();
   await assert.rejects(starting);
-  assert.deepEqual(seen, ["operations:start", "operations:end", "dispatcher", "relay", "observations", "dashboard", "endpoint"]);
+  assert.deepEqual(seen, ["managed", "relay", "observations", "operations:start", "operations:end", "dispatcher", "dashboard", "endpoint"]);
 });
 
 test("recovery-owner cleanup settles later owners after an earlier cleanup fails", async () => {
@@ -888,10 +1078,10 @@ test("recovery-owner cleanup settles later owners after an earlier cleanup fails
     operations: { stop: async () => { seen.push("operations"); throw new Error("operation cleanup failed"); } },
     dispatcher: { stop: async () => { seen.push("dispatcher"); } },
     relay: { stop: async () => { seen.push("relay"); throw new Error("relay cleanup failed"); } },
-    observations: { idle: async () => { seen.push("observations"); } },
+    observations: { stop: async () => { seen.push("observations"); } },
     finishDashboard: async () => { seen.push("dashboard"); },
-  }), /operation cleanup failed/u);
-  assert.deepEqual(seen, ["operations", "dispatcher", "relay", "observations", "dashboard"]);
+  }), /relay cleanup failed/u);
+  assert.deepEqual(seen, ["relay", "observations", "operations", "dispatcher", "dashboard"]);
 });
 
 test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {
