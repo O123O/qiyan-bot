@@ -1,6 +1,6 @@
-import { basename } from "node:path";
 import type { ConversationBinding } from "../chat/binding.ts";
-import type { NormalizedSlackEvent, SlackEventClassification, SlackFileDescriptor } from "./types.ts";
+import { normalizeSlackMessageContent } from "./content-normalizer.ts";
+import type { NormalizedSlackEvent, SlackEventClassification } from "./types.ts";
 
 export interface SlackClassificationContext {
   teamId: string;
@@ -24,12 +24,15 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
   if (event.bot_id != null || event.app_id != null || event.hidden === true) return discard();
   if (subtype && !(type === "message" && subtype === "file_share")) return discard();
 
+  const content = normalizeSlackMessageContent(event);
+  if (content.kind === "empty") return discard();
+
   const threadTs = string(event.thread_ts);
   let eventType: NormalizedSlackEvent["eventType"];
   let conversationKey: string;
   let destination: ConversationBinding["destination"];
   let activate = false;
-  let rawText = string(event.text) ?? "";
+  let rawText = content.text;
 
   if (type === "app_mention") {
     const root = threadTs ?? messageTs;
@@ -51,8 +54,8 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
     rawText = stripLeadingMention(rawText, context.botUserId);
   } else return discard();
 
-  const files = normalizeFiles(event.files);
-  if (!files) return discard();
+  if (!rawText && content.files.length === 0) return discard();
+
   const nativeSourceId = `${context.teamId}:${channelId}:${messageTs}`;
   const receivedAt = typeof body.event_time === "number" && Number.isFinite(body.event_time)
     ? Math.trunc(body.event_time * 1_000)
@@ -68,7 +71,7 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
       ...(threadTs ? { threadTs } : {}),
       userId,
       rawText,
-      files,
+      files: content.files,
       nativeSourceId,
       sourceId: `slack:${nativeSourceId}`,
       binding: {
@@ -83,37 +86,9 @@ export function classifySlackEvent(value: unknown, context: SlackClassificationC
   };
 }
 
-function normalizeFiles(value: unknown): SlackFileDescriptor[] | undefined {
-  if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 100) return undefined;
-  const files: SlackFileDescriptor[] = [];
-  for (const candidate of value) {
-    const file = record(candidate);
-    const slackFileId = string(file?.id);
-    if (!file || !slackFileId) return undefined;
-    const displayName = safeName(string(file.name) ?? string(file.title) ?? "attachment");
-    const mediaType = (string(file.mimetype) ?? "application/octet-stream").slice(0, 200);
-    const declaredSize = typeof file.size === "number" && Number.isSafeInteger(file.size) && file.size >= 0 ? file.size : undefined;
-    const downloadUrl = string(file.url_private_download) ?? string(file.url_private);
-    files.push({
-      slackFileId,
-      displayName,
-      mediaType,
-      ...(declaredSize === undefined ? {} : { declaredSize }),
-      ...(downloadUrl === undefined ? {} : { downloadUrl }),
-    });
-  }
-  return files;
-}
-
 function stripLeadingMention(text: string, botUserId: string): string {
   const escaped = botUserId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   return text.replace(new RegExp(`^<@${escaped}>[\\t\\n\\r ]*`, "u"), "");
-}
-
-function safeName(value: string): string {
-  const clean = basename(value.replace(/[\u0000-\u001f\u007f]/gu, "_")).trim().slice(0, 180);
-  return clean || "attachment";
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

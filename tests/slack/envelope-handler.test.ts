@@ -39,6 +39,32 @@ test("unauthorized content is acknowledged without retention", async () => {
   assert.doesNotMatch(JSON.stringify(db.prepare("SELECT * FROM slack_inbox").all()), /private secret/u);
 });
 
+test("malformed and empty content is acknowledged without poison retries or retention", async () => {
+  const db = createTestDatabase();
+  const store = new SlackInboxStore(db);
+  let acked = 0;
+  const base = { type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "3.0", text: "" };
+  await handler(store).handle({ body: { ...mention, event_id: "E-empty", event: { ...base, blocks: [], attachments: [] } }, ack: async () => { acked += 1; } });
+  await handler(store).handle({ body: { ...mention, event_id: "E-malformed", event: { ...base, ts: "4.0", blocks: "bad", files: [{ nope: true }] } }, ack: async () => { acked += 1; } });
+  assert.equal(acked, 2);
+  assert.equal(store.get("E-empty"), undefined);
+  assert.equal(store.get("E-malformed")?.state, "pending");
+  assert.match(store.get("E-malformed")?.rawText ?? "", /Unsupported Slack content/u);
+});
+
+test("a mention-only event is acknowledged without activating its thread", async () => {
+  const db = createTestDatabase();
+  const store = new SlackInboxStore(db);
+  let acked = 0;
+  await handler(store).handle({
+    body: { ...mention, event_id: "E-mention-only", event: { ...mention.event, text: "<@B1>" } },
+    ack: async () => { acked += 1; },
+  });
+  assert.equal(acked, 1);
+  assert.equal(store.get("E-mention-only"), undefined);
+  assert.equal(store.isActivated("slack:T1:thread:C1:1.0"), false);
+});
+
 test("persistence failure prevents acknowledgement", async () => {
   const db = createTestDatabase();
   const store = new SlackInboxStore(db);

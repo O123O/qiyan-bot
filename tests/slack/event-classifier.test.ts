@@ -36,6 +36,37 @@ test("accepts an owner DM with stable DM identity", () => {
   assert.equal(result.event.activate, false);
 });
 
+test("accepts a forwarded owner DM from shared attachment content", () => {
+  const result = classifySlackEvent(envelope({
+    type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "1710000000.000200", text: "",
+    attachments: [{
+      is_share: true,
+      is_msg_unfurl: true,
+      author_name: "Bob",
+      text: "Forwarded hello",
+    }],
+  }), context());
+  assert.equal(result.kind, "accept");
+  if (result.kind !== "accept") return;
+  assert.equal(result.event.rawText, "[Forwarded Slack message from Bob]\nForwarded hello");
+  assert.deepEqual(result.event.files, []);
+});
+
+test("discards a genuinely empty owner DM", () => {
+  const result = classifySlackEvent(envelope({
+    type: "message", channel_type: "im", channel: "D1", user: "U1", ts: "1710000000.000200", text: "", blocks: [], attachments: [],
+  }), context());
+  assert.equal(result.kind, "discard");
+});
+
+test("discards a mention-only activation after removing the routing mention", () => {
+  const result = classifySlackEvent(envelope({
+    type: "app_mention", channel_type: "channel", channel: "C1", user: "U1", ts: "1710000000.000200",
+    text: "<@B1>", blocks: [{ type: "rich_text", elements: [{ type: "rich_text_section", elements: [{ type: "user", user_id: "B1" }] }] }],
+  }), context());
+  assert.equal(result.kind, "discard");
+});
+
 test("a top-level owner mention activates its own thread and preserves pass payload", () => {
   const result = classifySlackEvent(envelope({
     type: "app_mention", channel: "C1", user: "U1", ts: "1710000000.000100", text: "<@B1> /pass  exact",

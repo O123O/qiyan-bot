@@ -77,7 +77,7 @@ export class SlackChatAdapter implements ChatAdapter {
     const event = record(value);
     const ack = event?.ack;
     if (!this.handler || typeof ack !== "function") return;
-    const body = reduceEnvelopeBody(event?.body);
+    const body = event?.body;
     const task = this.handler.handle({ body, ack: () => Promise.resolve(ack()) })
       .then(() => this.worker.drain())
       .catch(() => { this.options.onOperationalEvent?.({ level: "warn", code: "chat_ingress_failed", adapter: "slack", consecutiveFailures: 1 }); });
@@ -275,46 +275,6 @@ function transientSlackFailure(error: unknown): boolean {
   if (error instanceof AppError && error.code === "ATTACHMENT_INVALID") return false;
   if (!(error instanceof SlackApiError)) return true;
   return !error.deterministic || error.status === 429 || (error.status !== undefined && error.status >= 500);
-}
-
-function reduceEnvelopeBody(value: unknown): unknown {
-  const body = record(value);
-  const event = record(body?.event);
-  if (!body || !event) return {};
-  return {
-    type: body.type,
-    team_id: body.team_id,
-    event_id: body.event_id,
-    event_time: body.event_time,
-    event: {
-      type: event.type,
-      channel: event.channel,
-      channel_type: event.channel_type,
-      user: event.user,
-      ts: event.ts,
-      thread_ts: event.thread_ts,
-      text: event.text,
-      bot_id: event.bot_id,
-      app_id: event.app_id,
-      subtype: event.subtype,
-      hidden: event.hidden,
-      ...(Array.isArray(event.files) ? { files: event.files.map(reduceFile) } : {}),
-    },
-  };
-}
-
-function reduceFile(value: unknown): unknown {
-  const file = record(value);
-  if (!file) return {};
-  return {
-    id: file.id,
-    name: file.name,
-    title: file.title,
-    mimetype: file.mimetype,
-    size: file.size,
-    url_private: file.url_private,
-    url_private_download: file.url_private_download,
-  };
 }
 
 function record(value: unknown): Record<string, any> | undefined {
