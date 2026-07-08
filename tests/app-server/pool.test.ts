@@ -26,6 +26,7 @@ class AdmissionRaceEndpoint implements ManagedAppServerEndpoint {
   private armedRead: number | undefined;
   private stateReads = 0;
   starts = 0;
+  requests = 0;
   constructor(readonly id: string) {}
   get state(): ManagedAppServerEndpoint["state"] {
     if (this.armedRead !== undefined && ++this.stateReads >= this.armedRead) this.currentState = "unavailable";
@@ -39,6 +40,7 @@ class AdmissionRaceEndpoint implements ManagedAppServerEndpoint {
     return { kind: "ssh", token: "a".repeat(32), pid: 1, linuxStartTime: "1", processGroupId: 1 };
   }
   async request<T>(): Promise<T> {
+    this.requests += 1;
     return { thread: { status: "active", turns: [] } } as T;
   }
   onNotification(): () => void { return () => undefined; }
@@ -476,7 +478,7 @@ test("real ready-lease admission cannot activate after loss between predicate an
   pool.restoreObservedActiveTurn("devbox", "thread-b", "turn-b");
 
   await manager.withReadyWorkLease("devbox", async (lease) => {
-    remote.armUnavailableOnStateRead(4);
+    remote.armUnavailableOnStateRead(3);
     await pool.reconcileEndpointClaims(
       "devbox", lease, () => manager.validateReadyWorkLease(lease, "devbox"),
     );
@@ -484,6 +486,7 @@ test("real ready-lease admission cannot activate after loss between predicate an
 
   assert.equal(resolveCalls, 0);
   assert.equal(remote.starts, 1, "the published runtime is never restarted by stale claim recovery");
+  assert.equal(remote.requests, 0, "the unavailable endpoint is rejected at final admission before its RPC");
   assert.equal(pool.activeTurnCount, 2, "no later claim is reconciled after the loss");
 });
 
