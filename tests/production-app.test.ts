@@ -14,15 +14,18 @@ import {
   reconcileLifecycleTransitions,
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
+  recoverRemovalOperation,
+  recoverableOperationActivationReferences,
+  recoverableOperationEndpointReferences,
   recoverableOperationTarget,
   registryReloadPreservesWorkerMappings,
   removalRecoveryDecision,
   reportAssistantTerminalFailure,
   requestOperationRecoveryForAttempt,
   runAssistantTerminalRecovery,
+  runOperationRecoveryTarget,
   stopRelayRecovery,
   stopRecoveryOwnerSet,
-  withRecoveredSessionLease,
   withRelayEndpointWorkLease,
   type OperationReconciliationPass,
   type OperationRecoveryTarget,
@@ -32,6 +35,9 @@ import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
 import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
+import { createTestDatabase } from "../src/storage/database.ts";
+import { OperationStore } from "../src/storage/operation-store.ts";
+import { EndpointManager } from "../src/endpoints/manager.ts";
 
 test("operation recovery waits only for the exact in-process tool handler", () => {
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true }), "wait_for_tool");
@@ -45,7 +51,13 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     ["worker-a", "endpoint-a"],
     ["worker-b", "endpoint-b"],
   ]);
-  const resolve = { defaultProjectEndpointId: "local", sessionEndpoint: (nickname: string) => sessionEndpoints.get(nickname) };
+  const resolve = {
+    defaultProjectEndpointId: "local",
+    session: (nickname: string) => {
+      const endpoint = sessionEndpoints.get(nickname);
+      return endpoint ? { endpoint, thread_id: `thread-${nickname}`, project_dir: "/project", mapping_id: `mapping-${nickname}`, lifecycle_state: "managed" as const } : undefined;
+    },
+  };
   const target = (kind: string, args: Record<string, unknown> = {}, receipt?: unknown) => recoverableOperationTarget({ kind, args, ...(receipt === undefined ? {} : { receipt }) }, resolve);
   const localKinds = [
     "update_session_notes", "send_chat_message", "send_chat_attachment", "collect_messages",
@@ -58,12 +70,13 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" }, kind);
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, `${kind} checkpoint`);
   }
+  assert.deepEqual(target("create_session", { endpoint: "" }), { policy: "ready_endpoint", endpointId: "local" });
   assert.deepEqual(target("send_to_session", { nickname: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
   for (const kind of ["set_goal", "pause_goal", "resume_goal", "cancel_goal", "interrupt_session"]) {
     assert.deepEqual(target(kind, { nickname: "worker-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, kind);
   }
   for (const kind of ["unadopt_session", "archive_session"]) {
-    assert.deepEqual(target(kind, { nickname: "worker-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, kind);
+    assert.deepEqual(target(kind, { nickname: "worker-a" }, { endpoint: "endpoint-b" }), { policy: "local" }, kind);
   }
   for (const kind of ["disconnect_endpoint", "restart_endpoint"]) {
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-a" }, kind);
@@ -71,6 +84,135 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   }
   assert.deepEqual(target("future_operation", { endpoint: "endpoint-a" }), { policy: "unknown" });
   assert.deepEqual(target("send_to_session", { nickname: "missing" }), { policy: "unknown" });
+  assert.deepEqual(recoverableOperationEndpointReferences([
+    { kind: "create_session", args: {}, receipt: undefined },
+    { kind: "restart_endpoint", args: { endpoint: "endpoint-b" }, receipt: undefined },
+    { kind: "future_operation", args: { endpoint: "endpoint-a" }, receipt: undefined },
+    { kind: "adopt_session", args: { endpoint: "endpoint-b" }, receipt: undefined },
+  ], resolve), ["endpoint-b"]);
+  assert.deepEqual(recoverableOperationActivationReferences([
+    { kind: "restart_endpoint", args: { endpoint: "endpoint-b" }, receipt: undefined },
+    { kind: "disconnect_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
+    { kind: "future_operation", args: { endpoint: "endpoint-a" }, receipt: undefined },
+  ], resolve), []);
+  assert.deepEqual(recoverableOperationEndpointReferences([
+    { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
+  ], resolve), ["endpoint-a"], "lifecycle targets pin identity without eager activation");
+});
+
+test("durable operation endpoints survive restart as startup identity references", async () => {
+  const db = createTestDatabase();
+  const beforeRestart = new OperationStore(db);
+  const operation = beforeRestart.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session",
+    args: { nickname: "worker", endpoint: "devbox", project_dir: "/project" },
+  });
+  beforeRestart.markDispatched(operation.id);
+  beforeRestart.checkpoint(operation.id, { endpoint: "devbox", dispatchStarted: true, projectDir: "/project" });
+
+  const afterRestart = new OperationStore(db);
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const references = recoverableOperationEndpointReferences(afterRestart.listRecoverable(), resolver);
+  const activationReferences = recoverableOperationActivationReferences(afterRestart.listRecoverable(), resolver);
+  assert.deepEqual(references, ["devbox"]);
+  assert.deepEqual(activationReferences, ["devbox"]);
+
+  const listeners = () => () => undefined;
+  const local = {
+    id: "local", state: "stopped" as const, start: async () => undefined, closeConnection: async () => undefined,
+    shutdownRuntime: async () => undefined, runtimeIdentity: async () => ({ kind: "local" as const, pid: 1, startTime: "1" }),
+    request: async () => ({}), onNotification: listeners, onReady: listeners, onUnavailable: listeners, onPermissionBlocked: listeners,
+  };
+  let remoteState: "stopped" | "ready" = "stopped";
+  let remoteStarts = 0;
+  const remote = {
+    id: "devbox", get state() { return remoteState; },
+    start: async () => { remoteStarts += 1; remoteState = "ready"; }, closeConnection: async () => undefined,
+    shutdownRuntime: async () => undefined,
+    runtimeIdentity: async () => ({ kind: "ssh" as const, token: "a".repeat(32), pid: 1, linuxStartTime: "1", processGroupId: 1 }),
+    request: async () => ({}), onNotification: listeners, onReady: listeners, onUnavailable: listeners, onPermissionBlocked: listeners,
+  };
+  const identityReferenceChecks: boolean[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local as never,
+    catalog: { reload: async () => undefined, require: (id: string) => ({ id, type: "ssh" as const, projectsRoot: "~/projects" }) },
+    createRemote: async (_definition, hasReferences) => { identityReferenceChecks.push(hasReferences); return { endpoint: remote as never }; },
+    hasIdentityReferences: (endpointId) => references.includes(endpointId),
+    managedThreadIds: () => [],
+  });
+  assert.deepEqual(await manager.activateReferenced(activationReferences), { unavailable: [] });
+  assert.equal(remoteStarts, 1);
+  assert.deepEqual(identityReferenceChecks, [true]);
+
+  const target = recoverableOperationTarget(afterRestart.listRecoverable()[0]!, resolver);
+  let recovered = false;
+  await runOperationRecoveryTarget(target, manager, async (lease) => {
+    assert.equal(lease?.endpointId, "devbox");
+    recovered = true;
+  });
+  assert.equal(recovered, true);
+});
+
+test("removal recovery concludes locally and leases only an actionable reconciliation", async () => {
+  const saved = {
+    endpoint: "devbox", thread_id: "thread", project_dir: "/project", mapping_id: "mapping",
+    lifecycle_state: "archiving" as const, step: "transitioned",
+  };
+  const operation = { id: "op", kind: "archive_session", args: { nickname: "worker" }, receipt: saved } as const;
+  let endpointCalls = 0;
+  let succeeded = 0;
+  let failed = 0;
+  const unavailableEndpoints = {
+    withReadyWorkLease: async () => { endpointCalls += 1; throw new Error("must not touch endpoint"); },
+  };
+  const localTarget = recoverableOperationTarget(operation as never, { defaultProjectEndpointId: "local", session: () => undefined });
+  await runOperationRecoveryTarget(localTarget, unavailableEndpoints as never, (lease) => recoverRemovalOperation({
+    operation: operation as never,
+    registry: { get: () => undefined } as never,
+    lifecycle: { reconcileRemoval: async () => { endpointCalls += 1; } } as never,
+    ...(lease ? { lease } : {}),
+    succeed: async () => { succeeded += 1; },
+    failNoEffect: () => { failed += 1; },
+  }));
+  assert.deepEqual({ endpointCalls, succeeded, failed }, { endpointCalls: 0, succeeded: 1, failed: 0 });
+
+  const prepared = { ...saved, lifecycle_state: "managed" as const, step: "prepared" };
+  const preparedOperation = { ...operation, kind: "unadopt_session", receipt: prepared } as const;
+  const preparedSession = { ...prepared, lifecycle_state: "managed" as const };
+  const preparedTarget = recoverableOperationTarget(preparedOperation as never, {
+    defaultProjectEndpointId: "local", session: () => preparedSession,
+  });
+  await runOperationRecoveryTarget(preparedTarget, unavailableEndpoints as never, (lease) => recoverRemovalOperation({
+    operation: preparedOperation as never,
+    registry: { get: () => preparedSession } as never,
+    lifecycle: { reconcileRemoval: async () => { endpointCalls += 1; } } as never,
+    ...(lease ? { lease } : {}),
+    succeed: async () => { succeeded += 1; },
+    failNoEffect: () => { failed += 1; },
+  }));
+  assert.deepEqual(preparedTarget, { policy: "local" });
+  assert.deepEqual({ endpointCalls, succeeded, failed }, { endpointCalls: 0, succeeded: 1, failed: 1 });
+
+  const transitioning = { ...saved, lifecycle_state: "archiving" as const };
+  const reconcileOperation = { ...operation, receipt: transitioning };
+  const reconcileTarget = recoverableOperationTarget(reconcileOperation as never, {
+    defaultProjectEndpointId: "local",
+    session: () => transitioning,
+  });
+  const lease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "removal" };
+  await runOperationRecoveryTarget(reconcileTarget, {
+    withReadyWorkLease: async (_endpointId: string | undefined, run: (lease: EndpointWorkLease) => Promise<unknown>) => { endpointCalls += 1; return run(lease); },
+  } as never, (actual) => recoverRemovalOperation({
+    operation: reconcileOperation as never,
+    registry: { get: () => transitioning } as never,
+    lifecycle: { reconcileRemoval: async (_nickname: string, _current: unknown, received: unknown) => {
+      assert.equal(received, lease);
+    } } as never,
+    ...(actual ? { lease: actual } : {}),
+    succeed: async () => undefined,
+    failNoEffect: () => undefined,
+  }));
+  assert.equal(endpointCalls, 1);
 });
 
 test("ordinary operation recovery waits without endpoint activation while lifecycle work remains actionable", () => {
@@ -344,19 +486,6 @@ test("production chat history resolves the immutable assistant-attempt binding",
   const action = createChatHistoryAction(() => registry, (attemptId) => { assert.equal(attemptId, "attempt-1"); return binding; });
   assert.deepEqual(await action({ scope: "channel", count: 5 }, { attemptId: "attempt-1" }), { messages: [] });
   assert.deepEqual(seen, [{ actualBinding: binding, request: { scope: "channel", count: 5 } }]);
-});
-
-test("session operation recovery holds one endpoint lease for its complete callback", async () => {
-  const lease: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
-  let acquisitions = 0;
-  const result = await withRecoveredSessionLease({
-    withReadyWorkLease: async (_id, run) => { acquisitions += 1; return run(lease); },
-  }, "devbox", async (actual) => {
-    assert.equal(actual, lease);
-    return "recovered";
-  });
-  assert.equal(result, "recovered");
-  assert.equal(acquisitions, 1);
 });
 
 test("production relay work reuses the identical existing endpoint lease", async () => {

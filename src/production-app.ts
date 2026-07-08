@@ -125,7 +125,7 @@ export type OperationRecoveryTarget =
 
 interface OperationRecoveryTargetResolver {
   readonly defaultProjectEndpointId: string;
-  sessionEndpoint(nickname: string): string | undefined;
+  session(nickname: string): RegistrySession | undefined;
 }
 
 function stringField(value: unknown, key: string): string | undefined {
@@ -141,12 +141,12 @@ export function recoverableOperationTarget(
   const args = operation.args && typeof operation.args === "object" ? operation.args as Record<string, unknown> : {};
   const sessionTarget = (nickname: unknown): OperationRecoveryTarget => {
     if (typeof nickname !== "string") return { policy: "unknown" };
-    const endpointId = resolver.sessionEndpoint(nickname);
+    const endpointId = resolver.session(nickname)?.endpoint;
     return endpointId ? { policy: "ready_endpoint", endpointId } : { policy: "unknown" };
   };
   const projectTarget = (): OperationRecoveryTarget => ({
     policy: "ready_endpoint",
-    endpointId: stringField(operation.receipt, "endpoint") ?? (typeof args.endpoint === "string" ? args.endpoint : resolver.defaultProjectEndpointId),
+    endpointId: stringField(operation.receipt, "endpoint") ?? stringField(args, "endpoint") ?? resolver.defaultProjectEndpointId,
   });
   switch (operation.kind) {
     case "update_session_notes":
@@ -171,18 +171,50 @@ export function recoverableOperationTarget(
       return sessionTarget(args.nickname);
     case "unadopt_session":
     case "archive_session": {
-      const endpointId = stringField(operation.receipt, "endpoint");
-      return endpointId ? { policy: "ready_endpoint", endpointId } : sessionTarget(args.nickname);
+      const saved = operation.receipt as (Partial<RegistrySession> & { step?: string; nickname?: string }) | undefined;
+      const nickname = saved?.nickname ?? args.nickname;
+      if (typeof nickname !== "string") return { policy: "unknown" };
+      const current = resolver.session(nickname);
+      const decision = removalRecoveryDecision(operation.kind, saved, current);
+      if (decision === "succeeded" || decision === "no_effect") return { policy: "local" };
+      if (decision !== "reconcile") return { policy: "unknown" };
+      const endpointId = stringField(saved, "endpoint") ?? current?.endpoint;
+      return endpointId ? { policy: "ready_endpoint", endpointId } : { policy: "unknown" };
     }
     case "disconnect_endpoint":
     case "restart_endpoint":
       return {
         policy: "endpoint_lifecycle",
-        endpointId: stringField(operation.receipt, "endpoint") ?? (typeof args.endpoint === "string" ? args.endpoint : resolver.defaultProjectEndpointId),
+        endpointId: stringField(operation.receipt, "endpoint") ?? stringField(args, "endpoint") ?? resolver.defaultProjectEndpointId,
       };
     default:
       return { policy: "unknown" };
   }
+}
+
+export function recoverableOperationEndpointReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if ((target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle")
+      && target.endpointId !== resolver.defaultProjectEndpointId) references.add(target.endpointId);
+  }
+  return [...references].sort();
+}
+
+export function recoverableOperationActivationReferences(
+  operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
+  resolver: OperationRecoveryTargetResolver,
+): string[] {
+  const references = new Set<string>();
+  for (const operation of operations) {
+    const target = recoverableOperationTarget(operation, resolver);
+    if (target.policy === "ready_endpoint" && target.endpointId !== resolver.defaultProjectEndpointId) references.add(target.endpointId);
+  }
+  return [...references].sort();
 }
 
 export type OperationRecoveryPreflight = "attempt" | "wait_for_endpoint" | "sleep";
@@ -194,6 +226,14 @@ export function operationRecoveryPreflight(
   if (target.policy === "unknown") return "sleep";
   if (target.policy === "ready_endpoint" && !isEndpointReady(target.endpointId)) return "wait_for_endpoint";
   return "attempt";
+}
+
+export function runOperationRecoveryTarget<T>(
+  target: OperationRecoveryTarget,
+  endpoints: Pick<EndpointManager, "withReadyWorkLease">,
+  recover: (lease?: EndpointWorkLease) => Promise<T>,
+): Promise<T> {
+  return target.policy === "ready_endpoint" ? endpoints.withReadyWorkLease(target.endpointId, recover) : recover();
 }
 
 export type OperationRecoveryFailureDisposition = "retry" | "wait_for_endpoint" | "sleep";
@@ -396,6 +436,32 @@ export function removalRecoveryDecision(
   return "pending";
 }
 
+export async function recoverRemovalOperation(options: {
+  operation: Pick<RecoverableOperation, "id" | "kind" | "args" | "receipt">;
+  registry: Pick<SessionRegistry, "get">;
+  lifecycle: Pick<SessionLifecycle, "reconcileRemoval">;
+  lease?: EndpointWorkLease;
+  succeed(receipt: unknown): void | Promise<void>;
+  failNoEffect(): void;
+}): Promise<RemovalRecoveryDecision> {
+  if (options.operation.kind !== "unadopt_session" && options.operation.kind !== "archive_session") return "pending";
+  const saved = options.operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
+  const args = options.operation.args && typeof options.operation.args === "object" ? options.operation.args as Record<string, unknown> : {};
+  const nickname = saved?.nickname ?? args.nickname;
+  if (typeof nickname !== "string") return "pending";
+  let current = options.registry.get(nickname);
+  let decision = removalRecoveryDecision(options.operation.kind, saved, current);
+  if (decision === "reconcile") {
+    if (!options.lease) throw new AppError("ENDPOINT_UNAVAILABLE", "removal recovery requires a ready endpoint lease");
+    await options.lifecycle.reconcileRemoval(nickname, current!, options.lease);
+    current = options.registry.get(nickname);
+    decision = removalRecoveryDecision(options.operation.kind, saved, current);
+  }
+  if (decision === "succeeded") await options.succeed({ nickname, mapping_id: saved!.mapping_id });
+  else if (decision === "no_effect") options.failNoEffect();
+  return decision;
+}
+
 export function registryReloadPreservesWorkerMappings(current: RegistryDocument, candidate: RegistryDocument): boolean {
   return isDeepStrictEqual(current.sessions, candidate.sessions);
 }
@@ -415,14 +481,6 @@ export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: st
   try {
     return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
   } catch { return undefined; }
-}
-
-export function withRecoveredSessionLease<T>(
-  endpoints: Pick<EndpointManager, "withReadyWorkLease">,
-  endpointId: string,
-  recover: (lease: EndpointWorkLease) => Promise<T>,
-): Promise<T> {
-  return endpoints.withReadyWorkLease(endpointId, recover);
 }
 
 type LifecycleRecoveryFailure = (nickname: string, session: RegistrySession, error: unknown) => void | Promise<void>;
@@ -1195,6 +1253,7 @@ export async function buildProductionApp(
         const referencedEndpoints = [...new Set([
           ...Object.values(registry.snapshot().sessions).map((session) => session.endpoint),
           ...recoveredEndpointIds,
+          ...recoverableActivationReferences(),
         ])].filter((id) => id !== "local" && id !== assistantEndpoint.id);
         const activation = await endpointManager.activateReferenced(referencedEndpoints);
         await reconcileOperations();
@@ -1655,7 +1714,23 @@ export async function buildProductionApp(
   function hasEndpointIdentityReferences(endpointId: string): boolean {
     return Object.values(registry.snapshot().sessions).some((session) => session.endpoint === endpointId)
       || Boolean(pool?.hasClaims(endpointId))
-      || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId));
+      || Boolean(operations?.listRecoverable().some((operation) => recoverableCapacityHint(operation)?.endpoint === endpointId))
+      || recoverableEndpointReferences().includes(endpointId);
+  }
+
+  function recoverableEndpointReferences(): string[] {
+    if (!operations || !registry) return [];
+    return recoverableOperationEndpointReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }).filter((endpointId) => endpointId !== assistantEndpoint?.id);
+  }
+
+  function recoverableActivationReferences(): string[] {
+    return recoverableOperationActivationReferences(operations.listRecoverable(), {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => registry.get(nickname),
+    }).filter((endpointId) => endpointId !== assistantEndpoint.id);
   }
 
   function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
@@ -1819,7 +1894,7 @@ export async function buildProductionApp(
       if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") continue;
       const target = recoverableOperationTarget(operation, {
         defaultProjectEndpointId: endpoint.id,
-        sessionEndpoint: (nickname) => registry.get(nickname)?.endpoint,
+        session: (nickname) => registry.get(nickname),
       });
       const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
       if (preflight === "sleep") continue;
@@ -1927,58 +2002,60 @@ export async function buildProductionApp(
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
           const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
-          await withRecoveredSessionLease(endpointManager, recoveryEndpointId, async (lease) => {
-            let session = registry.get(args.nickname);
-            if (project) {
-              await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
-            }
-            const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
-            const expectedDir = project?.path;
-            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
-              failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+          if (!recoveryLease || recoveryLease.endpointId !== recoveryEndpointId) {
+            throw new AppError("ENDPOINT_UNAVAILABLE", "session recovery endpoint lease changed");
+          }
+          const lease = recoveryLease;
+          let session = registry.get(args.nickname);
+          if (project) {
+            await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
+          }
+          const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
+          const expectedDir = project?.path;
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
+            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
+            return;
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
+            const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
+              .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
+            if (candidates.length === 0) {
+              failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
               return;
             }
-            if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
-              const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
-                .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
-              if (candidates.length === 0) {
-                failRecoveredNoEffect(operation.id, "worker discovery proved the requested thread was not created");
-                return;
-              }
-              if (candidates.length !== 1) return;
-              checkpoint.threadId = candidates[0]!.id;
-              operations.checkpoint(operation.id, checkpoint);
-            }
-            if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
-              if (!checkpoint.mappingId) return;
-              await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
-                if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
-                hydrateThreadOrder(recoveryEndpointId, thread);
-              }, checkpoint.mappingId, lease);
-              session = registry.get(args.nickname);
-            }
-            if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
-              await lifecycle.reconcileAdopting({ nickname: args.nickname, endpointId: recoveryEndpointId, existingLease: lease });
-              session = registry.get(args.nickname);
-            }
-            if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
-              && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
-              const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-              const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
-                ? await lifecycle.reconcileManaged(args.nickname, session, lease)
-                : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
-              await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
-              hydrateThreadOrder(session.endpoint, native.thread);
-              await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
-                advanceNativeWatermark(args.nickname);
-                observeLifecycle(args.nickname);
-                const currentSettings = (checkpoint as any)?.currentSettings;
-                if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
-              });
-            } else if (!session && operation.kind !== "create_session") {
-              failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
-            }
-          });
+            if (candidates.length !== 1) return;
+            checkpoint.threadId = candidates[0]!.id;
+            operations.checkpoint(operation.id, checkpoint);
+          }
+          if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
+            if (!checkpoint.mappingId) return;
+            await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+              hydrateThreadOrder(recoveryEndpointId, thread);
+            }, checkpoint.mappingId, lease);
+            session = registry.get(args.nickname);
+          }
+          if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
+            await lifecycle.reconcileAdopting({ nickname: args.nickname, endpointId: recoveryEndpointId, existingLease: lease });
+            session = registry.get(args.nickname);
+          }
+          if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
+            && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
+            const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+            const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
+              ? await lifecycle.reconcileManaged(args.nickname, session, lease)
+              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
+            await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
+            hydrateThreadOrder(session.endpoint, native.thread);
+            await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
+              advanceNativeWatermark(args.nickname);
+              observeLifecycle(args.nickname);
+              const currentSettings = (checkpoint as any)?.currentSettings;
+              if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+            });
+          } else if (!session && operation.kind !== "create_session") {
+            failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
+          }
         } else if (operation.kind === "rename_session") {
           const saved = operation.receipt as Partial<RegistrySession> | undefined;
           const oldMapping = registry.get(args.old_nickname);
@@ -1989,20 +2066,14 @@ export async function buildProductionApp(
             failRecoveredNoEffect(operation.id, "atomic nickname replacement was not committed");
           }
         } else if (operation.kind === "unadopt_session" || operation.kind === "archive_session") {
-          const saved = operation.receipt as (Partial<RegistrySession> & { nickname?: string; step?: string }) | undefined;
-          const nickname = saved?.nickname ?? args.nickname;
-          let current = registry.get(nickname);
-          let decision = removalRecoveryDecision(operation.kind, saved, current);
-          if (decision === "reconcile") {
-            await lifecycle.reconcileRemoval(nickname, current!, recoveryLease);
-            current = registry.get(nickname);
-            decision = removalRecoveryDecision(operation.kind, saved, current);
-          }
-          if (decision === "succeeded") {
-            await succeedRecovered(operation, { nickname, mapping_id: saved!.mapping_id }, () => dashboardStore.markDirty());
-          } else if (decision === "no_effect") {
-            failRecoveredNoEffect(operation.id, "durable removal transition was not committed");
-          }
+          await recoverRemovalOperation({
+            operation,
+            registry,
+            lifecycle,
+            ...(recoveryLease ? { lease: recoveryLease } : {}),
+            succeed: (receipt) => succeedRecovered(operation, receipt, () => dashboardStore.markDirty()),
+            failNoEffect: () => failRecoveredNoEffect(operation.id, "durable removal transition was not committed"),
+          });
         } else if (["set_goal", "pause_goal", "resume_goal", "cancel_goal"].includes(operation.kind)) {
           const session = registry.get(args.nickname);
           if (!session) return;
@@ -2039,8 +2110,7 @@ export async function buildProductionApp(
           });
         }
         };
-        if (target.policy === "ready_endpoint") await endpointManager.withReadyWorkLease(target.endpointId, recover);
-        else await recover();
+        await runOperationRecoveryTarget(target, endpointManager, recover);
       } catch (error) {
         const disposition = operationRecoveryFailureDisposition(error);
         const current = operations.get(operation.id);
@@ -2069,6 +2139,7 @@ export async function buildProductionApp(
       endpointId: session.endpoint,
       projectRoot: session.project_dir,
       mapping: session,
+      ...(recoveryLease ? { lease: recoveryLease } : {}),
       scopeId,
       relativePath,
       requestedId,
