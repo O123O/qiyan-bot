@@ -13,6 +13,7 @@ export class AttachmentCleanup {
   private generation = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<void> | undefined;
+  private starting: Promise<void> | undefined;
 
   constructor(
     private readonly cleanup: () => Promise<number>,
@@ -22,10 +23,20 @@ export class AttachmentCleanup {
   ) {}
 
   async start(): Promise<void> {
-    if (!this.stopped) return;
+    if (!this.stopped) {
+      await (this.starting ?? this.running);
+      return;
+    }
     this.stopped = false;
     this.generation += 1;
-    await this.run(this.generation);
+    const generation = this.generation;
+    const draining = this.running;
+    let starting: Promise<void>;
+    starting = this.startGeneration(generation, draining).finally(() => {
+      if (this.starting === starting) this.starting = undefined;
+    });
+    this.starting = starting;
+    await starting;
   }
 
   async stop(): Promise<void> {
@@ -33,6 +44,12 @@ export class AttachmentCleanup {
     if (this.timer !== undefined) this.timers.clearTimeout(this.timer);
     this.timer = undefined;
     await this.running;
+  }
+
+  private async startGeneration(generation: number, draining: Promise<void> | undefined): Promise<void> {
+    if (draining) await draining;
+    if (this.stopped || generation !== this.generation) return;
+    await this.run(generation);
   }
 
   private run(generation: number): Promise<void> {
