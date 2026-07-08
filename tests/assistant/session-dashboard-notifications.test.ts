@@ -4,10 +4,14 @@ import { SessionObservationProcessor } from "../../src/assistant/session-observe
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
+import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 
 const mappingId = "mapping-1";
 
-function fixture(options: { readThread?: () => Promise<any>; readGoal?: () => Promise<any> } = {}) {
+function fixture(options: {
+  readThread?: (endpointId: string, threadId: string, lease?: EndpointWorkLease) => Promise<any>;
+  readGoal?: () => Promise<any>;
+} = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
   const runtime = new RuntimeStore(db);
@@ -191,4 +195,29 @@ test("terminal observation stores only metadata and cannot clear a newer active 
   assert.deepEqual(value.store.facts({ endpointId: "local", threadId: "thread-1" }).lastWorkerEvent, {
     message_id: "message-1", turn_id: "old", status: "completed", at: "1970-01-01T00:00:02.000Z",
   });
+});
+
+test("terminal ordinal hydration passes through an existing endpoint lease", async () => {
+  const existingLease: EndpointWorkLease = {
+    endpointId: "local", lifecycleGeneration: 2, endpointGeneration: 3, leaseId: "terminal-observation",
+  };
+  const seen: Array<EndpointWorkLease | undefined> = [];
+  const value = fixture({
+    readThread: async (_endpointId, _threadId, lease) => {
+      seen.push(lease);
+      return { turns: [{ id: "terminal", startedAt: 1 }] };
+    },
+  });
+
+  await value.processor.observeTerminal({
+    endpointId: "local",
+    threadId: "thread-1",
+    turnId: "terminal",
+    status: "completed",
+    startedAt: 1,
+    completedAt: 2,
+    finalMessageId: "message-terminal",
+  }, existingLease);
+
+  assert.deepEqual(seen, [existingLease]);
 });

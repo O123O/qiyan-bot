@@ -230,6 +230,16 @@ export function withRelayEndpointWorkLease<T>(
   });
 }
 
+export async function stopRelayRecovery(
+  relay: Pick<EventRelay, "stop">,
+  observations: Pick<SessionObservationProcessor, "idle">,
+  finishDashboard: () => Promise<void>,
+): Promise<void> {
+  await relay.stop();
+  await observations.idle();
+  await finishDashboard();
+}
+
 export async function buildProductionApp(
   config: BotConfig,
   options: {
@@ -731,7 +741,13 @@ export async function buildProductionApp(
         sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
-          readThread: async (endpointId, threadId) => (await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true })).thread,
+          readThread: async (endpointId, threadId, lease) => (await pool.request<any>(
+            endpointId,
+            "thread/read",
+            { threadId, includeTurns: true },
+            undefined,
+            lease,
+          )).thread,
           readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
           onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
           onError: () => recordBackgroundFailure("session observation"),
@@ -739,7 +755,7 @@ export async function buildProductionApp(
         relay = new EventRelay(db, pool, registry, runtime, finals, deliveries, {
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
-          onTerminal: (event) => observations.observeTerminal(event),
+          onTerminal: (event, lease) => observations.observeTerminal(event, lease),
           withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
             endpointManager,
             endpointId,
@@ -784,8 +800,6 @@ export async function buildProductionApp(
         for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
         for (const subscriptions of projectEndpointSubscriptions.values()) for (const unsubscribe of subscriptions) unsubscribe();
         projectEndpointSubscriptions.clear();
-        await relay.stop();
-        await observations.idle();
       },
     },
     {
@@ -817,7 +831,10 @@ export async function buildProductionApp(
     {
       name: "reconciliation",
       start: async () => { acceptingReadyEvents = false; },
-      stop: async () => { acceptingReadyEvents = false; await observations.idle(); await renderDashboardSafely(); },
+      stop: async () => {
+        acceptingReadyEvents = false;
+        await stopRelayRecovery(relay, observations, renderDashboardSafely);
+      },
     },
     {
       name: "assistant",

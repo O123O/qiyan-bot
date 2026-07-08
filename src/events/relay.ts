@@ -71,6 +71,7 @@ export class EventRelay {
   private readonly endpointTails = new Map<string, Promise<void>>();
   private readonly endpointGenerations = new Map<string, number>();
   private readonly unavailableEndpoints = new Set<string>();
+  private readonly scanPendingEndpoints = new Set<string>();
   private stopped = false;
 
   constructor(
@@ -83,7 +84,7 @@ export class EventRelay {
     private readonly options: {
       binding(): ConversationBinding;
       clock: Clock;
-      onTerminal?(event: TerminalObservation): void | Promise<void>;
+      onTerminal?(event: TerminalObservation, lease: EndpointWorkLease): void | Promise<void>;
       withEndpointWorkLease<T>(
         endpointId: string,
         existingLease: EndpointWorkLease | undefined,
@@ -104,8 +105,8 @@ export class EventRelay {
   ): Promise<RelayOutcome> {
     if (method !== "turn/completed" || this.stopped) return "conclusively_ignored";
     const threadId = String(params.threadId);
-    const notifiedTurn = params.turn as TerminalTurn;
-    const target = await this.gate.run(endpointId, threadId, async () => this.captureTarget(endpointId, threadId, notifiedTurn.id));
+    const turnId = String(params.turn.id);
+    const target = await this.gate.run(endpointId, threadId, async () => this.captureTarget(endpointId, threadId, turnId));
     if (!target || this.stopped) return "conclusively_ignored";
     this.retryTargets.set(relayTargetKey(target), target);
     return this.enqueueEndpoint(endpointId, async () => {
@@ -113,7 +114,7 @@ export class EventRelay {
       const generation = this.endpointGeneration(endpointId);
       const outcome = this.unavailableEndpoints.has(endpointId)
         ? "retry"
-        : await this.classifyOne(target, notifiedTurn, lease, generation);
+        : await this.classifyOne(target, lease, generation);
       return this.settleTarget(target, outcome, generation);
     });
   }
@@ -159,18 +160,18 @@ export class EventRelay {
     this.unavailableEndpoints.delete(endpointId);
     const generation = this.advanceEndpointGeneration(endpointId);
     this.clearRetryTimer(endpointId);
+    this.scanPendingEndpoints.add(endpointId);
     await this.enqueueEndpoint(endpointId, async () => {
       if (!this.runIsCurrent(endpointId, generation)) return;
-      const retained = this.targetsForEndpoint(endpointId);
       try {
         await this.options.withEndpointWorkLease(endpointId, lease, async (activeLease) => {
-          await this.reconcileHistory(endpointId, activeLease, generation);
-          for (const target of retained) {
+          const complete = await this.reconcileHistory(endpointId, activeLease, generation);
+          if (complete && this.runIsCurrent(endpointId, generation)) this.scanPendingEndpoints.delete(endpointId);
+          for (const target of this.targetsForEndpoint(endpointId)) {
             if (!this.runIsCurrent(endpointId, generation)) return;
             if (!this.retryTargets.has(relayTargetKey(target))) continue;
             const outcome = await this.gate.run(endpointId, target.threadId, () => this.projectTarget(
               target,
-              undefined,
               activeLease,
               generation,
             ));
@@ -178,7 +179,6 @@ export class EventRelay {
           }
         });
       } catch (error) {
-        for (const target of retained) this.settleTarget(target, "retry", generation, false);
         this.scheduleRetry(endpointId);
         throw error;
       }
@@ -194,6 +194,8 @@ export class EventRelay {
     this.stopped = true;
     for (const endpointId of this.retryTimers.keys()) this.clearRetryTimer(endpointId);
     this.retryTargets.clear();
+    this.scanPendingEndpoints.clear();
+    this.retryAttempts.clear();
     await Promise.allSettled([...this.endpointTails.values()]);
   }
 
@@ -213,7 +215,6 @@ export class EventRelay {
 
   private async classifyOne(
     target: RelayTarget,
-    notifiedTurn: TerminalTurn,
     lease: EndpointWorkLease | undefined,
     generation: number,
   ): Promise<RelayOutcome> {
@@ -221,7 +222,7 @@ export class EventRelay {
       return await this.options.withEndpointWorkLease(target.endpointId, lease, (activeLease) => this.gate.run(
         target.endpointId,
         target.threadId,
-        () => this.projectTarget(target, notifiedTurn, activeLease, generation),
+        () => this.projectTarget(target, activeLease, generation),
       ));
     } catch {
       return "retry";
@@ -230,7 +231,6 @@ export class EventRelay {
 
   private async projectTarget(
     target: RelayTarget,
-    _notifiedTurn: TerminalTurn | undefined,
     lease: EndpointWorkLease,
     generation: number,
   ): Promise<RelayOutcome> {
@@ -272,21 +272,25 @@ export class EventRelay {
     if (!this.isTerminal(turn.status)) return "retry";
     if (this.ownership && !this.ownership.ownsTurn(current.session, turn.id)) return "conclusively_ignored";
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    return this.commitTerminal(target, turn);
+    return this.commitTerminal(target, turn, lease);
   }
 
-  private async reconcileHistory(endpointId: string, lease: EndpointWorkLease, generation: number): Promise<void> {
+  private async reconcileHistory(endpointId: string, lease: EndpointWorkLease, generation: number): Promise<boolean> {
+    let complete = true;
     for (const session of Object.values(this.registry.managedSnapshot().sessions)) {
-      if (session.endpoint !== endpointId || !this.runIsCurrent(endpointId, generation)) continue;
-      await this.gate.run(endpointId, session.thread_id, async () => {
+      if (session.endpoint !== endpointId) continue;
+      if (!this.runIsCurrent(endpointId, generation)) return false;
+      const sessionComplete = await this.gate.run(endpointId, session.thread_id, async () => {
         const mapping = this.mapping(endpointId, session.thread_id);
         const state = mapping ? this.runtime.getSession(endpointId, session.thread_id, mapping.session.mapping_id) : undefined;
         const epoch = mapping ? this.runtime.currentEpoch(endpointId, session.thread_id, mapping.session.mapping_id) : undefined;
-        if (!mapping || mapping.session.mapping_id !== session.mapping_id || mapping.session.lifecycle_state !== "managed"
-          || !state || !this.isDeliverableState(state.managementState) || !epoch) return;
+        if (!mapping) return true;
+        if (mapping.session.mapping_id !== session.mapping_id) return false;
+        if (mapping.session.lifecycle_state !== "managed"
+          || !state || !this.isDeliverableState(state.managementState) || !epoch) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
         const before = await this.inspectOwnership(session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || before.state === "unclassified") return;
+        if (!this.runIsCurrent(endpointId, generation) || before.state === "unclassified") return false;
         const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
           endpointId,
           "thread/read",
@@ -294,15 +298,16 @@ export class EventRelay {
           undefined,
           lease,
         );
-        if (!this.runIsCurrent(endpointId, generation)) return;
+        if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
-        if (!current || current.session.mapping_id !== session.mapping_id) return;
+        if (!current) return true;
+        if (current.session.mapping_id !== session.mapping_id) return false;
         const after = await this.inspectOwnership(current.session, lease);
         if (!this.runIsCurrent(endpointId, generation) || after.state === "unclassified"
-          || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return;
+          || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
         const turns = response.thread.turns;
         let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
-        if (epoch.baselineTurnId && index === 0) return;
+        if (epoch.baselineTurnId && index === 0) return false;
         if (state.deliveryCursor) {
           const cursorIndex = turns.findIndex((turn) => turn.id === state.deliveryCursor);
           if (cursorIndex >= 0) index = Math.max(index, cursorIndex + 1);
@@ -310,7 +315,9 @@ export class EventRelay {
         for (const turn of turns.slice(index)) {
           if (!this.isTerminal(turn.status)) break;
           if (this.ownership && !this.ownership.ownsTurn(current.session, turn.id)) {
+            if (!this.runIsCurrent(endpointId, generation)) return false;
             this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
+            if (!this.runIsCurrent(endpointId, generation)) return false;
             this.retryTargets.delete(relayTargetKey({
               endpointId,
               threadId: session.thread_id,
@@ -320,7 +327,7 @@ export class EventRelay {
             }));
             continue;
           }
-          if (!this.runIsCurrent(endpointId, generation)) return;
+          if (!this.runIsCurrent(endpointId, generation)) return false;
           const target: RelayTarget = {
             endpointId,
             threadId: session.thread_id,
@@ -328,16 +335,22 @@ export class EventRelay {
             mappingId: session.mapping_id,
             epochId: epoch.id,
           };
-          const outcome = await this.commitTerminal(target, turn);
-          if (outcome !== "handled") return;
+          this.retryTargets.set(relayTargetKey(target), target);
+          const outcome = await this.commitTerminal(target, turn, lease);
+          if (!this.runIsCurrent(endpointId, generation)) return false;
+          if (outcome !== "handled") return false;
           this.retryTargets.delete(relayTargetKey(target));
+          if (!this.runIsCurrent(endpointId, generation)) return false;
           this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
         }
+        return true;
       });
+      if (!sessionComplete) complete = false;
     }
+    return complete;
   }
 
-  private async commitTerminal(target: RelayTarget, turn: TerminalTurn): Promise<RelayOutcome> {
+  private async commitTerminal(target: RelayTarget, turn: TerminalTurn, lease: EndpointWorkLease): Promise<RelayOutcome> {
     if (this.targetState(target) !== "deliverable") return "conclusively_ignored";
     const mapping = this.mapping(target.endpointId, target.threadId)!;
     const nickname = mapping.nickname;
@@ -364,7 +377,7 @@ export class EventRelay {
       startedAt: turn.startedAt ?? null,
       completedAt: turn.completedAt ?? this.options.clock.now(),
       finalMessageId: messages.at(-1)?.id ?? null,
-    });
+    }, lease);
     if (messages.length === 0 && turn.status !== "completed") {
       this.deliveries.prepare({
         id: `${eventId}:warning`,
@@ -433,14 +446,17 @@ export class EventRelay {
     if (!this.stopped) {
       if (effective === "retry") this.retryTargets.set(relayTargetKey(target), target);
       else this.retryTargets.delete(relayTargetKey(target));
-      if (schedule) this.scheduleRetry(target.endpointId);
+      if (!this.hasPendingWork(target.endpointId)) {
+        this.clearRetryTimer(target.endpointId);
+        this.retryAttempts.delete(target.endpointId);
+      } else if (schedule) this.scheduleRetry(target.endpointId);
     }
     return effective;
   }
 
   private scheduleRetry(endpointId: string): void {
     if (this.stopped || this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
-    if (this.targetsForEndpoint(endpointId).length === 0) {
+    if (!this.hasPendingWork(endpointId)) {
       this.retryAttempts.delete(endpointId);
       return;
     }
@@ -462,23 +478,23 @@ export class EventRelay {
 
   private async retryEndpoint(endpointId: string, generation: number): Promise<void> {
     if (!this.runIsCurrent(endpointId, generation)) return;
-    const targets = this.targetsForEndpoint(endpointId);
     try {
       await this.options.withEndpointWorkLease(endpointId, undefined, async (lease) => {
-        for (const target of targets) {
+        if (this.scanPendingEndpoints.has(endpointId)) {
+          const complete = await this.reconcileHistory(endpointId, lease, generation);
+          if (complete && this.runIsCurrent(endpointId, generation)) this.scanPendingEndpoints.delete(endpointId);
+        }
+        for (const target of this.targetsForEndpoint(endpointId)) {
           if (!this.runIsCurrent(endpointId, generation)) return;
           const outcome = await this.gate.run(endpointId, target.threadId, () => this.projectTarget(
             target,
-            undefined,
             lease,
             generation,
           ));
           this.settleTarget(target, outcome, generation, false);
         }
       });
-    } catch {
-      for (const target of targets) this.settleTarget(target, "retry", generation, false);
-    }
+    } catch { /* Exact targets and the scan marker remain pending. */ }
     this.scheduleRetry(endpointId);
   }
 
@@ -493,6 +509,10 @@ export class EventRelay {
     return [...this.retryTargets.values()].filter((target) => target.endpointId === endpointId);
   }
 
+  private hasPendingWork(endpointId: string): boolean {
+    return this.scanPendingEndpoints.has(endpointId) || this.targetsForEndpoint(endpointId).length > 0;
+  }
+
   private endpointGeneration(endpointId: string): number {
     return this.endpointGenerations.get(endpointId) ?? 0;
   }
@@ -500,6 +520,7 @@ export class EventRelay {
   private advanceEndpointGeneration(endpointId: string): number {
     const generation = this.endpointGeneration(endpointId) + 1;
     this.endpointGenerations.set(endpointId, generation);
+    this.retryAttempts.delete(endpointId);
     return generation;
   }
 

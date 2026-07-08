@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, stopRelayRecovery, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
+import { composeApp } from "../src/app.ts";
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {
   assert.equal(isUncertainAssistantTransportFailure(new AppError("OPERATION_UNCERTAIN", "shutdown"), "ready"), true);
@@ -98,6 +99,35 @@ test("production relay work reuses the identical existing endpoint lease", async
 
   assert.equal(result, "classified");
   assert.deepEqual(seen, [{ method: "existing", endpointId: "devbox", actual: existing }]);
+});
+
+test("production shutdown drains blocked relay work before endpoint teardown", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const seen: string[] = [];
+  const app = composeApp([
+    {
+      name: "endpoint",
+      start: async () => undefined,
+      stop: async () => { seen.push("endpoint"); },
+    },
+    {
+      name: "reconciliation",
+      start: async () => undefined,
+      stop: () => stopRelayRecovery(
+        { stop: async () => { seen.push("relay:start"); await blocked; seen.push("relay:end"); } },
+        { idle: async () => { seen.push("observations"); } },
+        async () => { seen.push("dashboard"); },
+      ),
+    },
+  ]);
+  await app.start();
+  const stopping = app.stop();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(seen, ["relay:start"]);
+  release();
+  await stopping;
+  assert.deepEqual(seen, ["relay:start", "relay:end", "observations", "dashboard", "endpoint"]);
 });
 
 test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {

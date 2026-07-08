@@ -4,11 +4,14 @@ import { SessionDashboardStore, type DashboardIdentity, type DashboardNotificati
 import { normalizeTokenUsage, toIsoTimestamp, type DashboardGoal } from "./dashboard-schema.ts";
 import type { TerminalObservation } from "../events/relay.ts";
 import { ZodError } from "zod";
+import type { EndpointWorkLease } from "../endpoints/types.ts";
 
 interface RegistryView { snapshot(): RegistryDocument }
 interface ObserverOptions {
   now(): number;
-  readThread(endpointId: string, threadId: string): Promise<{ turns: Array<{ id: string; startedAt: number | null; status?: unknown }> }>;
+  readThread(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<{
+    turns: Array<{ id: string; startedAt: number | null; status?: unknown }>;
+  }>;
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
@@ -88,13 +91,13 @@ export class SessionObservationProcessor {
     if (visibleChanged || settings.valueChanged) this.options.onChanged();
   }
 
-  async observeTerminal(event: TerminalObservation): Promise<void> {
+  async observeTerminal(event: TerminalObservation, lease?: EndpointWorkLease): Promise<void> {
     const target = this.managedTarget(event.endpointId, event.threadId);
     if (!target) return;
     const { identity, mappingId } = target;
     let ordinal = this.store.turnOrdinal(identity, event.turnId);
     if (ordinal === undefined) {
-      const history = await this.options.readThread(event.endpointId, event.threadId);
+      const history = await this.options.readThread(event.endpointId, event.threadId, lease);
       this.store.hydrateTurnOrder(identity, history.turns.map((turn) => ({ id: turn.id, startedAt: turn.startedAt })));
       ordinal = this.store.turnOrdinal(identity, event.turnId);
     }
