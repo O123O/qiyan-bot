@@ -123,6 +123,84 @@ export type OperationRecoveryTarget =
   | { policy: "endpoint_lifecycle"; endpointId: string }
   | { policy: "unknown" };
 
+export interface EndpointReadyBuffer {
+  ready(endpointId: string): Promise<void> | undefined;
+  acknowledge(endpointId: string): void;
+  pause(): void;
+  acceptAndDrain(): Promise<void>;
+  stop(): void;
+}
+
+export function createEndpointReadyBuffer(options: {
+  recover(endpointId: string): Promise<void>;
+  maxPendingEndpoints?: number;
+}): EndpointReadyBuffer {
+  const maxPendingEndpoints = options.maxPendingEndpoints ?? 65_536;
+  if (!Number.isSafeInteger(maxPendingEndpoints) || maxPendingEndpoints < 1) {
+    throw new RangeError("maxPendingEndpoints must be a positive safe integer");
+  }
+  const pending = new Set<string>();
+  let accepting = false;
+  let stopped = false;
+
+  return {
+    ready: (endpointId) => {
+      if (stopped) return undefined;
+      if (accepting) return options.recover(endpointId);
+      if (pending.has(endpointId)) return undefined;
+      if (pending.size >= maxPendingEndpoints) {
+        return Promise.reject(new AppError("CAPACITY_EXCEEDED", "too many endpoint-ready events are pending"));
+      }
+      pending.add(endpointId);
+      return undefined;
+    },
+    acknowledge: (endpointId) => { pending.delete(endpointId); },
+    pause: () => { if (!stopped) accepting = false; },
+    acceptAndDrain: async () => {
+      if (stopped) return;
+      accepting = true;
+      for (const endpointId of [...pending].sort()) {
+        if (stopped) break;
+        pending.delete(endpointId);
+        try { await options.recover(endpointId); }
+        catch (error) {
+          if (!stopped) pending.add(endpointId);
+          throw error;
+        }
+      }
+    },
+    stop: () => {
+      stopped = true;
+      accepting = false;
+      pending.clear();
+    },
+  };
+}
+
+export async function runOperationRecoveryChains<
+  T extends { operation: { id: string; sequence: number } },
+>(
+  entries: readonly T[],
+  targetOf: (entry: T) => OperationRecoveryTarget,
+  attempt: (entry: T, target: OperationRecoveryTarget) => Promise<boolean>,
+): Promise<ReadonlySet<string>> {
+  const ordered = [...entries].sort((left, right) => left.operation.sequence - right.operation.sequence
+    || left.operation.id.localeCompare(right.operation.id));
+  const blockedEndpoints = new Set<string>();
+  for (const entry of ordered) {
+    const target = targetOf(entry);
+    if (target.policy !== "endpoint_lifecycle" || blockedEndpoints.has(target.endpointId)) continue;
+    if (await attempt(entry, target)) blockedEndpoints.add(target.endpointId);
+  }
+  for (const entry of ordered) {
+    const target = targetOf(entry);
+    if (target.policy === "endpoint_lifecycle") continue;
+    if (target.policy === "ready_endpoint" && blockedEndpoints.has(target.endpointId)) continue;
+    await attempt(entry, target);
+  }
+  return blockedEndpoints;
+}
+
 interface OperationRecoveryTargetResolver {
   readonly defaultProjectEndpointId: string;
   session(nickname: string): RegistrySession | undefined;
@@ -687,7 +765,7 @@ export async function buildProductionApp(
   let chatRegistry!: ChatAdapterRegistry;
   let slackContextService: SlackContextService | undefined;
   let deliveryWorker!: DeliveryWorker;
-  let acceptingReadyEvents = false;
+  let endpointReadyBuffer: EndpointReadyBuffer | undefined;
   let schedulerAccepting = false;
   const unsubscribers: Array<() => void> = [];
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
@@ -1169,6 +1247,7 @@ export async function buildProductionApp(
           reconcileOnce: reconcileOperationsOnce,
           isEndpointReady: isRecoveryEndpointReady,
         });
+        endpointReadyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => runBackground(
@@ -1222,7 +1301,7 @@ export async function buildProductionApp(
     },
     {
       name: "recovery-owners",
-      start: async () => { acceptingReadyEvents = false; },
+      start: async () => { endpointReadyBuffer?.pause(); },
       stop: stopRecoveryOwners,
     },
     {
@@ -1287,10 +1366,11 @@ export async function buildProductionApp(
           await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async () => {
             await pool.reconcileEndpointClaims(endpointId);
           });
+          endpointReadyBuffer?.acknowledge(endpointId);
         }
         deliveries.recoverAfterCrash();
         reconcileDeliveryEvents();
-        acceptingReadyEvents = true;
+        await endpointReadyBuffer?.acceptAndDrain();
         assistantToolReadiness.ready();
       }, stop: async () => undefined,
     },
@@ -1344,7 +1424,7 @@ export async function buildProductionApp(
 
   function stopRecoveryOwners(): Promise<void> {
     if (recoveryOwnersStop) return recoveryOwnersStop;
-    acceptingReadyEvents = false;
+    endpointReadyBuffer?.stop();
     recoveryOwnersStop = stopRecoveryOwnerSet({
       ...(operationReconciler ? { operations: operationReconciler } : {}),
       ...(dispatcherAvailable ? { dispatcher } : {}),
@@ -1773,6 +1853,11 @@ export async function buildProductionApp(
     const remoteContext = remoteCandidateContexts.get(target);
     if (remoteContext) remoteContexts.set(target.id, remoteContext);
     pool.replaceEndpoint(target);
+    const requestReadyRecovery = (): void => {
+      if (!current()) return;
+      const recovery = endpointReadyBuffer?.ready(target.id);
+      if (recovery) runBackground(() => recovery, () => recordBackgroundFailure("project ready reconciliation"));
+    };
     const subscriptions = [
       target.onNotification((method, params) => {
         if (!current()) return;
@@ -1792,11 +1877,11 @@ export async function buildProductionApp(
           enqueuePendingEvents();
         }, () => recordBackgroundFailure("permission notification"));
       }),
-      target.onReady(() => { if (current() && acceptingReadyEvents) runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation")); }),
+      target.onReady(requestReadyRecovery),
       target.onUnavailable((kind) => { if (current()) runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling")); }),
     ];
     projectEndpointSubscriptions.set(target.id, subscriptions);
-    if (acceptingReadyEvents && target.state === "ready") runBackground(() => recoverProjectEndpoint(target.id), () => recordBackgroundFailure("project ready reconciliation"));
+    if (target.state === "ready") requestReadyRecovery();
   }
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
@@ -1919,22 +2004,19 @@ export async function buildProductionApp(
     let attempted = false;
     let waitingForEndpoint = false;
     const transientTargets = new Map<string, OperationRecoveryTarget>();
-    const recoverable = operations.listRecoverable();
-    const ordered = [
-      ...recoverable.filter((operation) => operation.kind === "disconnect_endpoint" || operation.kind === "restart_endpoint"),
-      ...recoverable.filter((operation) => operation.kind !== "disconnect_endpoint" && operation.kind !== "restart_endpoint"),
-    ];
-    for (const operation of ordered) {
-      if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") continue;
-      const target = recoverableOperationTarget(operation, {
+    const entries = operations.listRecoverable().map((operation) => ({ operation }));
+    const resolveTarget = ({ operation }: { operation: RecoverableOperation }): OperationRecoveryTarget =>
+      recoverableOperationTarget(operation, {
         defaultProjectEndpointId: endpoint.id,
         session: (nickname) => registry.get(nickname),
       });
+    await runOperationRecoveryChains(entries, resolveTarget, async ({ operation }, target) => {
+      if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") return true;
       const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
-      if (preflight === "sleep") continue;
+      if (preflight === "sleep") return true;
       if (preflight === "wait_for_endpoint") {
         waitingForEndpoint = true;
-        continue;
+        return true;
       }
       attempted = true;
       const args = operation.args as any;
@@ -2154,7 +2236,9 @@ export async function buildProductionApp(
         else if (disposition === "wait_for_endpoint") waitingForEndpoint = true;
         // Leave the operation uncertain unless authoritative state proves its exact outcome.
       }
-    }
+      const current = operations.get(operation.id);
+      return current?.state === "dispatched" || current?.state === "uncertain";
+    });
     return {
       outcome: { attempted, transientRetry: transientTargets.size > 0, waitingForEndpoint },
       transientTargets,
@@ -2205,7 +2289,10 @@ export async function buildProductionApp(
     const excluded = lifecycleOwnedEndpointIds();
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
-    for (const endpointId of endpointIds) await resumeManagedSessions(endpointId);
+    for (const endpointId of endpointIds) {
+      await resumeManagedSessions(endpointId);
+      endpointReadyBuffer?.acknowledge(endpointId);
+    }
   }
 
   async function resumeManagedSessions(endpointFilter?: string, unavailableOnly = false): Promise<void> {
@@ -2284,7 +2371,7 @@ export async function buildProductionApp(
     if (stopping || !endpointsCommitted) return;
     relay.endpointUnavailable(target.id);
     endpointIncident += 1;
-    if (target.id === assistantEndpoint.id) acceptingReadyEvents = false;
+    if (target.id === assistantEndpoint.id) endpointReadyBuffer?.pause();
     pool.markEndpointUnavailable(target.id, kind);
     operationReconciler?.endpointUnavailable(target.id);
     for (const session of runtime.listSessions()) {
@@ -2349,7 +2436,7 @@ export async function buildProductionApp(
       assistantToolReadiness.ready();
       schedulerAccepting = true;
     }
-    acceptingReadyEvents = true;
+    await endpointReadyBuffer?.acceptAndDrain();
     reconnectAttempts.set(target.id, 0);
     await enqueuePendingEvents();
   }

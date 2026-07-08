@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOperationReconciliationLoop,
+  createEndpointReadyBuffer,
   createChatHistoryAction,
   isUncertainAssistantTransportFailure,
   managedSessionNeedsRecovery,
@@ -25,6 +26,7 @@ import {
   requestOperationRecoveryForAttempt,
   runAssistantTerminalRecovery,
   runOperationRecoveryTarget,
+  runOperationRecoveryChains,
   stopRelayRecovery,
   stopRecoveryOwnerSet,
   withRelayEndpointWorkLease,
@@ -156,6 +158,98 @@ test("durable operation endpoints survive restart as startup identity references
     recovered = true;
   });
   assert.equal(recovered, true);
+});
+
+test("a ready event deferred during startup drains the complete endpoint pipeline once", async () => {
+  const owners: string[] = [];
+  const readyBuffer = createEndpointReadyBuffer({
+    recover: async (endpointId) => {
+      owners.push(`lifecycle:${endpointId}`, `managed:${endpointId}`, `claims:${endpointId}`, `relay:${endpointId}`, `observations:${endpointId}`, `operations:${endpointId}`);
+    },
+  });
+  let retry!: () => void;
+  const fakeTimer = { set: (callback: () => void) => { retry = callback; } };
+  fakeTimer.set(() => {
+    assert.equal(readyBuffer.ready("devbox"), undefined);
+    assert.equal(readyBuffer.ready("devbox"), undefined);
+  });
+
+  retry();
+  assert.deepEqual(owners, []);
+  await readyBuffer.acceptAndDrain();
+  assert.deepEqual(owners, [
+    "lifecycle:devbox", "managed:devbox", "claims:devbox", "relay:devbox", "observations:devbox", "operations:devbox",
+  ]);
+  await readyBuffer.ready("devbox");
+  assert.equal(owners.filter((item) => item === "operations:devbox").length, 2, "accepted ready events remain live after startup");
+
+  let fail = true;
+  let attempts = 0;
+  const retrying = createEndpointReadyBuffer({
+    maxPendingEndpoints: 1,
+    recover: async () => {
+      attempts += 1;
+      if (fail) throw new Error("retry ready recovery");
+    },
+  });
+  retrying.ready("devbox");
+  const overflow = retrying.ready("other");
+  assert.ok(overflow);
+  await assert.rejects(overflow, (error: unknown) => error instanceof AppError && error.code === "CAPACITY_EXCEEDED");
+  await assert.rejects(retrying.acceptAndDrain(), /retry ready recovery/u);
+  fail = false;
+  await retrying.acceptAndDrain();
+  assert.equal(attempts, 2, "a failed drain remains pending for the next recovery boundary");
+});
+
+test("per-endpoint recovery chains preserve durable lifecycle order and unrelated progress", async () => {
+  const entry = (id: string, sequence: number, policy: "endpoint_lifecycle" | "ready_endpoint" | "local", endpointId?: string) => ({
+    operation: { id, sequence, createdAt: 1_000 },
+    target: policy === "local" ? { policy } as const : { policy, endpointId: endpointId! } as const,
+  });
+  const tied = [
+    entry("disconnect-a", 2, "endpoint_lifecycle", "a"),
+    entry("restart-a", 1, "endpoint_lifecycle", "a"),
+    entry("ordinary-a", 3, "ready_endpoint", "a"),
+    entry("ordinary-b", 4, "ready_endpoint", "b"),
+    entry("local", 5, "local"),
+  ];
+  const first: string[] = [];
+  await runOperationRecoveryChains(tied, (item) => item.target, async ({ operation }) => {
+    first.push(operation.id);
+    return operation.id === "restart-a";
+  });
+  assert.deepEqual(first, ["restart-a", "ordinary-b", "local"]);
+
+  const second: string[] = [];
+  await runOperationRecoveryChains(tied, (item) => item.target, async ({ operation }) => {
+    second.push(operation.id);
+    return false;
+  });
+  assert.deepEqual(second, ["restart-a", "disconnect-a", "ordinary-a", "ordinary-b", "local"]);
+
+  const reverse = [
+    entry("restart-a", 2, "endpoint_lifecycle", "a"),
+    entry("disconnect-a", 1, "endpoint_lifecycle", "a"),
+  ];
+  const reverseSeen: string[] = [];
+  await runOperationRecoveryChains(reverse, (item) => item.target, async ({ operation }) => { reverseSeen.push(operation.id); return false; });
+  assert.deepEqual(reverseSeen, ["disconnect-a", "restart-a"]);
+
+  let ordinaryTarget: OperationRecoveryTarget = { policy: "unknown" };
+  const dynamic = [
+    entry("restart-a", 1, "endpoint_lifecycle", "a"),
+    entry("rename", 2, "local"),
+    entry("ordinary-after-rename", 3, "ready_endpoint", "placeholder"),
+  ];
+  const dynamicSeen: string[] = [];
+  await runOperationRecoveryChains(dynamic, (item) => item.operation.id === "ordinary-after-rename" ? ordinaryTarget : item.target, async ({ operation }) => {
+    dynamicSeen.push(operation.id);
+    if (operation.id === "restart-a") return true;
+    if (operation.id === "rename") ordinaryTarget = { policy: "ready_endpoint", endpointId: "a" };
+    return false;
+  });
+  assert.deepEqual(dynamicSeen, ["restart-a", "rename"], "later targets are resolved after earlier durable mutations");
 });
 
 test("removal recovery concludes locally and leases only an actionable reconciliation", async () => {
