@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease } from "../src/production-app.ts";
+import { createChatHistoryAction, isUncertainAssistantTransportFailure, managedSessionNeedsRecovery, parseEndpointLifecycleCheckpoint, reconcileLifecycleAndOwnership, reconcileLifecycleTransitions, reconcileOwnershipBeforeRelay, reconcileOwnershipBeforeRelayWithLease, registryReloadPreservesWorkerMappings, removalRecoveryDecision, withRecoveredSessionLease, withRelayEndpointWorkLease } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
@@ -76,6 +76,28 @@ test("session operation recovery holds one endpoint lease for its complete callb
   });
   assert.equal(result, "recovered");
   assert.equal(acquisitions, 1);
+});
+
+test("production relay work reuses the identical existing endpoint lease", async () => {
+  const existing: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 3, endpointGeneration: 4, leaseId: "relay-existing" };
+  const replacement: EndpointWorkLease = { endpointId: "devbox", lifecycleGeneration: 9, endpointGeneration: 9, leaseId: "must-not-replace" };
+  const seen: unknown[] = [];
+  const result = await withRelayEndpointWorkLease({
+    runWithWorkLease: async (endpointId, actual, run) => {
+      seen.push({ method: "existing", endpointId, actual });
+      return run(actual);
+    },
+    withReadyWorkLease: async (endpointId, run) => {
+      seen.push({ method: "ready", endpointId });
+      return run(replacement);
+    },
+  }, "devbox", existing, async (actual) => {
+    assert.equal(actual, existing);
+    return "classified";
+  });
+
+  assert.equal(result, "classified");
+  assert.deepEqual(seen, [{ method: "existing", endpointId: "devbox", actual: existing }]);
 });
 
 test("periodic lifecycle reconciliation supplies per-session failure isolation to both phases", async () => {

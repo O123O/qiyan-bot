@@ -217,6 +217,19 @@ export function reconcileOwnershipBeforeRelayWithLease(
   ));
 }
 
+export function withRelayEndpointWorkLease<T>(
+  endpoints: Pick<EndpointManager, "runWithWorkLease" | "withReadyWorkLease">,
+  endpointId: string,
+  existingLease: EndpointWorkLease | undefined,
+  run: (lease: EndpointWorkLease) => Promise<T>,
+): Promise<T> {
+  if (!existingLease) return endpoints.withReadyWorkLease(endpointId, run);
+  return endpoints.runWithWorkLease(endpointId, existingLease, (lease) => {
+    if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "endpoint work lease is unavailable");
+    return run(lease);
+  });
+}
+
 export async function buildProductionApp(
   config: BotConfig,
   options: {
@@ -727,6 +740,12 @@ export async function buildProductionApp(
           binding: currentOwnerBinding,
           clock: { now: () => Date.now() },
           onTerminal: (event) => observations.observeTerminal(event),
+          withEndpointWorkLease: (endpointId, existingLease, run) => withRelayEndpointWorkLease(
+            endpointManager,
+            endpointId,
+            existingLease,
+            run,
+          ),
         }, attachments, ownership, threadGate);
         ownershipWatcher = new SessionOwnershipWatcher(registry, ownership, lifecycle, {
           isInspectable: (identity) => {
@@ -765,6 +784,7 @@ export async function buildProductionApp(
         for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
         for (const subscriptions of projectEndpointSubscriptions.values()) for (const unsubscribe of subscriptions) unsubscribe();
         projectEndpointSubscriptions.clear();
+        await relay.stop();
         await observations.idle();
       },
     },
@@ -1759,6 +1779,7 @@ export async function buildProductionApp(
 
   async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
+    relay.endpointUnavailable(target.id);
     endpointIncident += 1;
     if (target.id === assistantEndpoint.id) acceptingReadyEvents = false;
     pool.markEndpointUnavailable(target.id, kind);
