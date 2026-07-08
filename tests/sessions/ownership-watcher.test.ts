@@ -10,6 +10,7 @@ import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import {
   ExternalOwnershipMonitor,
   externalOwnershipEventPayload,
+  type ExternalOwnershipCycleResult,
   type OwnershipMonitorTimers,
   SessionOwnershipWatcher,
 } from "../../src/sessions/ownership-watcher.ts";
@@ -42,6 +43,12 @@ class FakeOwnershipTimers implements OwnershipMonitorTimers {
 
   takeNext(): ScheduledOwnershipCycle {
     const next = this.scheduled.shift();
+    assert.ok(next);
+    return next;
+  }
+
+  peekNext(): ScheduledOwnershipCycle {
+    const next = this.scheduled[0];
     assert.ok(next);
     return next;
   }
@@ -247,8 +254,8 @@ test("one endpoint failure does not block another and cycles never overlap", asy
   let releaseFailure: (() => void) | undefined;
   const failureBarrier = new Promise<void>((resolve) => { releaseFailure = resolve; });
   const calls: string[] = [];
-  let completed: ((results: readonly { endpointId: string; outcome: string }[]) => void) | undefined;
-  const cycleCompleted = new Promise<readonly { endpointId: string; outcome: string }[]>((resolve) => { completed = resolve; });
+  let completed: ((results: readonly ExternalOwnershipCycleResult[]) => void) | undefined;
+  const cycleCompleted = new Promise<readonly ExternalOwnershipCycleResult[]>((resolve) => { completed = resolve; });
   const monitor = new ExternalOwnershipMonitor({
     endpointIds: () => ["broken", "healthy"],
     pending: () => [],
@@ -288,8 +295,8 @@ test("an unavailable endpoint is inconclusive and the ownership tick does not ac
   let leaseAttempts = 0;
   let removalAttempts = 0;
   let inspectionAttempts = 0;
-  let completeCycle: ((results: readonly { endpointId: string; outcome: string }[]) => void) | undefined;
-  const cycleCompleted = new Promise<readonly { endpointId: string; outcome: string }[]>((resolve) => { completeCycle = resolve; });
+  let completeCycle: ((results: readonly ExternalOwnershipCycleResult[]) => void) | undefined;
+  const cycleCompleted = new Promise<readonly ExternalOwnershipCycleResult[]>((resolve) => { completeCycle = resolve; });
   const monitor = new ExternalOwnershipMonitor({
     endpointIds: () => ["pending-only"],
     pending: () => [{
@@ -310,6 +317,94 @@ test("an unavailable endpoint is inconclusive and the ownership tick does not ac
   assert.equal(leaseAttempts, 1);
   assert.equal(removalAttempts, 0);
   assert.equal(inspectionAttempts, 0);
+  await monitor.stop();
+});
+
+test("an endpoint-unavailable error after ready-lease admission is a failed cycle", async (context) => {
+  for (const stage of ["resume", "inspect"] as const) await context.test(stage, async () => {
+    const timers = new FakeOwnershipTimers();
+    const pendingIncident = {
+      nickname: "worker", endpoint: "devbox", thread_id: "thread-1", mapping_id: "mapping-1", turnId: "external-turn",
+    };
+    let completeCycle: ((results: readonly ExternalOwnershipCycleResult[]) => void) | undefined;
+    const cycleCompleted = new Promise<readonly ExternalOwnershipCycleResult[]>((resolve) => { completeCycle = resolve; });
+    const monitor = new ExternalOwnershipMonitor({
+      endpointIds: () => ["devbox"],
+      pending: () => stage === "resume" ? [pendingIncident] : [],
+      withReadyEndpointWorkLease: async (endpointId, run) => run(lease(endpointId)),
+      resumeRemoval: async () => {
+        if (stage === "resume") throw new AppError("ENDPOINT_UNAVAILABLE", "admitted removal failed");
+      },
+      inspectAndRelease: async () => {
+        if (stage === "inspect") throw new AppError("ENDPOINT_UNAVAILABLE", "admitted inspection failed");
+      },
+      onCycle: (results) => { completeCycle?.(results); },
+    }, timers);
+
+    await monitor.start();
+    timers.takeNext().callback();
+    assert.deepEqual(await cycleCompleted, [{ endpointId: "devbox", outcome: "failed" }]);
+    await monitor.stop();
+  });
+});
+
+test("candidate enumeration failure is fixed, privacy-safe, retryable, and advances degradation", async () => {
+  const timers = new FakeOwnershipTimers();
+  const warnings: string[] = [];
+  const observed: unknown[] = [];
+  const reporter = createBackgroundFailureReporter({
+    runId: "ownership-candidates",
+    onOperational: () => undefined,
+    onDurable: (notice) => { warnings.push(notice.id); },
+  });
+  let enumerationFails = true;
+  const monitor = new ExternalOwnershipMonitor({
+    endpointIds: () => {
+      if (enumerationFails) throw new Error("persisted-payload-must-not-escape");
+      return [];
+    },
+    pending: () => [],
+    withReadyEndpointWorkLease: async (_endpointId, run) => run(lease("unused")),
+    resumeRemoval: async () => undefined,
+    inspectAndRelease: async () => undefined,
+    onCycle: (results) => {
+      observed.push(results);
+      const cycle = createFailureCycle({
+        onFailed: () => reporter.report("external session ownership detection is degraded", { episode: "external-ownership", notifyAfter: 3 }),
+        onResolved: () => reporter.resolve("external-ownership"),
+      });
+      for (const result of results) cycle[result.outcome]();
+      cycle.finish();
+    },
+  }, timers);
+  const runCycle = async () => {
+    timers.takeNext().callback();
+    await nextTurn();
+  };
+
+  await monitor.start();
+  await runCycle();
+  await runCycle();
+  assert.deepEqual(warnings, []);
+  await runCycle();
+  await runCycle();
+  assert.deepEqual(warnings, ["background-failure:ownership-candidates:1"]);
+  assert.deepEqual(observed.slice(0, 4), Array.from({ length: 4 }, () => [
+    { component: "candidate_enumeration", outcome: "failed" },
+  ]));
+  assert.equal(JSON.stringify(observed).includes("persisted-payload-must-not-escape"), false);
+
+  enumerationFails = false;
+  await runCycle();
+  assert.deepEqual(observed.at(-1), []);
+  enumerationFails = true;
+  await runCycle();
+  await runCycle();
+  await runCycle();
+  assert.deepEqual(warnings, [
+    "background-failure:ownership-candidates:1",
+    "background-failure:ownership-candidates:2",
+  ]);
   await monitor.stop();
 });
 
@@ -341,6 +436,104 @@ test("stop cancels the ownership clock and awaits its in-flight cycle", async ()
   release?.();
   await stopping;
   assert.equal(timers.scheduled.length, 0);
+});
+
+test("a captured ownership callback is inert after stop", async () => {
+  const timers = new FakeOwnershipTimers();
+  let cycles = 0;
+  const monitor = new ExternalOwnershipMonitor({
+    endpointIds: () => [],
+    pending: () => [],
+    withReadyEndpointWorkLease: async (_endpointId, run) => run(lease("unused")),
+    resumeRemoval: async () => undefined,
+    inspectAndRelease: async () => undefined,
+    onCycle: () => { cycles += 1; },
+  }, timers);
+
+  await monitor.start();
+  const stale = timers.peekNext();
+  await monitor.stop();
+  stale.callback();
+  await nextTurn();
+
+  assert.equal(cycles, 0);
+  assert.equal(timers.scheduled.length, 0);
+});
+
+test("an old-generation callback cannot disturb a restarted ownership timer", async () => {
+  const timers = new FakeOwnershipTimers();
+  let cycles = 0;
+  const monitor = new ExternalOwnershipMonitor({
+    endpointIds: () => [],
+    pending: () => [],
+    withReadyEndpointWorkLease: async (_endpointId, run) => run(lease("unused")),
+    resumeRemoval: async () => undefined,
+    inspectAndRelease: async () => undefined,
+    onCycle: () => { cycles += 1; },
+  }, timers);
+
+  await monitor.start();
+  const stale = timers.peekNext();
+  await monitor.stop();
+  await monitor.start();
+  const current = timers.peekNext();
+
+  stale.callback();
+  await nextTurn();
+  assert.equal(cycles, 0);
+  assert.deepEqual(timers.scheduled.map(({ handle }) => handle), [current.handle]);
+
+  timers.takeNext().callback();
+  await nextTurn();
+  assert.equal(cycles, 1);
+  assert.equal(timers.scheduled.length, 1);
+  await monitor.stop();
+});
+
+test("restart waits for an old ownership cycle to drain and schedules one new generation", async () => {
+  const timers = new FakeOwnershipTimers();
+  let entered: (() => void) | undefined;
+  const oldCycleEntered = new Promise<void>((resolve) => { entered = resolve; });
+  let release: (() => void) | undefined;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let cycles = 0;
+  let inspections = 0;
+  const monitor = new ExternalOwnershipMonitor({
+    endpointIds: () => ["devbox"],
+    pending: () => [],
+    withReadyEndpointWorkLease: async (endpointId, run) => run(lease(endpointId)),
+    resumeRemoval: async () => undefined,
+    inspectAndRelease: async () => {
+      inspections += 1;
+      if (inspections === 1) { entered?.(); await barrier; }
+    },
+    onCycle: () => { cycles += 1; },
+  }, timers);
+
+  await monitor.start();
+  const oldCallback = timers.takeNext();
+  oldCallback.callback();
+  await oldCycleEntered;
+  const stopping = monitor.stop();
+  const restarting = monitor.start();
+  await nextTurn();
+  assert.equal(timers.scheduled.length, 0);
+  oldCallback.callback();
+  await nextTurn();
+  assert.equal(inspections, 1);
+
+  release?.();
+  await Promise.all([stopping, restarting]);
+  assert.equal(cycles, 1);
+  assert.equal(timers.scheduled.length, 1);
+  assert.equal(timers.peekNext().ms, MINUTE_MS);
+
+  timers.takeNext().callback();
+  await nextTurn();
+  assert.equal(cycles, 2);
+  assert.equal(inspections, 2);
+  assert.equal(timers.scheduled.length, 1);
+  await monitor.stop();
 });
 
 test("the degradation episode warns after three failed cycles and resets after success", async () => {

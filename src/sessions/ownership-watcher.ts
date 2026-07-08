@@ -114,10 +114,17 @@ export class SessionOwnershipWatcher {
 
 export type ExternalOwnershipOutcome = "succeeded" | "failed" | "inconclusive";
 
-export interface ExternalOwnershipCycleResult {
+export interface ExternalOwnershipEndpointResult {
   endpointId: string;
   outcome: ExternalOwnershipOutcome;
 }
+
+export interface ExternalOwnershipCandidateFailure {
+  component: "candidate_enumeration";
+  outcome: "failed";
+}
+
+export type ExternalOwnershipCycleResult = ExternalOwnershipEndpointResult | ExternalOwnershipCandidateFailure;
 
 export interface ExternalOwnershipMonitorOptions {
   endpointIds(): readonly string[];
@@ -206,15 +213,26 @@ export class ExternalOwnershipMonitor {
   }
 
   private async runCycle(): Promise<void> {
-    const endpointIds = [...new Set(this.options.endpointIds())];
+    let endpointIds: string[];
+    try { endpointIds = [...new Set(this.options.endpointIds())]; }
+    catch {
+      this.publishCycle([{ component: "candidate_enumeration", outcome: "failed" }]);
+      return;
+    }
     const results = await Promise.all(endpointIds.map((endpointId) => this.runEndpoint(endpointId)));
+    this.publishCycle(results);
+  }
+
+  private publishCycle(results: readonly ExternalOwnershipCycleResult[]): void {
     try { this.options.onCycle(results); }
     catch { /* Operational reporting must not stop the ownership clock. */ }
   }
 
-  private async runEndpoint(endpointId: string): Promise<ExternalOwnershipCycleResult> {
+  private async runEndpoint(endpointId: string): Promise<ExternalOwnershipEndpointResult> {
+    let admitted = false;
     try {
       await this.options.withReadyEndpointWorkLease(endpointId, async (lease) => {
+        admitted = true;
         for (const incident of this.options.pending(endpointId)) {
           await this.options.resumeRemoval(incident, lease);
         }
@@ -224,7 +242,7 @@ export class ExternalOwnershipMonitor {
     } catch (error) {
       return {
         endpointId,
-        outcome: error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" ? "inconclusive" : "failed",
+        outcome: !admitted && error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" ? "inconclusive" : "failed",
       };
     }
   }
