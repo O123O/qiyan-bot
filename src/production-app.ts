@@ -265,6 +265,45 @@ export function createEndpointReadyBuffer(options: {
   };
 }
 
+export type ProjectReadyRecoveryDisposition = "retry" | "publication" | "retain";
+
+export function projectReadyRecoveryDisposition(
+  error: unknown,
+  failedGeneration: number,
+  current: { generation: number; ready: boolean; automatic: boolean } | undefined,
+): ProjectReadyRecoveryDisposition {
+  const sameReadyGeneration = current?.generation === failedGeneration && current.ready && current.automatic;
+  if (error instanceof RpcRequestTimeoutError
+    || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) {
+    return sameReadyGeneration ? "retry" : "publication";
+  }
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") {
+    return sameReadyGeneration ? "retry" : "publication";
+  }
+  return "retain";
+}
+
+export class EndpointRecoveryIncidents {
+  private sequence = 0;
+  private readonly incidents = new Map<string, number>();
+
+  record(endpointId: string): number {
+    this.sequence += 1;
+    this.incidents.set(endpointId, this.sequence);
+    return this.sequence;
+  }
+
+  pending(endpointId: string): number | undefined { return this.incidents.get(endpointId); }
+
+  consume(endpointId: string, incident: number): boolean {
+    if (this.incidents.get(endpointId) !== incident) return false;
+    this.incidents.delete(endpointId);
+    return true;
+  }
+
+  get latestSequence(): number { return this.sequence; }
+}
+
 export async function runOperationRecoveryChains<
   T extends { operation: { id: string; sequence: number } },
 >(
@@ -277,14 +316,11 @@ export async function runOperationRecoveryChains<
   const blockedEndpoints = new Set<string>();
   for (const entry of ordered) {
     const target = targetOf(entry);
-    if (target.policy !== "endpoint_lifecycle" || blockedEndpoints.has(target.endpointId)) continue;
-    if (await attempt(entry, target)) blockedEndpoints.add(target.endpointId);
-  }
-  for (const entry of ordered) {
-    const target = targetOf(entry);
-    if (target.policy === "endpoint_lifecycle") continue;
-    if (target.policy === "ready_endpoint" && blockedEndpoints.has(target.endpointId)) continue;
-    await attempt(entry, target);
+    const endpointId = target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle"
+      ? target.endpointId
+      : undefined;
+    if (endpointId && blockedEndpoints.has(endpointId)) continue;
+    if (await attempt(entry, target) && endpointId) blockedEndpoints.add(endpointId);
   }
   return blockedEndpoints;
 }
@@ -371,6 +407,40 @@ export function recoverableOperationEndpointReferences(
   return [...references].sort();
 }
 
+type SequencedRecoverableOperation = Pick<RecoverableOperation, "sequence" | "kind" | "args" | "receipt">;
+
+export function hasEarlierEndpointOperation(
+  operations: readonly SequencedRecoverableOperation[],
+  currentSequence: number,
+  endpointId: string,
+  resolver: OperationRecoveryTargetResolver,
+): boolean {
+  return operations.some((operation) => {
+    if (operation.sequence >= currentSequence) return false;
+    const target = recoverableOperationTarget(operation, resolver);
+    return (target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle")
+      && target.endpointId === endpointId;
+  });
+}
+
+export function hasEarlierSessionCreation(
+  operations: readonly SequencedRecoverableOperation[],
+  currentSequence: number,
+  current: { nickname: string; endpointId: string; threadId?: string },
+  resolver: OperationRecoveryTargetResolver,
+): boolean {
+  return operations.some((operation) => {
+    if (operation.sequence >= currentSequence || (operation.kind !== "create_session" && operation.kind !== "adopt_session")) return false;
+    const args = operation.args && typeof operation.args === "object" ? operation.args as Record<string, unknown> : {};
+    if (args.nickname === current.nickname) return true;
+    if (!current.threadId) return false;
+    const target = recoverableOperationTarget(operation, resolver);
+    if (target.policy !== "ready_endpoint" || target.endpointId !== current.endpointId) return false;
+    const priorThreadId = stringField(operation.receipt, "threadId") ?? stringField(args, "thread_id");
+    return priorThreadId === current.threadId;
+  });
+}
+
 export function recoverableOperationActivationReferences(
   operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
   resolver: OperationRecoveryTargetResolver,
@@ -419,11 +489,16 @@ export type OperationRecoveryFailureDisposition = "retry" | "wait_for_endpoint" 
 export function operationRecoveryFailureDisposition(
   error: unknown,
   target?: OperationRecoveryTarget,
+  exactGenerationReady = false,
 ): OperationRecoveryFailureDisposition {
   if (error instanceof RpcRequestTimeoutError
-    || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) return "retry";
+    || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) {
+    return target?.policy === "ready_endpoint" && !exactGenerationReady ? "wait_for_endpoint" : "retry";
+  }
   if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") {
-    return target?.policy === "endpoint_lifecycle" ? "retry" : "wait_for_endpoint";
+    return target?.policy === "endpoint_lifecycle" || (target?.policy === "ready_endpoint" && exactGenerationReady)
+      ? "retry"
+      : "wait_for_endpoint";
   }
   return "sleep";
 }
@@ -760,10 +835,10 @@ export function managedSessionNeedsRecovery(
 
 export type ManagedRecoveryDisposition = "retry" | "endpoint" | "external" | "permanent";
 
-export function managedRecoveryDisposition(error: unknown): ManagedRecoveryDisposition {
+export function managedRecoveryDisposition(error: unknown, currentReadyLease = false): ManagedRecoveryDisposition {
   if (error instanceof RpcRequestTimeoutError
     || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) return "retry";
-  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return "endpoint";
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return currentReadyLease ? "retry" : "endpoint";
   if (error instanceof AppError && error.code === "SESSION_BUSY" && error.details?.recovery === "external_turn") return "external";
   return "permanent";
 }
@@ -866,6 +941,39 @@ export async function recoverManagedEndpointReady(
   return { ...result, sharedWake: "completed" };
 }
 
+export async function recoverStartupManagedEndpoint(options: {
+  endpointId: string;
+  withReadyLease<T>(run: (lease: EndpointWorkLease) => Promise<T>): Promise<T>;
+  isLeaseCurrent(lease: EndpointWorkLease): boolean;
+  recover(
+    lease: EndpointWorkLease,
+    isCurrent: () => boolean,
+  ): Promise<ManagedSessionRecoveryBatchResult>;
+  reconcile(lease: EndpointWorkLease, isCurrent: () => boolean): Promise<void>;
+  acknowledge(): void;
+}): Promise<"acknowledged" | "publication"> {
+  try {
+    await options.withReadyLease(async (lease) => {
+      const isCurrent = (): boolean => options.isLeaseCurrent(lease);
+      const result = await options.recover(lease, isCurrent);
+      if (!isCurrent()) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `managed startup recovery generation changed: ${options.endpointId}`);
+      }
+      if (result.restored) {
+        await options.reconcile(lease, isCurrent);
+        if (!isCurrent()) {
+          throw new AppError("ENDPOINT_UNAVAILABLE", `managed startup reconciliation generation changed: ${options.endpointId}`);
+        }
+      }
+      options.acknowledge();
+    });
+    return "acknowledged";
+  } catch (error) {
+    if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return "publication";
+    throw error;
+  }
+}
+
 export function createManagedSessionRecoveryOwner(options: {
   endpoints: Pick<EndpointManager, "withReadyWorkLease">;
   isLeaseCurrent(endpointId: string, lease: EndpointWorkLease): boolean;
@@ -933,8 +1041,13 @@ export function createManagedSessionRecoveryOwner(options: {
     }
     clearTimer(endpointId);
   };
-  const applyFailure = (keys: readonly ManagedRetryKey[], error: unknown, stage: PendingTarget["stage"]): void => {
-    const disposition = managedRecoveryDisposition(error);
+  const applyFailure = (
+    keys: readonly ManagedRetryKey[],
+    error: unknown,
+    stage: PendingTarget["stage"],
+    currentReadyLease = false,
+  ): void => {
+    const disposition = managedRecoveryDisposition(error, currentReadyLease);
     for (const key of keys) {
       const current = pending.get(key);
       const incidents = current?.stage === stage ? current.incidents : undefined;
@@ -942,11 +1055,11 @@ export function createManagedSessionRecoveryOwner(options: {
       if (disposition === "retry" || disposition === "endpoint") pending.set(key, {
         disposition, stage, incidents, sharedWakeEpoch,
       });
-      else if (stage === "managed") pending.delete(key);
-      else pending.set(key, { disposition: "safety", stage, incidents, sharedWakeEpoch });
+      else if (disposition === "permanent") pending.set(key, { disposition: "safety", stage, incidents, sharedWakeEpoch });
+      else pending.delete(key);
     }
     if (disposition === "endpoint" && keys.length > 0) markEndpointWaiting(managedRetryEndpoint(keys[0]!));
-    if (disposition !== "retry" && disposition !== "endpoint" && stage !== "managed" && keys.length > 0) {
+    if (disposition === "permanent" && keys.length > 0) {
       const endpointId = managedRetryEndpoint(keys[0]!);
       if (!safetyReported.has(endpointId)) {
         safetyReported.add(endpointId);
@@ -1000,14 +1113,14 @@ export function createManagedSessionRecoveryOwner(options: {
       try {
         if (managedKeys.length > 0) batch = await options.recover(endpointId, managedKeys, lease, isCurrent);
       } catch (error) {
-        if (isCurrent()) applyFailure(managedKeys, error, "managed");
+        if (isCurrent()) applyFailure(managedKeys, error, "managed", true);
         return pendingWake();
       }
       if (!isCurrent()) return pendingWake();
       const managedSet = new Set(managedKeys);
       const returnedKeys = [...batch.restoredKeys, ...batch.settledKeys, ...batch.failures.map(({ key }) => key)];
       if (returnedKeys.some((key) => !managedSet.has(key))) {
-        applyFailure(managedKeys, new Error("managed recovery returned an unexpected mapping"), "managed");
+        applyFailure(managedKeys, new Error("managed recovery returned an unexpected mapping"), "managed", true);
         return pendingWake();
       }
       for (const key of batch.restoredKeys) {
@@ -1022,6 +1135,15 @@ export function createManagedSessionRecoveryOwner(options: {
           pending.set(failure.key, {
             disposition: failure.disposition, stage: "managed", incidents: undefined, sharedWakeEpoch: undefined,
           });
+        } else if (failure.disposition === "permanent") {
+          pending.set(failure.key, {
+            disposition: "safety", stage: "managed", incidents: undefined, sharedWakeEpoch: undefined,
+          });
+          if (!safetyReported.has(endpointId)) {
+            safetyReported.add(endpointId);
+            try { options.onSafetyFailure(new Error("permanent managed recovery failure")); }
+            catch { /* An isolation callback must not change recovery ownership. */ }
+          }
         } else pending.delete(failure.key);
       }
       if (batch.failures.some(({ disposition }) => disposition === "endpoint")) markEndpointWaiting(endpointId);
@@ -1050,7 +1172,7 @@ export function createManagedSessionRecoveryOwner(options: {
             sharedWakeCompleted = true;
           }
         } catch (error) {
-          if (isCurrent()) applyFailure(beforeKeys, error, "before_shared");
+          if (isCurrent()) applyFailure(beforeKeys, error, "before_shared", true);
           return pendingWake();
         }
         if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
@@ -1068,7 +1190,7 @@ export function createManagedSessionRecoveryOwner(options: {
         const beforeIncidents = dedupeIncidents(afterKeys.flatMap((key) => pending.get(key)?.incidents ?? []));
         try { await options.afterShared(endpointId, lease, beforeIncidents, isCurrent); }
         catch (error) {
-          if (isCurrent()) applyFailure(afterKeys, error, "after_shared");
+          if (isCurrent()) applyFailure(afterKeys, error, "after_shared", true);
           return {
             recovery: recovery(),
             sharedWake: isGenerationCurrent() ? sharedWakeCompleted ? "completed" : "needed" : "stale",
@@ -1161,6 +1283,9 @@ export function createManagedSessionRecoveryOwner(options: {
       if (disposition === "retry" || disposition === "endpoint") pending.set(key, current && current.stage !== "managed"
         ? { ...current, disposition }
         : { disposition, stage: "managed", incidents: undefined, sharedWakeEpoch: undefined });
+      else if (disposition === "permanent") pending.set(key, {
+        disposition: "safety", stage: "managed", incidents: undefined, sharedWakeEpoch: undefined,
+      });
       else pending.delete(key);
       const endpointId = managedRetryEndpoint(key);
       if (disposition === "endpoint") markEndpointWaiting(endpointId);
@@ -1422,6 +1547,7 @@ export async function buildProductionApp(
   const unsubscribers: Array<() => void> = [];
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
   const projectEndpointRecoveries = new Map<string, Promise<void>>();
+  const projectReadyRetryTimers = new Map<string, { generation: number; timer: ReturnType<typeof setTimeout> }>();
   type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
   const remoteContexts = new Map<string, RemoteContext>();
   const remoteCandidateContexts = new WeakMap<ManagedAppServerEndpoint, RemoteContext>();
@@ -1429,7 +1555,7 @@ export async function buildProductionApp(
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
   const assistantToolReadiness = new ToolReadinessGate();
-  let endpointIncident = 0;
+  const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
   let stopping = false;
   let endpointsCommitted = false;
   let operationReconciler: OperationReconciliationLoop | undefined;
@@ -1977,7 +2103,9 @@ export async function buildProductionApp(
           beforeShared: beforeRestoredEndpoint,
           wakeShared: wakeRestoredEndpoint,
           afterShared: afterRestoredEndpoint,
-          onSafetyFailure: requestRestartOnce,
+          onSafetyFailure: () => reportOperationalSafely(report, {
+            level: "warn", code: "background_task_failed", component: "managed_session_recovery_isolated",
+          }),
           onError: () => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "managed_session_recovery",
           }),
@@ -2006,6 +2134,8 @@ export async function buildProductionApp(
         for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
         for (const subscriptions of projectEndpointSubscriptions.values()) for (const unsubscribe of subscriptions) unsubscribe();
         projectEndpointSubscriptions.clear();
+        for (const { timer } of projectReadyRetryTimers.values()) clearTimeout(timer);
+        projectReadyRetryTimers.clear();
       },
     },
     {
@@ -2205,6 +2335,7 @@ export async function buildProductionApp(
       },
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
+        assertSessionCreationOrder(context.operationSequence, args.nickname, endpointId);
         return endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
           const project = await workspaceRouter.prepareCreate(endpointId, args.nickname, args.project_dir, lease);
           const mappingId = `mapping_${randomUUID()}`;
@@ -2231,6 +2362,7 @@ export async function buildProductionApp(
       },
       adopt_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
+        assertSessionCreationOrder(context.operationSequence, args.nickname, endpointId, args.thread_id);
         const mappingId = `mapping_${randomUUID()}`;
         context.checkpoint({ endpoint: endpointId, threadId: args.thread_id, mappingId });
         await lifecycle.adopt(args.nickname, endpointId, args.thread_id, (thread) => hydrateThreadOrder(endpointId, thread), mappingId);
@@ -2365,11 +2497,13 @@ export async function buildProductionApp(
       list_models: async (args) => sessions.models(projectEndpoint(args.endpoint)),
       disconnect_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
+        assertEndpointLifecycleOrder(context.operationSequence, endpointId);
         await endpointManager.disconnect(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         return { endpoint: endpointId, state: "disconnected" };
       },
       restart_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
+        assertEndpointLifecycleOrder(context.operationSequence, endpointId);
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         return { endpoint: endpointId, state: "ready" };
       },
@@ -2561,6 +2695,27 @@ export async function buildProductionApp(
     return endpointId;
   }
 
+  function operationTargetResolver(): OperationRecoveryTargetResolver {
+    return { defaultProjectEndpointId: "local", session: (nickname) => registry.get(nickname) };
+  }
+
+  function assertEndpointLifecycleOrder(operationSequence: number, endpointId: string): void {
+    if (!hasEarlierEndpointOperation(operations.listRecoverable(), operationSequence, endpointId, operationTargetResolver())) return;
+    throw new AppError("OPERATION_CONFLICT", `endpoint ${endpointId} has an earlier unresolved operation`);
+  }
+
+  function assertSessionCreationOrder(
+    operationSequence: number,
+    nickname: string,
+    endpointId: string,
+    threadId?: string,
+  ): void {
+    if (!hasEarlierSessionCreation(
+      operations.listRecoverable(), operationSequence, { nickname, endpointId, ...(threadId ? { threadId } : {}) }, operationTargetResolver(),
+    )) return;
+    throw new AppError("OPERATION_CONFLICT", `session ${nickname} has an earlier unresolved creation operation`);
+  }
+
   function hasEndpointIdentityReferences(endpointId: string): boolean {
     return Object.values(registry.snapshot().sessions).some((session) => session.endpoint === endpointId)
       || Boolean(pool?.hasClaims(endpointId))
@@ -2592,6 +2747,9 @@ export async function buildProductionApp(
 
   function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
     for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
+    const previousRetry = projectReadyRetryTimers.get(target.id);
+    if (previousRetry) clearTimeout(previousRetry.timer);
+    projectReadyRetryTimers.delete(target.id);
     const current = () => {
       try {
         const value = endpointManager.endpointGeneration(target.id);
@@ -2604,11 +2762,29 @@ export async function buildProductionApp(
     const requestReadyRecovery = (): void => {
       if (!current()) return;
       const recovery = endpointReadyBuffer?.ready(target.id);
-      if (recovery) runBackground(() => recovery, () => {
+      if (recovery) runBackground(() => recovery, (error) => {
         reportOperationalSafely(report, {
           level: "warn", code: "background_task_failed", component: "project_ready_safety",
         });
-        requestRestartOnce();
+        let currentState: { generation: number; ready: boolean; automatic: boolean } | undefined;
+        try {
+          const value = endpointManager.endpointGeneration(target.id);
+          currentState = {
+            generation: value.generation,
+            ready: value.endpoint.state === "ready",
+            automatic: endpointManager.desiredState(target.id) === "automatic",
+          };
+        } catch { /* An absent generation waits for manager publication. */ }
+        if (projectReadyRecoveryDisposition(error, generation, currentState) !== "retry"
+          || projectReadyRetryTimers.has(target.id)) return;
+        const timer = setTimeout(() => {
+          const pending = projectReadyRetryTimers.get(target.id);
+          if (pending?.generation !== generation) return;
+          projectReadyRetryTimers.delete(target.id);
+          requestReadyRecovery();
+        }, 1_000);
+        timer.unref?.();
+        projectReadyRetryTimers.set(target.id, { generation, timer });
       });
     };
     const subscriptions = [
@@ -2629,7 +2805,6 @@ export async function buildProductionApp(
           }
         }, () => recordBackgroundFailure("permission notification"));
       }),
-      target.onReady(requestReadyRecovery),
       target.onUnavailable((kind) => { if (current()) runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling")); }),
     ];
     projectEndpointSubscriptions.set(target.id, subscriptions);
@@ -2772,8 +2947,10 @@ export async function buildProductionApp(
       }
       attempted = true;
       const args = operation.args as any;
+      let attemptedEndpointGeneration: number | undefined;
       try {
         const recover = async (recoveryLease?: EndpointWorkLease): Promise<void> => {
+        attemptedEndpointGeneration = recoveryLease?.endpointGeneration;
         if (operation.kind === "update_session_notes") {
           const result = dashboardStore.noteOperationResult(operation.id);
           if (result) await succeedRecovered(operation, result);
@@ -2980,7 +3157,16 @@ export async function buildProductionApp(
         };
         await runOperationRecoveryTarget(target, endpointManager, recover);
       } catch (error) {
-        const disposition = operationRecoveryFailureDisposition(error, target);
+        let exactGenerationReady = false;
+        if (target.policy === "ready_endpoint" && attemptedEndpointGeneration !== undefined) {
+          try {
+            const value = endpointManager.endpointGeneration(target.endpointId);
+            exactGenerationReady = value.generation === attemptedEndpointGeneration
+              && value.endpoint.state === "ready"
+              && endpointManager.desiredState(target.endpointId) === "automatic";
+          } catch { /* A missing generation waits for manager publication. */ }
+        }
+        const disposition = operationRecoveryFailureDisposition(error, target, exactGenerationReady);
         const current = operations.get(operation.id);
         if (disposition === "retry" && current && (current.state === "dispatched" || current.state === "uncertain")) {
           transientTargets.set(operation.id, target);
@@ -3042,9 +3228,14 @@ export async function buildProductionApp(
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
     for (const endpointId of endpointIds) {
-      const result = await resumeManagedSessions(endpointId);
-      if (result.restored) await reconcileRestoredEndpoint(endpointId);
-      endpointReadyBuffer?.acknowledge(endpointId);
+      await recoverStartupManagedEndpoint({
+        endpointId,
+        withReadyLease: (run) => endpointManager.withReadyWorkLease(endpointId, run),
+        isLeaseCurrent: (lease) => isManagedRecoveryLeaseCurrent(endpointId, lease),
+        recover: (lease, isCurrent) => resumeManagedSessions(endpointId, { lease, isCurrent }),
+        reconcile: (lease) => reconcileRestoredEndpoint(endpointId, lease),
+        acknowledge: () => endpointReadyBuffer?.acknowledge(endpointId),
+      });
     }
   }
 
@@ -3104,7 +3295,10 @@ export async function buildProductionApp(
         restoredKeys.push(key);
       } catch (error) {
         if (options.isCurrent && !options.isCurrent()) throw error;
-        const disposition = managedRecoveryDisposition(error);
+        const disposition = managedRecoveryDisposition(
+          error,
+          Boolean(options.lease && isManagedRecoveryLeaseCurrent(session.endpoint, options.lease)),
+        );
         failures.push({ key, disposition });
         if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
         const current = registry.get(nickname);
@@ -3221,13 +3415,17 @@ export async function buildProductionApp(
         if (lease.endpointGeneration !== recoveredGeneration || !endpointManager.validateReadyWorkLease(lease, endpointId)) {
           throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint generation changed before recovery publication: ${endpointId}`);
         }
-        deliveries.prepare({
-          id: `endpoint-recovered:${endpointId}:${endpointIncident}`,
-          kind: "system_warning",
-          binding: currentOwnerBinding(),
-          body: `[system] ${endpointId} app-server reconnected`,
-          mandatory: true,
-        });
+        const incident = endpointRecoveryIncidents.pending(endpointId);
+        if (incident !== undefined) {
+          deliveries.prepare({
+            id: `endpoint-recovered:${endpointId}:${incident}`,
+            kind: "system_warning",
+            binding: currentOwnerBinding(),
+            body: `[system] ${endpointId} app-server reconnected`,
+            mandatory: true,
+          });
+          endpointRecoveryIncidents.consume(endpointId, incident);
+        }
         await renderDashboardSafely();
       });
     })().finally(() => { if (projectEndpointRecoveries.get(endpointId) === recovery) projectEndpointRecoveries.delete(endpointId); });
@@ -3237,13 +3435,13 @@ export async function buildProductionApp(
 
   async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
+    const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({
       relay,
       observations,
       managed: managedRecoveryOwner!,
       operations: operationReconciler!,
     }, target.id);
-    endpointIncident += 1;
     if (target.id === assistantEndpoint.id) endpointReadyBuffer?.pause();
     pool.markEndpointUnavailable(target.id, kind);
     for (const session of runtime.listSessions()) {
@@ -3295,7 +3493,7 @@ export async function buildProductionApp(
       await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
     } catch (error) {
       if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
-        recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointIncident);
+        recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointRecoveryIncidents.latestSequence);
       }
       throw error;
     }
@@ -3329,7 +3527,7 @@ export async function buildProductionApp(
 
   function warnSessionUnavailable(nickname: string, endpointId: string, threadId: string): void {
     deliveries.prepare({
-      id: `session-unavailable:${endpointId}:${threadId}:${endpointIncident}`,
+      id: `session-unavailable:${endpointId}:${threadId}:${endpointRecoveryIncidents.latestSequence}`,
       kind: "worker_warning",
       binding: currentOwnerBinding(),
       body: `[${nickname}] unavailable; its registered thread and project directory require verification`,

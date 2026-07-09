@@ -18,8 +18,10 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   startError: Error | undefined;
   identityAvailable = true;
   identityToken = "a".repeat(32);
+  localPid = 10;
   threadStatus: "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
+  onRuntimeIdentity: (() => void) | undefined;
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
   async start() { this.starts += 1; if (this.failStart) throw this.startError ?? new Error("offline"); this.state = "ready"; this.events.emit("ready"); }
@@ -27,12 +29,16 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   async shutdownRuntime() {
     this.runtimeStops += 1;
     this.state = "stopped";
-    if (this.rotateIdentityOnStop && this.id !== "local") this.identityToken = "b".repeat(32);
+    if (this.rotateIdentityOnStop) {
+      if (this.id === "local") this.localPid += 1;
+      else this.identityToken = "b".repeat(32);
+    }
   }
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
+    this.onRuntimeIdentity?.();
     if (!this.identityAvailable) return undefined;
     return this.id === "local"
-      ? { kind: "local", pid: 10, startTime: "20" }
+      ? { kind: "local", pid: this.localPid, startTime: "20" }
       : { kind: "ssh", token: this.identityToken, pid: 10, linuxStartTime: "20", processGroupId: 10 };
   }
   async request<T>(method: string): Promise<T> {
@@ -45,6 +51,26 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   onUnavailable(listener: (kind: EndpointLossKind) => void) { this.events.on("unavailable", listener); return () => this.events.off("unavailable", listener); }
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void) { this.events.on("permission", listener); return () => this.events.off("permission", listener); }
   fail(kind: EndpointLossKind = "connection-lost") { this.state = "unavailable"; this.events.emit("unavailable", kind); }
+}
+
+function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly string[] = []) {
+  const local = new FakeEndpoint("local");
+  let index = 0;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, type: "ssh" as const, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async () => {
+      const endpoint = candidates[index++];
+      assert.ok(endpoint, "unexpected remote candidate request");
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => managedThreadIds,
+  });
+  return { manager, local, candidateCount: () => index };
 }
 
 function fixture() {
@@ -346,8 +372,13 @@ test("runtime-stopped restart recovery refuses to relabel the old runtime as its
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
   const identity = await remote.runtimeIdentity();
   assert.ok(identity);
+  let publications = 0;
+  value.manager.onEndpoint(() => { publications += 1; });
 
   await assert.rejects(value.manager.recoverRestart("devbox", "runtime_stopped", identity), /replacement|identity changed/u);
+  assert.equal(publications, 0);
+  assert.equal(remote.connectionCloses, 1);
+  assert.equal(remote.state, "stopped");
 });
 
 test("restart prepares the replacement before stopping the current runtime", async () => {
@@ -371,6 +402,159 @@ test("restart refuses a replacement that retains the stopped runtime identity", 
   await value.manager.ensureReady("devbox");
 
   await assert.rejects(value.manager.restart("devbox"), /replacement|identity/u);
+});
+
+test("restart checkpoints and reopens admission before publishing its replacement", async () => {
+  const first = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const { manager } = queuedFixture([first, replacement]);
+  await manager.ensureReady("devbox");
+  let runtimeStartedCheckpointed = false;
+  const publications: Array<{ automatic: boolean; checkpointed: boolean }> = [];
+  const admissions: Array<Promise<boolean>> = [];
+  manager.onEndpoint(() => {
+    publications.push({
+      automatic: manager.desiredState("devbox") === "automatic",
+      checkpointed: runtimeStartedCheckpointed,
+    });
+    admissions.push(manager.withReadyWorkLease("devbox", async () => true).catch(() => false));
+  });
+
+  await manager.restart("devbox", (value) => {
+    const phase = (value as { phase?: string }).phase;
+    if (phase === "runtime_started") runtimeStartedCheckpointed = true;
+    assert.equal(publications.length, 0, "replacement must remain unpublished through every checkpoint");
+  });
+
+  assert.deepEqual(publications, [{ automatic: true, checkpointed: true }]);
+  assert.deepEqual(await Promise.all(admissions), [true]);
+  assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
+test("restart recovery validates stopped and started checkpoint identities before publication", async () => {
+  const stoppedIdentity = { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+
+  const wrongReplacement = new FakeEndpoint("devbox");
+  const stoppedRecovery = queuedFixture([wrongReplacement]);
+  let stoppedPublications = 0;
+  stoppedRecovery.manager.onEndpoint(() => { stoppedPublications += 1; });
+  await assert.rejects(
+    stoppedRecovery.manager.recoverRestart("devbox", "runtime_stopped", stoppedIdentity),
+    /replacement|identity/u,
+  );
+  assert.equal(stoppedPublications, 0);
+
+  const wrongStarted = new FakeEndpoint("devbox");
+  wrongStarted.identityToken = "b".repeat(32);
+  const startedRecovery = queuedFixture([wrongStarted]);
+  let startedPublications = 0;
+  startedRecovery.manager.onEndpoint(() => { startedPublications += 1; });
+  await assert.rejects(
+    startedRecovery.manager.recoverRestart("devbox", "runtime_started", stoppedIdentity),
+    /identity changed/u,
+  );
+  assert.equal(startedPublications, 0);
+});
+
+test("temporary disconnect proof activation is never published", async () => {
+  const remote = new FakeEndpoint("devbox");
+  const { manager } = queuedFixture([remote], ["thread-1"]);
+  const identity = await remote.runtimeIdentity();
+  assert.ok(identity);
+  let publications = 0;
+  manager.onEndpoint(() => { publications += 1; });
+
+  await manager.recoverDisconnect("devbox", "draining", identity);
+
+  assert.equal(publications, 0);
+  assert.equal(remote.starts, 1);
+  assert.equal(remote.runtimeStops, 1);
+  assert.equal(manager.desiredState("devbox"), "disconnected");
+});
+
+test("failed idle proof reopens and republishes one retained ready target", async () => {
+  const remote = new FakeEndpoint("devbox");
+  const { manager } = queuedFixture([remote], ["thread-1"]);
+  await manager.ensureReady("devbox");
+  const identity = await remote.runtimeIdentity();
+  assert.ok(identity);
+  remote.state = "unavailable";
+  remote.threadStatus = "active";
+  const publicationStates: string[] = [];
+  const admissions: Array<Promise<boolean>> = [];
+  manager.onEndpoint(() => {
+    publicationStates.push(manager.desiredState("devbox"));
+    admissions.push(manager.withReadyWorkLease("devbox", async () => true).catch(() => false));
+  });
+
+  await assert.rejects(manager.recoverDisconnect("devbox", "draining", identity), /not idle/u);
+
+  assert.deepEqual(publicationStates, ["automatic"]);
+  assert.deepEqual(await Promise.all(admissions), [true]);
+  assert.equal(manager.endpointGeneration("devbox").endpoint, remote);
+});
+
+test("replacement readiness lost after checkpoint is cleaned before admission reopens", async () => {
+  const first = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const { manager } = queuedFixture([first, replacement]);
+  await manager.ensureReady("devbox");
+  let checkpointed = false;
+  replacement.onRuntimeIdentity = () => { replacement.state = "unavailable"; };
+  const publications: string[] = [];
+  manager.onEndpoint(() => { publications.push(manager.desiredState("devbox")); });
+
+  await assert.rejects(manager.restart("devbox", (value) => {
+    if ((value as { phase?: string }).phase === "runtime_started") checkpointed = true;
+  }), (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+
+  assert.equal(checkpointed, true);
+  assert.deepEqual(publications, []);
+  assert.equal(replacement.connectionCloses, 1);
+  assert.equal(manager.desiredState("devbox"), "automatic");
+});
+
+test("a microtask cannot invalidate a checkpointed replacement between readiness check and publication", async () => {
+  const first = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const { manager } = queuedFixture([first, replacement]);
+  await manager.ensureReady("devbox");
+  const publications: Array<{ state: string; desired: string }> = [];
+  manager.onEndpoint((endpoint) => {
+    publications.push({ state: endpoint.state, desired: manager.desiredState("devbox") });
+  });
+
+  await manager.restart("devbox", (value) => {
+    if ((value as { phase?: string }).phase === "runtime_started") {
+      queueMicrotask(() => { replacement.state = "unavailable"; });
+    }
+  });
+  await Promise.resolve();
+
+  assert.deepEqual(publications, [{ state: "ready", desired: "automatic" }]);
+  assert.equal(replacement.connectionCloses, 0);
+  assert.equal(replacement.state, "unavailable");
+  assert.equal(manager.desiredState("devbox"), "automatic");
+});
+
+test("local restart checkpoint failure closes the unpublished replacement before reopening", async () => {
+  const value = fixture();
+  value.local.rotateIdentityOnStop = true;
+  await value.manager.ensureReady("local");
+  let publications = 0;
+  value.manager.onEndpoint(() => { publications += 1; });
+
+  await assert.rejects(value.manager.restart("local", (checkpoint) => {
+    if ((checkpoint as { phase?: string }).phase === "runtime_started") throw new Error("checkpoint failed");
+  }), /checkpoint failed/u);
+
+  assert.equal(publications, 0);
+  assert.equal(value.local.connectionCloses, 1);
+  assert.equal(value.local.state, "stopped");
+  assert.equal(value.manager.desiredState("local"), "automatic");
 });
 
 test("active history prevents disconnect and reopens admission without stopping", async () => {

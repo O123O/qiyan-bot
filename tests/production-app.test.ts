@@ -5,10 +5,13 @@ import {
   createAttachmentCleanupOwner,
   createManagedSessionRecoveryOwner,
   createEndpointReadyBuffer,
+  EndpointRecoveryIncidents,
   createDurableEventWakeBoundary,
   createDurableEventSourceCallbacks,
   createExternalOwnershipCycleReporter,
   createChatHistoryAction,
+  hasEarlierEndpointOperation,
+  hasEarlierSessionCreation,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRecoveryManagementState,
@@ -18,6 +21,7 @@ import {
   operationRecoveryAction,
   operationRecoveryFailureDisposition,
   operationRecoveryPreflight,
+  projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
   processWorkerTerminalNotification,
   reconcileLifecycleAndOwnership,
@@ -25,6 +29,7 @@ import {
   reconcileOwnershipBeforeRelay,
   reconcileOwnershipBeforeRelayWithLease,
   recoverManagedEndpointReady,
+  recoverStartupManagedEndpoint,
   recoverReadyEndpointOwners,
   releaseRestoredOwnershipIncidents,
   recoverRemovalOperation,
@@ -564,6 +569,18 @@ test("per-endpoint recovery chains preserve durable lifecycle order and unrelate
   await runOperationRecoveryChains(reverse, (item) => item.target, async ({ operation }) => { reverseSeen.push(operation.id); return false; });
   assert.deepEqual(reverseSeen, ["disconnect-a", "restart-a"]);
 
+  const uncertainCreateBeforeRestart = [
+    entry("create-a", 1, "ready_endpoint", "a"),
+    entry("restart-a", 2, "endpoint_lifecycle", "a"),
+    entry("ordinary-b", 3, "ready_endpoint", "b"),
+  ];
+  const fencedSeen: string[] = [];
+  await runOperationRecoveryChains(uncertainCreateBeforeRestart, (item) => item.target, async ({ operation }) => {
+    fencedSeen.push(operation.id);
+    return operation.id === "create-a";
+  });
+  assert.deepEqual(fencedSeen, ["create-a", "ordinary-b"], "a later restart cannot overtake an earlier uncertain create");
+
   let ordinaryTarget: OperationRecoveryTarget = { policy: "unknown" };
   const dynamic = [
     entry("restart-a", 1, "endpoint_lifecycle", "a"),
@@ -657,16 +674,83 @@ test("operation recovery retries only source-classified transient proof failures
   const lifecycleTarget = { policy: "endpoint_lifecycle", endpointId: "endpoint-a" } as const;
   const ordinaryTarget = { policy: "ready_endpoint", endpointId: "endpoint-a" } as const;
   assert.equal(operationRecoveryFailureDisposition(new RpcRequestTimeoutError("thread/read")), "retry");
+  assert.equal(operationRecoveryFailureDisposition(new RpcRequestTimeoutError("thread/read"), ordinaryTarget, false), "wait_for_endpoint");
+  assert.equal(operationRecoveryFailureDisposition(new RpcRequestTimeoutError("thread/read"), ordinaryTarget, true), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "temporary", { recovery: "ownership_unclassified" })), "retry");
+  assert.equal(operationRecoveryFailureDisposition(
+    new AppError("OPERATION_UNCERTAIN", "temporary", { recovery: "ownership_unclassified" }), ordinaryTarget, false,
+  ), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), lifecycleTarget), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), ordinaryTarget), "wait_for_endpoint");
+  assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "helper"), ordinaryTarget, true), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");
   assert.equal(operationRecoveryFailureDisposition(new Error("unknown")), "sleep");
+});
+
+test("project ready failures retry only the exact still-current generation and never require process restart", () => {
+  const endpointFailure = new AppError("ENDPOINT_UNAVAILABLE", "workspace helper failed");
+  assert.equal(projectReadyRecoveryDisposition(endpointFailure, 4, {
+    generation: 4, ready: true, automatic: true,
+  }), "retry");
+  assert.equal(projectReadyRecoveryDisposition(endpointFailure, 4, {
+    generation: 5, ready: true, automatic: true,
+  }), "publication");
+  assert.equal(projectReadyRecoveryDisposition(endpointFailure, 4, {
+    generation: 4, ready: true, automatic: false,
+  }), "publication");
+  assert.equal(projectReadyRecoveryDisposition(new Error("permanent project failure"), 4, {
+    generation: 4, ready: true, automatic: true,
+  }), "retain");
+  assert.equal(projectReadyRecoveryDisposition(new RpcRequestTimeoutError("thread/read"), 4, {
+    generation: 4, ready: true, automatic: true,
+  }), "retry");
+});
+
+test("durable overlap fences are endpoint-sequenced and nickname/thread exact", () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const operations = [
+    {
+      sequence: 1, kind: "create_session", args: { nickname: "worker", endpoint: "endpoint-a" },
+      receipt: { endpoint: "endpoint-a", threadId: "thread-a" },
+    },
+    {
+      sequence: 2, kind: "adopt_session", args: { nickname: "other", endpoint: "endpoint-a", thread_id: "thread-b" },
+      receipt: { endpoint: "endpoint-a", threadId: "thread-b" },
+    },
+  ];
+
+  assert.equal(hasEarlierEndpointOperation(operations, 3, "endpoint-a", resolver), true);
+  assert.equal(hasEarlierEndpointOperation(operations, 3, "endpoint-b", resolver), false);
+  assert.equal(hasEarlierSessionCreation(operations, 3, {
+    nickname: "worker", endpointId: "endpoint-b", threadId: "new-thread",
+  }, resolver), true, "nickname identity is global across endpoints");
+  assert.equal(hasEarlierSessionCreation(operations, 3, {
+    nickname: "third", endpointId: "endpoint-a", threadId: "thread-b",
+  }, resolver), true, "native endpoint/thread identity cannot be adopted twice");
+  assert.equal(hasEarlierSessionCreation(operations, 3, {
+    nickname: "third", endpointId: "endpoint-b", threadId: "thread-c",
+  }, resolver), false);
+});
+
+test("reconnection incidents compare-delete per endpoint and preserve a newer loss", () => {
+  const incidents = new EndpointRecoveryIncidents();
+  assert.equal(incidents.pending("endpoint-a"), undefined, "initial activation has no recovery incident");
+  const first = incidents.record("endpoint-a");
+  const other = incidents.record("endpoint-b");
+  assert.equal(incidents.pending("endpoint-a"), first);
+  assert.equal(incidents.pending("endpoint-b"), other);
+  const newer = incidents.record("endpoint-a");
+  assert.equal(incidents.consume("endpoint-a", first), false);
+  assert.equal(incidents.pending("endpoint-a"), newer);
+  assert.equal(incidents.consume("endpoint-a", newer), true);
+  assert.equal(incidents.pending("endpoint-a"), undefined);
+  assert.equal(incidents.pending("endpoint-b"), other);
 });
 
 test("managed recovery uses only source-specific transient and external dispositions", () => {
   assert.equal(managedRecoveryDisposition(new RpcRequestTimeoutError("thread/read")), "retry");
   assert.equal(managedRecoveryDisposition(new AppError("ENDPOINT_UNAVAILABLE", "x")), "endpoint");
+  assert.equal(managedRecoveryDisposition(new AppError("ENDPOINT_UNAVAILABLE", "x"), true), "retry");
   assert.equal(managedRecoveryDisposition(new AppError("OPERATION_UNCERTAIN", "x", { recovery: "ownership_unclassified" })), "retry");
   assert.equal(managedRecoveryDisposition(new AppError("SESSION_BUSY", "x", { recovery: "external_turn" })), "external");
   assert.equal(managedRecoveryDisposition(new AppError("OPERATION_UNCERTAIN", "changed rollout path")), "permanent");
@@ -739,7 +823,7 @@ test("ready endpoint recovery isolates downstream owner failures and still reach
   ]);
 });
 
-test("ready-generation loss before managed admission escapes the ready buffer without a recovered publication", async () => {
+test("ready-generation loss remains buffered without a process restart or recovered publication", async () => {
   const listeners = () => () => undefined;
   let endpointState: "stopped" | "ready" | "unavailable" = "stopped";
   const endpoint = {
@@ -783,7 +867,9 @@ test("ready-generation loss before managed admission escapes the ready buffer wi
         });
         recoveredPublications += 1;
       } catch (error) {
-        restarts += 1;
+        assert.equal(projectReadyRecoveryDisposition(error, 1, {
+          generation: 1, ready: endpointState === "ready", automatic: true,
+        }), "publication");
         throw error;
       }
     },
@@ -798,7 +884,7 @@ test("ready-generation loss before managed admission escapes the ready buffer wi
   assert.deepEqual({ managedAdmissions, recoveredPublications, restarts }, {
     managedAdmissions: 0,
     recoveredPublications: 0,
-    restarts: 1,
+    restarts: 0,
   });
 });
 
@@ -1267,10 +1353,13 @@ test("managed retry retains downstream-only work across failures before and afte
   assert.equal(beforeCalls, 2);
   assert.equal(helperCalls, 1, "the timer retry acknowledges the successful independent shared wake");
   assert.equal(afterCalls, 1);
-  assert.equal(timers.length, 1, "endpoint loss after helper work sleeps for ready without another timer");
+  assert.equal(timers.length, 2, "a current-generation helper failure keeps endpoint-local retry ownership");
+  timers[1]!.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(afterCalls, 2);
 
   const final = await owner.endpointReady("endpoint-a", lease);
-  assert.deepEqual(final, { recovery: "completed", sharedWake: "needed" });
+  assert.deepEqual(final, { recovery: "none", sharedWake: "needed" });
   assert.equal(recoveries, 1, "downstream retry never re-runs a healthy managed mapping");
   assert.equal(beforeCalls, 2);
   assert.equal(helperCalls, 1, "pre- and post-helper retries do not duplicate relay or observation wakes");
@@ -1493,6 +1582,120 @@ test("permanent post-helper failure requests safety once without polling or dupl
   assert.equal(sharedWakes, 2);
   assert.equal(timers.length, 0);
   await owner.stop();
+});
+
+test("permanent managed failure remains non-polling until the next explicit ready edge", async () => {
+  type Timer = { callback: () => void };
+  const timers: Timer[] = [];
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "permanent-managed" };
+  let attempts = 0;
+  let isolated = 0;
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => {
+      attempts += 1;
+      return attempts === 1
+        ? { restored: false, restoredKeys: [], settledKeys: [], failures: [{ key, disposition: "permanent" as const }] }
+        : { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
+    },
+    beforeShared: async () => [],
+    wakeShared: async () => undefined,
+    afterShared: async () => undefined,
+    onSafetyFailure: () => { isolated += 1; },
+    onError: () => undefined,
+    timers: {
+      setTimeout: (callback) => { const timer = { callback }; timers.push(timer); return timer; },
+      clearTimeout: () => undefined,
+    },
+  });
+  owner.recordFailure(key, "endpoint");
+
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "pending", sharedWake: "needed" });
+  assert.equal(attempts, 1);
+  assert.equal(isolated, 1);
+  assert.equal(timers.length, 0, "permanent managed failures do not poll");
+
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "completed", sharedWake: "completed" });
+  assert.equal(attempts, 2);
+  assert.equal(timers.length, 0);
+  await owner.stop();
+});
+
+test("a directly recorded permanent managed failure waits without polling for an explicit ready edge", async () => {
+  type Timer = { callback: () => void };
+  const timers: Timer[] = [];
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "recorded-permanent" };
+  let attempts = 0;
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => {
+      attempts += 1;
+      return { restored: true, restoredKeys: keys, settledKeys: [], failures: [] };
+    },
+    beforeShared: async () => [],
+    wakeShared: async () => undefined,
+    afterShared: async () => undefined,
+    onSafetyFailure: () => undefined,
+    onError: () => undefined,
+    timers: {
+      setTimeout: (callback) => { const timer = { callback }; timers.push(timer); return timer; },
+      clearTimeout: () => undefined,
+    },
+  });
+
+  owner.recordFailure(key, "permanent");
+  assert.equal(timers.length, 0, "permanent startup failures never poll");
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease), { recovery: "completed", sharedWake: "completed" });
+  assert.equal(attempts, 1, "the next explicit ready edge retries the retained mapping");
+  await owner.stop();
+});
+
+test("startup managed recovery acknowledges only the exact ready generation", async () => {
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 4, leaseId: "startup-managed" };
+  let currentGeneration = 4;
+  let acknowledged = 0;
+  let capturedLease: EndpointWorkLease | undefined;
+
+  assert.equal(await recoverStartupManagedEndpoint({
+    endpointId: "endpoint-a",
+    withReadyLease: (run) => run(lease),
+    isLeaseCurrent: (candidate) => candidate.endpointGeneration === currentGeneration,
+    recover: async (candidate, isCurrent) => {
+      capturedLease = candidate;
+      assert.equal(isCurrent(), true);
+      return {
+        restored: false,
+        restoredKeys: [],
+        settledKeys: [],
+        failures: [{
+          key: managedRetryKey("endpoint-a", "thread-a", "mapping-a"),
+          disposition: managedRecoveryDisposition(new AppError("ENDPOINT_UNAVAILABLE", "helper failed"), isCurrent()),
+        }],
+      };
+    },
+    reconcile: async () => assert.fail("nothing was restored"),
+    acknowledge: () => { acknowledged += 1; },
+  }), "acknowledged");
+
+  assert.equal(capturedLease, lease);
+  assert.equal(acknowledged, 1, "the retained owner retry supersedes the buffered startup edge");
+
+  assert.equal(await recoverStartupManagedEndpoint({
+    endpointId: "endpoint-a",
+    withReadyLease: (run) => run(lease),
+    isLeaseCurrent: (candidate) => candidate.endpointGeneration === currentGeneration,
+    recover: async () => {
+      currentGeneration = 5;
+      return { restored: false, restoredKeys: [], settledKeys: [], failures: [] };
+    },
+    reconcile: async () => assert.fail("nothing was restored"),
+    acknowledge: () => { acknowledged += 1; },
+  }), "publication");
+  assert.equal(acknowledged, 1, "a replacement generation keeps its buffered manager publication");
 });
 
 test("a partial managed restore survives another mapping entering endpoint wait", async () => {
