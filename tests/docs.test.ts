@@ -64,6 +64,7 @@ test("SSH worker guides document supported endpoints and the source-checkout fix
   }
   assert.match(supported, /ControlPath.*\$\{XDG_RUNTIME_DIR\}.*private local filesystem/isu);
   assert.match(supported, /NFS.*ControlMaster.*not supported/isu);
+  assert.match(supported, /ServerAliveInterval 15.*ServerAliveCountMax 3/isu);
   assert.doesNotMatch(supported, /ControlPath\s+~\/\.ssh/iu);
   const guide = await readFile(resolve("docs/development/ssh-worker-fixture.md"), "utf8");
   for (const required of [
