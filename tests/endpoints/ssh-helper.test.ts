@@ -154,6 +154,21 @@ test("the remote helper reports an allowed missing rollout without masking it as
   assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), { results: [{ missing: true }] });
 });
 
+test("the remote workspace helper returns a structured missing-path error", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const missing = join(root, "missing");
+  const argument = encodeRemoteArgument(JSON.stringify({ action: "realpath", path: missing }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "workspace", argument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), { error: { code: "ENOENT" } });
+  assert.equal(result.stderr.byteLength, 0);
+});
+
 test("the remote helper collects a completed first turn only for explicit pending-rollout promotion", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
   t.after(() => rm(root, { recursive: true, force: true }));

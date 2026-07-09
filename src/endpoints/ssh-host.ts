@@ -41,6 +41,9 @@ const stateSchema = z.object({
   device: z.string().regex(/^\d+$/u).optional(),
   inode: z.string().regex(/^\d+$/u).optional(),
 }).strict();
+const workspaceErrorSchema = z.object({
+  error: z.object({ code: z.enum(["ENOENT", "EEXIST"]) }).strict(),
+}).strict();
 
 export class SshHost implements WorkspaceHost {
   constructor(
@@ -69,8 +72,16 @@ export class SshHost implements WorkspaceHost {
   }
   async chmod(path: string, mode: number): Promise<void> { await this.call({ action: "chmod", path, mode }); }
 
-  private call<T = unknown>(value: unknown): Promise<T> {
-    return this.remote.invoke<T>("workspace", [JSON.stringify(value)], this.helperPath);
+  private async call<T = unknown>(value: unknown): Promise<T> {
+    const result = await this.remote.invoke<unknown>("workspace", [JSON.stringify(value)], this.helperPath);
+    const failure = workspaceErrorSchema.safeParse(result);
+    if (failure.success) {
+      throw Object.assign(new Error(`SSH workspace operation failed (${failure.data.error.code})`), {
+        code: failure.data.error.code,
+      });
+    }
+    if (result && typeof result === "object" && !Array.isArray(result) && Object.hasOwn(result, "error")) throw this.invalid();
+    return result as T;
   }
   private invalid(): AppError { return new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace helper returned invalid data: ${this.endpointId}`); }
 }

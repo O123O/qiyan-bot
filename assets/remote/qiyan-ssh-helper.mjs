@@ -384,6 +384,14 @@ function pathWithin(root, candidate) {
 }
 
 async function workspace(value) {
+  try { return await workspaceOperation(value); }
+  catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "EEXIST") return { error: { code: error.code } };
+    throw error;
+  }
+}
+
+async function workspaceOperation(value) {
   const action = value?.action;
   const path = value?.path;
   if (action === "home") return { path: userInfo().homedir };

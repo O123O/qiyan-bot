@@ -26,6 +26,25 @@ test("SSH workspace paths are passed as encoded helper data, not command tokens"
   assert.equal((values[0] as { path: string }).path, hostile);
 });
 
+test("SSH workspace structured errors preserve only safe filesystem codes", async () => {
+  const responses: unknown[] = [
+    { error: { code: "ENOENT" } },
+    { error: { code: "private remote detail" } },
+  ];
+  const remote: RemoteRuntimeClient = {
+    bootstrap: async () => undefined,
+    invoke: async <T>() => responses.shift() as T,
+  };
+  const host = new SshHost("devbox", remote, "/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs");
+
+  await assert.rejects(host.realpath("/home/xin/missing"), (error: unknown) => {
+    assert.equal(error instanceof Error && "code" in error && error.code === "ENOENT", true);
+    assert.doesNotMatch(String(error), /xin|missing/u);
+    return true;
+  });
+  await assert.rejects(host.realpath("/home/xin/private"), /invalid data/u);
+});
+
 test("local workspace creation never follows a symlinked parent", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-safe-mkdir-"));
   const outside = join(root, "outside");

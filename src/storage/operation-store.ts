@@ -5,6 +5,7 @@ import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
 
 const readOnlyOperationKinds = new Set(["list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal"]);
+const currentRecoveryProtocol = 1;
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -119,13 +120,21 @@ export class OperationStore {
     }
     const id = `op_${randomUUID()}`;
     const now = Date.now();
-    this.db.prepare(`INSERT INTO operations
-      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class, recovery_protocol)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations), ?, 1)`)
-      .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now, effectClass);
-    const created = this.get(id);
-    if (!created) throw new Error("operation insert was not persisted");
-    return created;
+    this.db.exec("SAVEPOINT prepare_operation");
+    try {
+      this.db.prepare(`INSERT INTO operations
+        (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class, recovery_protocol)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations), ?, ?)`)
+        .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now, effectClass, currentRecoveryProtocol);
+      const created = this.get(id);
+      if (!created) throw new Error("operation insert was not persisted");
+      if (created.recoveryProtocol !== currentRecoveryProtocol) throw new Error("operation recovery protocol was not persisted");
+      this.db.exec("RELEASE SAVEPOINT prepare_operation");
+      return created;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT prepare_operation; RELEASE SAVEPOINT prepare_operation");
+      throw error;
+    }
   }
 
   get(id: string): OperationRecord | undefined {

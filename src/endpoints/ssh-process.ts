@@ -19,6 +19,8 @@ export function runBoundedProcess(
     let bytes = 0;
     let settled = false;
     let inputSettled = options.input === undefined;
+    let stdoutClosed = false;
+    let stderrClosed = false;
     let exitOutcome: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let terminalError: Error | undefined;
     let escalation: ReturnType<typeof setTimeout> | undefined;
@@ -30,11 +32,16 @@ export function runBoundedProcess(
       if (escalation) clearTimeout(escalation);
       if (hardDeadline) clearTimeout(hardDeadline);
       options.signal?.removeEventListener("abort", abort);
+      if (error) {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
       if (error) reject(error);
       else resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
     };
     const finishExited = () => {
-      if (!exitOutcome || !inputSettled) return;
+      if (!exitOutcome || !inputSettled || !stdoutClosed || !stderrClosed) return;
       if (terminalError) { finish(terminalError); return; }
       if (exitOutcome.code === 0) finish();
       else finish(new AppError("ENDPOINT_UNAVAILABLE", `SSH process failed (${exitOutcome.signal ? "signal" : `exit ${exitOutcome.code ?? "unknown"}`})`));
@@ -50,12 +57,15 @@ export function runBoundedProcess(
       finishExited();
     };
     const capture = (target: Buffer[]) => (chunk: Buffer) => {
+      if (settled) return;
       bytes += chunk.byteLength;
       if (bytes > options.maxOutputBytes) { stop(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its output limit")); return; }
       target.push(Buffer.from(chunk));
     };
     child.stdout.on("data", capture(stdout));
     child.stderr.on("data", capture(stderr));
+    child.stdout.once("close", () => { stdoutClosed = true; finishExited(); });
+    child.stderr.once("close", () => { stderrClosed = true; finishExited(); });
     child.once("error", () => finish(terminalError ?? new AppError("ENDPOINT_UNAVAILABLE", "SSH process could not start")));
     child.once("exit", (code, signal) => {
       exitOutcome = { code, signal };

@@ -76,6 +76,22 @@ test("recoverable operations retain their canonical arguments and stable call id
   assert.equal(store.listRecoverable()[0]?.recoveryProtocol, 1);
 });
 
+test("a recovery protocol persistence mismatch rolls back the complete prepared row", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  db.exec(`CREATE TRIGGER force_wrong_recovery_protocol AFTER INSERT ON operations
+    BEGIN UPDATE operations SET recovery_protocol = 0 WHERE id = NEW.id; END;`);
+
+  assert.throws(
+    () => store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } }),
+    /recovery protocol was not persisted/u,
+  );
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM operations").get() as { count: number }).count, 0);
+
+  db.exec("DROP TRIGGER force_wrong_recovery_protocol");
+  assert.equal(store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } }).recoveryProtocol, 1);
+});
+
 test("durable operation errors are projected consistently and cleared by recovered success", () => {
   const store = new OperationStore(createTestDatabase());
   const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } });
