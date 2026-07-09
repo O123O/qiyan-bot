@@ -4,6 +4,7 @@ import {
   scanLocalRollout,
   type RolloutAccess,
   type RolloutCursor,
+  type RolloutMaterialization,
   type RolloutScanResult,
 } from "../sessions/rollout-ownership.ts";
 import type { RemoteRuntimeClient } from "./ssh-runtime.ts";
@@ -22,6 +23,9 @@ const resultSchema = z.object({
   malformed: z.literal(true).optional(),
 }).strict();
 const responseSchema = z.object({ results: z.array(resultSchema).max(128) }).strict();
+const materializationResponseSchema = z.object({
+  results: z.array(z.union([resultSchema, z.object({ missing: z.literal(true) }).strict()])).length(1),
+}).strict();
 
 export interface RolloutScanRequest {
   path: string;
@@ -52,14 +56,36 @@ export class RolloutAccessRouter implements RolloutAccess {
     if (!parsed.success || parsed.data.results.length !== requests.length) {
       throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper returned invalid data: ${endpointId}`);
     }
-    return parsed.data.results.map((result) => ({
-      cursor: result.cursor,
-      starts: result.starts.map((turn) => ({ turnId: turn.turnId, ...(turn.clientId === undefined ? {} : { clientId: turn.clientId }) })),
-      ...(result.openTurn === undefined ? {} : {
-        openTurn: { turnId: result.openTurn.turnId, ...(result.openTurn.clientId === undefined ? {} : { clientId: result.openTurn.clientId }) },
-      }),
-      ...(result.malformed === undefined ? {} : { malformed: true }),
-    }));
+    return parsed.data.results.map(publicResult);
+  }
+
+  async scanUnmaterialized(endpointId: string, request: RolloutScanRequest, lease?: EndpointWorkLease): Promise<RolloutMaterialization> {
+    if (request.cursor) throw new AppError("CONFIGURATION_ERROR", "unmaterialized rollout scan cannot use a cursor");
+    this.requireLease(endpointId, lease);
+    if (endpointId === "local") {
+      try {
+        const result = await scanLocalRollout({ ...request, collectFromStart: true });
+        this.requireLease(endpointId, lease);
+        return { state: "present", result };
+      } catch (error) {
+        if (!isErrno(error, "ENOENT")) throw error;
+        this.requireLease(endpointId, lease);
+        return { state: "missing" };
+      }
+    }
+    const context = this.options.remote(endpointId);
+    if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
+    const response = await context.remote.invoke("rollout-scan", [JSON.stringify({
+      requests: [request],
+      allowMissing: true,
+      collectFromStart: true,
+    })], context.helperPath);
+    this.requireLease(endpointId, lease);
+    const parsed = materializationResponseSchema.safeParse(response);
+    if (!parsed.success) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper returned invalid data: ${endpointId}`);
+    const [result] = parsed.data.results;
+    if (!result || "missing" in result) return { state: "missing" };
+    return { state: "present", result: publicResult(result) };
   }
 
   private requireLease(endpointId: string, lease?: EndpointWorkLease): void {
@@ -67,4 +93,19 @@ export class RolloutAccessRouter implements RolloutAccess {
       throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint work lease changed: ${endpointId}`);
     }
   }
+}
+
+function publicResult(result: z.infer<typeof resultSchema>): RolloutScanResult {
+  return {
+    cursor: result.cursor,
+    starts: result.starts.map((turn) => ({ turnId: turn.turnId, ...(turn.clientId === undefined ? {} : { clientId: turn.clientId }) })),
+    ...(result.openTurn === undefined ? {} : {
+      openTurn: { turnId: result.openTurn.turnId, ...(result.openTurn.clientId === undefined ? {} : { clientId: result.openTurn.clientId }) },
+    }),
+    ...(result.malformed === undefined ? {} : { malformed: true }),
+  };
+}
+
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }

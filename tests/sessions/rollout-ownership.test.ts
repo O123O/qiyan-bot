@@ -8,6 +8,7 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { scanLocalRollout, SessionOwnershipGuard } from "../../src/sessions/rollout-ownership.ts";
+import { RolloutAccessRouter } from "../../src/endpoints/rollout-access.ts";
 
 function line(type: string, payload: unknown): string {
   return `${JSON.stringify({ timestamp: "2026-07-06T00:00:00.000Z", type, payload })}\n`;
@@ -303,6 +304,192 @@ test("initialization accepts only positive active external evidence from a malfo
   });
   assert.deepEqual(await externalGuard.inspect(externalIdentity), { state: "external", turnId: "external-active" });
   assert.equal(externalRuntime.getSession(externalIdentity.endpoint, externalIdentity.thread_id, externalIdentity.mapping_id)?.managementState, "unadopting");
+});
+
+test("an empty created thread promotes a completed owned first turn from the real rollout scanner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-lazy.jsonl");
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const operations = new OperationStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-lazy", mapping_id: "mapping-lazy" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, operations, new RolloutAccessRouter({ remote: () => undefined }));
+
+  await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
+  const pending = db.prepare(`SELECT materialized FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { materialized: number };
+  assert.equal(pending.materialized, 0);
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+
+  operations.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args: { nickname: "worker", content: "private" } });
+  await writeFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "owned-first-turn" }),
+    line("event_msg", { type: "user_message", client_id: "ctx:call" }),
+    line("event_msg", { type: "task_complete", turn_id: "owned-first-turn" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  const materialized = db.prepare(`SELECT materialized, device, inode, byte_offset FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown>;
+  assert.equal(materialized.materialized, 1);
+  assert.notEqual(materialized.device, "");
+  assert.notEqual(materialized.inode, "");
+  assert.equal(materialized.byte_offset, (await stat(path)).size);
+  assert.equal(guard.ownsTurn(identity, "owned-first-turn"), true);
+});
+
+test("a pending rollout detects active and completed external first turns with the real scanner", async (t) => {
+  for (const terminal of [false, true]) await t.test(terminal ? "completed" : "active", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const threadId = terminal ? "thread-external-completed" : "thread-external-active";
+  const path = join(root, `rollout-${threadId}.jsonl`);
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: threadId, mapping_id: `mapping-${threadId}` };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), new RolloutAccessRouter({ remote: () => undefined }));
+  await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
+  await writeFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "external-first-turn" }),
+    line("event_msg", { type: "user_message" }),
+    ...(terminal ? [line("event_msg", { type: "task_complete", turn_id: "external-first-turn" })] : []),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-first-turn" });
+  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
+  });
+});
+
+test("restart initialization reclassifies an existing pending or external ownership row", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-restart-lazy.jsonl");
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const operations = new OperationStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-restart-lazy", mapping_id: "mapping-restart-lazy" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
+  const access = new RolloutAccessRouter({ remote: () => undefined });
+  await new SessionOwnershipGuard(db, runtime, operations, access)
+    .initialize(identity, path, undefined, { allowUnmaterialized: true });
+  await writeFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "external-during-restart" }),
+    line("event_msg", { type: "user_message" }),
+    line("event_msg", { type: "task_complete", turn_id: "external-during-restart" }),
+  ].join(""));
+
+  const recovered = new SessionOwnershipGuard(db, runtime, operations, access);
+  for (const phase of ["pending", "external-persisted"]) {
+    await assert.rejects(
+      recovered.initialize(identity, path, undefined, { allowUnmaterialized: true }),
+      (error: unknown) => {
+        assert.equal(error instanceof AppError && error.code === "SESSION_BUSY", true, phase);
+        return true;
+      },
+    );
+  }
+  const row = db.prepare(`SELECT materialized, external_turn_id FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, { materialized: 1, external_turn_id: "external-during-restart" });
+});
+
+test("known-empty initialization detects a first turn that materialized before the pending row commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-initialize-race.jsonl");
+  await writeFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "external-before-initialize" }),
+    line("event_msg", { type: "user_message" }),
+    line("event_msg", { type: "task_complete", turn_id: "external-before-initialize" }),
+  ].join(""));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-initialize-race", mapping_id: "mapping-initialize-race" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
+  const guard = new SessionOwnershipGuard(
+    db,
+    runtime,
+    new OperationStore(db),
+    new RolloutAccessRouter({ remote: () => undefined }),
+  );
+
+  await assert.rejects(
+    guard.initialize(identity, path, undefined, { allowUnmaterialized: true }),
+    (error: unknown) => {
+      assert.equal(error instanceof AppError && error.code === "SESSION_BUSY", true);
+      return true;
+    },
+  );
+  const row = db.prepare(`SELECT materialized, external_turn_id FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, { materialized: 1, external_turn_id: "external-before-initialize" });
+});
+
+test("existing-row initialization rechecks a partial first turn after its user record arrives", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-partial-retry.jsonl");
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-partial-retry", mapping_id: "mapping-partial-retry" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
+  const guard = new SessionOwnershipGuard(
+    db,
+    runtime,
+    new OperationStore(db),
+    new RolloutAccessRouter({ remote: () => undefined }),
+  );
+  await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
+  await writeFile(path, line("event_msg", { type: "task_started", turn_id: "external-partial" }));
+
+  await assert.rejects(
+    guard.initialize(identity, path, undefined, { allowUnmaterialized: true }),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  await appendFile(path, [
+    line("event_msg", { type: "user_message" }),
+    line("event_msg", { type: "task_complete", turn_id: "external-partial" }),
+  ].join(""));
+
+  await assert.rejects(
+    guard.initialize(identity, path, undefined, { allowUnmaterialized: true }),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+  const row = db.prepare(`SELECT materialized, external_turn_id FROM session_rollout_ownership
+    WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+    .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, { materialized: 1, external_turn_id: "external-partial" });
+});
+
+test("a pending baseline requires a classified turn when native metadata is no longer empty", async (t) => {
+  for (const rollout of ["missing", "recreated-empty"] as const) await t.test(rollout, async () => {
+    const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+    const threadId = `thread-native-nonempty-${rollout}`;
+    const path = join(root, `rollout-${threadId}.jsonl`);
+    const db = createTestDatabase();
+    const runtime = new RuntimeStore(db);
+    const identity = { endpoint: "local", thread_id: threadId, mapping_id: `mapping-${threadId}` };
+    runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
+    const guard = new SessionOwnershipGuard(
+      db,
+      runtime,
+      new OperationStore(db),
+      new RolloutAccessRouter({ remote: () => undefined }),
+    );
+    await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
+    if (rollout === "recreated-empty") await writeFile(path, "");
+
+    await assert.rejects(
+      guard.initialize(identity, path, undefined, { allowUnmaterialized: false }),
+      (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+    );
+    const row = db.prepare(`SELECT materialized, device, inode, byte_offset, external_turn_id FROM session_rollout_ownership
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+      .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown>;
+    assert.deepEqual({ ...row }, { materialized: 0, device: "", inode: "", byte_offset: 0, external_turn_id: null });
+  });
 });
 
 test("a malformed record can heal in place and is reparsed from the durable cursor", async () => {

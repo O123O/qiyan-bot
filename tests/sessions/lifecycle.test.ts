@@ -6,7 +6,7 @@ import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
-import { isExactThreadNotLoaded } from "../../src/app-server/thread-errors.ts";
+import { isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../../src/app-server/thread-errors.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry, type RegistrySession } from "../../src/registry/session-registry.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
@@ -31,6 +31,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   turns = [{ id: "historical" }];
   path = "/tmp/rollout-thread-1.jsonl";
   pathOnStart: string | null | undefined;
+  unmaterialized = false;
   failResume = false;
   readonly readErrors: Error[] = [];
   unsubscribeError: Error | undefined;
@@ -50,6 +51,9 @@ class LifecycleEndpoint implements AppServerEndpoint {
     if (method === "thread/read") {
       const error = this.readErrors.shift();
       if (error) throw error;
+      if (this.unmaterialized && params.includeTurns === true) {
+        throw new JsonRpcResponseError(-32600, `thread ${this.threadId} is not materialized yet; includeTurns is unavailable before first user message`);
+      }
       return { thread } as T;
     }
     if (method === "thread/resume") {
@@ -65,7 +69,12 @@ class LifecycleEndpoint implements AppServerEndpoint {
 }
 
 async function fixture(ownership?: {
-  initialize(identity: { endpoint: string; thread_id: string; mapping_id: string }, path: string): Promise<void>;
+  initialize(
+    identity: { endpoint: string; thread_id: string; mapping_id: string },
+    path: string,
+    lease?: EndpointWorkLease,
+    options?: { allowUnmaterialized?: boolean },
+  ): Promise<void>;
   inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<
     { state: "uninitialized" | "owned" } | { state: "external" | "unclassified"; turnId: string }
   >;
@@ -118,6 +127,14 @@ test("thread-not-loaded evidence requires the exact RPC code, message, and threa
   assert.equal(isExactThreadNotLoaded(new Error("thread not loaded: thread-1"), "thread-1"), false);
 });
 
+test("thread-not-materialized evidence requires the exact RPC code, message, and thread identity", () => {
+  const message = "thread thread-1 is not materialized yet; includeTurns is unavailable before first user message";
+  assert.equal(isExactThreadNotMaterialized(new JsonRpcResponseError(-32600, message), "thread-1"), true);
+  assert.equal(isExactThreadNotMaterialized(new JsonRpcResponseError(-32000, message), "thread-1"), false);
+  assert.equal(isExactThreadNotMaterialized(new JsonRpcResponseError(-32600, message), "thread-2"), false);
+  assert.equal(isExactThreadNotMaterialized(new Error(message), "thread-1"), false);
+});
+
 test("create establishes one generation-safe managed epoch", async () => {
   const { registry, endpoint, runtime, lifecycle, project } = await fixture();
   const settings = await lifecycle.create("payments", "local", project, "operation-1");
@@ -141,6 +158,27 @@ test("create resolves a nullable start-response rollout path before managing the
 
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/start", "thread/read"]);
   assert.deepEqual(initialized, [endpoint.path]);
+});
+
+test("create manages an empty thread before Codex materializes its rollout", async () => {
+  const initialized: Array<{ path: string; allowUnmaterialized?: boolean }> = [];
+  const { registry, endpoint, lifecycle, project } = await fixture({
+    initialize: async (_identity, path, _lease, options) => { initialized.push({ path, ...options }); },
+    release: () => undefined,
+  });
+  endpoint.turns = [];
+  endpoint.pathOnStart = null;
+  endpoint.unmaterialized = true;
+
+  await lifecycle.create("payments", "local", project, "operation-1");
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/start", undefined],
+    ["thread/read", true],
+    ["thread/read", false],
+  ]);
+  assert.deepEqual(initialized, [{ path: endpoint.path, allowUnmaterialized: true }]);
 });
 
 test("adopt reserves before resume, uses only native cwd, and promotes after a second idle read", async () => {
@@ -346,7 +384,32 @@ test("adopt rolls back when rollout ownership finds an external active turn", as
 
   assert.equal(registry.get("payments"), undefined);
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/unsubscribe"]);
-  assert.equal(released.length, 1);
+  assert.equal(released.length, 0, "rollback must preserve durable external-turn evidence");
+});
+
+test("create and adoption retries preserve failed ownership classification across rollback", async () => {
+  for (const action of ["create", "adopt"] as const) {
+    let classifications = 0;
+    const released: string[] = [];
+    const value = await fixture({
+      initialize: async () => {
+        classifications += 1;
+        throw new AppError("SESSION_BUSY", "external first turn is durably classified");
+      },
+      release: (identity) => { released.push(identity.mapping_id); },
+    });
+    value.endpoint.turns = [];
+    const run = () => action === "create"
+      ? value.lifecycle.create("payments", "local", value.project, "operation-create", undefined, undefined, "mapping-retry")
+      : value.lifecycle.adopt("payments", "local", "thread-1", undefined, "mapping-retry");
+
+    await assert.rejects(run(), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+    await assert.rejects(run(), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+
+    assert.equal(value.registry.get("payments"), undefined, action);
+    assert.equal(classifications, 2, `${action} retry must re-run durable classification`);
+    assert.deepEqual(released, [], `${action} rollback must not erase classification evidence`);
+  }
 });
 
 test("duplicate nickname or native identity fails before resume", async () => {

@@ -575,4 +575,8 @@ export const migrations: readonly Migration[] = [
       ON DELETE CASCADE
   );
   `,
+  `
+  ALTER TABLE session_rollout_ownership
+    ADD COLUMN materialized INTEGER NOT NULL DEFAULT 1 CHECK(materialized IN (0, 1));
+  `,
 ];

@@ -11,6 +11,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
+import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface SessionOwnershipCheck {
   inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
@@ -139,7 +140,7 @@ export class SessionService {
     observeNative?(snapshot: { nativeStatus: string; activeTurnId: string | null }): void;
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
-    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+    const native = await this.readWithTurns(session.endpoint, session.thread_id);
     const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
     const nativeStatus = native.thread.status?.type ?? "unknown";
     const activeTurnId = nativeStatus === "active"
@@ -284,6 +285,16 @@ export class SessionService {
       cursor = page.nextCursor ?? null;
     } while (cursor);
     return data;
+  }
+
+  private async readWithTurns(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<any> {
+    try {
+      return await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
   }
 
   private required(nickname: string) {

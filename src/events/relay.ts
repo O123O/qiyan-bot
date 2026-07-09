@@ -11,6 +11,7 @@ import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";
 import type { OwnershipInspection } from "../sessions/rollout-ownership.ts";
+import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface TerminalTurn {
   id: string;
@@ -293,13 +294,7 @@ export class EventRelay {
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
         const before = await this.inspectOwnership(session, lease);
         if (!this.runIsCurrent(endpointId, generation) || before.state === "unclassified") return false;
-        const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
-          endpointId,
-          "thread/read",
-          { threadId: session.thread_id, includeTurns: true },
-          undefined,
-          lease,
-        );
+        const response = await this.readHistory(endpointId, session.thread_id, lease);
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
@@ -437,6 +432,26 @@ export class EventRelay {
 
   private inspectOwnership(identity: MappingIdentity, lease: EndpointWorkLease): Promise<OwnershipInspection> {
     return this.ownership?.inspect(identity, lease) ?? Promise.resolve({ state: "owned" });
+  }
+
+  private async readHistory(
+    endpointId: string,
+    threadId: string,
+    lease: EndpointWorkLease,
+  ): Promise<{ thread: { turns: TerminalTurn[] } }> {
+    try {
+      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<{ thread: object }>(
+        endpointId,
+        "thread/read",
+        { threadId, includeTurns: false },
+        undefined,
+        lease,
+      );
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
   }
 
   private settleTarget(

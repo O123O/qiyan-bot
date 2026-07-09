@@ -17,6 +17,7 @@ import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
+import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 
 const mappingId = "mapping-1";
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
@@ -48,7 +49,7 @@ class FakeRelayTimers implements RelayTimers {
 class RelayEndpoint implements AppServerEndpoint {
   readonly id = "local"; state: AppServerEndpoint["state"] = "ready";
   turns: any[] = [];
-  async request<T>(): Promise<T> { return { thread: { turns: this.turns } } as T; }
+  async request<T>(_method: string, _params: unknown): Promise<T> { return { thread: { turns: this.turns } } as T; }
 }
 
 async function fixture(
@@ -370,6 +371,38 @@ test("ready reconciliation reads history after baseline and advances a durable c
   await relay.reconcileEndpoint("local");
   await relay.reconcileEndpoint("local");
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[payments] done"]);
+});
+
+test("an empty first session does not block endpoint-ready reconciliation for later sessions", async () => {
+  const timers = new FakeRelayTimers();
+  const { endpoint, registry, runtime, deliveries, relay } = await fixture(undefined, undefined, { timers });
+  runtime.endEpoch("local", "worker", mappingId, 2);
+  runtime.beginEpoch("local", "worker", mappingId, undefined, 3);
+  await registry.createManaged("later", {
+    endpoint: "local", thread_id: "later-worker", project_dir: registry.get("payments")!.project_dir, mapping_id: "mapping-later",
+  });
+  runtime.setSession("local", "later-worker", "mapping-later", "managed", "idle");
+  runtime.beginEpoch("local", "later-worker", "mapping-later", "later-baseline", 4);
+  const requests: Array<{ threadId: string; includeTurns: boolean }> = [];
+  endpoint.request = async <T>(_method: string, params: any) => {
+    requests.push(params);
+    if (params.threadId === "worker" && params.includeTurns === true) {
+      throw new JsonRpcResponseError(-32600, "thread worker is not materialized yet; includeTurns is unavailable before first user message");
+    }
+    if (params.threadId === "worker") return { thread: { id: "worker", status: { type: "idle" }, turns: [] } } as T;
+    return { thread: { turns: [terminal("later-baseline"), terminal("later-missed")] } } as T;
+  };
+
+  await relay.endpointReady("local", workLease);
+
+  assert.deepEqual(requests, [
+    { threadId: "worker", includeTurns: true },
+    { threadId: "worker", includeTurns: false },
+    { threadId: "later-worker", includeTurns: true },
+  ]);
+  assert.deepEqual(deliveries.listReady().map((item) => item.body), ["[later] done"]);
+  assert.equal((relay as unknown as { scanPendingEndpoints: Set<string> }).scanPendingEndpoints.size, 0);
+  assert.equal(timers.scheduled.length, 0);
 });
 
 test("terminal notification with partial items reads the authoritative completed turn", async () => {

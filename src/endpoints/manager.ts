@@ -454,7 +454,7 @@ export class EndpointManager {
   private async requireManagedThreadsIdle(endpointId: string, endpoint: ManagedAppServerEndpoint): Promise<void> {
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
       let response: { thread?: { status?: string | { type?: string } } };
-      try { response = await endpoint.request("thread/read", { threadId, includeTurns: true }); }
+      try { response = await endpoint.request("thread/read", { threadId, includeTurns: false }); }
       catch (error) {
         if (error instanceof RpcRequestTimeoutError) throw error;
         throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });

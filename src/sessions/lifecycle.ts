@@ -10,7 +10,7 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
+import { isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -23,7 +23,12 @@ export interface LifecycleCheckpoint extends MappingIdentity {
 }
 
 interface SessionOwnershipLifecycle {
-  initialize(identity: MappingIdentity, path: string, lease?: EndpointWorkLease): Promise<void>;
+  initialize(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+    options?: { allowUnmaterialized?: boolean },
+  ): Promise<void>;
   inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
     { state: "uninitialized" } | OwnershipInspection
   >;
@@ -78,13 +83,10 @@ export class SessionLifecycle {
         project_dir: project.path,
         mapping_id: mappingId,
       };
-      try {
-        if (this.ownership) await this.ownership.initialize(identity, this.requireRolloutPath(managedThread), lease);
-        await this.registry.createManaged(nickname, identity);
-      } catch (error) {
-        this.ownership?.release(identity);
-        throw error;
-      }
+      if (this.ownership) await this.ownership.initialize(identity, this.requireRolloutPath(managedThread), lease, {
+        allowUnmaterialized: managedThread.turns.length === 0,
+      });
+      await this.registry.createManaged(nickname, identity);
       this.runtime.setSession(endpointId, managedThread.id, mappingId, "managed", managedThread.status.type);
       this.runtime.beginEpoch(endpointId, managedThread.id, mappingId, this.baseline(managedThread), this.clock.now());
     });
@@ -140,7 +142,9 @@ export class SessionLifecycle {
         this.requireIdle(after.thread);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
-        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease);
+        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease, {
+          allowUnmaterialized: after.thread.turns.length === 0,
+        });
         await this.registry.promote(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
         this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
@@ -151,7 +155,6 @@ export class SessionLifecycle {
             if (reserved && !await this.registry.removeIfMatch(nickname, reserved)) {
               throw new Error("adopting reservation changed during rollback");
             }
-            if (reserved) this.ownership?.release(reserved);
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
           }
@@ -261,7 +264,9 @@ export class SessionLifecycle {
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           const promotable = this.assertExact(nickname, expected, "adopting");
-          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease);
+          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease, {
+            allowUnmaterialized: native.thread.turns.length === 0,
+          });
           await this.registry.promote(nickname, promotable);
           this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
           if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
@@ -273,7 +278,6 @@ export class SessionLifecycle {
             try {
               await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
               if (!await this.registry.removeIfMatch(nickname, current)) throw new Error("adopting reservation changed during rollback");
-              this.ownership?.release(current);
             } catch {
               throw new AppError("OPERATION_UNCERTAIN", "adoption recovery failed and its subscription rollback could not be confirmed");
             }
@@ -329,7 +333,9 @@ export class SessionLifecycle {
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
       if (this.ownership) {
-        await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);
+        await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease, {
+          allowUnmaterialized: before.thread.turns.length === 0,
+        });
         assertCurrent();
       }
       this.assertExact(nickname, expected, "managed");
@@ -419,8 +425,14 @@ export class SessionLifecycle {
     return current;
   }
 
-  private read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
-    return this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+  private async read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
+    try {
+      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
   }
 
   private requireIdle(thread: ThreadView): void {

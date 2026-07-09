@@ -31,6 +31,26 @@ test("SSH rollout scans use one bounded metadata-only helper call", async () => 
   assert.deepEqual(JSON.parse(calls[0]!.args[0]!), { requests: [request] });
 });
 
+test("SSH rollout scans distinguish a not-yet-materialized file from transport failure", async () => {
+  const calls: unknown[] = [];
+  const router = new RolloutAccessRouter({
+    remote: () => ({
+      helperPath: "/tmp/qiyan/helper.mjs",
+      remote: {
+        bootstrap: async () => undefined,
+        invoke: async <T>(_operation: string, args: readonly string[]) => {
+          calls.push(JSON.parse(args[0]!));
+          return { results: [{ missing: true }] } as T;
+        },
+      },
+    }),
+  });
+  const request = { path: "/home/user/.codex/sessions/rollout-thread.jsonl", threadId: "thread" };
+
+  assert.deepEqual(await router.scanUnmaterialized("devbox", request), { state: "missing" });
+  assert.deepEqual(calls, [{ requests: [request], allowMissing: true, collectFromStart: true }]);
+});
+
 test("SSH rollout scans reject malformed helper metadata", async () => {
   const router = new RolloutAccessRouter({
     remote: () => ({

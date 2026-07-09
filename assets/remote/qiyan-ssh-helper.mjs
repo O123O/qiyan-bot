@@ -157,10 +157,23 @@ async function stop(value) {
 
 async function scanRollouts(value) {
   if (!Array.isArray(value?.requests) || value.requests.length < 1 || value.requests.length > 128) throw new Error("invalid rollout scan request");
-  return { results: await Promise.all(value.requests.map(scanRollout)) };
+  if (value.allowMissing !== undefined && value.allowMissing !== true) throw new Error("invalid rollout scan request");
+  if (value.collectFromStart !== undefined && value.collectFromStart !== true) throw new Error("invalid rollout scan request");
+  if (value.collectFromStart === true && value.allowMissing !== true) throw new Error("invalid rollout scan request");
+  const collectFromStart = value.collectFromStart === true;
+  return {
+    results: await Promise.all(value.requests.map((request) => value.allowMissing === true
+      ? scanRolloutAllowMissing(request, collectFromStart)
+      : scanRollout(request, collectFromStart))),
+  };
 }
 
-async function scanRollout(request) {
+async function scanRolloutAllowMissing(request, collectFromStart) {
+  try { return await scanRollout(request, collectFromStart); }
+  catch (error) { if (error?.code === "ENOENT") return { missing: true }; throw error; }
+}
+
+async function scanRollout(request, collectFromStart = false) {
   const path = request?.path;
   const threadId = request?.threadId;
   const cursor = request?.cursor;
@@ -179,7 +192,7 @@ async function scanRollout(request) {
     const inode = state.ino.toString(10);
     if (cursor && (cursor.device !== device || cursor.inode !== inode)) throw new Error("rollout identity changed");
     if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
-    const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined);
+    const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined || collectFromStart);
     const after = await file.stat({ bigint: true });
     if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });

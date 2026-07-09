@@ -3124,7 +3124,7 @@ export async function buildProductionApp(
             const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
             const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
               ? await lifecycle.reconcileManaged(args.nickname, session, lease)
-              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
+              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
             await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
             hydrateThreadOrder(session.endpoint, native.thread);
             await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {

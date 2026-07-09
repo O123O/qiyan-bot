@@ -137,6 +137,53 @@ test("the remote helper scans rollout ownership without returning message bodies
   assert.deepEqual(JSON.parse(body).results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call" }]);
 });
 
+test("the remote helper reports an allowed missing rollout without masking it as SSH failure", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-lazy.jsonl");
+  const argument = encodeRemoteArgument(JSON.stringify({
+    requests: [{ path, threadId: "thread-lazy" }],
+    allowMissing: true,
+  }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), { results: [{ missing: true }] });
+});
+
+test("the remote helper collects a completed first turn only for explicit pending-rollout promotion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-first.jsonl");
+  await writeFile(path, [
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "external-first" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_complete", turn_id: "external-first" } }),
+    "",
+  ].join("\n"));
+  const ordinaryArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-first" }] }));
+  const promotionArgument = encodeRemoteArgument(JSON.stringify({
+    requests: [{ path, threadId: "thread-first" }],
+    allowMissing: true,
+    collectFromStart: true,
+  }));
+
+  const ordinary = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", ordinaryArgument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+  const promotion = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", promotionArgument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(JSON.parse(ordinary.stdout.toString("utf8")).results[0].starts, []);
+  assert.deepEqual(JSON.parse(promotion.stdout.toString("utf8")).results[0].starts, [{ turnId: "external-first" }]);
+});
+
 test("the remote helper reports a malformed boundary and later independent external evidence", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
   t.after(() => rm(root, { recursive: true, force: true }));

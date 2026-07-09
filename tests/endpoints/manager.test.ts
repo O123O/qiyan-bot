@@ -21,6 +21,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   localPid = 10;
   threadStatus: "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
+  readonly requests: Array<{ method: string; params: unknown }> = [];
   onRuntimeIdentity: (() => void) | undefined;
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
@@ -41,7 +42,8 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
       ? { kind: "local", pid: this.localPid, startTime: "20" }
       : { kind: "ssh", token: this.identityToken, pid: 10, linuxStartTime: "20", processGroupId: 10 };
   }
-  async request<T>(method: string): Promise<T> {
+  async request<T>(method: string, params: unknown): Promise<T> {
+    this.requests.push({ method, params });
     if (this.requestError) throw this.requestError;
     if (method === "thread/read") return { thread: { status: { type: this.threadStatus }, turns: [] } } as T;
     return {} as T;
@@ -327,6 +329,15 @@ test("lifecycle idle proof preserves the typed RPC timeout source", async () => 
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
   remote.requestError = new RpcRequestTimeoutError("thread/read");
   await assert.rejects(value.manager.disconnect("devbox"), (error: unknown) => error instanceof RpcRequestTimeoutError);
+});
+
+test("lifecycle idle proof does not require materialized turn history", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+
+  await value.manager.disconnect("devbox");
+
+  assert.deepEqual(remote.requests, [{ method: "thread/read", params: { threadId: "thread-1", includeTurns: false } }]);
 });
 
 test("lifecycle cold activation retries on its capped timer without a ready event", async () => {
