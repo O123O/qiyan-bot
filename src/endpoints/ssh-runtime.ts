@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, statfs } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -17,6 +17,7 @@ export const REMOTE_HELPER_SHA256 = "281761252b16b86961bf2b27ae731d62cf219d30775
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
+const NFS_SUPER_MAGIC = 0x6969;
 const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
@@ -57,22 +58,39 @@ export interface RemoteBootstrapPayload {
   launcher: Buffer;
 }
 
-export async function attestUserControlMaster(plan: SshConnectionPlan): Promise<void> {
+export async function attestUserControlMaster(
+  plan: SshConnectionPlan,
+  inspectFileSystem: (path: string) => Promise<{ type: number | bigint }> = statfs,
+): Promise<void> {
   if (plan.ownsControlMaster) return;
   const controlPath = plan.controlPath;
   const uid = process.getuid?.();
+  let parent: string;
   try {
     if (!controlPath || resolve(controlPath) !== controlPath) throw new Error("invalid path");
-    const parent = dirname(controlPath);
+    parent = dirname(controlPath);
     if (await realpath(parent) !== parent) throw new Error("aliased parent");
-    const [directory, socket] = await Promise.all([lstat(parent), lstat(controlPath)]);
+    const [directory, fileSystem] = await Promise.all([
+      lstat(parent),
+      inspectFileSystem(parent),
+    ]);
     if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0
-      || !socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0
-      || (uid !== undefined && (directory.uid !== uid || socket.uid !== uid))) {
+      || (uid !== undefined && directory.uid !== uid)
+      || Number(fileSystem.type) === NFS_SUPER_MAGIC) {
       throw new Error("unsafe identity");
     }
   } catch {
-    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster");
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+  }
+  let socket;
+  try { socket = await lstat(controlPath!); }
+  catch (error) {
+    if (isErrno(error, "ENOENT")) return;
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+  }
+  if (!socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0
+    || (uid !== undefined && socket.uid !== uid)) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
   }
 }
 
@@ -319,4 +337,8 @@ function requireDigest(bytes: Buffer, expected: string): void {
   if (createHash("sha256").update(bytes).digest("hex") !== expected) {
     throw new AppError("CONFIGURATION_ERROR", "packaged SSH runtime asset failed integrity verification");
   }
+}
+
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }

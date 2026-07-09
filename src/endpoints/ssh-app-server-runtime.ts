@@ -182,8 +182,8 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
   }
 
   private async requireControlMaster(): Promise<void> {
+    await (this.options.attestControlMaster ?? attestUserControlMaster)(this.options.plan);
     try {
-      await (this.options.attestControlMaster ?? attestUserControlMaster)(this.options.plan);
       await this.runControl(buildControlMasterCheckArgs(this.options.plan));
     }
     catch {

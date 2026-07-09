@@ -73,6 +73,7 @@ function fixture(root: string, remote = new FakeRemoteRuntime(), options: {
   beforeControl?: (operation: string, args: readonly string[]) => void | Promise<void>;
   cancelClosesForward?: () => boolean;
   plan?: SshConnectionPlan;
+  attestControlMaster?: (plan: SshConnectionPlan) => Promise<void>;
 } = {}) {
   const commands: string[][] = [];
   const wires: FakeWire[] = [];
@@ -81,7 +82,7 @@ function fixture(root: string, remote = new FakeRemoteRuntime(), options: {
     runtime: remote,
     plan: options.plan ?? plan,
     socketRoot: root,
-    attestControlMaster: async () => undefined,
+    attestControlMaster: options.attestControlMaster ?? (async () => undefined),
     run: async (_command, args) => {
       commands.push([...args]);
       const operation = controlOperation(args);
@@ -127,6 +128,24 @@ test("opening requires the existing authenticated ControlMaster", async (t) => {
   assert.deepEqual(value.commands.map(controlOperation), ["check"]);
   assert.equal(value.remote.starts, 0, "an MFA endpoint must not attempt helper authentication without its user-owned master");
   assert.deepEqual(value.remote.stops, []);
+});
+
+test("opening preserves an actionable ControlMaster configuration error", async (t) => {
+  const root = await privateRoot(t);
+  const value = fixture(root, new FakeRemoteRuntime(), {
+    attestControlMaster: async () => {
+      throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+    },
+  });
+
+  await assert.rejects(
+    value.runtime.open(),
+    (error: unknown) => error instanceof AppError
+      && error.code === "CONFIGURATION_ERROR"
+      && /private local filesystem/u.test(error.message),
+  );
+  assert.deepEqual(value.commands, []);
+  assert.equal(value.remote.starts, 0);
 });
 
 test("wire connection failure cancels the exact forward without stopping the remote runtime", async (t) => {

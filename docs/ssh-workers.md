@@ -32,20 +32,19 @@ Host devbox
   HostName devbox.example
   User xin
   ControlMaster auto
-  ControlPath ~/.ssh/controlmasters/%C
+  ControlPath ${XDG_RUNTIME_DIR}/qiyan-ssh-controlmasters/%C
   ControlPersist yes
 ```
 
 Create its private socket directory, authenticate once interactively, and verify the master before starting QiYan:
 
 ```bash
-mkdir -p ~/.ssh/controlmasters
-chmod 700 ~/.ssh/controlmasters
+install -d -m 700 "${XDG_RUNTIME_DIR:?}/qiyan-ssh-controlmasters"
 ssh devbox true
 ssh -O check devbox
 ```
 
-QiYan requires both the ControlMaster directory and socket to be canonical same-user objects without group or world permissions. It reuses that authenticated connection and does not prompt for MFA. If the master exits or expires, the remote endpoint becomes unavailable until you authenticate a new master; QiYan does not stop or replace a user-owned master.
+The ControlMaster directory must be on a private local filesystem. NFS-backed ControlMaster sockets are not supported; OpenSSH cannot reliably retain or address them. `${XDG_RUNTIME_DIR}` is local per-user runtime storage on a normal Linux login or systemd user session. QiYan requires both the directory and socket to be canonical same-user objects without group or world permissions and rejects an NFS directory before dispatch. It reuses that authenticated connection and does not prompt for MFA. If the master exits or expires, the remote endpoint becomes unavailable until you authenticate a new master; QiYan does not stop or replace a user-owned master.
 
 QiYan never accepts a new host key automatically. Handle first connection and host-key changes through ordinary OpenSSH yourself, or explicitly ask QiYan to help inspect them.
 

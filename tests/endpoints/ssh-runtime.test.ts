@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   SshRemoteClient,
   SshRuntime,
+  attestUserControlMaster,
   decodeRemoteArgument,
   encodeRemoteArgument,
   type RemoteRuntimeClient,
@@ -113,6 +114,27 @@ test("a failed user-owned master check dispatches no helper command", async (t) 
   assert.equal(calls[0]!.includes("check"), true);
 });
 
+test("a missing socket in a safe local parent reaches only the master check", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-missing-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan: { ...userMasterPlan, controlPath: join(root, "master") },
+    helperSource: Buffer.from("helper"),
+    run: async (_command, args) => {
+      calls.push([...args]);
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
+    },
+  });
+
+  await assert.rejects(
+    remote.invoke("inspect", ["{}"], helperPath),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE",
+  );
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check"]);
+});
+
 test("user-owned ControlMaster attestation rejects unsafe parents and sockets before SSH", async (t) => {
   const calls: string[][] = [];
   const run = async (_command: string, args: readonly string[]) => {
@@ -147,6 +169,20 @@ test("user-owned ControlMaster attestation rejects unsafe parents and sockets be
   });
   await assert.rejects(linked.invoke("inspect", ["{}"], helperPath), /unsafe user-owned SSH ControlMaster/u);
   assert.equal(calls.length, 0);
+});
+
+test("user-owned ControlMaster attestation rejects NFS socket directories", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-nfs-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const nfsPlan = { ...userMasterPlan, controlPath: join(root, "missing-master") };
+
+  await assert.rejects(
+    attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })),
+    (error: unknown) => error instanceof AppError
+      && error.code === "CONFIGURATION_ERROR"
+      && /private local filesystem/u.test(error.message),
+  );
 });
 
 test("owned transport cleanup exits only its persistent QiYan ControlMaster", async () => {

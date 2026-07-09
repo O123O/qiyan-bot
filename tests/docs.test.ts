@@ -62,6 +62,9 @@ test("SSH worker guides document supported endpoints and the source-checkout fix
   for (const required of ["SSH worker endpoints", "endpoints.json", "0.142.5 or newer", "tmux -L qiyan-bot", "list-sessions", "disconnect_endpoint", "restart_endpoint", "unavailable SSH endpoint", "capacity stays reserved"]) {
     assert.equal(supported.includes(required), true, `SSH worker guide is missing: ${required}`);
   }
+  assert.match(supported, /ControlPath.*\$\{XDG_RUNTIME_DIR\}.*private local filesystem/isu);
+  assert.match(supported, /NFS.*ControlMaster.*not supported/isu);
+  assert.doesNotMatch(supported, /ControlPath\s+~\/\.ssh/iu);
   const guide = await readFile(resolve("docs/development/ssh-worker-fixture.md"), "utf8");
   for (const required of [
     "Development fixture", "Docker Compose", "127.0.0.1", "ssh-worker:up",
