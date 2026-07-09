@@ -11,6 +11,7 @@ const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
+const RESPONSE_PREFIX = "qiyan-helper-v1:";
 
 const operation = process.argv[2];
 const encoded = process.argv.slice(3);
@@ -29,7 +30,7 @@ try {
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
   }
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.stdout.write(`\n${RESPONSE_PREFIX}${JSON.stringify(result)}\n`);
 } catch {
   process.stderr.write("qiyan remote helper failed\n");
   process.exitCode = 1;

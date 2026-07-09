@@ -13,11 +13,12 @@ import {
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "281761252b16b86961bf2b27ae731d62cf219d30775982a54381eb772a9ee29d";
+export const REMOTE_HELPER_SHA256 = "396a17e7635fb224e4d8d278de56d84bd5b46f9de820d5a7491951cd2952c9a7";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
 const NFS_SUPER_MAGIC = 0x6969;
+const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
@@ -218,8 +219,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       ? buildInstalledHelperCommand(installedHelperPath, operation, args)
       : ["node", "-", operation, ...args.map(encodeRemoteArgument)];
     const result = await this.execute(command, installedHelperPath ? undefined : this.options.helperSource);
-    try { return JSON.parse(result.stdout.toString("utf8")) as T; }
-    catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH helper returned an invalid response"); }
+    return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
   async invokeTransfer<T>(
@@ -230,8 +230,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   ): Promise<T> {
     const command = buildInstalledHelperCommand(installedHelperPath, operation, args);
     const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? 60_000);
-    try { return JSON.parse(result.stdout.toString("utf8")) as T; }
-    catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH file helper returned an invalid response"); }
+    return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
   async closeControlMaster(): Promise<void> {
@@ -307,6 +306,15 @@ export function decodeRemoteArgument(value: string): string {
   return bytes.toString("utf8");
 }
 
+export function parseRemoteHelperResponse<T = unknown>(stdout: Buffer, operation: string): T {
+  const frames = stdout.toString("utf8").split(/\r?\n/u)
+    .filter((line) => line.startsWith(REMOTE_HELPER_RESPONSE_PREFIX));
+  if (frames.length !== 1) throw invalidHelperResponse(operation);
+  const body = frames[0]!.slice(REMOTE_HELPER_RESPONSE_PREFIX.length);
+  try { return JSON.parse(body) as T; }
+  catch { throw invalidHelperResponse(operation); }
+}
+
 export function buildInstalledHelperCommand(helperPath: string, operation: string, args: readonly string[]): string[] {
   if (!/^\/tmp\/qiyan-\d+\/[a-f0-9]{24}\/qiyan-ssh-helper\.mjs$/u.test(helperPath) || !helperOperations.has(operation)) {
     throw new AppError("CONFIGURATION_ERROR", "invalid installed SSH helper invocation");
@@ -341,4 +349,9 @@ function requireDigest(bytes: Buffer, expected: string): void {
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+function invalidHelperResponse(operation: string): AppError {
+  const label = helperOperations.has(operation) ? operation : "remote";
+  return new AppError("ENDPOINT_UNAVAILABLE", `SSH ${label} helper returned an invalid response`);
 }

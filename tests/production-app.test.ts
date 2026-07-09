@@ -281,6 +281,8 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" }, kind);
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, `${kind} checkpoint`);
   }
+  assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-a", dispatchStarted: false }), { policy: "local" });
+  assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-b", dispatchStarted: true }), { policy: "ready_endpoint", endpointId: "endpoint-b" });
   assert.deepEqual(target("create_session", { endpoint: "" }), { policy: "ready_endpoint", endpointId: "local" });
   assert.deepEqual(target("send_to_session", { nickname: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
   for (const kind of ["set_goal", "pause_goal", "resume_goal", "cancel_goal", "interrupt_session"]) {
@@ -296,12 +298,14 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   assert.deepEqual(target("future_operation", { endpoint: "endpoint-a" }), { policy: "unknown" });
   assert.deepEqual(target("send_to_session", { nickname: "missing" }), { policy: "unknown" });
   assert.deepEqual(recoverableOperationEndpointReferences([
+    { kind: "create_session", args: { endpoint: "endpoint-a" }, receipt: { endpoint: "endpoint-a", dispatchStarted: false } },
     { kind: "create_session", args: {}, receipt: undefined },
     { kind: "restart_endpoint", args: { endpoint: "endpoint-b" }, receipt: undefined },
     { kind: "future_operation", args: { endpoint: "endpoint-a" }, receipt: undefined },
     { kind: "adopt_session", args: { endpoint: "endpoint-b" }, receipt: undefined },
   ], resolve), ["endpoint-b"]);
   assert.deepEqual(recoverableOperationActivationReferences([
+    { kind: "create_session", args: { endpoint: "endpoint-a" }, receipt: { endpoint: "endpoint-a", dispatchStarted: false } },
     { kind: "restart_endpoint", args: { endpoint: "endpoint-b" }, receipt: undefined },
     { kind: "disconnect_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
     { kind: "future_operation", args: { endpoint: "endpoint-a" }, receipt: undefined },
@@ -310,9 +314,32 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
     { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
   ], resolve), ["endpoint-a"], "lifecycle targets pin identity without eager activation");
   assert.deepEqual(recoverableLifecycleEndpointReferences([
+    { kind: "create_session", args: { endpoint: "endpoint-a" }, receipt: { endpoint: "endpoint-a", dispatchStarted: false } },
     { kind: "disconnect_endpoint", args: {}, receipt: undefined },
     { kind: "restart_endpoint", args: { endpoint: "endpoint-a" }, receipt: undefined },
   ], resolve), ["endpoint-a", "local"]);
+});
+
+test("a proven no-dispatch create recovery terminalizes without an endpoint lease", async () => {
+  const store = new OperationStore(createTestDatabase());
+  const operation = store.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session",
+    args: { nickname: "worker", endpoint: "devbox", project_dir: "/project" },
+  });
+  store.markDispatched(operation.id);
+  store.checkpoint(operation.id, { endpoint: "devbox", mappingId: "mapping", dispatchStarted: false });
+  const recovered = store.listRecoverable()[0]!;
+  const target = recoverableOperationTarget(recovered, { defaultProjectEndpointId: "local", session: () => undefined });
+  let endpointCalls = 0;
+
+  await runOperationRecoveryTarget(target, {
+    withReadyWorkLease: async () => { endpointCalls += 1; throw new Error("endpoint must not be touched"); },
+  } as never, async () => {
+    store.failAndUnbind(operation.id, { message: "worker dispatch was never started" });
+  });
+
+  assert.equal(endpointCalls, 0);
+  assert.equal(store.get(operation.id)?.state, "failed");
 });
 
 test("durable operation endpoints survive restart as startup identity references", async () => {

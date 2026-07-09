@@ -23,6 +23,7 @@ const userMasterPlan: SshConnectionPlan = {
   ownsControlMaster: false,
 };
 const helperPath = "/tmp/qiyan-1000/abcdef0123456789abcdef01/qiyan-ssh-helper.mjs";
+const framedOk = Buffer.from('qiyan-helper-v1:{"ok":true}\n');
 
 async function privateUserMaster(t: test.TestContext, mode = 0o600): Promise<{ plan: SshConnectionPlan; server: Server }> {
   const root = await mkdtemp(join(tmpdir(), "qiyan-user-master-"));
@@ -79,7 +80,7 @@ test("user-owned helper and transfer calls check and reuse only the authenticate
       calls.push([...args]);
       const control = args[args.indexOf("-O") + 1];
       return {
-        stdout: control === "check" ? Buffer.alloc(0) : Buffer.from('{"ok":true}'),
+        stdout: control === "check" ? Buffer.alloc(0) : framedOk,
         stderr: Buffer.alloc(0),
       };
     },
@@ -95,6 +96,21 @@ test("user-owned helper and transfer calls check and reuse only the authenticate
   }
   await remote.closeControlMaster();
   assert.equal(calls.some((args) => args.includes("exit")), false);
+});
+
+test("helper response framing ignores unrelated remote shell stdout", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const framed = 'qiyan-helper-v1:{"ok":true}\n';
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource: Buffer.from("helper"),
+    run: async (_command, args) => ({
+      stdout: args.includes("-O") ? Buffer.alloc(0) : Buffer.from(`remote shell banner\n${framed}`),
+      stderr: Buffer.alloc(0),
+    }),
+  });
+
+  assert.deepEqual(await remote.invoke("inspect", ["{}"], helperPath), { ok: true });
 });
 
 test("a failed user-owned master check dispatches no helper command", async (t) => {
@@ -139,7 +155,7 @@ test("user-owned ControlMaster attestation rejects unsafe parents and sockets be
   const calls: string[][] = [];
   const run = async (_command: string, args: readonly string[]) => {
     calls.push([...args]);
-    return { stdout: Buffer.from('{"ok":true}'), stderr: Buffer.alloc(0) };
+    return { stdout: framedOk, stderr: Buffer.alloc(0) };
   };
   const shared = new SshRemoteClient({
     plan: { ...userMasterPlan, controlPath: join(tmpdir(), `qiyan-unsafe-master-${process.pid}`) },

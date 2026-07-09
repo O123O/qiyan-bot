@@ -391,6 +391,7 @@ export function recoverableOperationTarget(
     case "prepare_chat_attachment":
       return args.owner === "assistant" ? { policy: "local" } : sessionTarget(args.owner);
     case "create_session":
+      return recoverableCreateHasNoDispatch(operation.receipt, 0) ? { policy: "local" } : projectTarget();
     case "adopt_session":
       return projectTarget();
     case "send_to_session":
@@ -2505,9 +2506,10 @@ export async function buildProductionApp(
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         assertSessionCreationOrder(context.operationSequence, args.nickname, endpointId);
+        const mappingId = `mapping_${randomUUID()}`;
+        context.checkpoint({ endpoint: endpointId, mappingId, dispatchStarted: false });
         return endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
           const project = await workspaceRouter.prepareCreate(endpointId, args.nickname, args.project_dir, lease);
-          const mappingId = `mapping_${randomUUID()}`;
           const workspaceReceipt = projectWorkspaceReceipt(project);
           let dispatchStarted = false;
           let settingsObservationSequence: number | undefined;
@@ -3230,23 +3232,22 @@ export async function buildProductionApp(
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
-          const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
+          if (operation.kind === "create_session" && recoverableCreateHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
+            failRecoveredNoEffect(operation.id, "worker dispatch was never started");
+            return;
+          }
           const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
           if (!recoveryLease || recoveryLease.endpointId !== recoveryEndpointId) {
             throw new AppError("ENDPOINT_UNAVAILABLE", "session recovery endpoint lease changed");
           }
           const lease = recoveryLease;
           let session = registry.get(args.nickname);
+          const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           if (project) {
             await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
           }
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
-          if (!session && operation.kind === "create_session"
-            && recoverableCreateHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
-            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
-            return;
-          }
           if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
             const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
               .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);

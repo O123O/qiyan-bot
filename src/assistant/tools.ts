@@ -203,6 +203,9 @@ const provenNoEffectCodes = new Set([
   "CONFIGURATION_ERROR",
 ]);
 function isProvenNoEffect(error: unknown, operation?: OperationRecord): boolean {
-  if (operation?.kind === "create_session" && isRecord(operation.receipt) && operation.receipt.dispatchStarted === true) return false;
+  if (operation?.kind === "create_session" && isRecord(operation.receipt)) {
+    if (operation.receipt.dispatchStarted === true) return false;
+    if (operation.receipt.dispatchStarted === false) return true;
+  }
   return error instanceof AppError && provenNoEffectCodes.has(error.code);
 }
