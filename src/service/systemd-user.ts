@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, mkdir, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { hostname } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { ServiceAction } from "../cli.ts";
 import { SERVICE_UNSET_ENV_NAMES } from "../config-source.ts";
@@ -10,6 +11,7 @@ import { AppError } from "../core/errors.ts";
 export const SYSTEMD_UNIT_NAME = "qiyan-bot.service";
 export const MANAGED_UNIT_MARKER = "# Managed by qiyan-bot; use `qiyan-bot service uninstall` to remove.";
 const MAX_UNIT_BYTES = 64 * 1024;
+const MAX_HOST_LENGTH = 253;
 const MAX_CAPTURED_PATH_BYTES = 32 * 1024;
 const MAX_SYSTEMCTL_OUTPUT_BYTES = 4 * 1024;
 const MAX_JOURNAL_OUTPUT_BYTES = 64 * 1024;
@@ -35,17 +37,23 @@ export function buildServiceEffectiveEnvironment(host: NodeJS.ProcessEnv): NodeJ
   return result;
 }
 
-export function renderSystemdUserUnit(input: { nodeExecutable: string; executable: string; qiyanHome: string; path: string }): string {
+export function renderSystemdUserUnit(input: { nodeExecutable: string; executable: string; qiyanHome: string; path: string; host: string }): string {
   const nodeExecutable = systemdPath(input.nodeExecutable, "Node executable");
   const executable = systemdPath(input.executable, "service executable");
   const qiyanHome = systemdPath(input.qiyanHome, "QiYan home");
   const workingDirectory = systemdWorkingDirectory(input.qiyanHome, "QiYan home");
   const path = systemdSearchPath(input.path);
+  const host = systemdConditionHost(input.host);
   const unset = [...SERVICE_UNSET_ENV_NAMES].join(" ");
+  // ConditionHost pins the service to the host it was installed on. The unit file and its
+  // enable symlink live on the shared home, so without this guard a login on any node that
+  // shares the home starts a second instance against the same state database. Condition
+  // (not Assert) makes the start a silent skip elsewhere instead of a restart loop.
   const unit = `${MANAGED_UNIT_MARKER}
 [Unit]
 Description=QiYan personal assistant
 Documentation=https://github.com/O123O/qiyan-bot
+ConditionHost=${host}
 After=network-online.target
 Wants=network-online.target
 
@@ -81,6 +89,7 @@ export class SystemdUserService {
     unitStore?: SystemdUnitStore;
     env?: NodeJS.ProcessEnv;
     expectedUid?: number;
+    host?: string;
   }) {
     const defaultConfigHome = join(options.userHome, ".config");
     const configuredHome = options.env?.XDG_CONFIG_HOME;
@@ -115,11 +124,16 @@ export class SystemdUserService {
       executable: this.options.executable,
       qiyanHome,
       path: this.capturedPath(),
+      host: this.capturedHost(),
     });
   }
 
   private capturedPath(): string {
     return (this.options.env ?? process.env).PATH ?? "";
+  }
+
+  private capturedHost(): string {
+    return this.options.host ?? hostname();
   }
 
   private async executeLocked(action: ServiceAction, input: { qiyanHome?: string }, installUnit?: string): Promise<string> {
@@ -415,6 +429,16 @@ function systemdWorkingDirectory(value: string, label: string): string {
 function validateSystemdPath(value: string, label: string): void {
   if (!isAbsolute(value) || resolve(value) !== value) throw configuration(`${label} must be an absolute normalized path`);
   if (/[\u0000-\u001f\u007f$]/u.test(value)) throw configuration(`${label} contains unsupported characters`);
+}
+
+function systemdConditionHost(value: string): string {
+  // Must equal gethostname() on the install host, so keep it to a literal hostname without
+  // globs or specifiers. Rejecting anything outside this allowlist also prevents unit-file
+  // injection through a crafted hostname.
+  if (value.length === 0) throw configuration("service host name must be a nonempty hostname");
+  if (value.length > MAX_HOST_LENGTH) throw configuration("service host name is too long");
+  if (!/^[A-Za-z0-9._-]+$/u.test(value)) throw configuration("service host name contains unsupported characters");
+  return value;
 }
 
 async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv): Promise<SystemdOutcome> {

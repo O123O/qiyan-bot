@@ -19,12 +19,14 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
     executable: "/bin/qiyan",
     qiyanHome: "/home/user/.qiyan-bot",
     path: "/home/user/.local/bin:/usr/local/bin:/usr/bin",
+    host: "build-host.example.com",
   };
   const unit = renderSystemdUserUnit({
     nodeExecutable: "/home/user/Node Runtime/node%24",
     executable: "/home/user/My Bin/qiyan%bot",
     qiyanHome: "/home/user/QiYan Home",
     path: "/home/user/My Bin:/opt/tool%kit/bin:/usr/bin",
+    host: "render-host.example.net",
   });
   assert.match(unit, new RegExp(`^${MANAGED_UNIT_MARKER.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\n`, "u"));
   assert.match(unit, /Type=simple/u);
@@ -35,7 +37,11 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   assert.match(unit, /Restart=on-failure/u);
   assert.match(unit, /TimeoutStopSec=30s/u);
   assert.match(unit, /UMask=0077/u);
+  assert.match(unit, /^ConditionHost=render-host\.example\.net$/mu);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);
+  for (const host of ["", "bad host", "host\nConditionHost=evil", "host$", "omniml-*", "a".repeat(254)]) {
+    assert.throws(() => renderSystemdUserUnit({ ...base, host }), /host/u);
+  }
   assert.throws(() => renderSystemdUserUnit({ ...base, nodeExecutable: "relative" }), /absolute/u);
   assert.throws(() => renderSystemdUserUnit({ ...base, executable: "relative" }), /absolute/u);
   assert.throws(() => renderSystemdUserUnit({ ...base, executable: "/bin/qiyan\nExecStart=/bin/evil" }), /unsupported characters/u);
@@ -79,6 +85,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
     userHome: "/home/user",
     nodeExecutable: "/usr/bin/node",
     executable: "/home/user/.local/bin/qiyan-bot",
+    host: "install-host.example.org",
     env: { PATH: "/home/user/.local/bin:/opt/user tools/bin:/usr/bin" },
     runner,
     journalRunner: async (args) => { journalCalls.push([...args]); return { code: 0, signal: null, stdout: "safe journal output\n" }; },
@@ -100,6 +107,7 @@ test("installs, controls, and reports one user service with fixed systemctl argu
   assert.equal(writes.length, 1);
   assert.equal(writes[0]?.path, "/home/user/.config/systemd/user/qiyan-bot.service");
   assert.match(writes[0]?.contents ?? "", /ExecStart="\/usr\/bin\/node" "\/home\/user\/\.local\/bin\/qiyan-bot"/u);
+  assert.match(writes[0]?.contents ?? "", /^ConditionHost=install-host\.example\.org$/mu);
   assert.match(writes[0]?.contents ?? "", /^Environment="PATH=\/home\/user\/\.local\/bin:\/opt\/user tools\/bin:\/usr\/bin"$/mu);
   assert.deepEqual(removals, ["/home/user/.config/systemd/user/qiyan-bot.service"]);
   assert.deepEqual(journalCalls, [["--user", "--unit", "qiyan-bot.service", "--lines", "100", "--no-pager", "--output", "short-iso"]]);
