@@ -49,6 +49,7 @@ import {
   reportAssistantTerminalFailure,
   reportOperationalSafely,
   requestOperationRecoveryForAttempt,
+  commitAssistantTerminalFinals,
   resolveAssistantTerminalTurn,
   settleAssistantTerminalTools,
   startupProjectEndpointReferences,
@@ -72,6 +73,7 @@ import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
+import { AssistantCompletedItems, parseAssistantLifecycleNotification } from "../src/assistant/lifecycle-buffer.ts";
 
 test("every production durable event source forwards only successful inserts to one wake boundary", async () => {
   let accepting = false;
@@ -2275,6 +2277,72 @@ test("a full assistant completion is authoritative without a history read", asyn
 
   assert.equal(resolved, notification);
   assert.equal(reads, 0);
+});
+
+test("live assistant finals reject stale or mixed history enrichment", async () => {
+  const notification = {
+    id: "turn-current",
+    status: "completed",
+    itemsView: "summary",
+    items: [
+      { type: "reasoning", id: "reasoning-current" },
+      { type: "agentMessage", id: "final-old", text: "old answer", phase: "final_answer" },
+    ],
+  };
+  const current = { type: "agentMessage", id: "final-current", text: "current answer", phase: "final_answer" };
+  let reads = 0;
+
+  const resolved = await resolveAssistantTerminalTurn(notification, async () => {
+    reads += 1;
+    return [{ ...notification, itemsView: "full", items: [...notification.items, current] }];
+  }, [current]);
+
+  assert.equal(reads, 0);
+  assert.deepEqual(resolved.items, [
+    { type: "reasoning", id: "reasoning-current" },
+    current,
+  ]);
+});
+
+test("a full assistant terminal preserves its final when live item capture is incomplete", async () => {
+  const notification = {
+    id: "turn",
+    status: "completed",
+    itemsView: "full",
+    items: [{ type: "agentMessage", id: "full-final", text: "full answer", phase: "final_answer" }],
+  };
+  const captured = { type: "agentMessage", id: "captured", text: "captured answer", phase: "final_answer" };
+  assert.equal(await resolveAssistantTerminalTurn(notification, async () => [], [captured]), notification);
+});
+
+test("assistant terminal retry retains its live final until durable terminalization succeeds", async () => {
+  const items = new AssistantCompletedItems();
+  const completed = parseAssistantLifecycleNotification("item/completed", {
+    threadId: "assistant",
+    turnId: "turn-current",
+    item: { type: "agentMessage", id: "final-current", text: "current answer", phase: "final_answer" },
+    completedAtMs: 10,
+  });
+  assert.equal(completed?.method, "item/completed");
+  if (completed?.method !== "item/completed") return;
+  items.record(completed);
+  const notification = {
+    id: "turn-current", status: "completed", itemsView: "summary",
+    items: [{ type: "agentMessage", id: "final-old", text: "old answer", phase: "final_answer" }],
+  };
+  const readTurns = async () => { throw new Error("live final must bypass stale history"); };
+
+  await assert.rejects(commitAssistantTerminalFinals(notification, items, readTurns, () => {
+    throw new Error("outbox failed");
+  }), /outbox failed/u);
+  assert.deepEqual(items.peek("turn-current").map(({ id }) => id), ["final-current"]);
+
+  let body = "";
+  await commitAssistantTerminalFinals(notification, items, readTurns, (turn) => {
+    body = String(turn.items.find((item) => item.type === "agentMessage")?.text);
+  });
+  assert.equal(body, "current answer");
+  assert.deepEqual(items.peek("turn-current"), []);
 });
 
 test("only a full exact history turn can enrich a partial assistant completion", async () => {

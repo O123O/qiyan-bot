@@ -41,9 +41,10 @@ import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
 import {
+  AssistantCompletedItems,
   AssistantLifecycleBuffer,
   parseAssistantLifecycleNotification,
-  type AssistantLifecycleNotification,
+  type AssistantTurnLifecycleNotification,
 } from "./assistant/lifecycle-buffer.ts";
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
@@ -135,14 +136,21 @@ type AssistantTerminalTurn = {
   status: string;
   itemsView: string;
   items: Array<Record<string, unknown>>;
-  [key: string]: unknown;
+  error?: unknown;
 };
 
 export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTurn>(
   notification: T,
   readTurns: () => Promise<T[]>,
+  liveFinalItems: readonly Record<string, unknown>[] = [],
 ): Promise<T> {
   if (notification.itemsView === "full") return notification;
+  if (liveFinalItems.length > 0) {
+    return {
+      ...notification,
+      items: [...notification.items.filter((item) => !isAssistantFinalCandidate(item)), ...liveFinalItems],
+    };
+  }
   let turns: T[];
   try { turns = await readTurns(); }
   catch { return notification; }
@@ -155,6 +163,22 @@ export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTu
     return !!match && Object.entries(item).every(([key, value]) => isDeepStrictEqual(match[key], value));
   });
   return retainsNotification ? candidate : notification;
+}
+
+export async function commitAssistantTerminalFinals<T extends AssistantTerminalTurn>(
+  notification: T,
+  completedItems: AssistantCompletedItems,
+  readTurns: () => Promise<T[]>,
+  commit: (turn: T) => void | Promise<void>,
+): Promise<void> {
+  const turn = await resolveAssistantTerminalTurn(notification, readTurns, completedItems.peek(notification.id));
+  await commit(turn);
+  completedItems.discard(notification.id);
+}
+
+function isAssistantFinalCandidate(item: Record<string, unknown>): boolean {
+  return item.type === "agentMessage" && typeof item.text === "string" && !!item.text
+    && (item.phase === "final_answer" || item.phase == null);
 }
 
 export function createAttachmentCleanupOwner(
@@ -1814,6 +1838,7 @@ export async function buildProductionApp(
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
   const assistantLifecycleBuffer = new AssistantLifecycleBuffer();
+  const assistantCompletedItems = new AssistantCompletedItems();
   const assistantToolReadiness = new ToolReadinessGate();
   const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
   let stopping = false;
@@ -2646,6 +2671,7 @@ export async function buildProductionApp(
     }).finally(() => {
       dispatcherAvailable = false;
       assistantLifecycleBuffer.clear();
+      assistantCompletedItems.clear();
     });
     return recoveryOwnersStop;
   }
@@ -3194,6 +3220,10 @@ export async function buildProductionApp(
     const identity = registry.snapshot().assistant;
     const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
     if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
+      if (assistantLifecycle.method === "item/completed") {
+        assistantCompletedItems.record(assistantLifecycle);
+        return;
+      }
       await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);
       return;
     }
@@ -3210,7 +3240,7 @@ export async function buildProductionApp(
     }
   }
 
-  async function handleAssistantLifecycleNotification(notification: AssistantLifecycleNotification): Promise<void> {
+  async function handleAssistantLifecycleNotification(notification: AssistantTurnLifecycleNotification): Promise<void> {
     if (notification.method === "turn/started") {
       await dispatcher.started(notification.params.turn as any);
       return;
@@ -3246,18 +3276,19 @@ export async function buildProductionApp(
       requestRestartOnce,
     });
     if (!settled) return;
-    const turn = await resolveAssistantTerminalTurn(params.turn, async () => {
+    const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
+    await commitAssistantTerminalFinals(params.turn, assistantCompletedItems, async () => {
       const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
       return history.thread.turns ?? [];
+    }, (resolved) => {
+      const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, resolved, Date.now());
+      assistant.handleTerminal(
+        resolved.id,
+        isTerminalStatus(resolved.status) ? resolved.status : "failed",
+        messages.map((message) => message.body).join("\n") || undefined,
+        resolved.error,
+      );
     });
-    const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
-    const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
-    assistant.handleTerminal(
-      turn.id,
-      isTerminalStatus(turn.status) ? turn.status : "failed",
-      messages.map((message) => message.body).join("\n") || undefined,
-      turn.error,
-    );
     for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
     if (operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId)) {
       await reconcileOperations();

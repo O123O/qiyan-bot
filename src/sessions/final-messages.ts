@@ -28,7 +28,8 @@ export class FinalMessageStore {
     if (turn.completedAt !== null) this.observedAt(endpointId, threadId, turn.id, completedAt);
     const explicit = turn.items.map((item, index) => ({ item, index })).filter(({ item }) => item.type === "agentMessage" && item.phase === "final_answer" && item.text);
     const unknown = turn.items.map((item, index) => ({ item, index })).filter(({ item }) => item.type === "agentMessage" && item.phase == null && item.text);
-    const eligible = explicit.length > 0 ? explicit : unknown.slice(-1);
+    const candidates = explicit.length > 0 ? explicit : unknown.slice(-1);
+    const eligible = candidates.filter(({ item }) => !this.persistedDuplicate(endpointId, threadId, turn.id, item.id, item.text ?? ""));
     for (const { item, index } of eligible) {
       this.db.prepare(`INSERT OR IGNORE INTO logical_final_messages
         (id, endpoint_id, thread_id, turn_id, item_id, completed_at, item_order, body, terminal_status)
@@ -68,6 +69,12 @@ export class FinalMessageStore {
 
   private id(endpointId: string, threadId: string, turnId: string, itemId: string): string {
     return `final:${endpointId}:${threadId}:${turnId}:${itemId}`;
+  }
+
+  private persistedDuplicate(endpointId: string, threadId: string, turnId: string, itemId: string, body: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM logical_final_messages
+      WHERE endpoint_id = ? AND thread_id = ? AND item_id = ? AND body = ? AND turn_id <> ? LIMIT 1`)
+      .get(endpointId, threadId, itemId, body, turnId);
   }
 
   private fromRow(row: Record<string, unknown>): LogicalFinalMessage {
