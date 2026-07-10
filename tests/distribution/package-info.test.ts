@@ -67,8 +67,8 @@ test("release package contract includes chat assets and bundles SDK dependencies
   const build = await import("node:fs/promises").then(({ readFile }) => readFile("scripts/build.mjs", "utf8"));
   assert.match(build, /bundle: true/u);
   assert.match(build, /packages: "bundle"/u);
-  const clients = await import("node:fs/promises").then(({ readFile }) => readFile("src/slack/clients.ts", "utf8"));
-  const socket = await import("node:fs/promises").then(({ readFile }) => readFile("src/slack/chat-adapter.ts", "utf8"));
+  const clients = await import("node:fs/promises").then(({ readFile }) => readFile("src/chat-apps/slack/clients.ts", "utf8"));
+  const socket = await import("node:fs/promises").then(({ readFile }) => readFile("src/chat-apps/slack/chat-adapter.ts", "utf8"));
   assert.match(clients, /@slack\/web-api/u);
   assert.match(socket, /@slack\/socket-mode/u);
   assert.equal(manifest.devDependencies["lossless-json"], "4.3.0");

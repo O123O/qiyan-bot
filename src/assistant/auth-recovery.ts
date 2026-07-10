@@ -1,5 +1,5 @@
 import type { DeliveryStore } from "../storage/delivery-store.ts";
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import { EndpointAuthenticationRequiredError } from "../app-server/managed-endpoint.ts";
 import { AppError } from "../core/errors.ts";
 

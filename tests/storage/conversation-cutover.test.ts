@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import type { ConversationBinding } from "../../src/chat/binding.ts";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { openDatabase } from "../../src/storage/database.ts";
 import { migrations } from "../../src/storage/migrations.ts";
 import { finalizeConversationCutover, runConversationRoutingBackfill } from "../../src/storage/conversation-cutover.ts";

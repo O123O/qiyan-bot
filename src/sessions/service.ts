@@ -2,7 +2,7 @@ import type { AppServerPool } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
 import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { FinalMessageStore, LogicalFinalMessage } from "./final-messages.ts";
 import type { ProjectWorkspacePolicy } from "./project-workspace.ts";

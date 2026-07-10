@@ -1,4 +1,4 @@
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import { inTransaction, type Database } from "./database.ts";
 import type { DeliveryStore } from "./delivery-store.ts";
 

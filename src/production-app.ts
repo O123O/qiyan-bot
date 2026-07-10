@@ -5,18 +5,18 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AttachmentStore, type FileHandleId } from "./attachments/store.ts";
 import { AttachmentCleanup, type CleanupTimers } from "./attachments/cleanup.ts";
-import type { ChatAdapter } from "./chat/contracts.ts";
-import type { ConversationBinding, JsonValue } from "./chat/binding.ts";
-import { ChatAdapterRegistry } from "./chat/adapter-registry.ts";
-import { OwnerRouteCatalog, OwnerRouteStore } from "./chat/owner-route-store.ts";
-import type { ChatHistoryRequest } from "./chat/contracts.ts";
-import { DeliveryWorker } from "./chat/delivery-worker.ts";
+import type { ChatAdapter } from "./chat-apps/shared/contracts.ts";
+import type { ConversationBinding, JsonValue } from "./chat-apps/shared/binding.ts";
+import { ChatAdapterRegistry } from "./chat-apps/shared/adapter-registry.ts";
+import { OwnerRouteCatalog, OwnerRouteStore } from "./chat-apps/shared/owner-route-store.ts";
+import type { ChatHistoryRequest } from "./chat-apps/shared/contracts.ts";
+import { DeliveryWorker } from "./chat-apps/shared/delivery-worker.ts";
 import {
   chatAttachmentDeliveryId,
   chatAttachmentFileHandle,
   chatMessageDeliveryId,
   createChatOutputActions,
-} from "./chat/output-actions.ts";
+} from "./chat-apps/shared/output-actions.ts";
 import { LocalAppServerRuntime } from "./app-server/local-runtime.ts";
 import { EndpointAuthenticationRequiredError, ManagedAppServerEndpoint } from "./app-server/managed-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
@@ -78,18 +78,18 @@ import { finalizeConversationCutover, preflightConversationCutover, runConversat
 import { OperationStore, type RecoverableOperation } from "./storage/operation-store.ts";
 import { RuntimeStore } from "./storage/runtime-store.ts";
 import { SessionDashboardStore } from "./storage/session-dashboard-store.ts";
-import { TelegramChatAdapter } from "./telegram/chat-adapter.ts";
-import type { SlackContextService } from "./slack/context-service.ts";
-import { SlackChatAdapter } from "./slack/chat-adapter.ts";
-import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
-import { WeixinApiClient, WeixinApiError } from "./weixin/api-client.ts";
-import { WeixinAccountStore } from "./weixin/account-store.ts";
-import { WeixinInboxStore } from "./weixin/inbox-store.ts";
-import { WeixinIngressWorker } from "./weixin/ingress-worker.ts";
-import { WeixinOutboundStore } from "./weixin/outbound-store.ts";
-import { WeixinDeliveryAdapter } from "./weixin/delivery-adapter.ts";
-import { authorizationIncident, WeixinChatAdapter } from "./weixin/chat-adapter.ts";
-import { WeixinIncidentRouter } from "./weixin/incident-router.ts";
+import { TelegramChatAdapter } from "./chat-apps/telegram/chat-adapter.ts";
+import type { SlackContextService } from "./chat-apps/slack/context-service.ts";
+import { SlackChatAdapter } from "./chat-apps/slack/chat-adapter.ts";
+import type { WeixinCredentialHandle } from "./chat-apps/weixin/credential-store.ts";
+import { WeixinApiClient, WeixinApiError } from "./chat-apps/weixin/api-client.ts";
+import { WeixinAccountStore } from "./chat-apps/weixin/account-store.ts";
+import { WeixinInboxStore } from "./chat-apps/weixin/inbox-store.ts";
+import { WeixinIngressWorker } from "./chat-apps/weixin/ingress-worker.ts";
+import { WeixinOutboundStore } from "./chat-apps/weixin/outbound-store.ts";
+import { WeixinDeliveryAdapter } from "./chat-apps/weixin/delivery-adapter.ts";
+import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/chat-adapter.ts";
+import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";

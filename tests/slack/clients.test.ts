@@ -8,7 +8,7 @@ import {
   SlackApiError,
   validateSlackStartup,
   type SlackWebClientShape,
-} from "../../src/slack/clients.ts";
+} from "../../src/chat-apps/slack/clients.ts";
 
 const config: SlackConfig = {
   appToken: "xapp-secret",

@@ -65,7 +65,7 @@ import {
 } from "../src/production-app.ts";
 import { AppError } from "../src/core/errors.ts";
 import type { ManagementState } from "../src/core/types.ts";
-import { ChatAdapterRegistry } from "../src/chat/adapter-registry.ts";
+import { ChatAdapterRegistry } from "../src/chat-apps/shared/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
 import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
-import { DeliveryWorker } from "../../src/chat/delivery-worker.ts";
-import { SlackDeliveryAdapter, slackClientMessageId } from "../../src/slack/delivery-adapter.ts";
-import { SlackApiError, type SlackBotClient } from "../../src/slack/clients.ts";
+import { ChatAdapterRegistry } from "../../src/chat-apps/shared/adapter-registry.ts";
+import { DeliveryWorker } from "../../src/chat-apps/shared/delivery-worker.ts";
+import { SlackDeliveryAdapter, slackClientMessageId } from "../../src/chat-apps/slack/delivery-adapter.ts";
+import { SlackApiError, type SlackBotClient } from "../../src/chat-apps/slack/clients.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
@@ -106,7 +106,7 @@ test("Slack documents use upload-v2 with the frozen channel thread and return op
     title: "report.txt",
     initial_comment: "report",
   }]);
-  const source = await readFile(new URL("../../src/slack/delivery-adapter.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../../src/chat-apps/slack/delivery-adapter.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /files\.upload(?:\W|$)/u);
 });
 

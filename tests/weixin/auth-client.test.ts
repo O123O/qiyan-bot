@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { WeixinAuthClient, type WeixinQrChallenge } from "../../src/weixin/auth-client.ts";
+import { WeixinAuthClient, type WeixinQrChallenge } from "../../src/chat-apps/weixin/auth-client.ts";
 
 interface ObservedRequest { url: URL; init: RequestInit }
 

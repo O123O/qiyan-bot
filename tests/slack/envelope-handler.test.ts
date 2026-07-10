@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SlackEnvelopeHandler } from "../../src/slack/envelope-handler.ts";
-import { SlackInboxStore } from "../../src/slack/inbox-store.ts";
+import { SlackEnvelopeHandler } from "../../src/chat-apps/slack/envelope-handler.ts";
+import { SlackInboxStore } from "../../src/chat-apps/slack/inbox-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 const mention = {

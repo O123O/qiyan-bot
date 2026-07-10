@@ -15,7 +15,7 @@ import type {
 } from "../../src/assistant/conversation-dispatcher.ts";
 import { ConversationDispatcher } from "../../src/assistant/conversation-dispatcher.ts";
 import { AttachmentStore } from "../../src/attachments/store.ts";
-import type { ConversationBinding } from "../../src/chat/binding.ts";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";

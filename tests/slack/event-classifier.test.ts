@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifySlackEvent } from "../../src/slack/event-classifier.ts";
+import { classifySlackEvent } from "../../src/chat-apps/slack/event-classifier.ts";
 
 const context = (activated: readonly string[] = []) => ({
   teamId: "T1",

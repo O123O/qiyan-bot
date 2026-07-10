@@ -9,7 +9,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
-import { TelegramPoller } from "../../src/telegram/poller.ts";
+import { TelegramPoller } from "../../src/chat-apps/telegram/poller.ts";
 
 test("accepted input atomically stores source context and advances the offset after download", async () => {
   const db = createTestDatabase();

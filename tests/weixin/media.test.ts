@@ -9,7 +9,7 @@ import {
   encryptWeixinMedia,
   safeWeixinFileName,
   verifyWeixinMediaIntegrity,
-} from "../../src/weixin/media.ts";
+} from "../../src/chat-apps/weixin/media.ts";
 
 async function bytes(source: AsyncIterable<Uint8Array>): Promise<Buffer> {
   const chunks: Buffer[] = [];

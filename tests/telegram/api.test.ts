@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TelegramApi, splitTelegramText } from "../../src/telegram/api.ts";
+import { TelegramApi, splitTelegramText } from "../../src/chat-apps/telegram/api.ts";
 
 test("Bot API retries 429 using retry_after and returns the result", async () => {
   const calls: string[] = [];

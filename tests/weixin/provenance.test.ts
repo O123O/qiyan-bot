@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { WEIXIN_PROTOCOL_REFERENCE } from "../../src/weixin/provenance.ts";
+import { WEIXIN_PROTOCOL_REFERENCE } from "../../src/chat-apps/weixin/provenance.ts";
 
 test("pins only the reviewed Tencent protocol dependencies", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8")) as {

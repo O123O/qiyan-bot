@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveTencentRedirect, validateTencentUrl } from "../../src/weixin/endpoint-policy.ts";
+import { resolveTencentRedirect, validateTencentUrl } from "../../src/chat-apps/weixin/endpoint-policy.ts";
 
 test("accepts only trusted Tencent HTTPS endpoint labels and paths", () => {
   assert.equal(

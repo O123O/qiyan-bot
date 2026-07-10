@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ConversationBinding } from "../../src/chat/binding.ts";
-import { OwnerRouteCatalog } from "../../src/chat/owner-route-store.ts";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
+import { OwnerRouteCatalog } from "../../src/chat-apps/shared/owner-route-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
-import { WeixinIncidentRouter } from "../../src/weixin/incident-router.ts";
+import { WeixinAccountStore } from "../../src/chat-apps/weixin/account-store.ts";
+import { WeixinIncidentRouter } from "../../src/chat-apps/weixin/incident-router.ts";
 
 const telegram = { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } as const;
 const slack = { adapterId: "slack", conversationKey: "slack:T:D", destination: { workspaceId: "T", channelId: "D" } } as const;

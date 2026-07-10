@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { TelegramChatAdapter } from "../../src/telegram/chat-adapter.ts";
+import { TelegramChatAdapter } from "../../src/chat-apps/telegram/chat-adapter.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;

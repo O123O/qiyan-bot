@@ -6,7 +6,7 @@ import {
   parseUpdates,
   readBoundedJson,
   WeixinProtocolError,
-} from "../../src/weixin/protocol.ts";
+} from "../../src/chat-apps/weixin/protocol.ts";
 
 test("preserves message identities above Number.MAX_SAFE_INTEGER", () => {
   const parsed = parseUpdates(JSON.stringify({

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SlackInboxStore } from "../../src/slack/inbox-store.ts";
-import type { NormalizedSlackEvent } from "../../src/slack/types.ts";
+import { SlackInboxStore } from "../../src/chat-apps/slack/inbox-store.ts";
+import type { NormalizedSlackEvent } from "../../src/chat-apps/slack/types.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 function event(id: string, channel: string, receivedAt = 1): NormalizedSlackEvent {

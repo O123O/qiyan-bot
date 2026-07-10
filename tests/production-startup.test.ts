@@ -8,7 +8,7 @@ import test, { type TestContext } from "node:test";
 import type { BotConfig } from "../src/config.ts";
 import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
 import { TOOL_NAMES } from "../src/assistant/tools.ts";
-import type { ChatAdapter } from "../src/chat/contracts.ts";
+import type { ChatAdapter } from "../src/chat-apps/shared/contracts.ts";
 import { StartupPhaseError } from "../src/app.ts";
 import { createTestDatabase, openDatabase, type Database } from "../src/storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "../src/storage/database-lease.ts";

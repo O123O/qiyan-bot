@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { composeApp, createApp, StartupPhaseError, TerminalInbox, type AppPhase } from "../src/app.ts";
 import type { BotConfig } from "../src/config.ts";
-import type { WeixinCredentialHandle } from "../src/weixin/credential-store.ts";
+import type { WeixinCredentialHandle } from "../src/chat-apps/weixin/credential-store.ts";
 
 test("composition starts in order, starts each worker once, and stops in reverse", async () => {
   const events: string[] = [];

@@ -6,20 +6,20 @@ import { join } from "node:path";
 import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
 import { AppError } from "../../src/core/errors.ts";
-import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
-import { DeliveryWorker } from "../../src/chat/delivery-worker.ts";
+import { ChatAdapterRegistry } from "../../src/chat-apps/shared/adapter-registry.ts";
+import { DeliveryWorker } from "../../src/chat-apps/shared/delivery-worker.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { WeixinAccountStore, type WeixinAuthorizationIncidentSink } from "../../src/weixin/account-store.ts";
+import { WeixinAccountStore, type WeixinAuthorizationIncidentSink } from "../../src/chat-apps/weixin/account-store.ts";
 import {
   WeixinApiError,
   type WeixinSendMessageRequest,
   type WeixinUploadRequest,
   type WeixinUploadTarget,
-} from "../../src/weixin/api-client.ts";
-import { WeixinDeliveryAdapter } from "../../src/weixin/delivery-adapter.ts";
-import { WeixinOutboundStore } from "../../src/weixin/outbound-store.ts";
-import { decryptWeixinMedia } from "../../src/weixin/media.ts";
+} from "../../src/chat-apps/weixin/api-client.ts";
+import { WeixinDeliveryAdapter } from "../../src/chat-apps/weixin/delivery-adapter.ts";
+import { WeixinOutboundStore } from "../../src/chat-apps/weixin/outbound-store.ts";
+import { decryptWeixinMedia } from "../../src/chat-apps/weixin/media.ts";
 
 function setup(input: { body?: string; mandatory?: boolean; send?: (request: WeixinSendMessageRequest) => Promise<{ messageId?: string }> } = {}) {
   const db = createTestDatabase();

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyUpdate, toTelegramCanonicalSource } from "../../src/telegram/adapter.ts";
+import { classifyUpdate, toTelegramCanonicalSource } from "../../src/chat-apps/telegram/adapter.ts";
 
 test("accepts an ordinary owner message", () => {
   const result = classifyUpdate({

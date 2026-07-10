@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { AttachmentStore } from "../../src/attachments/store.ts";
-import type { ConversationBinding } from "../../src/chat/binding.ts";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { AppError } from "../../src/core/errors.ts";
 import type { CanonicalChatSource } from "../../src/core/types.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";

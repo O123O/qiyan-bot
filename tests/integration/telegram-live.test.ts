@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TelegramApi } from "../../src/telegram/api.ts";
+import { TelegramApi } from "../../src/chat-apps/telegram/api.ts";
 
 const enabled = process.env.RUN_TELEGRAM_LIVE === "1"
   && Boolean(process.env.TELEGRAM_BOT_TOKEN)

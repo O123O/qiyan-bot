@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
+import type { ConversationBinding, JsonValue } from "../chat-apps/shared/binding.ts";
 import type { SourceContext } from "../core/types.ts";
 import type { Database } from "../storage/database.ts";
 import { inTransaction } from "../storage/database.ts";
