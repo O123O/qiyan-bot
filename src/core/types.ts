@@ -1,4 +1,4 @@
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 
 export type SessionKey = `${string}:${string}`;
 export type ManagementState =

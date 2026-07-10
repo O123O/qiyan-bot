@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
+import { WeixinAccountStore } from "../../src/chat-apps/weixin/account-store.ts";
 import {
   splitWeixinText,
   WeixinOutboundStore,
   type WeixinAttachmentPlan,
   type WeixinFrozenDestination,
-} from "../../src/weixin/outbound-store.ts";
+} from "../../src/chat-apps/weixin/outbound-store.ts";
 
 const target: WeixinFrozenDestination = {
   generationId: "generation",

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
-import type { ConversationBinding, JsonValue } from "../chat/binding.ts";
-import { sameConversation } from "../chat/binding.ts";
+import type { ConversationBinding, JsonValue } from "../chat-apps/shared/binding.ts";
+import { sameConversation } from "../chat-apps/shared/binding.ts";
 import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource, FailedAttachmentDescriptor, SourceContext } from "../core/types.ts";
 import type { Database } from "./database.ts";

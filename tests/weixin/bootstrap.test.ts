@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../../src/config.ts";
-import { bootstrapWeixin } from "../../src/weixin/bootstrap.ts";
-import { WeixinCredentialStore } from "../../src/weixin/credential-store.ts";
+import { bootstrapWeixin } from "../../src/chat-apps/weixin/bootstrap.ts";
+import { WeixinCredentialStore } from "../../src/chat-apps/weixin/credential-store.ts";
 
 test("bootstraps only a public configured flag while retaining an opaque credential handle", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-weixin-bootstrap-"));

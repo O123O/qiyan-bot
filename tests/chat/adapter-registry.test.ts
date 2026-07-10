@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ChatAdapter, ChatDeliveryAdapter } from "../../src/chat/contracts.ts";
+import type { ChatAdapter, ChatDeliveryAdapter } from "../../src/chat-apps/shared/contracts.ts";
 import { AppError } from "../../src/core/errors.ts";
-import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
+import { ChatAdapterRegistry } from "../../src/chat-apps/shared/adapter-registry.ts";
 
 function adapter(id: string): ChatDeliveryAdapter {
   return {

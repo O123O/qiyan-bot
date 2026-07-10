@@ -6,7 +6,7 @@ import type { Database } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
-import type { ConversationBinding } from "../chat/binding.ts";
+import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";

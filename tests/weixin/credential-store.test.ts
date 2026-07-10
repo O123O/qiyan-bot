@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { AppError } from "../../src/core/errors.ts";
-import { WeixinCredentialStore } from "../../src/weixin/credential-store.ts";
+import { WeixinCredentialStore } from "../../src/chat-apps/weixin/credential-store.ts";
 
 async function fixture(t: TestContext): Promise<{ root: string; qiyanHome: string; credentialPath: string }> {
   const root = await mkdtemp(join(tmpdir(), "qiyan-weixin-credentials-"));

@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AssistantRuntime } from "../../src/assistant/runtime.ts";
-import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
-import { DeliveryWorker } from "../../src/chat/delivery-worker.ts";
+import { ChatAdapterRegistry } from "../../src/chat-apps/shared/adapter-registry.ts";
+import { DeliveryWorker } from "../../src/chat-apps/shared/delivery-worker.ts";
 import { openDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
-import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
+import { OwnerRouteStore } from "../../src/chat-apps/shared/owner-route-store.ts";
 
 const binding = { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } as const;
 

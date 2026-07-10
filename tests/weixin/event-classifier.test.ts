@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyWeixinMessage } from "../../src/weixin/event-classifier.ts";
-import type { ParsedMessageCandidate } from "../../src/weixin/protocol.ts";
+import { classifyWeixinMessage } from "../../src/chat-apps/weixin/event-classifier.ts";
+import type { ParsedMessageCandidate } from "../../src/chat-apps/weixin/protocol.ts";
 
 const owner = { botId: "bot", ownerUserId: "owner" };
 

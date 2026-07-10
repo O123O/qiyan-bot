@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { JsonValue } from "../../src/chat/binding.ts";
-import type { ChatDeliveryAdapter, UncertainDeliveryResolution } from "../../src/chat/contracts.ts";
-import { ChatAdapterRegistry } from "../../src/chat/adapter-registry.ts";
-import { DeliveryWorker } from "../../src/chat/delivery-worker.ts";
+import type { JsonValue } from "../../src/chat-apps/shared/binding.ts";
+import type { ChatDeliveryAdapter, UncertainDeliveryResolution } from "../../src/chat-apps/shared/contracts.ts";
+import { ChatAdapterRegistry } from "../../src/chat-apps/shared/adapter-registry.ts";
+import { DeliveryWorker } from "../../src/chat-apps/shared/delivery-worker.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 

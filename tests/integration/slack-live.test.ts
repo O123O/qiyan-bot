@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
 import type { SlackConfig } from "../../src/config.ts";
-import { createSlackClients, validateSlackStartup } from "../../src/slack/clients.ts";
-import { SlackContextService } from "../../src/slack/context-service.ts";
-import { SlackDeliveryAdapter } from "../../src/slack/delivery-adapter.ts";
+import { createSlackClients, validateSlackStartup } from "../../src/chat-apps/slack/clients.ts";
+import { SlackContextService } from "../../src/chat-apps/slack/context-service.ts";
+import { SlackDeliveryAdapter } from "../../src/chat-apps/slack/delivery-adapter.ts";
 
 const enabled = process.env.RUN_SLACK_INTEGRATION === "1";
 

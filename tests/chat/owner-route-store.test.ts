@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OwnerRouteCatalog, OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
+import { OwnerRouteCatalog, OwnerRouteStore } from "../../src/chat-apps/shared/owner-route-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";

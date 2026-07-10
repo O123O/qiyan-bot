@@ -13,7 +13,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
-import { OwnerRouteStore } from "../../src/chat/owner-route-store.ts";
+import { OwnerRouteStore } from "../../src/chat-apps/shared/owner-route-store.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";

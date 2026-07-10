@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { WeixinCredentialPublic } from "../../src/weixin/credential-store.ts";
-import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
+import type { WeixinCredentialPublic } from "../../src/chat-apps/weixin/credential-store.ts";
+import { WeixinAccountStore } from "../../src/chat-apps/weixin/account-store.ts";
 import { createTestDatabase, inTransaction } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeSlackMessageContent } from "../../src/slack/content-normalizer.ts";
+import { normalizeSlackMessageContent } from "../../src/chat-apps/slack/content-normalizer.ts";
 
 test("normalizes a shared Slack forward with ordered inline semantics", () => {
   const result = normalizeSlackMessageContent({

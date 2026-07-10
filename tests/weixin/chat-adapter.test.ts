@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { WeixinAccountStore, type WeixinAuthorizationIncidentSink } from "../../src/weixin/account-store.ts";
-import { WeixinApiError } from "../../src/weixin/api-client.ts";
-import { WeixinChatAdapter } from "../../src/weixin/chat-adapter.ts";
-import { WeixinInboxStore } from "../../src/weixin/inbox-store.ts";
-import { WeixinOutboundStore } from "../../src/weixin/outbound-store.ts";
+import { WeixinAccountStore, type WeixinAuthorizationIncidentSink } from "../../src/chat-apps/weixin/account-store.ts";
+import { WeixinApiError } from "../../src/chat-apps/weixin/api-client.ts";
+import { WeixinChatAdapter } from "../../src/chat-apps/weixin/chat-adapter.ts";
+import { WeixinInboxStore } from "../../src/chat-apps/weixin/inbox-store.ts";
+import { WeixinOutboundStore } from "../../src/chat-apps/weixin/outbound-store.ts";
 
 function setup(
   responses: Array<"success" | "failure" | "authorization"> = ["success"],

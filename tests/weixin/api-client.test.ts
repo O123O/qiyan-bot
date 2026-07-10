@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { APP_VERSION } from "../../src/version.ts";
-import { WeixinApiClient, WeixinApiError, type WeixinHttpTransport } from "../../src/weixin/api-client.ts";
-import type { WeixinCredential, WeixinCredentialHandle } from "../../src/weixin/credential-store.ts";
+import { WeixinApiClient, WeixinApiError, type WeixinHttpTransport } from "../../src/chat-apps/weixin/api-client.ts";
+import type { WeixinCredential, WeixinCredentialHandle } from "../../src/chat-apps/weixin/credential-store.ts";
 
 const credential: Readonly<WeixinCredential> = Object.freeze({
   accountGenerationId: crypto.randomUUID(),

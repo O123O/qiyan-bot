@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TransientResultLimiter } from "../../src/slack/result-limiter.ts";
-import type { SlackSearchCoverage } from "../../src/slack/clients.ts";
+import { TransientResultLimiter } from "../../src/chat-apps/slack/result-limiter.ts";
+import type { SlackSearchCoverage } from "../../src/chat-apps/slack/clients.ts";
 
 interface Match { channelId: string; messageTs: string; text: string; id: string }
 

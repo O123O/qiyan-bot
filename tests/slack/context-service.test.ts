@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
-import type { ConversationBinding } from "../../src/chat/binding.ts";
-import { SlackApiError, type SlackBotClient, type SlackSearchClient, type SlackSearchCoverage } from "../../src/slack/clients.ts";
-import { SlackContextService } from "../../src/slack/context-service.ts";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
+import { SlackApiError, type SlackBotClient, type SlackSearchClient, type SlackSearchCoverage } from "../../src/chat-apps/slack/clients.ts";
+import { SlackContextService } from "../../src/chat-apps/slack/context-service.ts";
 
 type ResponseFactory = (args: Record<string, unknown>) => Record<string, unknown>;
 

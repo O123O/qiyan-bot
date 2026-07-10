@@ -1,6 +1,6 @@
 import type { BotConfig } from "./config.ts";
 import { StartupPhaseError } from "./core/errors.ts";
-import type { WeixinCredentialHandle } from "./weixin/credential-store.ts";
+import type { WeixinCredentialHandle } from "./chat-apps/weixin/credential-store.ts";
 import type { OperationalEventSink } from "./core/operational-log.ts";
 
 export { StartupPhaseError } from "./core/errors.ts";

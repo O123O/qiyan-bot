@@ -9,11 +9,11 @@ import type { CanonicalChatSource } from "../../src/core/types.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
-import { WeixinAccountStore } from "../../src/weixin/account-store.ts";
-import { WeixinApiError } from "../../src/weixin/api-client.ts";
-import { WeixinInboxStore } from "../../src/weixin/inbox-store.ts";
-import { WeixinIngressWorker } from "../../src/weixin/ingress-worker.ts";
-import { parseUpdates } from "../../src/weixin/protocol.ts";
+import { WeixinAccountStore } from "../../src/chat-apps/weixin/account-store.ts";
+import { WeixinApiError } from "../../src/chat-apps/weixin/api-client.ts";
+import { WeixinInboxStore } from "../../src/chat-apps/weixin/inbox-store.ts";
+import { WeixinIngressWorker } from "../../src/chat-apps/weixin/ingress-worker.ts";
+import { parseUpdates } from "../../src/chat-apps/weixin/protocol.ts";
 
 async function fixture(context: test.TestContext, download: (url: URL) => Promise<AsyncIterable<Uint8Array>>) {
   const root = await mkdtemp(join(tmpdir(), "qiyan-weixin-ingress-"));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTelegramTransports, effectiveProxyEnvironment } from "../../src/telegram/transport.ts";
+import { createTelegramTransports, effectiveProxyEnvironment } from "../../src/chat-apps/telegram/transport.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
