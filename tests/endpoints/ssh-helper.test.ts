@@ -43,7 +43,8 @@ test("the helper hard-codes the isolated tmux server and disables user tmux conf
 });
 
 test("the helper emits one versioned response frame", async () => {
-  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "preflight"], {
+  const argument = encodeRemoteArgument(JSON.stringify({ action: "home" }));
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "workspace", argument], {
     timeoutMs: 5_000,
     maxOutputBytes: 64 * 1024,
   });
@@ -51,11 +52,12 @@ test("the helper emits one versioned response frame", async () => {
 });
 
 test("the helper establishes a frame boundary after output without a trailing newline", async () => {
+  const argument = encodeRemoteArgument(JSON.stringify({ action: "home" }));
   const result = await runBoundedProcess("sh", [
-    "-c", "printf remote-shell-banner; exec \"$@\"", "sh", process.execPath, helperPath.pathname, "preflight",
+    "-c", "printf remote-shell-banner; exec \"$@\"", "sh", process.execPath, helperPath.pathname, "workspace", argument,
   ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
 
-  assert.doesNotThrow(() => parseRemoteHelperResponse(result.stdout, "preflight"));
+  assert.doesNotThrow(() => parseRemoteHelperResponse(result.stdout, "workspace"));
 });
 
 test("helper response parsing fails closed without exposing output", () => {
