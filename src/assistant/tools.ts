@@ -5,7 +5,7 @@ import { parseDirective } from "../directives/parser.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 import type { AttemptScope } from "./attempt-scope.ts";
 
-export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId: string; callId: string; toolFence?: number }
+export interface ToolCallContext { sourceContextId: string; attemptId: string; turnId?: string; callId: string; toolFence?: number; signal?: AbortSignal }
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 export interface ToolActionContext extends ToolCallContext { effectiveSourceContextId: string; operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
@@ -62,7 +62,7 @@ export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
 export function createAssistantTools(
   operations: OperationStore,
   actions: Partial<Record<AssistantToolName, Action>>,
-  options: { maxCollectCount: number; attemptScope?: AttemptScope },
+  options: { maxCollectCount: number; attemptScope?: AttemptScope; waitForTerminal?(operationId: string, signal?: AbortSignal): Promise<void> },
 ): Record<AssistantToolName, ToolHandler> {
   const result = {} as Record<AssistantToolName, ToolHandler>;
   for (const name of TOOL_NAMES) {
@@ -119,8 +119,16 @@ export function createAssistantTools(
       if (!options.attemptScope && directive) operation = operations.replayDirective(context.sourceContextId, directive.kind, directive.binding);
       operation ??= operations.prepare({ contextId: effectiveSourceContextId, attemptId: context.attemptId, callId: context.callId, kind: name, args, effectClass, ...(context.toolFence === undefined ? {} : { toolFence: context.toolFence }) });
       if (operation.state === "succeeded") return operation.receipt;
-      if (operation.state === "dispatched" || operation.state === "uncertain") throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
-      if (operation.state === "failed") throw new AppError("OPERATION_UNCERTAIN", `${name} previously failed and requires reconciliation`);
+      if (operation.state === "dispatched" || operation.state === "uncertain") {
+        if (operation.state === "uncertain" && name === "create_session" && options.waitForTerminal) {
+          return waitForCertainResult(operations, operation.id, name, options.waitForTerminal, context.signal);
+        }
+        throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect`);
+      }
+      if (operation.state === "failed") {
+        if (name === "create_session" && options.waitForTerminal) throw definiteOperationFailure(name, operation);
+        throw new AppError("OPERATION_UNCERTAIN", `${name} previously failed and requires reconciliation`);
+      }
       if (!options.attemptScope && directive) operations.bindDirective(context.sourceContextId, directive.kind, directive.binding, operation.id);
 
       const action = actions[name];
@@ -152,6 +160,9 @@ export function createAssistantTools(
         const failure = { message: error instanceof Error ? error.message : String(error) };
         if (uncertain) {
           operations.fail(operation.id, failure, true, context.toolFence);
+          if (name === "create_session" && options.waitForTerminal) {
+            return waitForCertainResult(operations, operation.id, name, options.waitForTerminal, context.signal);
+          }
           throw new AppError("OPERATION_UNCERTAIN", `${name} may already have taken effect; wait for durable reconciliation before retrying`);
         }
         operations.failAndUnbind(operation.id, failure, context.toolFence);
@@ -160,6 +171,27 @@ export function createAssistantTools(
     };
   }
   return result;
+}
+
+async function waitForCertainResult(
+  operations: OperationStore,
+  operationId: string,
+  name: AssistantToolName,
+  waitForTerminal: (operationId: string, signal?: AbortSignal) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  await waitForTerminal(operationId, signal);
+  const operation = operations.get(operationId);
+  if (operation?.state === "succeeded") return operation.receipt;
+  if (operation?.state === "failed") throw definiteOperationFailure(name, operation);
+  throw new AppError("OPERATION_UNCERTAIN", `${name} reconciliation returned without a terminal result`);
+}
+
+function definiteOperationFailure(name: AssistantToolName, operation: OperationRecord): AppError {
+  const reason = isRecord(operation.error) && typeof operation.error.message === "string"
+    ? operation.error.message
+    : "durable reconciliation proved that it did not complete";
+  return new AppError("OPERATION_FAILED", `${name} failed: ${reason}`, { operationId: operation.id });
 }
 
 function equalStrings(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every((value, index) => value === right[index]); }
@@ -171,6 +203,9 @@ const provenNoEffectCodes = new Set([
   "CONFIGURATION_ERROR",
 ]);
 function isProvenNoEffect(error: unknown, operation?: OperationRecord): boolean {
-  if (operation?.kind === "create_session" && isRecord(operation.receipt) && operation.receipt.dispatchStarted === true) return false;
+  if (operation?.kind === "create_session" && isRecord(operation.receipt)) {
+    if (operation.receipt.dispatchStarted === true) return false;
+    if (operation.receipt.dispatchStarted === false) return true;
+  }
   return error instanceof AppError && provenNoEffectCodes.has(error.code);
 }

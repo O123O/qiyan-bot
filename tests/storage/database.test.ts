@@ -10,6 +10,8 @@ import { isDatabaseIntegrityFailure, openDatabase } from "../../src/storage/data
 import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
+import { OperationStore } from "../../src/storage/operation-store.ts";
+import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {
@@ -275,6 +277,54 @@ test("an existing QiYan database reopens normally", async () => {
   const reopened = openDatabase(path);
   assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()!.count, migrations.length);
   reopened.close();
+});
+
+test("operation recovery protocol migration marks old rows legacy and new rows current", () => {
+  const protocolMigrationIndex = migrations.findIndex((migration) =>
+    typeof migration === "function" && migration.toString().includes("recovery_protocol"));
+  assert.ok(protocolMigrationIndex > 0);
+  const db = new DatabaseSync(":memory:");
+  for (const migration of migrations.slice(0, protocolMigrationIndex)) {
+    if (typeof migration === "function") migration(db);
+    else db.exec(migration);
+  }
+  db.prepare(`INSERT INTO operations
+    (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class)
+    VALUES ('legacy', 'ctx', 'attempt', 'legacy', 'create_session', 'hash', '{}', 'uncertain', 1, 1, 1, 'side_effecting')`).run();
+  const migration = migrations[protocolMigrationIndex];
+  assert.equal(typeof migration, "function");
+  (migration as (database: DatabaseSync) => void)(db);
+
+  assert.equal(db.prepare("SELECT recovery_protocol FROM operations WHERE id = 'legacy'").get()!.recovery_protocol, 0);
+  const current = new OperationStore(db).prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "current", kind: "create_session", args: {},
+  });
+  assert.equal(current.recoveryProtocol, 1);
+  db.close();
+});
+
+test("goal ownership migration distinguishes legacy mappings from newly created mappings", () => {
+  const knownMigrationIndex = migrations.findIndex((migration) =>
+    typeof migration === "function" && migration.toString().includes("goal_control_known"));
+  assert.ok(knownMigrationIndex > 0);
+  const db = new DatabaseSync(":memory:");
+  for (const migration of migrations.slice(0, knownMigrationIndex)) {
+    if (typeof migration === "function") migration(db);
+    else db.exec(migration);
+  }
+  db.prepare(`INSERT INTO session_runtime
+    (endpoint_id, thread_id, mapping_id, management_state, native_status)
+    VALUES ('local', 'legacy-thread', 'legacy-mapping', 'managed', 'idle')`).run();
+  const migration = migrations[knownMigrationIndex];
+  assert.equal(typeof migration, "function");
+  (migration as (database: DatabaseSync) => void)(db);
+
+  assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
+    WHERE mapping_id = 'legacy-mapping'`).get()!.goal_control_known, 0);
+  new RuntimeStore(db).setSession("local", "new-thread", "new-mapping", "managed", "idle");
+  assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
+    WHERE mapping_id = 'new-mapping'`).get()!.goal_control_known, 1);
+  db.close();
 });
 
 test("a cut-over QiYan state-version-3 database reopens normally", async () => {

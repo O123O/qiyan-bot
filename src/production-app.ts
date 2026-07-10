@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -17,7 +17,8 @@ import {
   chatMessageDeliveryId,
   createChatOutputActions,
 } from "./chat/output-actions.ts";
-import { LocalEndpoint } from "./app-server/local-endpoint.ts";
+import { LocalAppServerRuntime } from "./app-server/local-runtime.ts";
+import { EndpointAuthenticationRequiredError, ManagedAppServerEndpoint } from "./app-server/managed-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
@@ -31,17 +32,22 @@ import {
   type BackgroundFailureNotice,
 } from "./core/background-failure-reporter.ts";
 import type { OperationalEvent, OperationalEventSink } from "./core/operational-log.ts";
-import type { CanonicalChatSource, ManagementState } from "./core/types.ts";
+import type { CanonicalChatSource, ManagementState, OperationState } from "./core/types.ts";
 import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
-import { recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
-import { buildAssistantChildEnvironment, prepareAssistantProfile, startAuthenticatedAssistantEndpoint, type PreparedAssistantProfile } from "./assistant/profile.ts";
+import { assistantAuthenticationStartupError, recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
+import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedAssistantProfile } from "./assistant/profile.ts";
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantScheduler } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
+import {
+  AssistantLifecycleBuffer,
+  parseAssistantLifecycleNotification,
+  type AssistantTurnLifecycleNotification,
+} from "./assistant/lifecycle-buffer.ts";
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
-import { createAssistantTools, type AssistantToolName } from "./assistant/tools.ts";
+import { createAssistantTools, type AssistantToolName, type ToolHandler } from "./assistant/tools.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
@@ -58,7 +64,7 @@ import {
   type ExternalOwnershipReleaseStatus,
   type ExternalTurnIncident,
 } from "./sessions/ownership-watcher.ts";
-import { SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
+import { createAppServerRolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -88,12 +94,19 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
-import { openSshUnixTunnel, SshEndpoint } from "./endpoints/ssh-endpoint.ts";
+import { attestUserControlMaster, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
+import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
 import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type EndpointWorkLease, type ManagedAppServerEndpoint, type RuntimeIdentity } from "./endpoints/types.ts";
+import {
+  parseRuntimeIdentity,
+  type EndpointLossKind,
+  type EndpointWorkLease,
+  type ManagedAppServerEndpoint as ManagedEndpointContract,
+  type RuntimeIdentity,
+} from "./endpoints/types.ts";
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
@@ -115,6 +128,44 @@ export function reportAssistantTerminalFailure(
 ): void {
   try { report(); }
   finally { dispatcher?.requestRecovery(); }
+}
+
+type AssistantTerminalTurn = {
+  id: string;
+  status: string;
+  itemsView: string;
+  items: Array<Record<string, unknown>>;
+  error?: unknown;
+};
+
+export async function resolveAssistantTerminalTurn<T extends AssistantTerminalTurn>(
+  notification: T,
+  readTurns: () => Promise<T[]>,
+): Promise<T> {
+  if (notification.itemsView === "full") return notification;
+  let turns: T[];
+  try { turns = await readTurns(); }
+  catch { return notification; }
+  const candidate = turns.find((turn) => turn.id === notification.id);
+  if (!candidate || candidate.itemsView !== "full" || candidate.status !== notification.status) return notification;
+  // Only adopt the history turn when it still contains everything the notification observed;
+  // a divergent/empty "full" read must not drop a final the notification already captured.
+  const retainsNotification = notification.items.every((item) => {
+    const id = item.id;
+    if (typeof id !== "string") return false;
+    const match = candidate.items.find((value) => value.id === id);
+    return !!match && Object.entries(item).every(([key, value]) => isDeepStrictEqual(match[key], value));
+  });
+  return retainsNotification ? candidate : notification;
+}
+
+export async function commitAssistantTerminalFinals<T extends AssistantTerminalTurn>(
+  notification: T,
+  readTurns: () => Promise<T[]>,
+  commit: (turn: T) => void | Promise<void>,
+): Promise<void> {
+  const turn = await resolveAssistantTerminalTurn(notification, readTurns);
+  await commit(turn);
 }
 
 export function createAttachmentCleanupOwner(
@@ -165,8 +216,24 @@ export type OperationRecoveryAction = "wait_for_tool" | "attempt";
 export function operationRecoveryAction(input: {
   state: RecoverableOperation["state"];
   activeHandler: boolean;
+  recoveryOwned?: boolean;
 }): OperationRecoveryAction {
-  return input.activeHandler ? "wait_for_tool" : "attempt";
+  return input.activeHandler && !(input.state === "uncertain" && input.recoveryOwned) ? "wait_for_tool" : "attempt";
+}
+
+export async function stopOperationRecoveryBeforeTools(dependencies: {
+  stopOperationRecovery(): Promise<void>;
+  waitForTools(): Promise<void>;
+}): Promise<void> {
+  let stopping: Promise<void>;
+  try { stopping = dependencies.stopOperationRecovery(); }
+  catch (error) { stopping = Promise.reject(error); }
+  let waiting: Promise<void>;
+  try { waiting = dependencies.waitForTools(); }
+  catch (error) { waiting = Promise.reject(error); }
+  const [stopped, tools] = await Promise.allSettled([stopping, waiting]);
+  if (stopped.status === "rejected") throw stopped.reason;
+  if (tools.status === "rejected") throw tools.reason;
 }
 
 export type OperationRecoveryTarget =
@@ -362,6 +429,7 @@ export function recoverableOperationTarget(
     case "prepare_chat_attachment":
       return args.owner === "assistant" ? { policy: "local" } : sessionTarget(args.owner);
     case "create_session":
+      return recoverableCreateHasNoDispatch(operation.receipt, 0) ? { policy: "local" } : projectTarget();
     case "adopt_session":
       return projectTarget();
     case "send_to_session":
@@ -491,6 +559,29 @@ export function operationRecoveryPreflight(
   return "attempt";
 }
 
+export function recoverableCreateHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
+  if (receipt === undefined) return recoveryProtocol >= 1;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return false;
+  return Object.hasOwn(receipt, "dispatchStarted")
+    && (receipt as Record<string, unknown>).dispatchStarted === false;
+}
+
+export function isMissingUnmaterializedThread(error: unknown, threadId: string): boolean {
+  return error instanceof AppError
+    && error.code === "THREAD_NOT_FOUND"
+    && error.details?.recovery === "thread_not_durable"
+    && error.details.threadId === threadId;
+}
+
+// reconcileManaged's create-completion durability gate drops the phantom mapping and throws
+// THREAD_NOT_FOUND with recovery "pathless_thread_lost"; "thread_not_durable" is accepted
+// defensively so any future non-durable signal on this path fails the create with no effect.
+function isRecoveredThreadNotDurable(error: unknown): boolean {
+  return error instanceof AppError
+    && error.code === "THREAD_NOT_FOUND"
+    && (error.details?.recovery === "pathless_thread_lost" || error.details?.recovery === "thread_not_durable");
+}
+
 export function runOperationRecoveryTarget<T>(
   target: OperationRecoveryTarget,
   endpoints: Pick<EndpointManager, "withReadyWorkLease">,
@@ -536,6 +627,8 @@ interface OperationTimerApi {
 
 export interface OperationReconciliationLoop {
   request(): Promise<void>;
+  waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
+  recoveryOwns(operationId: string): boolean;
   endpointReady(endpointId: string): Promise<void>;
   endpointUnavailable(endpointId: string): void;
   stop(): Promise<void>;
@@ -544,6 +637,7 @@ export interface OperationReconciliationLoop {
 export function createOperationReconciliationLoop(options: {
   reconcileOnce(): Promise<OperationReconciliationPass>;
   isEndpointReady(endpointId: string): boolean;
+  operationState?(operationId: string): OperationState | undefined;
   timers?: OperationTimerApi;
 }): OperationReconciliationLoop {
   let operationReconciliationTail: Promise<void> = Promise.resolve();
@@ -554,7 +648,33 @@ export function createOperationReconciliationLoop(options: {
   let retryAttempt = 0;
   let timerGeneration = 0;
   let stopped = false;
+  let ownedPassFailureRetryActive = false;
   let transientTargets = new Map<string, OperationRecoveryTarget>();
+  const recoveryOwnedOperations = new Set<string>();
+  type TerminalWaiter = { resolve(): void; reject(error: Error): void; detach(): void };
+  const terminalWaiters = new Map<string, Set<TerminalWaiter>>();
+
+  const removeTerminalWaiter = (operationId: string, waiter: TerminalWaiter): void => {
+    waiter.detach();
+    const waiters = terminalWaiters.get(operationId);
+    waiters?.delete(waiter);
+    if (waiters?.size === 0) terminalWaiters.delete(operationId);
+  };
+
+  const settleTerminalWaiters = (): void => {
+    if (!options.operationState) return;
+    for (const operationId of recoveryOwnedOperations) {
+      const state = options.operationState(operationId);
+      if (state !== "succeeded" && state !== "failed") continue;
+      recoveryOwnedOperations.delete(operationId);
+      const waiters = terminalWaiters.get(operationId) ?? new Set<TerminalWaiter>();
+      terminalWaiters.delete(operationId);
+      for (const waiter of waiters) {
+        waiter.detach();
+        waiter.resolve();
+      }
+    }
+  };
 
   const isActionable = (target: OperationRecoveryTarget): boolean => target.policy === "local" || target.policy === "endpoint_lifecycle"
     || (target.policy === "ready_endpoint" && options.isEndpointReady(target.endpointId));
@@ -589,7 +709,17 @@ export function createOperationReconciliationLoop(options: {
     let queuedBeforeFirstPass = followupRequested;
     do {
       followupRequested = false;
-      finalPass = await options.reconcileOnce();
+      try {
+        finalPass = await options.reconcileOnce();
+      } catch (error) {
+        if (!stopped && recoveryOwnedOperations.size > 0) {
+          ownedPassFailureRetryActive = true;
+          armRetryTimer();
+        }
+        throw error;
+      }
+      ownedPassFailureRetryActive = false;
+      settleTerminalWaiters();
       if (queuedBeforeFirstPass) {
         queuedBeforeFirstPass = false;
         followupRequested = true;
@@ -605,7 +735,10 @@ export function createOperationReconciliationLoop(options: {
     if (stopped) return Promise.resolve();
     if (running) {
       followupRequested = true;
-      return running;
+      const current = running;
+      return current.then(() => {
+        if (!stopped && followupRequested) return request();
+      });
     }
     clearRetryTimer(false);
     followupRequested = false;
@@ -618,13 +751,51 @@ export function createOperationReconciliationLoop(options: {
 
   return {
     request,
+    waitForTerminal: (operationId, signal) => {
+      if (!options.operationState) return Promise.reject(new Error("operation terminal state reader is unavailable"));
+      if (stopped) return Promise.reject(new Error("operation reconciliation stopped"));
+      const state = options.operationState(operationId);
+      if (state === "succeeded" || state === "failed") return Promise.resolve();
+      if (state !== "uncertain") return Promise.reject(new Error("only an uncertain operation can be handed to reconciliation"));
+      const newlyOwned = !recoveryOwnedOperations.has(operationId);
+      recoveryOwnedOperations.add(operationId);
+      const pending = new Promise<void>((resolve, reject) => {
+        let abort: (() => void) | undefined;
+        const waiter: TerminalWaiter = {
+          resolve,
+          reject,
+          detach: () => { if (abort) signal?.removeEventListener("abort", abort); },
+        };
+        abort = () => {
+          removeTerminalWaiter(operationId, waiter);
+          reject(signal?.reason instanceof Error ? signal.reason : new Error("operation terminal wait was canceled"));
+        };
+        const waiters = terminalWaiters.get(operationId) ?? new Set<TerminalWaiter>();
+        waiters.add(waiter);
+        terminalWaiters.set(operationId, waiters);
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+      settleTerminalWaiters();
+      if (newlyOwned && recoveryOwnedOperations.has(operationId)) void request().catch(() => undefined);
+      return pending;
+    },
+    recoveryOwns: (operationId) => recoveryOwnedOperations.has(operationId),
     endpointReady: () => request(),
     endpointUnavailable: () => {
-      if (![...transientTargets.values()].some(isActionable)) clearRetryTimer(false);
+      if (!ownedPassFailureRetryActive && ![...transientTargets.values()].some(isActionable)) clearRetryTimer(false);
     },
     stop: async () => {
       if (!stopped) {
         stopped = true;
+        const error = new Error("operation reconciliation stopped");
+        for (const waiters of terminalWaiters.values()) for (const waiter of waiters) {
+          waiter.detach();
+          waiter.reject(error);
+        }
+        terminalWaiters.clear();
+        recoveryOwnedOperations.clear();
+        ownedPassFailureRetryActive = false;
         followupRequested = false;
         transientTargets.clear();
         clearRetryTimer(true);
@@ -858,6 +1029,17 @@ export function managedRecoveryDisposition(error: unknown, currentReadyLease = f
   return "permanent";
 }
 
+export function isSettledPathlessThreadLoss(
+  error: unknown,
+  current: RegistrySession | undefined,
+  expected: RegistrySession,
+): boolean {
+  if (!(error instanceof AppError) || error.code !== "THREAD_NOT_FOUND"
+    || error.details?.recovery !== "pathless_thread_lost") return false;
+  return !current || current.endpoint !== expected.endpoint || current.thread_id !== expected.thread_id
+    || current.mapping_id !== expected.mapping_id;
+}
+
 export function managedRecoveryManagementState(
   current: ManagementState | undefined,
   disposition: ManagedRecoveryDisposition,
@@ -987,6 +1169,81 @@ export async function recoverStartupManagedEndpoint(options: {
     if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") return "publication";
     throw error;
   }
+}
+
+export function requireManagedRecoveryAcknowledged(
+  outcome: "acknowledged" | "publication",
+  endpointId: string,
+): void {
+  if (outcome !== "acknowledged") {
+    throw new AppError("ENDPOINT_UNAVAILABLE", `managed sessions were not restored on endpoint ${endpointId}`);
+  }
+}
+
+const threadGoalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+
+export function restoredGoalControlIsActive(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "goal")) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal state is invalid");
+  }
+  const goal = (value as { goal: unknown }).goal;
+  if (goal === null) return false;
+  if (!goal || typeof goal !== "object" || Array.isArray(goal)) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal state is invalid");
+  }
+  const status = (goal as { status?: unknown }).status;
+  if (typeof status !== "string" || !threadGoalStatuses.has(status)) {
+    throw new AppError("OPERATION_UNCERTAIN", "managed goal status is invalid");
+  }
+  return status === "active";
+}
+
+export async function recoverCancelGoalInterrupt(options: {
+  requested: boolean;
+  checkpoint?: { turnId?: string | null };
+  goal: unknown;
+  nativeStatus: string;
+  turns: ReadonlyArray<{ id: string; status?: unknown }>;
+  checkpointTurn(turnId: string | null): void;
+  authorize(turnId: string): void;
+  interrupt(turnId: string): Promise<void>;
+}): Promise<boolean> {
+  if (!options.requested) return true;
+  if (options.goal !== null) return false;
+  const activeTurn = options.nativeStatus === "active"
+    ? [...options.turns].reverse().find((candidate) => !isRecoveryTerminalStatus(candidate.status))
+    : undefined;
+  let turnId = typeof options.checkpoint?.turnId === "string" ? options.checkpoint.turnId : undefined;
+  if (activeTurn && activeTurn.id !== turnId) {
+    turnId = activeTurn.id;
+    options.checkpointTurn(turnId);
+  }
+  if (!turnId) {
+    if (options.nativeStatus !== "idle") return false;
+    options.checkpointTurn(null);
+    return true;
+  }
+  options.authorize(turnId);
+  const turn = options.turns.find((candidate) => candidate.id === turnId);
+  if (turn && isRecoveryTerminalStatus(turn.status)) return true;
+  if (!turn) return false;
+  await options.interrupt(turnId);
+  return true;
+}
+
+function isRecoveryTerminalStatus(status: unknown): boolean {
+  const type = typeof status === "string" ? status : String((status as { type?: unknown } | null)?.type ?? "");
+  return type === "completed" || type === "failed" || type === "interrupted";
+}
+
+export async function interruptCancelledGoalTurn(
+  requested: boolean,
+  turnId: string | null,
+  interrupt: (turnId: string) => Promise<void>,
+): Promise<boolean> {
+  if (!requested || !turnId) return false;
+  await interrupt(turnId);
+  return true;
 }
 
 export function createManagedSessionRecoveryOwner(options: {
@@ -1446,11 +1703,11 @@ export function withRelayEndpointWorkLease<T>(
 
 export async function stopRelayRecovery(
   relay: Pick<EventRelay, "stop">,
-  observations: Pick<SessionObservationProcessor, "idle">,
+  observations: Pick<SessionObservationProcessor, "stop">,
   finishDashboard: () => Promise<void>,
 ): Promise<void> {
+  await observations.stop();
   await relay.stop();
-  await observations.idle();
   await finishDashboard();
 }
 
@@ -1467,8 +1724,8 @@ export async function stopRecoveryOwnerSet(dependencies: {
   for (const stop of [
     () => dependencies.ready?.stop(),
     () => dependencies.managed?.stop(),
-    () => dependencies.relay?.stop(),
     () => dependencies.observations?.stop(),
+    () => dependencies.relay?.stop(),
     () => dependencies.operations?.stop(),
     () => dependencies.dispatcher?.stop(),
     () => dependencies.finishDashboard?.(),
@@ -1487,6 +1744,13 @@ export async function buildProductionApp(
     weixinCredential?: WeixinCredentialHandle;
     onOperationalEvent?: OperationalEventSink;
     requestRestart?: () => void;
+    testing?: {
+      holdAssistantScheduler?: boolean;
+      onManagerToolsBuilt?(
+        tools: Readonly<Record<AssistantToolName, ToolHandler>>,
+        activity: { registerTool(attemptId: string): number; finishTool(attemptId: string): void },
+      ): void;
+    };
     storage?: {
       acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
       openDatabase?: (path: string) => Database;
@@ -1524,8 +1788,8 @@ export async function buildProductionApp(
   let backgroundFailures!: BackgroundFailureStore;
   let runtime!: RuntimeStore;
   let finals!: FinalMessageStore;
-  let endpoint!: LocalEndpoint;
-  let assistantEndpoint!: LocalEndpoint;
+  let endpoint!: ManagedAppServerEndpoint;
+  let assistantEndpoint!: ManagedAppServerEndpoint;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;
@@ -1565,10 +1829,11 @@ export async function buildProductionApp(
   const projectReadyRetryTimers = new Map<string, { generation: number; timer: ReturnType<typeof setTimeout> }>();
   type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
   const remoteContexts = new Map<string, RemoteContext>();
-  const remoteCandidateContexts = new WeakMap<ManagedAppServerEndpoint, RemoteContext>();
+  const remoteCandidateContexts = new WeakMap<ManagedEndpointContract, RemoteContext>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
+  const assistantLifecycleBuffer = new AssistantLifecycleBuffer();
   const assistantToolReadiness = new ToolReadinessGate();
   const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
   let stopping = false;
@@ -1909,7 +2174,18 @@ export async function buildProductionApp(
         attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
         assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding });
         const actions = buildActions();
-        const tools = createAssistantTools(operations, actions, { maxCollectCount: config.maxCollectCount, attemptScope });
+        const tools = createAssistantTools(operations, actions, {
+          maxCollectCount: config.maxCollectCount,
+          attemptScope,
+          waitForTerminal: (operationId, signal) => {
+            if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
+            return operationReconciler.waitForTerminal(operationId, signal);
+          },
+        });
+        options.testing?.onManagerToolsBuilt?.(tools, {
+          registerTool: (attemptId) => assistant.registerTool(attemptId),
+          finishTool: (attemptId) => assistant.finishTool(attemptId),
+        });
         mcp = new LoopbackMcpServer(tools, assistant, {
           host: config.mcpHost,
           port: config.mcpPort,
@@ -1926,24 +2202,29 @@ export async function buildProductionApp(
       start: async () => {
         recoveryOwnersStop = undefined;
         try {
-        endpoint = new LocalEndpoint({ id: "local", codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env), minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION });
-        assistantEndpoint = new LocalEndpoint({
-          id: "assistant-local",
-          codexBinary: config.codexBinary,
-          env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
-          expectedCodexHome: assistantProfile.codexHome,
-          validateEnvironment: () => assistantProfile.assertIntact(),
+        endpoint = new ManagedAppServerEndpoint({
+          id: "local",
+          runtime: new LocalAppServerRuntime({ codexBinary: config.codexBinary, env: buildWorkerChildEnvironment(process.env) }),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
-        const sshRuntimeRoot = join(dataDir, "ssh-runtime");
-        await mkdir(sshRuntimeRoot, { recursive: true, mode: 0o700 });
-        await chmod(sshRuntimeRoot, 0o700);
+        assistantEndpoint = new ManagedAppServerEndpoint({
+          id: "assistant-local",
+          runtime: new LocalAppServerRuntime({
+            codexBinary: config.codexBinary,
+            env: buildAssistantChildEnvironment(process.env, assistantProfile, token),
+            expectedCodexHome: assistantProfile.codexHome,
+            validateEnvironment: () => assistantProfile.assertIntact(),
+          }),
+          minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
+        });
+        const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
           sshBinary: "ssh",
           runtimeDir: sshRuntimeRoot,
           hasReferences: (id) => hasEndpointIdentityReferences(id),
           checkExisting: (id, destination, references) => endpointBindings.checkExisting(id, destination, references),
+          attestControlMaster: attestUserControlMaster,
         });
         endpointManager = new EndpointManager({
           localEndpoint: endpoint,
@@ -1952,16 +2233,16 @@ export async function buildProductionApp(
             const generation = await planner.createGeneration(definition.id);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-            const socketRoot = join(sshRuntimeRoot, "sockets", createHash("sha256").update(definition.id).digest("hex").slice(0, 24));
-            await mkdir(socketRoot, { recursive: true, mode: 0o700 });
-            await chmod(socketRoot, 0o700);
-            const localSocket = join(socketRoot, "app-server.sock");
-            const remoteEndpoint = new SshEndpoint({
+            const socketRoot = await prepareLocalSshEndpointSocketRoot(sshRuntimeRoot, definition.id);
+            const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
-              runtime: remoteRuntime,
+              runtime: new SshAppServerRuntime({
+                runtime: remoteRuntime,
+                plan: generation.plan,
+                socketRoot,
+                connectWire: (socketPath) => WebSocketWire.connect(socketPath, { timeoutMs: 10_000, trustedRoot: socketRoot }),
+              }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
-              openTunnel: (remoteSocketPath) => openSshUnixTunnel({ plan: generation.plan, localSocketPath: localSocket, remoteSocketPath }),
-              connectWire: () => WebSocketWire.connect(localSocket, { timeoutMs: 10_000, trustedRoot: socketRoot }),
             });
             remoteCandidateContexts.set(remoteEndpoint, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
@@ -2028,8 +2309,47 @@ export async function buildProductionApp(
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
         });
-        ownership = new SessionOwnershipGuard(db, runtime, operations, rolloutAccess);
-        lifecycle = new SessionLifecycle(pool, registry, runtime, { now: () => Date.now() }, workspaceRouter as never, threadGate, endpointManager, ownership);
+        ownership = new SessionOwnershipGuard(
+          db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),
+        );
+        lifecycle = new SessionLifecycle(
+          pool,
+          registry,
+          runtime,
+          { now: () => Date.now() },
+          workspaceRouter as never,
+          threadGate,
+          endpointManager,
+          ownership,
+          async (identity, lease, thread) => {
+            const control = runtime.goalControl(identity.endpoint, identity.thread_id, identity.mapping_id);
+            if (control.known && !control.controlled) return;
+            const currentGoal = await pool.request<any>(
+              identity.endpoint,
+              "thread/goal/get",
+              { threadId: identity.thread_id },
+              undefined,
+              lease,
+            );
+            const registered = registry.getByIdentity(identity.endpoint, identity.thread_id);
+            if (!registered || registered.session.mapping_id !== identity.mapping_id) {
+              throw new AppError("OPERATION_CONFLICT", "managed goal mapping changed during recovery");
+            }
+            const active = restoredGoalControlIsActive(currentGoal);
+            const hasGoal = currentGoal.goal !== null;
+            if (!control.known) setGoalControlled(registered.nickname, hasGoal);
+            let authorizedTurnId: string | undefined;
+            if ((control.controlled || hasGoal) && active) {
+              const activeTurn = [...(thread?.turns ?? [])].reverse().find((turn) => !isTerminalStatus(turn.status));
+              authorizedTurnId = activeTurn?.id;
+            }
+            observeGoal(registered.nickname, currentGoal);
+            const after = (control.controlled || hasGoal) && !active
+              ? () => setGoalControlled(registered.nickname, false)
+              : undefined;
+            if (authorizedTurnId || after) return { ...(authorizedTurnId ? { authorizedTurnId } : {}), ...(after ? { after } : {}) };
+          },
+        );
         sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
@@ -2041,6 +2361,15 @@ export async function buildProductionApp(
             lease,
           )).thread,
           readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
+          onIdleTurn: ({ endpointId, threadId, turnId }) => processWorkerTerminalNotification({
+            endpoints: endpointManager,
+            ownership: ownershipWatcher,
+            relay,
+            reconcileOperations,
+          }, endpointId, "turn/completed", { threadId, turn: { id: turnId } }),
+          onGoalTurnStarted: ({ endpointId, threadId, mappingId, turnId }) => {
+            ownership.authorizeTurn({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId }, turnId);
+          },
           onChanged: () => runBackground(() => renderDashboardSafely(), () => recordBackgroundFailure("dashboard rendering")),
           classifyFailure: (error) => error instanceof RpcRequestTimeoutError
             ? "retry"
@@ -2128,6 +2457,7 @@ export async function buildProductionApp(
         operationReconciler = createOperationReconciliationLoop({
           reconcileOnce: reconcileOperationsOnce,
           isEndpointReady: isRecoveryEndpointReady,
+          operationState: (operationId) => operations.get(operationId)?.state,
         });
         endpointReadyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
         scheduler = new AssistantScheduler();
@@ -2159,7 +2489,7 @@ export async function buildProductionApp(
         stopping = false;
         endpointsCommitted = false;
         try {
-          await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+          await assistantEndpoint.start();
           if (assistantEndpoint.state !== "ready") {
             throw new AppError("ENDPOINT_UNAVAILABLE", "the assistant app-server became unavailable during initial startup");
           }
@@ -2169,8 +2499,8 @@ export async function buildProductionApp(
           for (const timer of reconnectTimers.values()) clearTimeout(timer);
           reconnectTimers.clear();
           await stopRecoveryOwners().catch(() => undefined);
-          await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]).catch(() => undefined);
-          throw error;
+          await Promise.all([assistantEndpoint.closeConnection(), endpointManager.closeConnections()]).catch(() => undefined);
+          throw assistantAuthenticationStartupError(error);
         }
       },
       stop: async () => {
@@ -2178,7 +2508,7 @@ export async function buildProductionApp(
         endpointsCommitted = false;
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
-        await Promise.all([assistantEndpoint.stop(), endpointManager.closeConnections()]);
+        await Promise.all([assistantEndpoint.closeConnection(), endpointManager.closeConnections()]);
       },
     },
     {
@@ -2228,6 +2558,7 @@ export async function buildProductionApp(
           ),
         });
         dispatcherAvailable = true;
+        await assistantLifecycleBuffer.activate(handleAssistantLifecycleNotification);
         await dispatcher.recover();
         await dispatcher.idle();
         assistant.hydrateActive();
@@ -2262,15 +2593,23 @@ export async function buildProductionApp(
     },
     {
       name: "scheduler",
-      start: async () => { schedulerAccepting = true; await enqueuePendingEvents(); await dispatcher.enqueueInternal("startup"); },
+      start: async () => {
+        if (options.testing?.holdAssistantScheduler) return;
+        schedulerAccepting = true;
+        await enqueuePendingEvents();
+        await dispatcher.enqueueInternal("startup");
+      },
       stop: async () => {
         stopping = true;
         assistantToolReadiness.stop();
         schedulerAccepting = false;
-        assistant.fenceToolAdmission();
-        await assistant.waitForTools();
         const active = assistant.current();
-        if (active && !active.turnId.startsWith("pending:")) {
+        assistant.fenceToolAdmission();
+        await stopOperationRecoveryBeforeTools({
+          stopOperationRecovery: () => operationReconciler?.stop() ?? Promise.resolve(),
+          waitForTools: () => assistant.waitForTools(),
+        });
+        if (active?.turnId) {
           let interruptTimer: ReturnType<typeof setTimeout> | undefined;
           await Promise.race([
             pool.interrupt(assistantEndpoint.id, registry.snapshot().assistant.thread_id, active.turnId).catch(() => undefined),
@@ -2326,6 +2665,7 @@ export async function buildProductionApp(
       ...(relay && observations ? { finishDashboard: renderDashboardSafely } : {}),
     }).finally(() => {
       dispatcherAvailable = false;
+      assistantLifecycleBuffer.clear();
     });
     return recoveryOwnersStop;
   }
@@ -2351,9 +2691,10 @@ export async function buildProductionApp(
       create_session: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         assertSessionCreationOrder(context.operationSequence, args.nickname, endpointId);
+        const mappingId = `mapping_${randomUUID()}`;
+        context.checkpoint({ endpoint: endpointId, mappingId, dispatchStarted: false });
         return endpointManager.withWorkLease(endpointId, "session-mutation", async (_endpoint, lease) => {
           const project = await workspaceRouter.prepareCreate(endpointId, args.nickname, args.project_dir, lease);
-          const mappingId = `mapping_${randomUUID()}`;
           const workspaceReceipt = projectWorkspaceReceipt(project);
           let dispatchStarted = false;
           let settingsObservationSequence: number | undefined;
@@ -2520,6 +2861,7 @@ export async function buildProductionApp(
         const endpointId = projectEndpoint(args.endpoint);
         assertEndpointLifecycleOrder(context.operationSequence, endpointId);
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        await resumeManagedEndpoint(endpointId, true);
         return { endpoint: endpointId, state: "ready" };
       },
       set_session_model: async (args) => { await sessions.setModel(args.nickname, args.model); observeLifecycle(args.nickname); await renderDashboardSafely(); return { pending: true }; },
@@ -2531,33 +2873,58 @@ export async function buildProductionApp(
         return result;
       },
       set_goal: async (args) => {
-        const result = await sessions.setGoal(args.nickname, args.objective, args.token_budget);
+        const result = await sessions.setGoal(
+          args.nickname,
+          args.objective,
+          args.token_budget,
+          () => armGoalControl(args.nickname),
+          () => setGoalControlled(args.nickname, false),
+        );
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       pause_goal: async (args) => {
+        try { sessions.authorizeTurn(args.nickname, sessions.activeTurnId(args.nickname)); }
+        catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        await sessions.authorizeActiveTurn(args.nickname);
         const result = await sessions.pauseGoal(args.nickname);
+        await sessions.authorizeActiveTurn(args.nickname);
+        setGoalControlled(args.nickname, false);
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       resume_goal: async (args) => {
-        const result = await sessions.resumeGoal(args.nickname);
+        const result = await sessions.resumeGoal(
+          args.nickname,
+          () => armGoalControl(args.nickname),
+          () => setGoalControlled(args.nickname, false),
+        );
         observeGoal(args.nickname, result);
         await renderDashboardSafely();
         return result;
       },
       cancel_goal: async (args, context) => {
-        if (args.interrupt_active_turn) {
-          let turnId: string | null = null;
-          try { turnId = sessions.activeTurnId(args.nickname); }
-          catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
-          context.checkpoint({ turnId });
-          if (turnId) await sessions.interrupt(args.nickname, turnId);
-          if (turnId) advanceNativeWatermark(args.nickname);
-        }
+        let turnId: string | null = null;
+        try { turnId = sessions.activeTurnId(args.nickname); }
+        catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        if (turnId) sessions.authorizeTurn(args.nickname, turnId);
+        turnId = await sessions.authorizeActiveTurn(args.nickname) ?? turnId;
+        if (args.interrupt_active_turn) context.checkpoint({ turnId });
         const result = await sessions.cancelGoal(args.nickname);
+        const activeAfterClear = await sessions.authorizeActiveTurn(args.nickname);
+        if (args.interrupt_active_turn && activeAfterClear && activeAfterClear !== turnId) {
+          turnId = activeAfterClear;
+          context.checkpoint({ turnId });
+        }
+        setGoalControlled(args.nickname, false);
+        if (await interruptCancelledGoalTurn(args.interrupt_active_turn, turnId, async (currentTurnId) => {
+          try { await sessions.interrupt(args.nickname, currentTurnId); }
+          catch (error) { if (!(error instanceof AppError && error.code === "SESSION_IDLE")) throw error; }
+        })) {
+          advanceNativeWatermark(args.nickname);
+        }
         observeGoal(args.nickname, result);
         observeLifecycle(args.nickname);
         await renderDashboardSafely();
@@ -2687,6 +3054,22 @@ export async function buildProductionApp(
     }, updatedAt, sequence, updatedAt);
   }
 
+  function setGoalControlled(nickname: string, controlled: boolean): void {
+    const identity = dashboardIdentity(nickname);
+    runtime.setGoalControlled(identity.endpointId, identity.threadId, identity.mappingId, controlled);
+  }
+
+  function armGoalControl(nickname: string): void {
+    const identity = dashboardIdentity(nickname);
+    runtime.setGoalControlled(
+      identity.endpointId,
+      identity.threadId,
+      identity.mappingId,
+      true,
+      dashboardStore.allocateObservationSequence(),
+    );
+  }
+
   function hydrateThreadOrder(endpointId: string, thread: { id: string; turns?: Array<{ id: string; startedAt?: number | null }> }): void {
     dashboardStore.hydrateTurnOrder({ endpointId, threadId: thread.id }, (thread.turns ?? []).map((turn) => ({
       id: turn.id,
@@ -2761,7 +3144,7 @@ export async function buildProductionApp(
     }));
   }
 
-  function bindProjectEndpoint(target: ManagedAppServerEndpoint, generation: number): void {
+  function bindProjectEndpoint(target: ManagedEndpointContract, generation: number): void {
     for (const unsubscribe of projectEndpointSubscriptions.get(target.id) ?? []) unsubscribe();
     const previousRetry = projectReadyRetryTimers.get(target.id);
     if (previousRetry) clearTimeout(previousRetry.timer);
@@ -2829,8 +3212,9 @@ export async function buildProductionApp(
 
   async function onNotification(endpointId: string, method: string, params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
-    if (endpointId === identity.endpoint && method === "turn/completed" && params.threadId === identity.thread_id) {
-      await processAssistantTerminal(params);
+    const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
+    if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
+      await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);
       return;
     }
     if (method === "turn/completed") {
@@ -2844,6 +3228,14 @@ export async function buildProductionApp(
     } else {
       await relay.handleNotification(endpointId, method, params);
     }
+  }
+
+  async function handleAssistantLifecycleNotification(notification: AssistantTurnLifecycleNotification): Promise<void> {
+    if (notification.method === "turn/started") {
+      await dispatcher.started(notification.params.turn as any);
+      return;
+    }
+    await processAssistantTerminal(notification.params);
   }
 
   function processAssistantTerminal(params: any): Promise<void> {
@@ -2861,27 +3253,32 @@ export async function buildProductionApp(
     const identity = registry.snapshot().assistant;
     await dispatcher.terminal(params.turn);
     await dispatcher.idle();
-    const attemptBefore = assistant.contextForTurn(params.turn.id);
+    const terminalLease = conversations.lease();
+    if (!terminalLease || terminalLease.phase !== "terminalizing" || terminalLease.turnId !== params.turn.id) return;
+    const attemptBefore = assistant.contextForLease(terminalLease.attemptId, params.turn.id);
     if (!attemptBefore) return;
     if (conversations.membersForAttempt(attemptBefore.attemptId)
       .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state))) return;
-    assistant.beginTerminalizing(params.turn.id);
+    if (!assistant.beginLeaseTerminalizing(attemptBefore.attemptId, params.turn.id)) return;
     const settled = await settleAssistantTerminalTools({
       fenceTools: () => assistant.fenceTools(attemptBefore.attemptId, 1_000),
       reconcileOperations,
       requestRestartOnce,
     });
     if (!settled) return;
-    const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
-    const turn = history.thread.turns.find((candidate: any) => candidate.id === params.turn.id) ?? params.turn;
-    const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, turn, Date.now());
     const memberIds = conversations.membersForAttempt(attemptBefore.attemptId).map((member) => member.contextId);
-    assistant.handleTerminal(
-      turn.id,
-      isTerminalStatus(turn.status) ? turn.status : "failed",
-      messages.map((message) => message.body).join("\n") || undefined,
-      turn.error,
-    );
+    await commitAssistantTerminalFinals(params.turn, async () => {
+      const history = await pool.request<any>(identity.endpoint, "thread/read", { threadId: identity.thread_id, includeTurns: true });
+      return history.thread.turns ?? [];
+    }, (resolved) => {
+      const messages = finals.persistTerminalTurn(identity.endpoint, identity.thread_id, resolved, Date.now());
+      assistant.handleTerminal(
+        resolved.id,
+        isTerminalStatus(resolved.status) ? resolved.status : "failed",
+        messages.map((message) => message.body).join("\n") || undefined,
+        resolved.error,
+      );
+    });
     for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
     if (operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId)) {
       await reconcileOperations();
@@ -2954,7 +3351,11 @@ export async function buildProductionApp(
         session: (nickname) => registry.get(nickname),
       });
     await runOperationRecoveryChains(entries, resolveTarget, async ({ operation }, target) => {
-      if (operationRecoveryAction({ state: operation.state, activeHandler: assistant.hasActiveTools(operation.attemptId) }) === "wait_for_tool") return true;
+      if (operationRecoveryAction({
+        state: operation.state,
+        activeHandler: assistant.hasActiveTools(operation.attemptId),
+        recoveryOwned: operationReconciler?.recoveryOwns(operation.id) ?? false,
+      }) === "wait_for_tool") return true;
       const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
       if (preflight === "sleep") return true;
       if (preflight === "wait_for_endpoint") {
@@ -3004,6 +3405,7 @@ export async function buildProductionApp(
           if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
             (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          await resumeManagedEndpoint(endpointId, true);
           operations.succeed(operation.id, { endpoint: endpointId, state: "ready" });
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;
@@ -3061,22 +3463,22 @@ export async function buildProductionApp(
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
-          const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
+          if (operation.kind === "create_session" && recoverableCreateHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
+            failRecoveredNoEffect(operation.id, "worker dispatch was never started");
+            return;
+          }
           const recoveryEndpointId = projectEndpoint(checkpoint?.endpoint ?? args.endpoint);
           if (!recoveryLease || recoveryLease.endpointId !== recoveryEndpointId) {
             throw new AppError("ENDPOINT_UNAVAILABLE", "session recovery endpoint lease changed");
           }
           const lease = recoveryLease;
           let session = registry.get(args.nickname);
+          const project = operation.kind === "create_session" && checkpoint ? preparedProjectWorkspaceFromCheckpoint(checkpoint) : undefined;
           if (project) {
             await workspaceRouter.assertDispatchable(recoveryEndpointId, project, lease);
           }
           const expectedThread = args.thread_id as string | undefined ?? (operation.kind === "create_session" ? checkpoint?.threadId : undefined);
           const expectedDir = project?.path;
-          if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === false) {
-            failRecoveredNoEffect(operation.id, "project workspace was prepared before worker dispatch began");
-            return;
-          }
           if (!session && operation.kind === "create_session" && checkpoint?.dispatchStarted === true && !checkpoint.threadId && project) {
             const candidates = (await discovery.list({ endpointId: recoveryEndpointId, cwd: project.path, limit: 100 }, lease)).sessions
               .filter((candidate) => candidate.threadSource === operation.id && !candidate.archived);
@@ -3090,10 +3492,16 @@ export async function buildProductionApp(
           }
           if (!session && operation.kind === "create_session" && checkpoint?.threadId && project) {
             if (!checkpoint.mappingId) return;
-            await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
-              if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
-              hydrateThreadOrder(recoveryEndpointId, thread);
-            }, checkpoint.mappingId, lease);
+            try {
+              await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+                if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
+                hydrateThreadOrder(recoveryEndpointId, thread);
+              }, checkpoint.mappingId, lease);
+            } catch (error) {
+              if (!isMissingUnmaterializedThread(error, checkpoint.threadId)) throw error;
+              failRecoveredNoEffect(operation.id, "allocated worker thread was lost before its rollout materialized");
+              return;
+            }
             session = registry.get(args.nickname);
           }
           if (session?.lifecycle_state === "adopting" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId) {
@@ -3103,9 +3511,25 @@ export async function buildProductionApp(
           if (session?.lifecycle_state === "managed" && session.mapping_id === checkpoint?.mappingId && session.endpoint === recoveryEndpointId
             && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-            const native = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id)
-              ? await lifecycle.reconcileManaged(args.nickname, session, lease)
-              : await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, lease);
+            const needsReconcile = state?.managementState !== "managed" || !runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id);
+            let native: any;
+            if (needsReconcile) {
+              try {
+                native = await lifecycle.reconcileManaged(args.nickname, session, lease, undefined,
+                  operation.kind === "create_session" ? { requireDurableRollout: true } : undefined);
+              } catch (error) {
+                // A create whose worker thread never durably materialized is unrecoverable;
+                // reconcileManaged has already removed the phantom mapping, so fail with no effect
+                // instead of blessing it as managed (mirrors the adopt-branch gate above).
+                if (operation.kind === "create_session" && isRecoveredThreadNotDurable(error)) {
+                  failRecoveredNoEffect(operation.id, "allocated worker thread was lost before its rollout materialized");
+                  return;
+                }
+                throw error;
+              }
+            } else {
+              native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
+            }
             await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
             hydrateThreadOrder(session.endpoint, native.thread);
             await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
@@ -3144,17 +3568,36 @@ export async function buildProductionApp(
           let cancelInterruptProven = true;
           if (operation.kind === "cancel_goal" && args.interrupt_active_turn) {
             const checkpoint = operation.receipt as { turnId?: string | null } | undefined;
-            cancelInterruptProven = checkpoint !== undefined && checkpoint.turnId === null;
-            if (checkpoint?.turnId) {
-              const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
-              cancelInterruptProven = history.thread.turns.some((turn: any) => turn.id === checkpoint.turnId && isTerminalStatus(turn.status));
-            }
+            const history = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true }, undefined, recoveryLease);
+            cancelInterruptProven = await recoverCancelGoalInterrupt({
+              requested: true,
+              ...(checkpoint ? { checkpoint } : {}),
+              goal,
+              nativeStatus: String(history.thread.status?.type ?? "unknown"),
+              turns: history.thread.turns,
+              checkpointTurn: (turnId) => operations.checkpoint(operation.id, { turnId }),
+              authorize: (turnId) => sessions.authorizeTurn(args.nickname, turnId),
+              interrupt: (turnId) => sessions.interrupt(args.nickname, turnId, {
+                ...(recoveryLease ? { existingLease: recoveryLease } : {}),
+                recoverExactTurn: true,
+              }),
+            });
           }
           const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
                 : goal == null && cancelInterruptProven;
+          if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")) {
+            restoredGoalControlIsActive(current);
+            await sessions.authorizeActiveTurn(args.nickname, recoveryLease);
+            setGoalControlled(args.nickname, false);
+          }
+          if (proven && (operation.kind === "pause_goal" || operation.kind === "cancel_goal")) {
+            await sessions.authorizeActiveTurn(args.nickname, recoveryLease);
+          }
           if (proven) await succeedRecovered(operation, current, () => {
+            if (operation.kind === "set_goal" || operation.kind === "resume_goal") armGoalControl(args.nickname);
+            else setGoalControlled(args.nickname, false);
             observeGoal(args.nickname, current);
             if (operation.kind === "cancel_goal") observeLifecycle(args.nickname);
           });
@@ -3243,16 +3686,19 @@ export async function buildProductionApp(
     const excluded = lifecycleOwnedEndpointIds();
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
-    for (const endpointId of endpointIds) {
-      await recoverStartupManagedEndpoint({
-        endpointId,
-        withReadyLease: (run) => endpointManager.withReadyWorkLease(endpointId, run),
-        isLeaseCurrent: (lease) => isManagedRecoveryLeaseCurrent(endpointId, lease),
-        recover: (lease, isCurrent) => resumeManagedSessions(endpointId, { lease, isCurrent }),
-        reconcile: (lease) => reconcileRestoredEndpoint(endpointId, lease),
-        acknowledge: () => endpointReadyBuffer?.acknowledge(endpointId),
-      });
-    }
+    for (const endpointId of endpointIds) await resumeManagedEndpoint(endpointId);
+  }
+
+  async function resumeManagedEndpoint(endpointId: string, requireAcknowledged = false): Promise<void> {
+    const outcome = await recoverStartupManagedEndpoint({
+      endpointId,
+      withReadyLease: (run) => endpointManager.withReadyWorkLease(endpointId, run),
+      isLeaseCurrent: (lease) => isManagedRecoveryLeaseCurrent(endpointId, lease),
+      recover: (lease, isCurrent) => resumeManagedSessions(endpointId, { lease, isCurrent }),
+      reconcile: (lease) => reconcileRestoredEndpoint(endpointId, lease),
+      acknowledge: () => endpointReadyBuffer?.acknowledge(endpointId),
+    });
+    if (requireAcknowledged) requireManagedRecoveryAcknowledged(outcome, endpointId);
   }
 
   async function resumeManagedSessions(endpointFilter?: string, options: {
@@ -3311,13 +3757,17 @@ export async function buildProductionApp(
         restoredKeys.push(key);
       } catch (error) {
         if (options.isCurrent && !options.isCurrent()) throw error;
+        const current = registry.get(nickname);
+        if (isSettledPathlessThreadLoss(error, current, session)) {
+          settledKeys.push(key);
+          continue;
+        }
         const disposition = managedRecoveryDisposition(
           error,
           Boolean(options.lease && isManagedRecoveryLeaseCurrent(session.endpoint, options.lease)),
         );
         failures.push({ key, disposition });
         if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
-        const current = registry.get(nickname);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed") {
           const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
@@ -3449,7 +3899,7 @@ export async function buildProductionApp(
     return recovery;
   }
 
-  async function handleEndpointUnavailable(target: ManagedAppServerEndpoint, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
+  async function handleEndpointUnavailable(target: ManagedEndpointContract, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
     if (stopping || !endpointsCommitted) return;
     const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({
@@ -3506,9 +3956,9 @@ export async function buildProductionApp(
   async function recoverAssistantEndpoint(): Promise<void> {
     if (stopping) return;
     try {
-      await startAuthenticatedAssistantEndpoint(assistantEndpoint, assistantProfile);
+      await assistantEndpoint.start();
     } catch (error) {
-      if (error instanceof AppError && error.details?.reason === "assistant_auth_required") {
+      if (error instanceof EndpointAuthenticationRequiredError) {
         recordAssistantAuthenticationFailure(deliveries, currentOwnerBinding, endpointRecoveryIncidents.latestSequence);
       }
       throw error;
@@ -3587,7 +4037,7 @@ export function createChatHistoryAction(
   return (args, context) => registry().getHistory(binding(context.attemptId), args);
 }
 
-export function isUncertainAssistantTransportFailure(error: unknown, endpointState: LocalEndpoint["state"]): boolean {
+export function isUncertainAssistantTransportFailure(error: unknown, endpointState: ManagedEndpointContract["state"]): boolean {
   return endpointState !== "ready" || (error instanceof AppError && new Set(["ENDPOINT_UNAVAILABLE", "OPERATION_UNCERTAIN"]).has(error.code));
 }
 

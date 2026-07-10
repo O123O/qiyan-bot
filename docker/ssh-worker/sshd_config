@@ -8,7 +8,12 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 AllowUsers codex
-DisableForwarding yes
+DisableForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding local
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
 SetEnv CODEX_HOME=/home/codex/.codex
 UsePAM no
 PidFile /run/sshd/sshd.pid

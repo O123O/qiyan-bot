@@ -5,6 +5,7 @@ import type { Database } from "./database.ts";
 import { inTransaction } from "./database.ts";
 
 const readOnlyOperationKinds = new Set(["list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "list_models", "get_goal"]);
+const currentRecoveryProtocol = 1;
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -28,7 +29,9 @@ export interface OperationRecord {
   state: OperationState;
   createdAt: number;
   sequence: number;
+  recoveryProtocol: number;
   receipt?: unknown;
+  error?: unknown;
 }
 
 export interface RecoverableOperation extends OperationRecord {
@@ -105,7 +108,7 @@ export class OperationStore {
     const argsJson = canonical(input.args);
     const argsHash = hash(input.args);
     const effectClass = input.effectClass ?? (readOnlyOperationKinds.has(input.kind) ? "read_only" : "side_effecting");
-    const existing = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, args_hash, receipt_json, created_at, sequence FROM operations
+    const existing = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, args_hash, receipt_json, error_json, created_at, sequence, recovery_protocol FROM operations
       WHERE context_id = ? AND attempt_id = ? AND call_id = ? AND kind = ?`)
       .get(input.contextId, input.attemptId, input.callId, input.kind) as Record<string, unknown> | undefined;
     if (existing) {
@@ -117,27 +120,35 @@ export class OperationStore {
     }
     const id = `op_${randomUUID()}`;
     const now = Date.now();
-    this.db.prepare(`INSERT INTO operations
-      (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations), ?)`)
-      .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now, effectClass);
-    const created = this.get(id);
-    if (!created) throw new Error("operation insert was not persisted");
-    return created;
+    this.db.exec("SAVEPOINT prepare_operation");
+    try {
+      this.db.prepare(`INSERT INTO operations
+        (id, context_id, attempt_id, call_id, kind, args_hash, args_json, state, created_at, updated_at, sequence, effect_class, recovery_protocol)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations), ?, ?)`)
+        .run(id, input.contextId, input.attemptId, input.callId, input.kind, argsHash, argsJson, now, now, effectClass, currentRecoveryProtocol);
+      const created = this.get(id);
+      if (!created) throw new Error("operation insert was not persisted");
+      if (created.recoveryProtocol !== currentRecoveryProtocol) throw new Error("operation recovery protocol was not persisted");
+      this.db.exec("RELEASE SAVEPOINT prepare_operation");
+      return created;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT prepare_operation; RELEASE SAVEPOINT prepare_operation");
+      throw error;
+    }
   }
 
   get(id: string): OperationRecord | undefined {
-    const row = this.db.prepare("SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare("SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, error_json, created_at, sequence, recovery_protocol FROM operations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     return row ? this.parseOperation(row) : undefined;
   }
 
   listForAttempt(attemptId: string): OperationRecord[] {
-    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, error_json, created_at, sequence, recovery_protocol
       FROM operations WHERE attempt_id = ? ORDER BY sequence`).all(attemptId) as Array<Record<string, unknown>>).map((row) => this.parseOperation(row));
   }
 
   findForCall(attemptId: string, callId: string, kind: string): OperationRecord | undefined {
-    const row = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, created_at, sequence
+    const row = this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, effect_class, state, receipt_json, error_json, created_at, sequence, recovery_protocol
       FROM operations WHERE attempt_id = ? AND call_id = ? AND kind = ?`).get(attemptId, callId, kind) as Record<string, unknown> | undefined;
     return row ? this.parseOperation(row) : undefined;
   }
@@ -152,7 +163,7 @@ export class OperationStore {
   }
 
   listRecoverable(): RecoverableOperation[] {
-    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, effect_class, state, receipt_json, created_at, sequence
+    return (this.db.prepare(`SELECT id, context_id, attempt_id, call_id, kind, args_json, effect_class, state, receipt_json, error_json, created_at, sequence, recovery_protocol
       FROM operations WHERE state IN ('dispatched', 'uncertain') ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => ({
       id: String(row.id),
       contextId: String(row.context_id),
@@ -164,7 +175,9 @@ export class OperationStore {
       state: String(row.state) as OperationState,
       createdAt: Number(row.created_at),
       sequence: Number(row.sequence),
+      recoveryProtocol: Number(row.recovery_protocol),
       ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}),
+      ...(row.error_json ? { error: JSON.parse(String(row.error_json)) } : {}),
     }));
   }
 
@@ -199,8 +212,8 @@ export class OperationStore {
 
   succeed(id: string, receipt: unknown, toolFence?: number): void {
     const changed = toolFence === undefined
-      ? this.db.prepare("UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ? WHERE id = ? AND state IN ('prepared','dispatched','uncertain')").run(JSON.stringify(receipt), Date.now(), id).changes
-      : this.db.prepare(`UPDATE operations SET state = 'succeeded', receipt_json = ?, updated_at = ?
+      ? this.db.prepare("UPDATE operations SET state = 'succeeded', receipt_json = ?, error_json = NULL, updated_at = ? WHERE id = ? AND state IN ('prepared','dispatched','uncertain')").run(JSON.stringify(receipt), Date.now(), id).changes
+      : this.db.prepare(`UPDATE operations SET state = 'succeeded', receipt_json = ?, error_json = NULL, updated_at = ?
           WHERE id = ? AND state IN ('prepared','dispatched')
             AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
         .run(JSON.stringify(receipt), Date.now(), id, toolFence).changes;
@@ -291,7 +304,9 @@ export class OperationStore {
       state: String(row.state) as OperationState,
       createdAt: Number(row.created_at),
       sequence: Number(row.sequence),
+      recoveryProtocol: Number(row.recovery_protocol),
       ...(row.receipt_json ? { receipt: JSON.parse(String(row.receipt_json)) } : {}),
+      ...(row.error_json ? { error: JSON.parse(String(row.error_json)) } : {}),
     };
   }
 }

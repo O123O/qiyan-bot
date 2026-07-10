@@ -3,14 +3,23 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { LocalEndpoint } from "../../src/app-server/local-endpoint.ts";
+import { LocalAppServerRuntime } from "../../src/app-server/local-runtime.ts";
+import { ManagedAppServerEndpoint } from "../../src/app-server/managed-endpoint.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { DISCOVERY_SOURCE_KINDS } from "../../src/sessions/discovery.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
 const steerEnabled = process.env.RUN_CODEX_STEER_INTEGRATION === "1";
 
-function captureNextTurn(endpoint: LocalEndpoint, threadId: string, timeoutMs = 120_000): { completed: Promise<any>; cancel(): void } {
+function localEndpoint(): ManagedAppServerEndpoint {
+  return new ManagedAppServerEndpoint({
+    id: "local",
+    runtime: new LocalAppServerRuntime({ codexBinary: "codex" }),
+    requestTimeoutMs: 30_000,
+  });
+}
+
+function captureNextTurn(endpoint: ManagedAppServerEndpoint, threadId: string, timeoutMs = 120_000): { completed: Promise<any>; cancel(): void } {
   let unsubscribe: () => void = () => undefined;
   let timeout: ReturnType<typeof setTimeout>;
   const completed = new Promise((resolve, reject) => {
@@ -27,8 +36,8 @@ function captureNextTurn(endpoint: LocalEndpoint, threadId: string, timeoutMs = 
 test("pinned app-server supports multiple threads, discovery, goals, turns, and restart", { skip: !enabled, timeout: 180_000 }, async (t) => {
   const firstDir = await mkdtemp(join(tmpdir(), "qiyan-bot-real-one-"));
   const secondDir = await mkdtemp(join(tmpdir(), "qiyan-bot-real-two-"));
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", requestTimeoutMs: 30_000 });
-  t.after(() => endpoint.stop());
+  const endpoint = localEndpoint();
+  t.after(() => endpoint.closeConnection());
   await endpoint.start();
   const first = await endpoint.request<any>("thread/start", { cwd: firstDir, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
   const second = await endpoint.request<any>("thread/start", { cwd: secondDir, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
@@ -63,7 +72,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   const archived = await endpoint.request<any>("thread/list", { sourceKinds: [...DISCOVERY_SOURCE_KINDS], archived: true, useStateDbOnly: false, limit: 100 });
   assert.ok(archived.data.some((thread: any) => thread.id === first.thread.id));
   await endpoint.request("thread/unarchive", { threadId: first.thread.id });
-  await endpoint.stop();
+  await endpoint.closeConnection();
   await endpoint.start();
   const resumed = await endpoint.request<any>("thread/resume", { threadId: first.thread.id });
   assert.equal(resumed.thread.id, first.thread.id);
@@ -72,8 +81,8 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
 
 test("active turn steering persists its client correlation ID", { skip: !steerEnabled, timeout: 240_000 }, async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "qiyan-bot-steer-probe-"));
-  const endpoint = new LocalEndpoint({ codexBinary: "codex", requestTimeoutMs: 30_000 });
-  t.after(() => endpoint.stop());
+  const endpoint = localEndpoint();
+  t.after(() => endpoint.closeConnection());
   await endpoint.start();
   const startedThread = await endpoint.request<any>("thread/start", { cwd, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
   const threadId = startedThread.thread.id as string;

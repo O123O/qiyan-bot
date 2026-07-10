@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SshGenerationPlanner,
+  buildControlMasterCheckArgs,
   buildControlMasterExitArgs,
   buildSshArgs,
+  buildSshStreamForwardCancelArgs,
+  buildSshStreamForwardArgs,
   parseSshConfig,
   planSshConnection,
 } from "../../src/endpoints/ssh-config.ts";
@@ -21,6 +24,8 @@ test("parses effective SSH configuration and pins the final destination", () => 
   assert.ok(args.includes("HostName=host.example"));
   assert.ok(args.includes("xin"));
   assert.ok(args.includes("2222"));
+  assert.ok(args.includes("ControlPersist=yes"));
+  assert.equal(args.includes("ControlPersist=60"), false);
   assert.equal(args.at(-1), "devbox");
 });
 
@@ -29,8 +34,31 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   const plan = planSshConnection("devbox", effective, "/private/runtime");
   assert.equal(plan.ownsControlMaster, false);
   assert.equal(plan.controlPath, "/tmp/user-master");
-  assert.doesNotMatch(buildSshArgs(plan, [] ).join(" "), /ControlPersist/u);
+  const args = buildSshArgs(plan, []);
+  assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+  assert.ok(args.includes("ControlMaster=no"));
+  assert.doesNotMatch(args.join(" "), /ControlPersist/u);
   assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
+});
+
+test("stream-local forwarding is registered and cancelled on the authenticated ControlMaster", () => {
+  const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
+  const local = "/private/qiyan/f-01234567.sock";
+  const remote = "/tmp/qiyan-1000/abcdef/app-server.sock";
+  const check = buildControlMasterCheckArgs(plan);
+  const forward = buildSshStreamForwardArgs(plan, local, remote);
+  const cancel = buildSshStreamForwardCancelArgs(plan, local, remote);
+  for (const [args, command] of [[check, "check"], [forward, "forward"], [cancel, "cancel"]] as const) {
+    assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+    assert.deepEqual(args.slice(args.indexOf("-O"), args.indexOf("-O") + 2), ["-O", command]);
+    assert.equal(args.at(-1), "devbox");
+    assert.doesNotMatch(args.join(" "), /ControlPath=none|ControlPersist=60|-N|-T|-n/u);
+  }
+  for (const option of ["ExitOnForwardFailure=yes", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177"]) {
+    assert.ok(forward.includes(option), option);
+  }
+  assert.ok(forward.includes(`${local}:${remote}`));
+  assert.ok(cancel.includes(`${local}:${remote}`));
 });
 
 test("rejects malformed effective configuration and unsafe aliases", () => {
@@ -61,6 +89,7 @@ test("re-resolves SSH configuration and checks the durable binding on every gene
     runtimeDir: "/private/runtime",
     hasReferences: (endpointId) => endpointId === "devbox",
     checkExisting: (endpointId, destination, references) => { checked.push({ endpointId, hostname: destination.hostname, references }); },
+    attestControlMaster: async () => undefined,
     run: async (command, args) => {
       assert.equal(command, "ssh");
       assert.deepEqual(args, ["-G", "devbox"]);
@@ -76,4 +105,93 @@ test("re-resolves SSH configuration and checks the durable binding on every gene
     { endpointId: "devbox", hostname: "host-one", references: true },
     { endpointId: "devbox", hostname: "host-two", references: true },
   ]);
+});
+
+test("generation reuses a live user master and falls back to an owned master when it is absent", async () => {
+  const calls: string[][] = [];
+  let userMasterAvailable = true;
+  const planner = new SshGenerationPlanner({
+    sshBinary: "ssh",
+    runtimeDir: "/private/runtime",
+    hasReferences: () => true,
+    checkExisting: () => undefined,
+    attestControlMaster: async () => undefined,
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "-G") {
+        return {
+          stdout: Buffer.from("hostname host.example\nuser xin\nport 22\ncontrolmaster auto\ncontrolpath /private/user-master\n"),
+          stderr: Buffer.alloc(0),
+        };
+      }
+      assert.equal(args[args.indexOf("-O") + 1], "check");
+      if (!userMasterAvailable) throw new Error("master unavailable");
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+  });
+
+  const reused = await planner.createGeneration("devbox");
+  assert.equal(reused.plan.ownsControlMaster, false);
+  assert.equal(reused.plan.controlPath, "/private/user-master");
+
+  userMasterAvailable = false;
+  const fallback = await planner.createGeneration("devbox");
+  assert.equal(fallback.plan.ownsControlMaster, true);
+  assert.match(fallback.plan.controlPath!, /^\/private\/runtime\/ssh\/[a-f0-9]{24}$/u);
+  assert.ok(buildSshArgs(fallback.plan, []).includes("ControlMaster=auto"));
+  assert.deepEqual(calls.map((args) => args[0] === "-G" ? "config" : args[args.indexOf("-O") + 1]), [
+    "config", "check", "config", "check",
+  ]);
+});
+
+test("generation attests a configured user master before probing it", async () => {
+  const events: string[] = [];
+  const planner = new SshGenerationPlanner({
+    sshBinary: "ssh",
+    runtimeDir: "/private/runtime",
+    hasReferences: () => true,
+    checkExisting: () => undefined,
+    attestControlMaster: async () => { events.push("attest"); throw new Error("unsafe socket"); },
+    run: async (_command, args) => {
+      if (args[0] !== "-G") assert.fail("an unattested user master must not be probed");
+      events.push("config");
+      return {
+        stdout: Buffer.from("hostname host.example\nuser xin\nport 22\ncontrolmaster auto\ncontrolpath /private/user-master\n"),
+        stderr: Buffer.alloc(0),
+      };
+    },
+  });
+
+  const generation = await planner.createGeneration("devbox");
+  assert.equal(generation.plan.ownsControlMaster, true);
+  assert.deepEqual(events, ["config", "attest"]);
+});
+
+test("generation cancellation never becomes an owned-master fallback", async () => {
+  for (const boundary of ["attest", "check"] as const) {
+    const controller = new AbortController();
+    const planner = new SshGenerationPlanner({
+      sshBinary: "ssh",
+      runtimeDir: "/private/runtime",
+      hasReferences: () => true,
+      checkExisting: () => undefined,
+      attestControlMaster: async () => {
+        if (boundary !== "attest") return;
+        controller.abort(new Error("cancelled during attestation"));
+        throw controller.signal.reason;
+      },
+      run: async (_command, args) => {
+        if (args[0] === "-G") {
+          return {
+            stdout: Buffer.from("hostname host.example\nuser xin\nport 22\ncontrolmaster auto\ncontrolpath /private/user-master\n"),
+            stderr: Buffer.alloc(0),
+          };
+        }
+        controller.abort(new Error("cancelled during master check"));
+        throw controller.signal.reason;
+      },
+    });
+
+    await assert.rejects(planner.createGeneration("devbox", controller.signal), /cancelled during/u);
+  }
 });

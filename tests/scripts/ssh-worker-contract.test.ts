@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
+
+const execFileAsync = promisify(execFile);
 
 const fixturePath = (name: string): string => `docker/ssh-worker/${name}`;
 const readFixture = (name: string): Promise<string> => readFile(fixturePath(name), "utf8");
@@ -84,12 +90,40 @@ test("SSH daemon accepts only the codex user's public key", async () => {
     "KbdInteractiveAuthentication no",
     "PermitEmptyPasswords no",
     "AllowUsers codex",
-    "DisableForwarding yes",
+    "DisableForwarding no",
+    "AllowTcpForwarding no",
+    "AllowStreamLocalForwarding local",
+    "AllowAgentForwarding no",
+    "X11Forwarding no",
+    "PermitTunnel no",
     "SetEnv CODEX_HOME=/home/codex/.codex",
     "UsePAM no",
   ]) {
     assert.match(config, new RegExp(`^${directive.replaceAll("/", "\\/")}$`, "mu"), `missing ${directive}`);
   }
+});
+
+test("effective SSH policy enables only local stream-local forwarding", async (t) => {
+  const sshd = "/usr/sbin/sshd";
+  const sshKeygen = "/usr/bin/ssh-keygen";
+  try { await Promise.all([access(sshd), access(sshKeygen)]); }
+  catch { t.skip("host sshd is unavailable"); return; }
+  const root = await mkdtemp(join(tmpdir(), "qiyan-sshd-policy-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const hostKey = join(root, "host-key");
+  await execFileAsync(sshKeygen, ["-q", "-t", "ed25519", "-N", "", "-f", hostKey]);
+  const path = join(root, "sshd_config");
+  const source = (await readFixture("sshd_config"))
+    .replace("HostKey /var/lib/ssh-host-keys/ssh_host_ed25519_key", `HostKey ${hostKey}`);
+  await writeFile(path, source);
+
+  const { stdout } = await execFileAsync(sshd, ["-T", "-f", path, "-C", "user=codex,host=localhost,addr=127.0.0.1"]);
+
+  assert.match(stdout, /^allowstreamlocalforwarding local$/mu);
+  assert.match(stdout, /^allowtcpforwarding no$/mu);
+  assert.match(stdout, /^allowagentforwarding no$/mu);
+  assert.match(stdout, /^x11forwarding no$/mu);
+  assert.match(stdout, /^permittunnel no$/mu);
 });
 
 test("SSH worker entrypoint provisions only fixture-owned SSH state", async () => {

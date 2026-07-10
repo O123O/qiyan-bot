@@ -104,41 +104,6 @@ export function buildAssistantChildEnvironment(
   return { ...buildAssistantBaseEnvironment(host, mcpToken), HOME: profile.home, CODEX_HOME: profile.codexHome };
 }
 
-interface AccountEndpoint {
-  request<T>(method: string, params: unknown): Promise<T>;
-}
-
-interface StartableAccountEndpoint extends AccountEndpoint {
-  start(): Promise<void>;
-  stop(): Promise<void>;
-}
-
-export async function assertAssistantAuthenticated(
-  endpoint: AccountEndpoint,
-  profile: Pick<PreparedAssistantProfile, "root" | "home" | "codexHome">,
-): Promise<void> {
-  const response = await endpoint.request<{ account: unknown | null; requiresOpenaiAuth: boolean }>("account/read", { refreshToken: false });
-  if (response.account !== null || !response.requiresOpenaiAuth) return;
-  throw new AppError(
-    "CONFIGURATION_ERROR",
-    `assistant Codex profile is not authenticated (HOME ${profile.home}, CODEX_HOME ${profile.codexHome}); run qiyan-bot assistant-login with DATA_DIR set to ${dirname(profile.root)}`,
-    { reason: "assistant_auth_required" },
-  );
-}
-
-export async function startAuthenticatedAssistantEndpoint(
-  endpoint: StartableAccountEndpoint,
-  profile: Pick<PreparedAssistantProfile, "root" | "home" | "codexHome">,
-): Promise<void> {
-  await endpoint.start();
-  try {
-    await assertAssistantAuthenticated(endpoint, profile);
-  } catch (error) {
-    await endpoint.stop().catch(() => undefined);
-    throw error;
-  }
-}
-
 async function ensurePrivateDirectory(path: string): Promise<string> {
   let value;
   try { value = await lstat(path); }

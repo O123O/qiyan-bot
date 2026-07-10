@@ -1,4 +1,4 @@
-import { createServer, type Server as HttpServer } from "node:http";
+import { createServer, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readFile, readdir, readlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,8 +10,10 @@ import type { AssistantToolName, ToolCallContext, ToolHandler } from "../assista
 import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
 import { APP_VERSION } from "../version.ts";
 
+const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 15_000;
+
 export interface AssistantContextProvider {
-  current(): { contextId: string; attemptId: string; turnId: string; toolFence?: number } | undefined;
+  current(): { contextId: string; attemptId: string; turnId?: string; toolFence?: number } | undefined;
   registerTool?(attemptId: string): number;
   finishTool?(attemptId: string): void;
 }
@@ -60,10 +62,15 @@ export class LoopbackMcpServer {
       allowedClientProcess?: () => LinuxProcessIdentity | undefined;
       beforeToolCall?: () => Promise<void>;
       afterToolCall?: (attemptId: string) => void;
+      sseHeartbeatIntervalMs?: number;
     },
   ) {
     if (options.host !== "127.0.0.1") throw new Error("MCP server must bind only to 127.0.0.1");
     if (!options.token) throw new Error("MCP bearer token is required");
+    if (options.sseHeartbeatIntervalMs !== undefined
+      && (!Number.isSafeInteger(options.sseHeartbeatIntervalMs) || options.sseHeartbeatIntervalMs <= 0)) {
+      throw new Error("MCP SSE heartbeat interval must be a positive integer");
+    }
   }
 
   get url(): string { return `http://127.0.0.1:${this.actualPort}/mcp`; }
@@ -93,14 +100,31 @@ export class LoopbackMcpServer {
         const body = await readJson(request);
         const { mcp, transport } = await this.createProtocolServer();
         let closed = false;
+        let eventStreamResponse = false;
+        const writeHead = response.writeHead;
+        response.writeHead = function (this: ServerResponse, ...args: any[]) {
+          const headers = typeof args[1] === "string" ? args[2] : args[1];
+          const contentType = responseHeader(headers, "content-type") ?? response.getHeader("content-type");
+          eventStreamResponse = String(contentType ?? "").toLowerCase().startsWith("text/event-stream");
+          return Reflect.apply(writeHead, this, args);
+        } as typeof response.writeHead;
+        const heartbeat = setInterval(() => {
+          if (!eventStreamResponse || !response.headersSent || response.writableEnded || response.destroyed) return;
+          try { response.write(": qiyan-keepalive\n\n"); }
+          catch { clearInterval(heartbeat); }
+        }, this.options.sseHeartbeatIntervalMs ?? DEFAULT_SSE_HEARTBEAT_INTERVAL_MS);
+        heartbeat.unref?.();
         const close = () => {
           if (closed) return;
           closed = true;
+          clearInterval(heartbeat);
           this.activeServers.delete(mcp);
           void mcp.close().catch(() => undefined);
         };
         response.once("close", close);
-        await transport.handleRequest(request, response, body);
+        response.once("finish", () => clearInterval(heartbeat));
+        try { await transport.handleRequest(request, response, body); }
+        finally { clearInterval(heartbeat); }
       } catch (error) {
         if (!response.headersSent) response.writeHead(500, { "content-type": "application/json" });
         if (!response.writableEnded) response.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: error instanceof Error ? error.message : "internal error" } }));
@@ -136,9 +160,10 @@ export class LoopbackMcpServer {
         const context: ToolCallContext = {
           sourceContextId: active.contextId,
           attemptId: active.attemptId,
-          turnId: active.turnId,
           callId: `mcp:${String(extra.requestId)}`,
+          ...(active.turnId ? { turnId: active.turnId } : {}),
           ...(toolFence === undefined ? {} : { toolFence }),
+          ...(extra.signal ? { signal: extra.signal as AbortSignal } : {}),
         };
         try {
           const result = await this.tools[name](context, args);
@@ -204,6 +229,20 @@ function sameProcess(left: LinuxProcessIdentity, right: LinuxProcessIdentity): b
   return left.pid === right.pid && left.startTime === right.startTime;
 }
 
+function responseHeader(headers: unknown, name: string): string | undefined {
+  if (!headers || typeof headers !== "object") return undefined;
+  if (Array.isArray(headers)) {
+    for (let index = 0; index + 1 < headers.length; index += 2) {
+      if (String(headers[index]).toLowerCase() === name) return String(headers[index + 1]);
+    }
+    return undefined;
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name && value !== undefined) return Array.isArray(value) ? value.join(", ") : String(value);
+  }
+  return undefined;
+}
+
 function ipv4ProcHex(address: string | undefined): string | undefined {
   const octets = address?.split(".").map(Number);
   if (!octets || octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return undefined;
@@ -251,7 +290,14 @@ export function assistantTurnConfig(
   shellEnvironment: { userHome: string; codexHome: string },
 ): Record<string, unknown> {
   return {
-    mcp_servers: { qiyan_bot_manager: { url: mcpUrl, bearer_token_env_var: "QIYAN_BOT_MCP_TOKEN", default_tools_approval_mode: "approve" } },
+    mcp_servers: {
+      qiyan_bot_manager: {
+        url: mcpUrl,
+        bearer_token_env_var: "QIYAN_BOT_MCP_TOKEN",
+        default_tools_approval_mode: "approve",
+        tool_timeout_sec: 600,
+      },
+    },
     ...secureShellConfig(shellEnvironment),
   };
 }

@@ -49,3 +49,24 @@ test("a replacement mapping cannot see runtime settings, turns, or epochs from a
   assert.equal(store.currentEpoch("local", "thread", "mapping-new"), undefined);
   assert.equal(store.getSession("local", "thread", "mapping-old")?.nativeStatus, "active");
 });
+
+test("goal-turn control is durable and mapping-generation scoped", () => {
+  const store = new RuntimeStore(createTestDatabase());
+  store.setSession("local", "thread", "mapping-old", "managed", "idle");
+  assert.equal(store.goalControlled("local", "thread", "mapping-old"), false);
+  assert.deepEqual(store.goalControl("local", "thread", "mapping-old"), { controlled: false, known: true, observationSequence: 0 });
+  store.setGoalControlled("local", "thread", "mapping-old", true, 7);
+  assert.equal(store.goalControlled("local", "thread", "mapping-old"), true);
+  assert.deepEqual(store.goalControl("local", "thread", "mapping-old"), { controlled: true, known: true, observationSequence: 7 });
+
+  assert.equal(store.clearGoalControlledBefore("local", "thread", "mapping-old", 6), false);
+  assert.equal(store.goalControlled("local", "thread", "mapping-old"), true);
+  assert.equal(store.clearGoalControlledBefore("local", "thread", "mapping-old", 8), true);
+  assert.equal(store.goalControlled("local", "thread", "mapping-old"), false);
+  store.setGoalControlled("local", "thread", "mapping-old", true, 9);
+
+  store.setSession("local", "thread", "mapping-new", "managed", "idle");
+  assert.equal(store.goalControlled("local", "thread", "mapping-new"), false);
+  store.setGoalControlled("local", "thread", "mapping-old", false);
+  assert.equal(store.goalControlled("local", "thread", "mapping-old"), false);
+});

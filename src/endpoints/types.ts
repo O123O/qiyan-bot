@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AppServerEndpoint } from "../app-server/pool.ts";
-import type { PermissionBlockedEvent } from "../app-server/local-endpoint.ts";
+import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
 
 export type RuntimeIdentity =
   | { kind: "local"; pid: number; startTime: string }
@@ -18,7 +18,7 @@ export interface EndpointWorkLease {
 export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
-  shutdownRuntime(expectedIdentity?: RuntimeIdentity): Promise<void>;
+  shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;

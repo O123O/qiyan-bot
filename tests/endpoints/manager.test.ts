@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
-import type { PermissionBlockedEvent } from "../../src/app-server/local-endpoint.ts";
+import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 import { RpcRequestTimeoutError } from "../../src/app-server/rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";
@@ -21,6 +21,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   localPid = 10;
   threadStatus: "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
+  readonly requests: Array<{ method: string; params: unknown }> = [];
   onRuntimeIdentity: (() => void) | undefined;
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
@@ -41,7 +42,8 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
       ? { kind: "local", pid: this.localPid, startTime: "20" }
       : { kind: "ssh", token: this.identityToken, pid: 10, linuxStartTime: "20", processGroupId: 10 };
   }
-  async request<T>(method: string): Promise<T> {
+  async request<T>(method: string, params: unknown): Promise<T> {
+    this.requests.push({ method, params });
     if (this.requestError) throw this.requestError;
     if (method === "thread/read") return { thread: { status: { type: this.threadStatus }, turns: [] } } as T;
     return {} as T;
@@ -329,6 +331,15 @@ test("lifecycle idle proof preserves the typed RPC timeout source", async () => 
   await assert.rejects(value.manager.disconnect("devbox"), (error: unknown) => error instanceof RpcRequestTimeoutError);
 });
 
+test("lifecycle idle proof does not require materialized turn history", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+
+  await value.manager.disconnect("devbox");
+
+  assert.deepEqual(remote.requests, [{ method: "thread/read", params: { threadId: "thread-1", includeTurns: false } }]);
+});
+
 test("lifecycle cold activation retries on its capped timer without a ready event", async () => {
   const value = fixture();
   const replacement = new FakeEndpoint("devbox");
@@ -500,6 +511,30 @@ test("restart checkpoints and reopens admission before publishing its replacemen
 
   assert.deepEqual(publications, [{ automatic: true, checkpointed: true }]);
   assert.deepEqual(await Promise.all(admissions), [true]);
+  assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
+test("restart after disconnect starts a fresh runtime without proving stopped threads idle", async () => {
+  const first = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const { manager, candidateCount } = queuedFixture([first, replacement], ["thread-1"]);
+  await manager.ensureReady("devbox");
+  await manager.disconnect("devbox");
+  const checkpoints: unknown[] = [];
+
+  await manager.restart("devbox", (checkpoint) => { checkpoints.push(checkpoint); });
+
+  assert.equal(candidateCount(), 2);
+  assert.equal(first.runtimeStops, 1);
+  assert.equal(replacement.starts, 1);
+  assert.equal(replacement.state, "ready");
+  assert.deepEqual(replacement.requests, [], "a stopped endpoint has no live thread state to prove");
+  assert.deepEqual(checkpoints, [{
+    phase: "runtime_started",
+    identity: { kind: "ssh", token: "b".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 },
+  }]);
+  assert.equal(manager.desiredState("devbox"), "automatic");
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
 });
 

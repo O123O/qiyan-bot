@@ -58,6 +58,32 @@ test("a confirmed delivery stays confirmed when projection requests restart and 
   assert.equal(restarts, 1);
 });
 
+test("concurrent delivery processing dispatches one chat write", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const delivery = store.prepare({
+    id: "concurrent", kind: "chat",
+    binding: { adapterId: "slack", conversationKey: "owner", destination: { channel: "owner" } },
+    body: "private body", mandatory: true,
+  });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let sends = 0;
+  const adapter: ChatDeliveryAdapter = {
+    id: "slack",
+    sendMessage: async () => { sends += 1; await blocked; return { messageTs: String(sends) }; },
+  };
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: adapter }]));
+
+  const first = worker.processOne(delivery.id);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const second = worker.processOne(delivery.id);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(sends, 1);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(store.get(delivery.id)?.attemptCount, 1);
+});
+
 test("adapter-specific retry proof overrides generic HTTP status handling", async () => {
   const store = new DeliveryStore(createTestDatabase());
   const binding = { adapterId: "slack", conversationKey: "slack:C1", destination: { channel: "C1" } } as const;

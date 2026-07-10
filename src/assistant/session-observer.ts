@@ -15,6 +15,8 @@ interface ObserverOptions {
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
+  onIdleTurn?(event: { endpointId: string; threadId: string; turnId: string }): Promise<void>;
+  onGoalTurnStarted?(event: { endpointId: string; threadId: string; mappingId: string; turnId: string }): void;
   classifyFailure?(error: unknown): "retry" | "endpoint" | "sleep";
   retryMs?: number;
   timers?: ObservationTimers;
@@ -38,6 +40,7 @@ const supportedMethods = new Set([
   "thread/goal/updated",
   "thread/goal/cleared",
 ]);
+const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
 
 export class SessionObservationProcessor {
   private tails = new Map<string, Promise<void>>();
@@ -58,7 +61,23 @@ export class SessionObservationProcessor {
     if (!supportedMethods.has(method)) return false;
     const normalized = normalizeNotification(method, params);
     if (!normalized) return false;
+    if (method === "thread/goal/updated" && normalized.turnId !== null) {
+      const target = this.observationTarget(endpointId, String(normalized.threadId));
+      if (target.kind !== "discarded" && this.runtime.goalControlled(endpointId, target.identity.threadId, target.mappingId)) {
+        normalized.goalControlMappingId = target.mappingId;
+      }
+    }
     this.store.acceptNotification(endpointId, method, normalized, this.options.now());
+    if (method === "thread/goal/updated" && typeof normalized.goalControlMappingId === "string") {
+      try {
+        this.options.onGoalTurnStarted?.({
+          endpointId,
+          threadId: String(normalized.threadId),
+          mappingId: normalized.goalControlMappingId,
+          turnId: String(normalized.turnId),
+        });
+      } catch { /* Durable replay retries authorization after the ownership guard is ready. */ }
+    }
     void this.enqueue(endpointId);
     return true;
   }
@@ -247,6 +266,17 @@ export class SessionObservationProcessor {
     }
     if (notification.method === "thread/status/changed") {
       const nativeStatus = String(params.status.type);
+      const completedTurnId = nativeStatus === "idle"
+        ? this.runtime.activeTurn(notification.endpointId, identity.threadId, mappingId)
+        : undefined;
+      if (completedTurnId) {
+        await this.options.onIdleTurn?.({
+          endpointId: notification.endpointId,
+          threadId: identity.threadId,
+          turnId: completedTurnId,
+        });
+        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
+      }
       const activeTurn = nativeStatus === "active" ? this.runtime.activeTurn(notification.endpointId, identity.threadId, mappingId) : undefined;
       const before = this.visibleRuntime(identity, mappingId);
       this.runtime.reconcileNativeState(notification.endpointId, identity.threadId, mappingId, nativeStatus, activeTurn, notification.sequence);
@@ -274,19 +304,39 @@ export class SessionObservationProcessor {
       return this.store.observeTokenUsage(identity, params.turnId, tokenUsage, ordinal, notification.sequence);
     }
     if (notification.method === "thread/goal/updated") {
+      if (params.goalControlMappingId === mappingId && typeof params.turnId === "string") {
+        this.options.onGoalTurnStarted?.({
+          endpointId: notification.endpointId,
+          threadId: identity.threadId,
+          mappingId,
+          turnId: params.turnId,
+        });
+        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
+      }
       const normalized = normalizeGoal(params.goal);
       const sourceTime = normalizeProtocolTime(params.goal.updatedAt, notification.receivedAt);
-      return this.store.observeGoal(identity, normalized, sourceTime, notification.sequence, sourceTime);
+      const changed = this.store.observeGoal(identity, normalized, sourceTime, notification.sequence, sourceTime);
+      if (normalized.status !== "active") {
+        this.runtime.clearGoalControlledBefore(notification.endpointId, identity.threadId, mappingId, notification.sequence);
+      }
+      return changed;
     }
     if (notification.method === "thread/goal/cleared") {
       const current = await this.options.readGoal(notification.endpointId, identity.threadId) as any;
       if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
       const goal = current?.goal;
       if (goal) {
+        const normalized = normalizeGoal(goal);
         const sourceTime = normalizeProtocolTime(goal.updatedAt, notification.receivedAt);
-        return this.store.observeGoal(identity, normalizeGoal(goal), sourceTime, notification.sequence, sourceTime);
+        const changed = this.store.observeGoal(identity, normalized, sourceTime, notification.sequence, sourceTime);
+        if (normalized.status !== "active") {
+          this.runtime.clearGoalControlledBefore(notification.endpointId, identity.threadId, mappingId, notification.sequence);
+        }
+        return changed;
       }
-      return this.store.observeGoal(identity, null, notification.receivedAt, notification.sequence, notification.receivedAt);
+      const changed = this.store.observeGoal(identity, null, notification.receivedAt, notification.sequence, notification.receivedAt);
+      this.runtime.clearGoalControlledBefore(notification.endpointId, identity.threadId, mappingId, notification.sequence);
+      return changed;
     }
     return false;
   }
@@ -304,14 +354,14 @@ export class SessionObservationProcessor {
 
   private observationTarget(endpointId: string, threadId: string):
     | { kind: "managed"; identity: DashboardIdentity; mappingId: string }
-    | { kind: "deferred" }
+    | { kind: "deferred"; identity: DashboardIdentity; mappingId: string }
     | { kind: "discarded" } {
     const session = Object.values(this.registry.snapshot().sessions).find((candidate) => candidate.endpoint === endpointId && candidate.thread_id === threadId);
     if (!session) return { kind: "discarded" };
     const state = this.runtime.getSession(endpointId, threadId, session.mapping_id);
     if (session.lifecycle_state === "managed" && state?.managementState === "managed") return { kind: "managed", identity: { endpointId, threadId }, mappingId: session.mapping_id };
     if (session.lifecycle_state === "managed" && state?.managementState === "unavailable" && state.restoreState === "managed") {
-      return { kind: "deferred" };
+      return { kind: "deferred", identity: { endpointId, threadId }, mappingId: session.mapping_id };
     }
     return { kind: "discarded" };
   }
@@ -347,7 +397,8 @@ function normalizeNotification(method: string, raw: unknown): Record<string, unk
     return { threadId: params.threadId, turnId: params.turnId, tokenUsage: structuredClone(params.tokenUsage) };
   }
   if (method === "thread/goal/updated") {
-    if (!params.goal || typeof params.goal.objective !== "string" || typeof params.goal.status !== "string") return undefined;
+    if (!params.goal || typeof params.goal.objective !== "string" || typeof params.goal.status !== "string"
+      || !goalStatuses.has(params.goal.status)) return undefined;
     return { threadId: params.threadId, turnId: typeof params.turnId === "string" ? params.turnId : null, goal: {
       objective: params.goal.objective,
       status: params.goal.status,
@@ -360,9 +411,11 @@ function normalizeNotification(method: string, raw: unknown): Record<string, unk
 }
 
 function normalizeGoal(value: any): DashboardGoal {
+  const status = String(value.status);
+  if (!goalStatuses.has(status)) throw new Error("invalid goal status");
   return {
     objective: String(value.objective),
-    status: String(value.status),
+    status,
     token_budget: typeof value.tokenBudget === "number" ? value.tokenBudget : typeof value.token_budget === "number" ? value.token_budget : null,
   };
 }

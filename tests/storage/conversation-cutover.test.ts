@@ -91,7 +91,7 @@ test("a fresh Slack-only database completes routing backfill without a Telegram 
 test("finalization reconciles one active attempt from full history", async () => {
   const { db } = await legacyDatabase();
   db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
-    VALUES ('attempt-active', 'chat-pending', 'pending:attempt-active', 'user', 'active', 60)`).run();
+    VALUES ('attempt-active', 'chat-pending', 'turn-1', 'user', 'active', 60)`).run();
   runConversationRoutingBackfill(db, telegram);
   finalizeConversationCutover(db, {
     threadId: "assistant",
@@ -105,10 +105,25 @@ test("finalization reconciles one active attempt from full history", async () =>
   db.close();
 });
 
-test("summary history cannot finalize an active legacy attempt", async () => {
+test("client-correlated cutover history cannot replace a provisional attempt identity", async () => {
   const { db } = await legacyDatabase();
   db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
     VALUES ('attempt-active', 'chat-pending', 'pending:attempt-active', 'user', 'active', 60)`).run();
+  runConversationRoutingBackfill(db, telegram);
+  assert.throws(() => finalizeConversationCutover(db, {
+    threadId: "assistant",
+    turns: [{ id: "rollout-1874", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId: "chat-pending" }] }],
+  }), /exact|authoritative|identity/iu);
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = 'attempt-active'").get()!.turn_id, "pending:attempt-active");
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM assistant_turn_lease").get()!.count, 0);
+  assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "routing_backfilled");
+  db.close();
+});
+
+test("summary history cannot finalize an active legacy attempt", async () => {
+  const { db } = await legacyDatabase();
+  db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
+    VALUES ('attempt-active', 'chat-pending', 'turn-1', 'user', 'active', 60)`).run();
   runConversationRoutingBackfill(db, telegram);
   assert.throws(() => finalizeConversationCutover(db, {
     threadId: "assistant",

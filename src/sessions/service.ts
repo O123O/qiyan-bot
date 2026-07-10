@@ -11,9 +11,11 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
+import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface SessionOwnershipCheck {
   inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
+  authorizeTurn?(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, turnId: string): void;
 }
 
 export class SessionService {
@@ -25,7 +27,7 @@ export class SessionService {
     private readonly deliveries: DeliveryStore,
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable"> | WorkspaceRouter,
     private readonly gate: ThreadGate,
-    private readonly endpoints?: Pick<EndpointManager, "withWorkLease">,
+    private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
     private readonly ownership?: SessionOwnershipCheck,
   ) {}
 
@@ -81,18 +83,41 @@ export class SessionService {
     });
   }
 
-  async interrupt(nickname: string, turnId?: string): Promise<void> {
+  async interrupt(nickname: string, turnId?: string, options: {
+    existingLease?: EndpointWorkLease;
+    recoverExactTurn?: boolean;
+  } = {}): Promise<void> {
     const expected = this.managed(nickname);
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactManaged(nickname, expected.mapping_id);
       await this.assertOwned(nickname, session, lease);
       this.assertExactManaged(nickname, expected.mapping_id);
-      const active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+      let active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+      if (!active && options.recoverExactTurn && turnId) {
+        const native = await this.readWithTurns(session.endpoint, session.thread_id, lease);
+        const target = native.thread.turns.find((candidate: any) => candidate.id === turnId);
+        if (target && isTerminalStatus(target.status)) return;
+        if (!target) throw new AppError("OPERATION_UNCERTAIN", `turn ${turnId} is not present in authoritative history`);
+        active = turnId;
+      }
       if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
       if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
       await this.pool.interrupt(session.endpoint, session.thread_id, active, lease);
       this.runtime.clearActiveTurn(session.endpoint, session.thread_id, session.mapping_id, active);
-    }));
+    }), options.existingLease);
+  }
+
+  authorizeTurn(nickname: string, turnId: string): void {
+    const session = this.managed(nickname);
+    this.ownership?.authorizeTurn?.(session, turnId);
+  }
+
+  async authorizeActiveTurn(nickname: string, existingLease?: EndpointWorkLease): Promise<string | undefined> {
+    const expected = this.managed(nickname);
+    return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.assertExactManaged(nickname, expected.mapping_id);
+      return this.authorizeActiveTurnForSession(session, lease);
+    }), existingLease);
   }
 
   activeTurnId(nickname: string): string {
@@ -139,7 +164,7 @@ export class SessionService {
     observeNative?(snapshot: { nativeStatus: string; activeTurnId: string | null }): void;
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
-    const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: true });
+    const native = await this.readWithTurns(session.endpoint, session.thread_id);
     const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
     const nativeStatus = native.thread.status?.type ?? "unknown";
     const activeTurnId = nativeStatus === "active"
@@ -183,22 +208,36 @@ export class SessionService {
     const session = this.required(nickname); return this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id });
   }
 
-  async setGoal(nickname: string, objective: string, tokenBudget?: number): Promise<unknown> {
+  async setGoal(
+    nickname: string,
+    objective: string,
+    tokenBudget?: number,
+    beforeDispatch?: () => void,
+    onAuthoritativeMismatch?: () => void | Promise<void>,
+  ): Promise<unknown> {
     return this.runVerifiedExecution(nickname, async (session, _cwd, lease) => {
+      beforeDispatch?.();
       try {
         return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, objective, status: "active", ...(tokenBudget === undefined ? {} : { tokenBudget }) }, undefined, lease);
       } catch (error) {
         const current = await this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id }, undefined, lease).catch(() => undefined) as any;
         const goal = current?.goal;
         if (goal?.objective === objective && goal?.status === "active" && (tokenBudget === undefined || goal.tokenBudget === tokenBudget || goal.token_budget === tokenBudget)) return current;
+        if (isAuthoritativeGoalResponse(current)) {
+          await this.authorizeActiveTurnForSession(session, lease);
+          await onAuthoritativeMismatch?.();
+        }
         throw error;
       }
     });
   }
 
   pauseGoal(nickname: string): Promise<unknown> { return this.setGoalStatusUnchecked(nickname, "paused"); }
-  resumeGoal(nickname: string): Promise<unknown> {
-    return this.runVerifiedExecution(nickname, (session, _cwd, lease) => this.setGoalStatusForSession(session, "active", lease));
+  resumeGoal(nickname: string, beforeDispatch?: () => void, onAuthoritativeMismatch?: () => void | Promise<void>): Promise<unknown> {
+    return this.runVerifiedExecution(nickname, (session, _cwd, lease) => {
+      beforeDispatch?.();
+      return this.setGoalStatusForSession(session, "active", lease, onAuthoritativeMismatch);
+    });
   }
 
   async cancelGoal(nickname: string): Promise<unknown> {
@@ -216,11 +255,20 @@ export class SessionService {
     return this.setGoalStatusForSession(session, status);
   }
 
-  private async setGoalStatusForSession(session: RegistrySession, status: "paused" | "active", lease?: EndpointWorkLease): Promise<unknown> {
+  private async setGoalStatusForSession(
+    session: RegistrySession,
+    status: "paused" | "active",
+    lease?: EndpointWorkLease,
+    onAuthoritativeMismatch?: () => void | Promise<void>,
+  ): Promise<unknown> {
     try { return await this.pool.request(session.endpoint, "thread/goal/set", { threadId: session.thread_id, status }, undefined, lease); }
     catch (error) {
       const current = await this.pool.request(session.endpoint, "thread/goal/get", { threadId: session.thread_id }, undefined, lease).catch(() => undefined) as any;
       if (current?.goal?.status === status) return current;
+      if (isAuthoritativeGoalResponse(current)) {
+        await this.authorizeActiveTurnForSession(session, lease);
+        await onAuthoritativeMismatch?.();
+      }
       throw error;
     }
   }
@@ -240,17 +288,29 @@ export class SessionService {
     }));
   }
 
-  private withMutationLease<T>(endpointId: string, run: (lease?: EndpointWorkLease) => Promise<T>): Promise<T> {
-    return this.endpoints
-      ? this.endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => run(lease))
-      : run(undefined);
+  private withMutationLease<T>(endpointId: string, run: (lease?: EndpointWorkLease) => Promise<T>, existingLease?: EndpointWorkLease): Promise<T> {
+    if (!this.endpoints) return run(existingLease);
+    return existingLease
+      ? this.endpoints.runWithWorkLease(endpointId, existingLease, run)
+      : this.endpoints.withWorkLease(endpointId, "session-mutation", (_endpoint, lease) => run(lease));
   }
 
   private async assertOwned(nickname: string, session: RegistrySession, lease?: EndpointWorkLease): Promise<void> {
     if (!this.ownership) return;
     const ownership = await this.ownership.inspect(session, lease);
     if (ownership.state === "external") throw new AppError("SESSION_DETACHED", `${nickname} is being used outside QiYan`);
+    if (ownership.state === "lost") throw new AppError("THREAD_NOT_FOUND", `${nickname} has no durable rollout after restart`);
+    if (ownership.state === "pending") throw new AppError("SESSION_BUSY", `${nickname} is waiting for its rollout to materialize`);
     if (ownership.state === "unclassified") throw new AppError("SESSION_BUSY", `${nickname} has a turn whose ownership is not yet classified`);
+  }
+
+  private async authorizeActiveTurnForSession(session: RegistrySession, lease?: EndpointWorkLease): Promise<string | undefined> {
+    const native = await this.readWithTurns(session.endpoint, session.thread_id, lease);
+    if (native.thread.id !== session.thread_id || native.thread.status?.type !== "active") return undefined;
+    const turn = [...native.thread.turns].reverse().find((candidate: any) => !isTerminalStatus(candidate.status));
+    if (!turn) return undefined;
+    this.ownership?.authorizeTurn?.(session, turn.id);
+    return String(turn.id);
   }
 
   private prepareExisting(endpointId: string, path: string, lease?: EndpointWorkLease) {
@@ -286,6 +346,16 @@ export class SessionService {
     return data;
   }
 
+  private async readWithTurns(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<any> {
+    try {
+      return await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
+  }
+
   private required(nickname: string) {
     const session = this.registry.get(nickname);
     if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${nickname}`);
@@ -302,4 +372,15 @@ export class SessionService {
 function isTerminalStatus(status: unknown): boolean {
   const type = typeof status === "string" ? status : String((status as any)?.type ?? "");
   return new Set(["completed", "failed", "interrupted"]).has(type);
+}
+
+const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+
+function isAuthoritativeGoalResponse(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "goal")) return false;
+  const goal = (value as { goal: unknown }).goal;
+  if (goal === null) return true;
+  return !!goal && typeof goal === "object" && !Array.isArray(goal)
+    && typeof (goal as { status?: unknown }).status === "string"
+    && goalStatuses.has((goal as { status: string }).status);
 }

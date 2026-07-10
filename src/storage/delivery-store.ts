@@ -74,8 +74,9 @@ export class DeliveryStore {
     };
   }
 
-  markDispatched(id: string): void {
-    this.db.prepare("UPDATE deliveries SET state = 'dispatched', attempt_count = attempt_count + 1, updated_at = ? WHERE id = ?").run(Date.now(), id);
+  markDispatched(id: string): boolean {
+    return this.db.prepare(`UPDATE deliveries SET state = 'dispatched', attempt_count = attempt_count + 1, updated_at = ?
+      WHERE id = ? AND state IN ('prepared', 'uncertain')`).run(Date.now(), id).changes === 1;
   }
 
   confirm(id: string, receipt: JsonValue): void {

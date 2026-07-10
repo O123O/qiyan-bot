@@ -20,7 +20,7 @@ export class DeliveryWorker {
 
   async processOne(id: string): Promise<void> {
     const delivery = this.store.get(id);
-    if (!delivery || delivery.state === "confirmed") return;
+    if (!delivery || (delivery.state !== "prepared" && delivery.state !== "uncertain")) return;
     const adapter = this.adapters.delivery(delivery.binding.adapterId);
     if (delivery.state === "uncertain" && adapter.reconcileUncertain) {
       const resolution = await adapter.reconcileUncertain({
@@ -47,8 +47,8 @@ export class DeliveryWorker {
       throw new AppError("DELIVERY_UNCERTAIN", `optional delivery ${id} may already have been sent`);
     }
     const body = delivery.state === "uncertain" ? this.recoveryEnvelope(delivery.body, delivery.id) : delivery.body;
+    if (!this.store.markDispatched(id)) return;
     try {
-      this.store.markDispatched(id);
       const receipt = delivery.attachmentId
         ? await this.sendAttachment(adapter, delivery, body)
         : await adapter.sendMessage(delivery.binding.destination, body, delivery.binding.reply, { deliveryId: delivery.id });

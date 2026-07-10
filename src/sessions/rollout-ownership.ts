@@ -7,6 +7,8 @@ import { inTransaction, type Database } from "../storage/database.ts";
 import type { OperationStore } from "../storage/operation-store.ts";
 import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
+import type { AppServerPool } from "../app-server/pool.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 export interface RolloutCursor {
   device: string;
@@ -17,6 +19,7 @@ export interface RolloutCursor {
 export interface RolloutTurnStart {
   turnId: string;
   clientId?: string;
+  hasUserMessage?: true;
 }
 
 export interface RolloutScanResult {
@@ -26,14 +29,63 @@ export interface RolloutScanResult {
   malformed?: true;
 }
 
+export type RolloutMaterialization =
+  | { state: "missing" }
+  | { state: "present"; result: RolloutScanResult };
+
 export interface RolloutAccess {
   scan(endpointId: string, requests: ReadonlyArray<{ path: string; threadId: string; cursor?: RolloutCursor }>, lease?: EndpointWorkLease): Promise<RolloutScanResult[]>;
+  scanUnmaterialized?(
+    endpointId: string,
+    request: { path: string; threadId: string },
+    lease?: EndpointWorkLease,
+  ): Promise<RolloutMaterialization>;
 }
 
 export type OwnershipInspection =
   | { state: "owned" }
+  | { state: "pending" }
+  | { state: "lost" }
   | { state: "external"; turnId: string }
   | { state: "unclassified"; turnId: string };
+
+export type RolloutPathResolution =
+  | { state: "resolved"; path: string }
+  | { state: "pending" }
+  | { state: "lost" };
+
+export type RolloutPathResolver = (
+  identity: MappingIdentity,
+  lease?: EndpointWorkLease,
+) => Promise<RolloutPathResolution>;
+
+export function createAppServerRolloutPathResolver(
+  pool: Pick<AppServerPool, "request">,
+): RolloutPathResolver {
+  return async (identity, lease) => {
+    let response: unknown;
+    try {
+      response = await pool.request(identity.endpoint, "thread/read", {
+        threadId: identity.thread_id,
+        includeTurns: false,
+      }, undefined, lease);
+    } catch (error) {
+      if (isExactThreadNotMaterialized(error, identity.thread_id)) return { state: "pending" };
+      if (isExactThreadNoRollout(error, identity.thread_id)) return { state: "pending" };
+      if (!isExactThreadNotLoaded(error, identity.thread_id)) throw error;
+      try {
+        response = await pool.request(identity.endpoint, "thread/resume", {
+          threadId: identity.thread_id,
+        }, undefined, lease);
+      } catch (resumeError) {
+        if (isExactThreadNoRollout(resumeError, identity.thread_id)) return { state: "lost" };
+        throw resumeError;
+      }
+    }
+    const path = exactThreadPath(response, identity.thread_id);
+    return path === undefined ? { state: "pending" } : { state: "resolved", path };
+  };
+}
 
 const rolloutReadChunkBytes = 64 * 1024;
 const maxRolloutLineBytes = 64 * 1024 * 1024;
@@ -53,28 +105,94 @@ export class SessionOwnershipGuard {
     private readonly runtime: RuntimeStore,
     private readonly operations: OperationStore,
     private readonly access: RolloutAccess,
+    private readonly resolvePath?: RolloutPathResolver,
   ) {}
 
-  async initialize(identity: MappingIdentity, path: string, lease?: EndpointWorkLease): Promise<void> {
-    const existing = this.row(identity);
+  recordUnmaterialized(identity: MappingIdentity, path?: string): void {
+    if (path !== undefined && !validRolloutPath(path, identity.thread_id)) {
+      throw new AppError("OPERATION_UNCERTAIN", "managed rollout path is invalid");
+    }
+    inTransaction(this.db, () => {
+      this.db.prepare(`INSERT OR IGNORE INTO session_rollout_ownership
+        (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+        VALUES (?, ?, ?, ?, '', '', 0, 0, NULL, ?)`).run(
+        identity.endpoint, identity.thread_id, identity.mapping_id, path ?? "", Date.now(),
+      );
+      let existing = this.row(identity);
+      if (path !== undefined && existing?.rolloutPath === undefined) {
+        this.db.prepare(`UPDATE session_rollout_ownership SET rollout_path = ?, updated_at = ?
+          WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND rollout_path = ''`).run(
+          path, Date.now(), identity.endpoint, identity.thread_id, identity.mapping_id,
+        );
+        existing = this.row(identity);
+      }
+      if (path !== undefined && existing?.rolloutPath !== path) {
+        throw new AppError("OPERATION_UNCERTAIN", "managed rollout path changed");
+      }
+    });
+  }
+
+  async initialize(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+    options: { allowUnmaterialized?: boolean; authorizedTurnId?: string } = {},
+  ): Promise<void> {
+    let existing = this.row(identity);
     if (existing) {
-      if (existing.rolloutPath !== path) throw new AppError("OPERATION_UNCERTAIN", "managed rollout path changed");
+      this.recordUnmaterialized(identity, path);
+      if (options.authorizedTurnId) this.recordOwnedTurn(identity, options.authorizedTurnId);
+      existing = this.row(identity)!;
+      const inspection = await this.inspectCurrent(
+        identity,
+        lease,
+        !existing.materialized && options.allowUnmaterialized !== true,
+      );
+      if (inspection.state === "external") throw externalTurn(identity.thread_id);
+      if (inspection.state === "unclassified") throw ownershipUnclassified("rollout ownership is temporarily uncertain");
       return;
     }
-    const [result] = await this.access.scan(identity.endpoint, [{ path, threadId: identity.thread_id }], lease);
+    const materialization = options.allowUnmaterialized
+      ? await this.scanUnmaterialized(identity, path, lease)
+      : await this.scanMaterialized(identity, path, lease);
+    if (materialization.state === "missing") {
+      this.db.prepare(`INSERT INTO session_rollout_ownership
+        (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+        VALUES (?, ?, ?, ?, '', '', 0, 0, NULL, ?)`).run(
+        identity.endpoint, identity.thread_id, identity.mapping_id, path, Date.now(),
+      );
+      return;
+    }
+    const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
-    const owned = result.openTurn && this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
-    const external = result.openTurn && !owned ? result.openTurn : undefined;
-    if (result.malformed && !external) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
+    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
+    const pendingUnclassified = result.openTurn
+      && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
+      && !this.ownsObservedTurn(identity, result.openTurn)
+      && result.openTurn.turnId !== options.authorizedTurnId
+      && result.openTurn.hasUserMessage !== true ? result.openTurn : undefined;
+    const candidates = options.allowUnmaterialized ? [...result.starts] : [];
+    if (result.openTurn && !candidates.some((turn) => turn.turnId === result.openTurn!.turnId)
+      && (result.openTurn.hasUserMessage === true || this.ownsObservedTurn(identity, result.openTurn)
+        || result.openTurn.turnId === options.authorizedTurnId)) candidates.push(result.openTurn);
+    const classified = candidates.map((turn) => ({
+      turn,
+      state: this.classifyObservedTurn(identity, turn, goalControlled, options.authorizedTurnId),
+    }));
+    const external = classified.find((item) => item.state === "external")?.turn;
+    const pending = pendingUnclassified ?? classified.find((item) => item.state === "unclassified")?.turn;
+    if ((result.malformed || pending) && !external) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
     inTransaction(this.db, () => {
       this.db.prepare(`INSERT INTO session_rollout_ownership
-        (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, external_turn_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
         identity.endpoint, identity.thread_id, identity.mapping_id, path,
         result.cursor.device, result.cursor.inode, result.cursor.offset, external?.turnId ?? null, Date.now(),
       );
-      if (owned) this.recordOwnedTurn(identity, owned.turnId);
+      if (options.authorizedTurnId && !external) this.recordOwnedTurn(identity, options.authorizedTurnId);
+      for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
       if (external) {
+        this.revokeAuthorizedTurn(identity, external.turnId);
         const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
         if (state) this.runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "unadopting", state.nativeStatus);
       }
@@ -82,26 +200,62 @@ export class SessionOwnershipGuard {
     if (external) throw externalTurn(identity.thread_id);
   }
 
-  async inspect(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<OwnershipInspection> {
-    const existing = this.row(identity);
+  async inspect(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<OwnershipInspection> {
+    return this.inspectCurrent(identity, lease, false, options?.requireMaterialized ?? false);
+  }
+
+  private async inspectCurrent(
+    identity: MappingIdentity,
+    lease: EndpointWorkLease | undefined,
+    requireClassifiedTurn: boolean,
+    requireMaterialized = false,
+  ): Promise<OwnershipInspection> {
+    let existing = this.row(identity);
     if (!existing) throw ownershipUnclassified("session ownership guard is not initialized");
-    const [result] = await this.access.scan(identity.endpoint, [{
-      path: existing.rolloutPath,
-      threadId: identity.thread_id,
-      cursor: { device: existing.device, inode: existing.inode, offset: existing.byteOffset },
-    }], lease);
+    if (!existing.rolloutPath) {
+      if (!this.resolvePath) return { state: "pending" };
+      const resolution = await this.resolvePath(identity, lease);
+      if (resolution.state !== "resolved") return resolution;
+      this.recordUnmaterialized(identity, resolution.path);
+      existing = this.row(identity)!;
+    }
+    const rolloutPath = existing.rolloutPath;
+    if (!rolloutPath) throw ownershipUnclassified("managed rollout path is not materialized");
+    const materialization = existing.materialized
+      ? await this.scanMaterialized(identity, rolloutPath, lease, {
+        device: existing.device,
+        inode: existing.inode,
+        offset: existing.byteOffset,
+      })
+      : await this.scanUnmaterialized(identity, rolloutPath, lease);
+    if (materialization.state === "missing") {
+      // A rollout that was recorded but never durably written to disk is not recoverable after
+      // the endpoint forgets its in-memory thread. Create-completion recovery asks for this
+      // strict check so a never-materialized thread is dropped instead of blessed as owned.
+      if (requireMaterialized) return { state: "lost" };
+      if (requireClassifiedTurn) throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
+      return { state: "owned" };
+    }
+    const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
+    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
     const unclassified = result.openTurn && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && !this.operations.ownsWorkerTurn(result.openTurn) ? result.openTurn : undefined;
+      && !this.ownsObservedTurn(identity, result.openTurn) ? result.openTurn : undefined;
     const candidates = [...result.starts];
     if (result.openTurn && !candidates.some((turn) => turn.turnId === result.openTurn!.turnId)
-      && this.operations.ownsWorkerTurn(result.openTurn)) candidates.push(result.openTurn);
-    const classified = candidates.map((turn) => ({ turn, owned: this.operations.ownsWorkerTurn(turn) }));
-    const external = classified.find((item) => !item.owned)?.turn;
+      && this.ownsObservedTurn(identity, result.openTurn)) candidates.push(result.openTurn);
+    const classified = candidates.map((turn) => ({ turn, state: this.classifyObservedTurn(identity, turn, goalControlled) }));
+    const external = classified.find((item) => item.state === "external")?.turn;
+    const pending = unclassified ?? classified.find((item) => item.state === "unclassified")?.turn;
     const incidentTurnId = existing.externalTurnId ?? external?.turnId;
     if (result.malformed && !incidentTurnId) throw ownershipUnclassified("rollout ownership is temporarily uncertain");
+    if (requireClassifiedTurn && !incidentTurnId && (classified.length === 0 || pending)) {
+      throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
+    }
+    if (pending && !incidentTurnId) return { state: "unclassified", turnId: pending.turnId };
     inTransaction(this.db, () => {
-      for (const item of classified) if (item.owned) this.recordOwnedTurn(identity, item.turn.turnId);
+      for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
+      if (incidentTurnId) this.revokeAuthorizedTurn(identity, incidentTurnId);
       this.updateCursor(identity, existing, result.cursor, external?.turnId);
       if (incidentTurnId) {
         const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
@@ -109,14 +263,13 @@ export class SessionOwnershipGuard {
       }
     });
     if (incidentTurnId) return { state: "external", turnId: incidentTurnId };
-    if (unclassified) return { state: "unclassified", turnId: unclassified.turnId };
     return { state: "owned" };
   }
 
-  async inspectIfInitialized(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
+  async inspectIfInitialized(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" } | OwnershipInspection
   > {
-    return this.row(identity) ? this.inspect(identity, lease) : { state: "uninitialized" };
+    return this.row(identity) ? this.inspect(identity, lease, options) : { state: "uninitialized" };
   }
 
   release(identity: MappingIdentity): void {
@@ -131,24 +284,60 @@ export class SessionOwnershipGuard {
       .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
   }
 
+  authorizeTurn(identity: MappingIdentity, turnId: string): void {
+    if (!this.row(identity)) throw ownershipUnclassified("session ownership guard is not initialized");
+    this.recordOwnedTurn(identity, turnId);
+  }
+
+  authorizeTurnIfInitialized(identity: MappingIdentity, turnId: string): boolean {
+    if (!this.row(identity)) return false;
+    this.recordOwnedTurn(identity, turnId);
+    return true;
+  }
+
+  private ownsObservedTurn(identity: MappingIdentity, turn: RolloutTurnStart): boolean {
+    return this.operations.ownsWorkerTurn(turn) || this.isAuthorizedTurn(identity, turn.turnId);
+  }
+
+  private isAuthorizedTurn(identity: MappingIdentity, turnId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM session_rollout_owned_turns
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
+      .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
+  }
+
+  private classifyObservedTurn(
+    identity: MappingIdentity,
+    turn: RolloutTurnStart,
+    goalControlled: boolean,
+    authorizedTurnId?: string,
+  ): "owned" | "external" | "unclassified" {
+    if (this.operations.ownsWorkerTurn(turn)) return "owned";
+    if (turn.hasUserMessage === true) return "external";
+    if (turn.turnId === authorizedTurnId || this.isAuthorizedTurn(identity, turn.turnId) || goalControlled) return "owned";
+    return "unclassified";
+  }
+
   private row(identity: MappingIdentity): OwnershipRow | undefined {
-    const row = this.db.prepare(`SELECT rollout_path, device, inode, byte_offset, external_turn_id
+    const row = this.db.prepare(`SELECT rollout_path, device, inode, byte_offset, materialized, external_turn_id
       FROM session_rollout_ownership WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
       .get(identity.endpoint, identity.thread_id, identity.mapping_id) as Record<string, unknown> | undefined;
+    const rolloutPath = row ? String(row.rollout_path) : "";
     return row ? {
-      rolloutPath: String(row.rollout_path), device: String(row.device), inode: String(row.inode), byteOffset: Number(row.byte_offset),
+      ...(rolloutPath ? { rolloutPath } : {}), device: String(row.device), inode: String(row.inode), byteOffset: Number(row.byte_offset),
+      materialized: Number(row.materialized) === 1,
       ...(row.external_turn_id ? { externalTurnId: String(row.external_turn_id) } : {}),
     } : undefined;
   }
 
   private updateCursor(identity: MappingIdentity, expected: OwnershipRow, cursor: RolloutCursor, externalTurnId?: string): void {
+    if (!expected.rolloutPath) throw ownershipUnclassified("managed rollout path is not materialized");
     const changed = this.db.prepare(`UPDATE session_rollout_ownership
-      SET device = ?, inode = ?, byte_offset = ?, external_turn_id = COALESCE(external_turn_id, ?), updated_at = ?
+      SET device = ?, inode = ?, byte_offset = ?, materialized = 1, external_turn_id = COALESCE(external_turn_id, ?), updated_at = ?
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?
-        AND device = ? AND inode = ? AND byte_offset = ? AND external_turn_id IS ?`).run(
+        AND rollout_path = ? AND device = ? AND inode = ? AND byte_offset = ? AND materialized = ? AND external_turn_id IS ?`).run(
       cursor.device, cursor.inode, cursor.offset, externalTurnId ?? null, Date.now(),
       identity.endpoint, identity.thread_id, identity.mapping_id,
-      expected.device, expected.inode, expected.byteOffset, expected.externalTurnId ?? null,
+      expected.rolloutPath, expected.device, expected.inode, expected.byteOffset, expected.materialized ? 1 : 0, expected.externalTurnId ?? null,
     ).changes;
     if (changed !== 1) throw new AppError("OPERATION_UNCERTAIN", "session ownership cursor changed concurrently");
   }
@@ -158,19 +347,46 @@ export class SessionOwnershipGuard {
       (endpoint_id, thread_id, mapping_id, turn_id, recorded_at) VALUES (?, ?, ?, ?, ?)`)
       .run(identity.endpoint, identity.thread_id, identity.mapping_id, turnId, Date.now());
   }
+
+  private revokeAuthorizedTurn(identity: MappingIdentity, turnId: string): void {
+    this.db.prepare(`DELETE FROM session_rollout_owned_turns
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
+      .run(identity.endpoint, identity.thread_id, identity.mapping_id, turnId);
+  }
+
+  private async scanMaterialized(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+    cursor?: RolloutCursor,
+  ): Promise<RolloutMaterialization> {
+    const [result] = await this.access.scan(identity.endpoint, [{ path, threadId: identity.thread_id, ...(cursor ? { cursor } : {}) }], lease);
+    if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
+    return { state: "present", result };
+  }
+
+  private async scanUnmaterialized(identity: MappingIdentity, path: string, lease?: EndpointWorkLease): Promise<RolloutMaterialization> {
+    if (!this.access.scanUnmaterialized) throw ownershipUnclassified("rollout materialization cannot be checked safely");
+    return this.access.scanUnmaterialized(identity.endpoint, { path, threadId: identity.thread_id }, lease);
+  }
 }
 
 interface OwnershipRow {
-  rolloutPath: string;
+  rolloutPath?: string;
   device: string;
   inode: string;
   byteOffset: number;
+  materialized: boolean;
   externalTurnId?: string;
 }
 
-export async function scanLocalRollout(request: { path: string; threadId: string; cursor?: RolloutCursor }): Promise<RolloutScanResult> {
-  const name = basename(request.path);
-  if (!isAbsolute(request.path) || !safeThreadId(request.threadId) || !name.startsWith("rollout-") || !name.endsWith(`-${request.threadId}.jsonl`)) {
+export async function scanLocalRollout(request: {
+  path: string;
+  threadId: string;
+  cursor?: RolloutCursor;
+  collectFromStart?: true;
+}): Promise<RolloutScanResult> {
+  if (!validRolloutPath(request.path, request.threadId)) {
     throw new Error("invalid rollout ownership scan request");
   }
   const offset = request.cursor?.offset ?? 0;
@@ -183,15 +399,36 @@ export async function scanLocalRollout(request: { path: string; threadId: string
     const inode = state.ino.toString(10);
     if (request.cursor && (request.cursor.device !== device || request.cursor.inode !== inode)) throw new Error("rollout identity changed");
     if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
-    const parsed = await parseRolloutFile(file, offset, Number(state.size), request.cursor !== undefined);
+    const parsed = await parseRolloutFile(file, offset, Number(state.size), request.cursor !== undefined || request.collectFromStart === true);
     const after = await file.stat({ bigint: true });
-    if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) {
-      throw new Error("rollout changed while scanning");
-    }
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size < state.size) throw new Error("rollout was truncated");
+    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
   } finally {
     await file.close();
   }
+}
+
+function validRolloutPath(path: string, threadId: string): boolean {
+  const name = basename(path);
+  return isAbsolute(path) && safeThreadId(threadId) && name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`);
+}
+
+function exactThreadPath(response: unknown, threadId: string): string | undefined {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned invalid data");
+  }
+  const thread = (response as Record<string, unknown>).thread;
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)
+    || (thread as Record<string, unknown>).id !== threadId) {
+    throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned a different thread");
+  }
+  const path = (thread as Record<string, unknown>).path;
+  if (path === null || path === undefined) return undefined;
+  if (typeof path !== "string") throw new AppError("OPERATION_UNCERTAIN", "rollout path lookup returned invalid data");
+  return path;
 }
 
 interface PendingTurn extends RolloutTurnStart { startOffset: number; sawUserMessage: boolean }
@@ -273,7 +510,7 @@ async function parseRolloutFile(
   while (position < size) {
     const chunk = Buffer.allocUnsafe(Math.min(rolloutReadChunkBytes, size - position));
     const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
-    if (bytesRead === 0) throw new Error("rollout changed while scanning");
+    if (bytesRead === 0) throw new Error("rollout was truncated");
     position += bytesRead;
     const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
     let lineStart = 0;
@@ -290,7 +527,11 @@ async function parseRolloutFile(
 }
 
 function publicStart(turn: PendingTurn): RolloutTurnStart {
-  return { turnId: turn.turnId, ...(turn.clientId ? { clientId: turn.clientId } : {}) };
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientId ? { clientId: turn.clientId } : {}),
+    ...(turn.sawUserMessage ? { hasUserMessage: true as const } : {}),
+  };
 }
 
 function safeThreadId(value: string): boolean {

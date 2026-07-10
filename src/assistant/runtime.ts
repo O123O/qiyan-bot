@@ -9,7 +9,7 @@ import type { OperationRecord, OperationStore } from "../storage/operation-store
 export interface ActiveAssistantContext {
   attemptId: string;
   contextId: string;
-  turnId: string;
+  turnId?: string;
   triggerKind: "chat" | "internal";
   binding?: ConversationBinding;
   toolFence: number;
@@ -66,10 +66,7 @@ export class AssistantRuntime {
   }
 
   hydrateActive(): ActiveAssistantContext | undefined {
-    const row = this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
-        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
-      FROM assistant_attempts a LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id
-      WHERE a.state = 'active' ORDER BY (l.singleton IS NOT NULL) DESC, a.created_at DESC, a.id DESC LIMIT 1`).get() as Record<string, unknown> | undefined;
+    const row = this.admissibleRow();
     if (!row) {
       this.active = undefined;
       return undefined;
@@ -78,7 +75,16 @@ export class AssistantRuntime {
     return this.current();
   }
 
-  current(): ActiveAssistantContext | undefined { return this.active ? { ...this.active } : undefined; }
+  current(): ActiveAssistantContext | undefined {
+    if (!this.active) return undefined;
+    const row = this.admissibleRow(this.active.attemptId);
+    if (!row) {
+      this.active = undefined;
+      return undefined;
+    }
+    this.active = this.parseActive(row);
+    return { ...this.active };
+  }
 
   abandonActive(turnId: string): void {
     if (this.active?.turnId === turnId) this.active = undefined;
@@ -86,6 +92,14 @@ export class AssistantRuntime {
 
   contextForTurn(turnId: string): ActiveAssistantContext | undefined {
     const row = this.attemptRow(turnId);
+    return row ? this.parseActive(row) : undefined;
+  }
+
+  contextForLease(attemptId: string, turnId: string): ActiveAssistantContext | undefined {
+    const row = this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_turn_lease l
+      JOIN assistant_attempts a ON a.id = l.attempt_id
+      WHERE l.singleton = 1 AND l.phase = 'terminalizing' AND l.attempt_id = ? AND l.turn_id = ?
+        AND a.state = 'active' AND a.turn_id = ?`).get(attemptId, turnId, turnId) as Record<string, unknown> | undefined;
     return row ? this.parseActive(row) : undefined;
   }
 
@@ -102,17 +116,24 @@ export class AssistantRuntime {
     return this.terminalizeAttempt(String(row.id), turnId);
   }
 
+  beginLeaseTerminalizing(attemptId: string, turnId: string): ActiveAssistantContext | undefined {
+    if (!this.contextForLease(attemptId, turnId)) return undefined;
+    return this.terminalizeAttempt(attemptId, turnId);
+  }
+
   fenceToolAdmission(): void {
     for (const attempt of this.activeAttempts()) this.terminalizeAttempt(attempt.attemptId, attempt.turnId);
   }
 
-  private terminalizeAttempt(attemptId: string, turnId: string): ActiveAssistantContext {
+  private terminalizeAttempt(attemptId: string, turnId?: string): ActiveAssistantContext {
     return inTransaction(this.db, () => {
       this.db.prepare(`UPDATE assistant_attempts
         SET tool_fence = tool_fence + CASE WHEN accepting_tools = 1 THEN 1 ELSE 0 END, accepting_tools = 0
         WHERE id = ? AND state = 'active'`).run(attemptId);
-      this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
-        WHERE attempt_id = ? AND turn_id = ?`).run(attemptId, turnId);
+      if (turnId) {
+        this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
+          WHERE attempt_id = ? AND turn_id = ?`).run(attemptId, turnId);
+      }
       const refreshed = this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
         LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.id = ?`).get(attemptId) as Record<string, unknown>;
       const active = this.parseActive(refreshed);
@@ -122,8 +143,8 @@ export class AssistantRuntime {
   }
 
   registerTool(attemptId: string): number {
-    const row = this.db.prepare("SELECT state, accepting_tools, tool_fence FROM assistant_attempts WHERE id = ?").get(attemptId) as { state: string; accepting_tools: number; tool_fence: number } | undefined;
-    if (!row || row.state !== "active" || row.accepting_tools !== 1) throw new Error("assistant attempt has terminalized and does not accept new tools");
+    const row = this.admissibleRow(attemptId);
+    if (!row) throw new Error("assistant attempt has no active assistant lease for tools or has terminalized");
     this.activeTools.set(attemptId, (this.activeTools.get(attemptId) ?? 0) + 1);
     return Number(row.tool_fence);
   }
@@ -195,9 +216,10 @@ export class AssistantRuntime {
     if (unresolved) return {};
     this.beginTerminalizing(turnId);
     this.operations.markAttemptOperationsUncertain(String(attempt.id));
-    const result = status === "completed"
+    const missingChatFinal = status === "completed" && this.triggerKind(attempt) === "chat" && !text;
+    const result = status === "completed" && !missingChatFinal
       ? this.completeAttempt(attempt, text)
-      : this.failAttemptGroup(attempt, error ?? status);
+      : this.failAttemptGroup(attempt, error ?? (missingChatFinal ? "assistant turn completed without a final response" : status));
     if (this.active?.attemptId === String(attempt.id)) this.active = undefined;
     return result;
   }
@@ -281,6 +303,18 @@ export class AssistantRuntime {
       ORDER BY (l.singleton IS NOT NULL) DESC, (a.state = 'active') DESC, a.created_at DESC, a.id DESC LIMIT 1`).get(turnId) as Record<string, unknown> | undefined;
   }
 
+  private admissibleRow(attemptId?: string): Record<string, unknown> | undefined {
+    return this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
+        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
+      FROM assistant_turn_lease l JOIN assistant_attempts a ON a.id = l.attempt_id
+      WHERE l.singleton = 1 AND a.state = 'active' AND a.accepting_tools = 1
+        AND l.phase IN ('starting', 'active')
+        AND ((l.phase = 'starting' AND l.turn_id IS NULL AND a.turn_id IS NULL)
+          OR (l.phase = 'active' AND l.turn_id IS NOT NULL AND a.turn_id = l.turn_id))
+        AND (? IS NULL OR a.id = ?)
+      LIMIT 1`).get(attemptId ?? null, attemptId ?? null) as Record<string, unknown> | undefined;
+  }
+
   private memberContextIds(attempt: Record<string, unknown>): string[] {
     const rows = this.db.prepare("SELECT context_id FROM assistant_attempt_sources WHERE attempt_id = ? AND state IN ('submitted','completed') ORDER BY source_ordinal")
       .all(String(attempt.id)) as Array<{ context_id: string }>;
@@ -318,7 +352,7 @@ export class AssistantRuntime {
     return {
       attemptId: String(row.id),
       contextId: String(row.context_id),
-      turnId: String(row.turn_id),
+      ...(row.turn_id == null ? {} : { turnId: String(row.turn_id) }),
       triggerKind: this.triggerKind(row),
       ...(this.bindingForAttempt(row) ? { binding: this.bindingForAttempt(row)! } : {}),
       toolFence: Number(row.tool_fence),

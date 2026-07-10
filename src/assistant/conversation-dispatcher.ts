@@ -1,4 +1,5 @@
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
+import { TurnIdentityConflictError } from "../app-server/pool.ts";
 import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
 import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
 import { AppError } from "../core/errors.ts";
@@ -57,6 +58,8 @@ export class ConversationDispatcher {
   private networkCount = 0;
   private readonly idleWaiters = new Set<() => void>();
   private readonly earlyTerminals = new Map<string, TurnSnapshot>();
+  private earlyTerminalAttemptId: string | undefined;
+  private deferredTerminal: { attemptId: string; turn: TurnSnapshot } | undefined;
   private readonly unsubscribeCapacity: () => void;
   private capacityWaiting = false;
   private pumpPaused = false;
@@ -64,6 +67,7 @@ export class ConversationDispatcher {
   private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryGeneration = 0;
   private nativeSubmissionCount = 0;
+  private inFlightStartAttemptId: string | undefined;
   private eventWakeTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
 
@@ -93,19 +97,57 @@ export class ConversationDispatcher {
     return this.post(() => { this.pumpPaused = false; this.pump(); });
   }
 
+  started(turn: TurnSnapshot): Promise<void> {
+    return this.post(() => {
+      const correlated = this.correlatedUnresolvedStart(turn);
+      if (!correlated) return;
+      const early = this.takeEarlyTerminal(correlated.attemptId, turn.id);
+      const leaseBefore = this.store.lease();
+      const confirmation = this.confirmNotifiedStart(correlated, turn, !!early);
+      if (confirmation === "conflict") {
+        this.pauseIdentityConflict(correlated.attemptId);
+        return;
+      }
+      if (confirmation === "bound") {
+        this.options.onOperationalEvent?.("assistant_turn_started");
+        this.options.membershipObserver?.notifyMembership(correlated.contextId);
+      }
+      this.options.runtimeObserver?.hydrateActive();
+      if (early) {
+        if (confirmation === "bound") this.noteConversationPeriod(leaseBefore);
+        this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
+        this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
+        if (confirmation === "bound") this.options.onOperationalEvent?.("assistant_turn_terminal");
+        this.options.onDeferredTerminal?.(early);
+      } else if (confirmation !== "already_terminal_same") this.pump();
+    });
+  }
+
   terminal(turn: TurnSnapshot): Promise<void> {
     return this.post(() => {
       this.pumpPaused = false;
       const lease = this.store.lease();
       if (lease?.turnId === turn.id) {
-        this.noteConversationPeriod();
+        this.noteConversationPeriod(lease);
         this.store.beginTerminalizing(turn.id);
         this.options.runtimeObserver?.beginTerminalizing?.(turn.id);
         this.options.onOperationalEvent?.("assistant_turn_terminal");
-      } else {
-        this.earlyTerminals.set(turn.id, turn);
+        if (this.hasUnresolvedSubmission(lease.attemptId)) this.deferredTerminal = { attemptId: lease.attemptId, turn };
+        this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
+        return;
       }
-      this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, turn.id);
+      if (lease?.phase !== "starting") return;
+      const inFlight = this.inFlightStartAttemptId === lease.attemptId;
+      const submission = inFlight
+        ? this.unresolvedStart(lease)
+        : this.correlatedUnresolvedStart(turn);
+      if (!submission) return;
+      const newlyUncertain = this.store.observeUnknownStartTerminal(submission.attemptId, submission.contextId);
+      if (newlyUncertain) {
+        this.options.membershipObserver?.notifyMembership(submission.contextId);
+        this.options.onOperationalEvent?.("assistant_submission_uncertain");
+      }
+      if (inFlight) this.bufferEarlyTerminal(lease.attemptId, turn);
     });
   }
 
@@ -126,7 +168,8 @@ export class ConversationDispatcher {
         });
         const members = this.store.membersForAttempt(lease.attemptId);
         const unresolved = members.find((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state));
-        if (unresolved) {
+        const unknownTerminal = lease.phase === "starting" && lease.pauseReason === "unknown_terminal_observed";
+        if (unresolved && !unknownTerminal) {
           if (unresolved.state !== "uncertain") this.store.markUncertain(lease.attemptId, unresolved.contextId);
           const submission = this.store.submissionFor(lease.attemptId, unresolved.contextId)!;
           this.launch(
@@ -136,7 +179,7 @@ export class ConversationDispatcher {
               this.reconcileSubmission(submission, submission.submissionKind === "start" ? claim : undefined, thread);
               const current = this.store.membersForAttempt(lease.attemptId)
                 .find((member) => member.contextId === unresolved.contextId);
-              if (current && new Set(["start_submitting", "steer_submitting", "uncertain"]).has(current.state)) this.scheduleRecovery();
+              if (current && this.shouldRetryUnresolved(current)) this.scheduleRecovery();
             },
             () => { if (recoveryGeneration === this.recoveryGeneration) this.scheduleRecovery(); },
           );
@@ -190,6 +233,9 @@ export class ConversationDispatcher {
     this.cancelRetry();
     this.cancelRecovery();
     if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
+    const inFlightStart = this.inFlightStartAttemptId;
+    this.inFlightStartAttemptId = undefined;
+    if (inFlightStart) this.clearEarlyTerminals(inFlightStart);
     const lease = this.store.lease();
     if (lease) {
       const unresolved = this.store.membersForAttempt(lease.attemptId)
@@ -261,33 +307,57 @@ export class ConversationDispatcher {
       clientUserMessageId: submission.clientUserMessageId,
       input: this.input(submission),
     };
+    if (this.inFlightStartAttemptId && this.inFlightStartAttemptId !== submission.attemptId) {
+      throw new Error("another assistant start is already in flight");
+    }
+    this.inFlightStartAttemptId = submission.attemptId;
+    this.options.runtimeObserver?.hydrateActive();
     this.launch(
       this.trackNativeSubmission(() => this.runner.start(params, claim)),
       (response) => {
-        if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) return;
-        const early = this.earlyTerminals.get(response.turn.id);
+        this.settleInFlightStart(submission.attemptId);
+        if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) {
+          this.clearEarlyTerminals(submission.attemptId);
+          return;
+        }
+        const early = this.takeEarlyTerminal(submission.attemptId, response.turn.id);
+        this.clearEarlyTerminals(submission.attemptId);
+        const leaseBefore = this.store.lease();
         try {
           this.pool.bindTurnCapacityClaim(claim, response.turn.id);
         } catch (error) {
-          if (!early && !isTerminal(response.turn.status)) throw error;
+          const current = this.store.lease();
+          if (current?.attemptId === submission.attemptId && current.turnId === response.turn.id) {
+            // A lifecycle notification already bound the same exact identity.
+          } else {
+            this.pauseIdentityConflict(submission.attemptId);
+            return;
+          }
         }
-        this.store.markSubmitted(submission.attemptId, submission.contextId, response.turn.id);
-        this.options.onOperationalEvent?.("assistant_turn_started");
-        this.options.membershipObserver?.notifyMembership(submission.contextId);
+        const terminal = !!early || isTerminal(response.turn.status);
+        const confirmation = this.store.confirmStart(submission.attemptId, submission.contextId, response.turn.id, { terminal });
+        if (confirmation === "conflict") {
+          this.pauseIdentityConflict(submission.attemptId);
+          return;
+        }
+        if (confirmation === "bound") {
+          this.options.onOperationalEvent?.("assistant_turn_started");
+          this.options.membershipObserver?.notifyMembership(submission.contextId);
+        }
         this.options.runtimeObserver?.hydrateActive();
-        if (early || isTerminal(response.turn.status)) {
-          this.earlyTerminals.delete(response.turn.id);
-          this.noteConversationPeriod();
-          this.store.beginTerminalizing(response.turn.id);
+        if (terminal || confirmation === "already_terminal_same") {
+          if (confirmation === "bound") this.noteConversationPeriod(leaseBefore);
           this.options.runtimeObserver?.beginTerminalizing?.(response.turn.id);
           this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, response.turn.id);
-          this.options.onOperationalEvent?.("assistant_turn_terminal");
-          this.options.onDeferredTerminal?.(early ?? response.turn);
+          if (confirmation !== "already_terminal_same") this.options.onOperationalEvent?.("assistant_turn_terminal");
+          if (early || isTerminal(response.turn.status)) this.options.onDeferredTerminal?.(early ?? response.turn);
           return;
         }
         this.pump();
       },
       (error) => {
+        this.settleInFlightStart(submission.attemptId);
+        this.clearEarlyTerminals(submission.attemptId);
         if (recoveryGeneration !== undefined && recoveryGeneration !== this.recoveryGeneration) return;
         this.handleSubmissionFailure(submission, claim, error, recoveryGeneration);
       },
@@ -305,11 +375,18 @@ export class ConversationDispatcher {
     this.launch(
       this.trackNativeSubmission(() => this.runner.steer(params)),
       (response) => {
-        this.store.markSubmitted(submission.attemptId, submission.contextId, response.turnId);
-        this.options.onOperationalEvent?.("assistant_turn_steered");
+        const confirmation = this.store.confirmSteer(submission.attemptId, submission.contextId, response.turnId);
+        if (confirmation === "conflict") {
+          this.pauseIdentityConflict(submission.attemptId);
+          return;
+        }
+        if (confirmation === "bound") {
+          this.options.onOperationalEvent?.("assistant_turn_steered");
+        }
         this.options.membershipObserver?.notifyMembership(submission.contextId);
         this.options.runtimeObserver?.hydrateActive();
-        this.pump();
+        if (confirmation === "already_terminal_same") this.resumeDeferredTerminal(submission.attemptId);
+        else this.pump();
       },
       (error) => this.handleSubmissionFailure(submission, undefined, error),
       () => this.finishNativeSubmission(),
@@ -317,14 +394,21 @@ export class ConversationDispatcher {
   }
 
   private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown, recoveryGeneration?: number): void {
+    if (error instanceof TurnIdentityConflictError && submission.submissionKind === "start") {
+      this.pauseIdentityConflict(submission.attemptId);
+      return;
+    }
     if (this.isKnownNonSteerable(error) && submission.submissionKind === "steer") {
+      const current = this.store.membersForAttempt(submission.attemptId).find((member) => member.contextId === submission.contextId);
+      if (!current || !new Set(["steer_submitting", "uncertain"]).has(current.state)) return;
       this.store.restorePending(submission.attemptId, submission.contextId);
       this.options.membershipObserver?.notifyMembership(submission.contextId);
-      this.store.pauseSteering(submission.attemptId, "native_turn_not_steerable");
+      if (this.store.lease()?.phase === "terminalizing") this.resumeDeferredTerminal(submission.attemptId);
+      else this.store.pauseSteering(submission.attemptId, "native_turn_not_steerable");
       return;
     }
     const reconciliationGeneration = recoveryGeneration ?? ++this.recoveryGeneration;
-    this.store.markUncertain(submission.attemptId, submission.contextId);
+    if (!this.store.markUncertainIfUnresolved(submission.attemptId, submission.contextId)) return;
     this.options.onOperationalEvent?.("assistant_submission_uncertain");
     this.launch(
       this.runner.readThread(),
@@ -333,7 +417,7 @@ export class ConversationDispatcher {
         this.reconcileSubmission(submission, claim, thread);
         const current = this.store.membersForAttempt(submission.attemptId)
           .find((member) => member.contextId === submission.contextId);
-        if (current && new Set(["start_submitting", "steer_submitting", "uncertain"]).has(current.state)) this.scheduleRecovery();
+        if (current && this.shouldRetryUnresolved(current)) this.scheduleRecovery();
       },
       () => {
         if (reconciliationGeneration === this.recoveryGeneration) this.scheduleRecovery();
@@ -342,21 +426,29 @@ export class ConversationDispatcher {
   }
 
   private reconcileSubmission(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, thread: ThreadSnapshot): void {
-    const positive = [...thread.turns].reverse().find((turn) =>
-      turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId));
+    const positive = submission.submissionKind === "steer" && submission.expectedTurnId
+      ? thread.turns.find((turn) => turn.id === submission.expectedTurnId
+        && turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId))
+      : [...thread.turns].reverse().find((turn) =>
+        turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId));
     if (positive) {
-      this.store.markSubmitted(submission.attemptId, submission.contextId, positive.id);
-      this.options.onOperationalEvent?.(submission.submissionKind === "start" ? "assistant_turn_started" : "assistant_turn_steered");
+      if (submission.submissionKind === "start") return;
+      const confirmation = this.store.confirmSteer(submission.attemptId, submission.contextId, positive.id);
+      if (confirmation === "conflict") return;
+      if (confirmation === "bound") {
+        this.options.onOperationalEvent?.("assistant_turn_steered");
+      }
       this.options.membershipObserver?.notifyMembership(submission.contextId);
       this.options.runtimeObserver?.hydrateActive();
-      if (claim) this.pool.bindTurnCapacityClaim(claim, positive.id);
       if (isTerminal(positive.status)) {
-        this.noteConversationPeriod();
+        this.noteConversationPeriod(this.store.lease());
         this.store.beginTerminalizing(positive.id);
         this.options.runtimeObserver?.beginTerminalizing?.(positive.id);
         this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, positive.id);
         this.options.onOperationalEvent?.("assistant_turn_terminal");
-        this.options.onDeferredTerminal?.(positive);
+        if (!this.resumeDeferredTerminal(submission.attemptId)) this.options.onDeferredTerminal?.(positive);
+      } else if (confirmation === "already_terminal_same") {
+        this.resumeDeferredTerminal(submission.attemptId);
       } else this.pump();
       return;
     }
@@ -370,16 +462,17 @@ export class ConversationDispatcher {
     const provenAbsent = allFull && (submission.submissionKind === "steer"
       ? !!expected && isTerminal(expected.status)
       : noActiveTurn && threadStatus === "idle");
+    if (submission.submissionKind === "start" && this.store.lease()?.pauseReason === "unknown_terminal_observed") return;
     if (!provenAbsent) return;
 
     this.store.restorePending(submission.attemptId, submission.contextId);
     this.options.membershipObserver?.notifyMembership(submission.contextId);
     if (submission.submissionKind === "steer" && expected && isTerminal(expected.status)) {
-      this.noteConversationPeriod();
+      this.noteConversationPeriod(this.store.lease());
       this.store.beginTerminalizing(expected.id);
       this.options.runtimeObserver?.beginTerminalizing?.(expected.id);
       this.pool.markTurnTerminal(this.options.endpointId, this.options.threadId, expected.id);
-      this.options.onDeferredTerminal?.(expected);
+      if (!this.resumeDeferredTerminal(submission.attemptId)) this.options.onDeferredTerminal?.(expected);
     }
     if (claim) {
       this.pumpPaused = true;
@@ -489,8 +582,97 @@ export class ConversationDispatcher {
     return Object.hasOwn(info, "activeTurnNotSteerable");
   }
 
-  private noteConversationPeriod(): void {
+  private correlatedUnresolvedStart(turn: TurnSnapshot): ReservedSubmission | undefined {
     const lease = this.store.lease();
+    if (!lease || lease.phase !== "starting" || lease.turnId) return undefined;
+    const submission = this.unresolvedStart(lease);
+    if (!submission) return undefined;
+    return turn.items.some((item) => item.type === "userMessage" && item.clientId === submission.clientUserMessageId)
+      ? submission
+      : undefined;
+  }
+
+  private unresolvedStart(lease: AssistantLease): ReservedSubmission | undefined {
+    const submission = this.store.submissionFor(lease.attemptId, lease.primaryContextId);
+    return submission?.submissionKind === "start" && new Set(["start_submitting", "uncertain"]).has(submission.state)
+      ? submission
+      : undefined;
+  }
+
+  private settleInFlightStart(attemptId: string): void {
+    if (this.inFlightStartAttemptId === attemptId) this.inFlightStartAttemptId = undefined;
+  }
+
+  private shouldRetryUnresolved(member: { attemptId: string; submissionKind: "start" | "steer"; state: string }): boolean {
+    if (!new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state)) return false;
+    const lease = this.store.lease();
+    return !(member.submissionKind === "start" && lease?.attemptId === member.attemptId
+      && lease.phase === "starting" && lease.pauseReason === "unknown_terminal_observed");
+  }
+
+  private confirmNotifiedStart(submission: ReservedSubmission, turn: TurnSnapshot, terminal: boolean) {
+    const lease = this.store.lease();
+    if (!lease || lease.attemptId !== submission.attemptId) return "conflict" as const;
+    const claim = this.pool.restoreTurnCapacityClaim(this.options.endpointId, this.options.threadId, lease.capacityClaimId, { phase: "provisional" });
+    try {
+      this.pool.bindTurnCapacityClaim(claim, turn.id);
+    } catch {
+      return "conflict" as const;
+    }
+    const confirmation = this.store.confirmStart(submission.attemptId, submission.contextId, turn.id, { terminal });
+    return confirmation;
+  }
+
+  private pauseIdentityConflict(attemptId: string): void {
+    this.pumpPaused = true;
+    const lease = this.store.lease();
+    const unresolvedSteer = this.store.membersForAttempt(attemptId)
+      .find((member) => member.submissionKind === "steer" && new Set(["steer_submitting", "uncertain"]).has(member.state));
+    if (unresolvedSteer?.state === "steer_submitting" && this.store.markUncertainIfUnresolved(attemptId, unresolvedSteer.contextId)) {
+      this.scheduleRecovery();
+    }
+    if (lease?.attemptId === attemptId && lease.phase === "active" && !lease.steerPaused) {
+      this.store.pauseSteering(attemptId, "native_turn_identity_conflict");
+    }
+    this.options.onOperationalEvent?.("assistant_submission_uncertain");
+  }
+
+  private bufferEarlyTerminal(attemptId: string, turn: TurnSnapshot): void {
+    if (this.earlyTerminalAttemptId !== attemptId) {
+      this.earlyTerminals.clear();
+      this.earlyTerminalAttemptId = attemptId;
+    }
+    this.earlyTerminals.set(turn.id, turn);
+    if (this.earlyTerminals.size > 8) this.earlyTerminals.delete(this.earlyTerminals.keys().next().value!);
+  }
+
+  private takeEarlyTerminal(attemptId: string, turnId: string): TurnSnapshot | undefined {
+    if (this.earlyTerminalAttemptId !== attemptId) return undefined;
+    const turn = this.earlyTerminals.get(turnId);
+    if (turn) this.clearEarlyTerminals(attemptId);
+    return turn;
+  }
+
+  private clearEarlyTerminals(attemptId: string): void {
+    if (this.earlyTerminalAttemptId !== attemptId) return;
+    this.earlyTerminals.clear();
+    this.earlyTerminalAttemptId = undefined;
+  }
+
+  private hasUnresolvedSubmission(attemptId: string): boolean {
+    return this.store.membersForAttempt(attemptId)
+      .some((member) => new Set(["start_submitting", "steer_submitting", "uncertain"]).has(member.state));
+  }
+
+  private resumeDeferredTerminal(attemptId: string): boolean {
+    const deferred = this.deferredTerminal;
+    if (!deferred || deferred.attemptId !== attemptId || this.hasUnresolvedSubmission(attemptId)) return false;
+    this.deferredTerminal = undefined;
+    this.options.onDeferredTerminal?.(deferred.turn);
+    return true;
+  }
+
+  private noteConversationPeriod(lease: AssistantLease | undefined = this.store.lease()): void {
     if (lease?.phase !== "terminalizing" && lease?.binding) this.options.scheduler?.noteConversationPeriodCompleted();
   }
 }

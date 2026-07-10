@@ -31,6 +31,106 @@ test("SSH rollout scans use one bounded metadata-only helper call", async () => 
   assert.deepEqual(JSON.parse(calls[0]!.args[0]!), { requests: [request] });
 });
 
+test("local rollout scans retry two concurrent appends before returning one stable snapshot", async () => {
+  let attempts = 0;
+  const expected = { cursor: { device: "1", inode: "2", offset: 30 }, starts: [] };
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    scanLocal: async () => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error("rollout appended while scanning");
+      return expected;
+    },
+  });
+
+  assert.deepEqual(await router.scan("local", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }]), [expected]);
+  assert.equal(attempts, 3);
+});
+
+test("local rollout snapshot retries remain bounded", async () => {
+  let attempts = 0;
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    scanLocal: async () => {
+      attempts += 1;
+      throw new Error("rollout appended while scanning");
+    },
+  });
+
+  await assert.rejects(
+    router.scan("local", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }]),
+    /rollout appended while scanning/u,
+  );
+  assert.equal(attempts, 3);
+});
+
+test("local rollout scans never retry non-append mutations or malformed boundaries", async (t) => {
+  for (const message of [
+    "rollout identity changed",
+    "rollout was truncated",
+    "rollout changed while scanning",
+    "rollout line exceeds the maximum size",
+  ]) {
+    await t.test(message, async () => {
+      let attempts = 0;
+      const router = new RolloutAccessRouter({
+        remote: () => undefined,
+        scanLocal: async () => { attempts += 1; throw new Error(message); },
+      });
+      await assert.rejects(router.scan("local", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }]), new RegExp(message, "u"));
+      assert.equal(attempts, 1);
+    });
+  }
+
+  let malformedAttempts = 0;
+  const malformed = { cursor: { device: "1", inode: "2", offset: 30 }, starts: [], malformed: true as const };
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    scanLocal: async () => { malformedAttempts += 1; return malformed; },
+  });
+  assert.deepEqual(await router.scan("local", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }]), [malformed]);
+  assert.equal(malformedAttempts, 1);
+});
+
+test("local rollout append retry rechecks the endpoint lease before rescanning", async () => {
+  let attempts = 0;
+  let leaseChecks = 0;
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    validateLease: () => { leaseChecks += 1; return leaseChecks === 1; },
+    scanLocal: async () => { attempts += 1; throw new Error("rollout appended while scanning"); },
+  });
+
+  await assert.rejects(
+    router.scan("local", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }], {
+      endpointId: "local", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "lease",
+    }),
+    /endpoint work lease changed/u,
+  );
+  assert.equal(attempts, 1);
+  assert.equal(leaseChecks, 2);
+});
+
+test("SSH rollout scans distinguish a not-yet-materialized file from transport failure", async () => {
+  const calls: unknown[] = [];
+  const router = new RolloutAccessRouter({
+    remote: () => ({
+      helperPath: "/tmp/qiyan/helper.mjs",
+      remote: {
+        bootstrap: async () => undefined,
+        invoke: async <T>(_operation: string, args: readonly string[]) => {
+          calls.push(JSON.parse(args[0]!));
+          return { results: [{ missing: true }] } as T;
+        },
+      },
+    }),
+  });
+  const request = { path: "/home/user/.codex/sessions/rollout-thread.jsonl", threadId: "thread" };
+
+  assert.deepEqual(await router.scanUnmaterialized("devbox", request), { state: "missing" });
+  assert.deepEqual(calls, [{ requests: [request], allowMissing: true, collectFromStart: true }]);
+});
+
 test("SSH rollout scans reject malformed helper metadata", async () => {
   const router = new RolloutAccessRouter({
     remote: () => ({

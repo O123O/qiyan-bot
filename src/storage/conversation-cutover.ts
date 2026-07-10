@@ -158,13 +158,15 @@ export function finalizeConversationCutover(db: Database, assistant: FullAssista
 }
 
 function finalizeActiveAttempt(db: Database, attempt: Record<string, unknown>, assistant: FullAssistantThreadSnapshot): void {
+  const turnId = typeof attempt.turn_id === "string" ? attempt.turn_id : undefined;
+  if (!turnId || turnId.startsWith("pending:")) {
+    throw configuration("active assistant attempt requires an exact authoritative turn identity");
+  }
   const full = assistant.turns.filter((turn) => turn.itemsView === "full");
-  const turn = full.find((candidate) => candidate.id === String(attempt.turn_id))
-    ?? full.find((candidate) => candidate.items.some((item) => item.type === "userMessage" && item.clientId === String(attempt.context_id)));
-  if (!turn) throw configuration("active assistant attempt requires full authoritative turn history");
+  const turn = full.find((candidate) => candidate.id === turnId);
+  if (!turn) throw configuration("active assistant attempt requires exact full authoritative turn history");
   const terminal = new Set(["completed", "failed", "interrupted"]).has(turn.status);
   const now = Date.now();
-  db.prepare("UPDATE assistant_attempts SET turn_id = ? WHERE id = ?").run(turn.id, String(attempt.id));
   db.prepare(`INSERT OR IGNORE INTO assistant_attempt_sources
     (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, observed_turn_id, created_at, updated_at)
     VALUES (?, ?, 0, ?, 'start', 'submitted', ?, ?, ?)`)

@@ -1,18 +1,25 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, statfs } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
-import { buildControlMasterExitArgs, buildSshRemoteArgs, type SshConnectionPlan } from "./ssh-config.ts";
+import {
+  buildControlMasterExitArgs,
+  buildSshRemoteArgs,
+  type SshConnectionPlan,
+} from "./ssh-config.ts";
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "005987f48c4931da7165ba4dbd9a956b13ded96ff4a9fe0ed01a789b5384d533";
+export const REMOTE_HELPER_SHA256 = "88c85fa042ff0966732df3a5ab286c5976f260d9f855fd241d244f8e92e28def";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace", "tunnel"]);
+const NFS_SUPER_MAGIC = 0x6969;
+const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
+const REMOTE_HELPER_TIMEOUT_MS = 300_000;
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -52,13 +59,49 @@ export interface RemoteBootstrapPayload {
   launcher: Buffer;
 }
 
+export async function attestUserControlMaster(
+  plan: SshConnectionPlan,
+  inspectFileSystem: (path: string) => Promise<{ type: number | bigint }> = statfs,
+): Promise<void> {
+  if (plan.ownsControlMaster) return;
+  const controlPath = plan.controlPath;
+  const uid = process.getuid?.();
+  let parent: string;
+  try {
+    if (!controlPath || resolve(controlPath) !== controlPath) throw new Error("invalid path");
+    parent = dirname(controlPath);
+    if (await realpath(parent) !== parent) throw new Error("aliased parent");
+    const [directory, fileSystem] = await Promise.all([
+      lstat(parent),
+      inspectFileSystem(parent),
+    ]);
+    if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0
+      || (uid !== undefined && directory.uid !== uid)
+      || Number(fileSystem.type) === NFS_SUPER_MAGIC) {
+      throw new Error("unsafe identity");
+    }
+  } catch {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+  }
+  let socket;
+  try { socket = await lstat(controlPath!); }
+  catch (error) {
+    if (isErrno(error, "ENOENT")) return;
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+  }
+  if (!socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0
+    || (uid !== undefined && socket.uid !== uid)) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe user-owned SSH ControlMaster; use a private local filesystem");
+  }
+}
+
 export interface SshRuntimeController {
   readonly remoteSocketPath: string;
   ensureStarted(): Promise<RuntimeIdentity>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
   closeTransport?(): Promise<void>;
-  stop(expectedIdentity?: RuntimeIdentity): Promise<void>;
+  stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }
 
 export class SshRuntime implements SshRuntimeController {
@@ -112,7 +155,7 @@ export class SshRuntime implements SshRuntimeController {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(expectedIdentity?: RuntimeIdentity): Promise<void> {
+  async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
     if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
     try { await this.options.remote.invoke("stop", [JSON.stringify({ runtimeDir: prepared.runtimeDir, session: prepared.session, expected: expectedIdentity })], prepared.helperPath); }
@@ -122,6 +165,7 @@ export class SshRuntime implements SshRuntimeController {
   async closeTransport(): Promise<void> { await this.options.remote.closeControlMaster?.(); }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
+    if (this.prepared) return this.prepared;
     const preflight = preflightSchema.parse(await this.options.remote.invoke("preflight", []));
     const endpointHash = createHash("sha256").update(this.options.endpointId).digest("hex").slice(0, 24);
     const runtimeDir = `/tmp/qiyan-${preflight.uid}/${endpointHash}`;
@@ -175,8 +219,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       ? buildInstalledHelperCommand(installedHelperPath, operation, args)
       : ["node", "-", operation, ...args.map(encodeRemoteArgument)];
     const result = await this.execute(command, installedHelperPath ? undefined : this.options.helperSource);
-    try { return JSON.parse(result.stdout.toString("utf8")) as T; }
-    catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH helper returned an invalid response"); }
+    return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
   async invokeTransfer<T>(
@@ -186,9 +229,8 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     installedHelperPath: string,
   ): Promise<T> {
     const command = buildInstalledHelperCommand(installedHelperPath, operation, args);
-    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? 60_000);
-    try { return JSON.parse(result.stdout.toString("utf8")) as T; }
-    catch { throw new AppError("ENDPOINT_UNAVAILABLE", "SSH file helper returned an invalid response"); }
+    const result = await this.executePrepared(command, options.input, options.maxOutputBytes, options.timeoutMs ?? REMOTE_HELPER_TIMEOUT_MS);
+    return parseRemoteHelperResponse<T>(result.stdout, operation);
   }
 
   async closeControlMaster(): Promise<void> {
@@ -207,7 +249,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     command: readonly string[],
     input?: Uint8Array | AsyncIterable<Uint8Array | string>,
     maxOutputBytes = 1024 * 1024,
-    timeoutMs = 30_000,
+    timeoutMs = REMOTE_HELPER_TIMEOUT_MS,
   ): Promise<BoundedProcessResult> {
     if (this.options.plan.ownsControlMaster) {
       const directory = dirname(this.options.plan.controlPath!);
@@ -219,6 +261,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       }
     }
     const run = this.options.run ?? runBoundedProcess;
+    if (!this.options.plan.ownsControlMaster) await attestUserControlMaster(this.options.plan);
     return run(this.options.sshBinary ?? "ssh", buildSshRemoteArgs(this.options.plan, command), {
       timeoutMs,
       maxOutputBytes,
@@ -248,6 +291,15 @@ export function decodeRemoteArgument(value: string): string {
     throw new AppError("CONFIGURATION_ERROR", "invalid remote argument");
   }
   return bytes.toString("utf8");
+}
+
+export function parseRemoteHelperResponse<T = unknown>(stdout: Buffer, operation: string): T {
+  const frames = stdout.toString("utf8").split(/\r?\n/u)
+    .filter((line) => line.startsWith(REMOTE_HELPER_RESPONSE_PREFIX));
+  if (frames.length !== 1) throw invalidHelperResponse(operation);
+  const body = frames[0]!.slice(REMOTE_HELPER_RESPONSE_PREFIX.length);
+  try { return JSON.parse(body) as T; }
+  catch { throw invalidHelperResponse(operation); }
 }
 
 export function buildInstalledHelperCommand(helperPath: string, operation: string, args: readonly string[]): string[] {
@@ -280,4 +332,13 @@ function requireDigest(bytes: Buffer, expected: string): void {
   if (createHash("sha256").update(bytes).digest("hex") !== expected) {
     throw new AppError("CONFIGURATION_ERROR", "packaged SSH runtime asset failed integrity verification");
   }
+}
+
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+function invalidHelperResponse(operation: string): AppError {
+  const label = helperOperations.has(operation) ? operation : "remote";
+  return new AppError("ENDPOINT_UNAVAILABLE", `SSH ${label} helper returned an invalid response`);
 }

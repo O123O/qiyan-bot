@@ -4,7 +4,6 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from 
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createConnection } from "node:net";
 
 const TMUX = ["-L", "qiyan-bot", "-f", "/dev/null"];
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
@@ -12,16 +11,14 @@ const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
+const RESPONSE_PREFIX = "qiyan-helper-v1:";
 
 const operation = process.argv[2];
 const encoded = process.argv.slice(3);
 
 try {
-  if (operation === "tunnel") {
-    await tunnelSocket(decodeJson(encoded, 1));
-  } else {
-    let result;
-    switch (operation) {
+  let result;
+  switch (operation) {
     case "preflight": result = preflight(); break;
     case "bootstrap": result = await bootstrap(decodeJson(encoded, 1)); break;
     case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
@@ -32,25 +29,11 @@ try {
     case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
-    }
-    process.stdout.write(`${JSON.stringify(result)}\n`);
   }
+  process.stdout.write(`\n${RESPONSE_PREFIX}${JSON.stringify(result)}\n`);
 } catch {
   process.stderr.write("qiyan remote helper failed\n");
   process.exitCode = 1;
-}
-
-async function tunnelSocket(value) {
-  const socketPath = value?.socketPath;
-  if (typeof socketPath !== "string" || !socketPath.endsWith("/app-server.sock")) throw new Error("invalid tunnel request");
-  const runtimeDir = dirname(socketPath);
-  requireRuntimeDir(runtimeDir);
-  if (socketPath !== join(runtimeDir, "app-server.sock")) throw new Error("invalid tunnel request");
-  const socket = createConnection({ path: socketPath, allowHalfOpen: true });
-  await new Promise((resolve, reject) => socket.once("connect", resolve).once("error", reject));
-  process.stdin.pipe(socket);
-  socket.pipe(process.stdout);
-  await new Promise((resolve, reject) => socket.once("close", resolve).once("error", reject));
 }
 
 function decodeJson(values, count) {
@@ -157,10 +140,32 @@ async function stop(value) {
 
 async function scanRollouts(value) {
   if (!Array.isArray(value?.requests) || value.requests.length < 1 || value.requests.length > 128) throw new Error("invalid rollout scan request");
-  return { results: await Promise.all(value.requests.map(scanRollout)) };
+  if (value.allowMissing !== undefined && value.allowMissing !== true) throw new Error("invalid rollout scan request");
+  if (value.collectFromStart !== undefined && value.collectFromStart !== true) throw new Error("invalid rollout scan request");
+  if (value.collectFromStart === true && value.allowMissing !== true) throw new Error("invalid rollout scan request");
+  const collectFromStart = value.collectFromStart === true;
+  return {
+    results: await Promise.all(value.requests.map((request) => value.allowMissing === true
+      ? scanRolloutAllowMissing(request, collectFromStart)
+      : scanRollout(request, collectFromStart))),
+  };
 }
 
-async function scanRollout(request) {
+async function scanRolloutAllowMissing(request, collectFromStart) {
+  try { return await scanRollout(request, collectFromStart); }
+  catch (error) { if (error?.code === "ENOENT") return { missing: true }; throw error; }
+}
+
+async function scanRollout(request, collectFromStart = false) {
+  for (let attempt = 1; ; attempt += 1) {
+    try { return await scanRolloutSnapshot(request, collectFromStart); }
+    catch (error) {
+      if (attempt >= 3 || error?.message !== "rollout appended while scanning") throw error;
+    }
+  }
+}
+
+async function scanRolloutSnapshot(request, collectFromStart = false) {
   const path = request?.path;
   const threadId = request?.threadId;
   const cursor = request?.cursor;
@@ -179,9 +184,12 @@ async function scanRollout(request) {
     const inode = state.ino.toString(10);
     if (cursor && (cursor.device !== device || cursor.inode !== inode)) throw new Error("rollout identity changed");
     if (BigInt(offset) > state.size) throw new Error("rollout was truncated");
-    const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined);
+    const parsed = await parseRolloutFile(file, offset, Number(state.size), cursor !== undefined || collectFromStart);
     const after = await file.stat({ bigint: true });
-    if (after.dev !== state.dev || after.ino !== state.ino || after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size < state.size) throw new Error("rollout was truncated");
+    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
   } finally { await file.close(); }
 }
@@ -194,7 +202,7 @@ async function parseRolloutFile(file, offset, size, collectStarts) {
   while (position < size) {
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - position));
     const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
-    if (bytesRead === 0) throw new Error("rollout changed while scanning");
+    if (bytesRead === 0) throw new Error("rollout was truncated");
     position += bytesRead;
     const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
     let lineStart = 0;
@@ -268,7 +276,11 @@ function createRolloutParser(baseOffset, collectStarts) {
 }
 
 function publicRolloutStart(turn) {
-  return { turnId: turn.turnId, ...(turn.clientId ? { clientId: turn.clientId } : {}) };
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientId ? { clientId: turn.clientId } : {}),
+    ...(turn.sawUserMessage ? { hasUserMessage: true } : {}),
+  };
 }
 
 async function readFileDescriptor(value) {
@@ -371,6 +383,14 @@ function pathWithin(root, candidate) {
 }
 
 async function workspace(value) {
+  try { return await workspaceOperation(value); }
+  catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "EEXIST") return { error: { code: error.code } };
+    throw error;
+  }
+}
+
+async function workspaceOperation(value) {
   const action = value?.action;
   const path = value?.path;
   if (action === "home") return { path: userInfo().homedir };

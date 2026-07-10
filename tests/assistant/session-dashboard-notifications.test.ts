@@ -21,6 +21,8 @@ function fixture(options: {
     clearTimeout(handle: any): void;
   };
   onError?: (error: unknown) => void;
+  onIdleTurn?: (event: { endpointId: string; threadId: string; turnId: string }) => Promise<void>;
+  onGoalTurnStarted?: (event: { endpointId: string; threadId: string; mappingId: string; turnId: string }) => void;
 } = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
@@ -42,12 +44,51 @@ function fixture(options: {
       errors.push(error);
       options.onError?.(error);
     },
+    ...(options.onIdleTurn ? { onIdleTurn: options.onIdleTurn } : {}),
+    ...(options.onGoalTurnStarted ? { onGoalTurnStarted: options.onGoalTurnStarted } : {}),
     ...(options.classifyFailure ? { classifyFailure: options.classifyFailure } : {}),
     ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
     ...(options.timers ? { timers: options.timers } : {}),
   });
   return { db, store, runtime, processor, changes: () => changes, errors };
 }
+
+test("an idle status durably recovers a missing terminal notification before clearing its turn", async () => {
+  const clock = fakeTimers();
+  const attempts: Array<{ endpointId: string; threadId: string; turnId: string }> = [];
+  let fail = true;
+  let value: ReturnType<typeof fixture>;
+  value = fixture({
+    onIdleTurn: async (event) => {
+      attempts.push(event);
+      assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
+      if (fail) throw new RpcRequestTimeoutError("thread/read");
+    },
+    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
+    retryMs: 25,
+    timers: clock.api,
+  });
+  value.runtime.setActiveTurn("local", "thread-1", mappingId, "turn-1");
+
+  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+  await value.processor.idle();
+
+  assert.deepEqual(attempts, [{ endpointId: "local", threadId: "thread-1", turnId: "turn-1" }]);
+  assert.equal(value.store.pendingNotifications().length, 1);
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
+  assert.equal(clock.timers.length, 1);
+
+  fail = false;
+  await settleTimer(clock.timers[0]!);
+  await value.processor.idle();
+
+  assert.deepEqual(attempts, [
+    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
+    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
+  ]);
+  assert.equal(value.store.pendingNotifications().length, 0);
+  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), undefined);
+});
 
 interface FakeTimer {
   callback: () => void;
@@ -99,6 +140,130 @@ test("accepts body-free observations durably and processes settings, status, tok
   assert.equal(facts.goal?.objective, "finish");
   assert.equal(value.runtime.getSession("local", "thread-1", mappingId)?.nativeStatus, "idle");
   assert.ok(value.changes() >= 1);
+});
+
+test("only an exact active-goal notification authorizes its turn before a later pause", async () => {
+  const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
+  const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "goal-turn", startedAt: 1 } });
+  await value.processor.idle();
+  assert.equal(started.length, 0);
+
+  value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: "goal-turn",
+    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
+  });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, false);
+
+  await value.processor.idle();
+
+  assert.ok(started.length >= 1);
+  assert.equal(started.every((event) => event.endpointId === "local" && event.threadId === "thread-1"
+    && event.mappingId === mappingId && event.turnId === "goal-turn"), true);
+});
+
+test("an exact terminal goal notification authorizes its turn before revoking goal control", async () => {
+  const observed: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
+  const value = fixture({ onGoalTurnStarted: (event) => { observed.push(event); } });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+
+  value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: "completed-goal-turn",
+    goal: { objective: "finish", status: "complete", tokenBudget: null, updatedAt: 2 },
+  });
+  await value.processor.idle();
+
+  assert.ok(observed.length >= 1);
+  assert.equal(observed.every((event) => event.turnId === "completed-goal-turn"), true);
+  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), false);
+});
+
+test("a fast idle cannot clear a newly armed goal before its ordered goal update", async () => {
+  const value = fixture();
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+  await value.processor.idle();
+  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+
+  value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: null,
+    goal: { objective: "finish", status: "paused", tokenBudget: null, updatedAt: 2 },
+  });
+
+  await value.processor.idle();
+
+  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), false);
+});
+
+test("a stale non-active goal update cannot clear a newer activation", async () => {
+  const value = fixture();
+  value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: null,
+    goal: { objective: "finish", status: "paused", tokenBudget: null, updatedAt: 2 },
+  });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+
+  await value.processor.idle();
+
+  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+});
+
+test("an unknown goal status cannot revoke controlled-goal ownership", async () => {
+  const value = fixture();
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+
+  assert.equal(value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: null,
+    goal: { objective: "finish", status: "future-status", tokenBudget: null, updatedAt: 2 },
+  }), false);
+  await value.processor.idle();
+
+  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+});
+
+test("a goal turn received while its managed mapping is unavailable is authorized after restore", async () => {
+  const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
+  const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
+  assert.equal(value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: "deferred-goal-turn",
+    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
+  }), true);
+  await value.processor.idle();
+  assert.deepEqual(started, [{ endpointId: "local", threadId: "thread-1", mappingId, turnId: "deferred-goal-turn" }]);
+
+  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
+  await value.processor.endpointReady("local");
+  assert.equal(started.every((event) => event.turnId === "deferred-goal-turn"), true);
+});
+
+test("goal authorization failure cannot prevent the durable observation from being queued", async () => {
+  let attempts = 0;
+  const value = fixture({
+    onGoalTurnStarted: () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ownership guard is not ready");
+    },
+  });
+  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+
+  assert.doesNotThrow(() => value.processor.accept("local", "thread/goal/updated", {
+    threadId: "thread-1",
+    turnId: "retry-goal-turn",
+    goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
+  }));
+  await value.processor.idle();
+
+  assert.equal(attempts, 2);
+  assert.equal(value.store.pendingNotifications().length, 0);
 });
 
 test("replays a token notification accepted before a crash", async () => {

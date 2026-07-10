@@ -49,6 +49,19 @@ test("Slack and Telegram share one durable conversation owner and arrival queue"
   assert.deepEqual(new OwnerRouteStore(db, telegram).current(), otherThread, "latest owner route survives restart");
 });
 
+test("another adapter with the same literal conversation key still waits", () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  const slack = { adapterId: "slack", conversationKey: "shared", destination: { channelId: "C1" } } as const;
+  const telegramSameKey = { adapterId: "telegram", conversationKey: "shared", destination: { chatId: "42" } } as const;
+  conversations.acceptChatSource(source("owner", slack, 1));
+  conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+
+  assert.equal(conversations.acceptChatSource(source("outsider", telegramSameKey, 2)).disposition, "queued");
+  assert.equal(deliveries.get("queued:outsider")?.binding.adapterId, "telegram");
+});
+
 test("Slack thread activation survives store reconstruction", () => {
   const db = createTestDatabase();
   const inbox = new SlackInboxStore(db);

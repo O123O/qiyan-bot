@@ -79,9 +79,30 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
   return [...baseArgs(plan, true), plan.alias, ...command];
 }
 
+export function buildSshStreamForwardArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
+  const forwarding = streamForwarding(localSocket, remoteSocket);
+  return [
+    ...baseArgs(plan, false),
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "StreamLocalBindUnlink=no",
+    "-o", "StreamLocalBindMask=0177",
+    "-O", "forward",
+    "-L", forwarding,
+    plan.alias,
+  ];
+}
+
+export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
+  return [...baseArgs(plan, false), "-O", "cancel", "-L", streamForwarding(localSocket, remoteSocket), plan.alias];
+}
+
+export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
+  return [...baseArgs(plan, false), "-O", "check", plan.alias];
+}
+
 export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
   if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
-  return [...baseArgs(plan, false), "-S", plan.controlPath!, "-O", "exit", plan.alias];
+  return [...baseArgs(plan, false), "-O", "exit", plan.alias];
 }
 
 export class SshGenerationPlanner {
@@ -90,6 +111,7 @@ export class SshGenerationPlanner {
     runtimeDir: string;
     hasReferences(endpointId: string): boolean | Promise<boolean>;
     checkExisting(endpointId: string, destination: SshDestination, hasReferences: boolean): void;
+    attestControlMaster(plan: SshConnectionPlan): Promise<void>;
     run?: (command: string, args: readonly string[], options: { timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal }) => Promise<BoundedProcessResult>;
   }) {}
 
@@ -97,19 +119,45 @@ export class SshGenerationPlanner {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
     const run = this.options.run ?? runBoundedProcess;
     const result = await run(this.options.sshBinary, ["-G", endpointId], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024, ...(signal ? { signal } : {}) });
-    const plan = planSshConnection(endpointId, parseSshConfig(result.stdout.toString("utf8")), this.options.runtimeDir);
+    const effective = parseSshConfig(result.stdout.toString("utf8"));
+    let plan = planSshConnection(endpointId, effective, this.options.runtimeDir);
     const references = await this.options.hasReferences(endpointId);
     this.options.checkExisting(endpointId, plan.destination, references);
+    if (!plan.ownsControlMaster) {
+      try {
+        await this.options.attestControlMaster(plan);
+        await run(this.options.sshBinary, buildControlMasterCheckArgs(plan), {
+          timeoutMs: 5_000,
+          maxOutputBytes: 64 * 1024,
+          ...(signal ? { signal } : {}),
+        });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        plan = planSshConnection(endpointId, {
+          hostname: effective.hostname,
+          user: effective.user,
+          port: effective.port,
+          controlMaster: "no",
+        }, this.options.runtimeDir);
+      }
+    }
     return { plan, pendingBinding: { endpointId, destination: { ...plan.destination } } };
   }
 }
 
 function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): string[] {
   const pinned = ["-o", `HostName=${plan.destination.hostname}`, "-l", plan.destination.user, "-p", String(plan.destination.port)];
-  const control = plan.ownsControlMaster
-    ? ["-S", plan.controlPath!, ...(establishOwnedMaster ? ["-o", "ControlMaster=auto", "-o", "ControlPersist=60"] : [])]
-    : [];
+  const control = ["-S", plan.controlPath!, ...(plan.ownsControlMaster && establishOwnedMaster
+    ? ["-o", "ControlMaster=auto", "-o", "ControlPersist=yes"]
+    : !plan.ownsControlMaster ? ["-o", "ControlMaster=no"] : [])];
   return [...plan.commonArgs, ...pinned, ...control];
+}
+
+function streamForwarding(localSocket: string, remoteSocket: string): string {
+  if (![localSocket, remoteSocket].every((value) => isAbsolute(value) && /^[A-Za-z0-9_./-]+$/u.test(value))) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream-local forwarding path");
+  }
+  return `${localSocket}:${remoteSocket}`;
 }
 
 function usableControlPath(value: string): boolean {

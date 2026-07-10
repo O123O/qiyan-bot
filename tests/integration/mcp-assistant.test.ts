@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { LocalEndpoint } from "../../src/app-server/local-endpoint.ts";
+import { LocalAppServerRuntime } from "../../src/app-server/local-runtime.ts";
+import { ManagedAppServerEndpoint } from "../../src/app-server/managed-endpoint.ts";
 import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { createAssistantTools } from "../../src/assistant/tools.ts";
@@ -14,6 +15,18 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
 
+function localEndpoint(options: { id: string; env?: NodeJS.ProcessEnv; expectedCodexHome?: string }): ManagedAppServerEndpoint {
+  return new ManagedAppServerEndpoint({
+    id: options.id,
+    runtime: new LocalAppServerRuntime({
+      codexBinary: "codex",
+      ...(options.env ? { env: options.env } : {}),
+      ...(options.expectedCodexHome ? { expectedCodexHome: options.expectedCodexHome } : {}),
+    }),
+    requestTimeoutMs: 30_000,
+  });
+}
+
 async function writeSkill(root: string, name: string): Promise<void> {
   const path = join(root, name);
   await mkdir(path, { recursive: true });
@@ -21,7 +34,7 @@ async function writeSkill(root: string, name: string): Promise<void> {
 }
 
 async function assertShellEnvironment(
-  endpoint: LocalEndpoint,
+  endpoint: ManagedAppServerEndpoint,
   threadId: string,
   expected: { userHome: string; codexHome: string },
 ): Promise<void> {
@@ -59,19 +72,17 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
     writeSkill(join(workdir, ".agents/skills"), "assistant-workdir"),
     writeSkill(join(repository, ".agents/skills"), "repository-parent"),
   ]);
-  const endpoint = new LocalEndpoint({
+  const endpoint = localEndpoint({
     id: "assistant-local",
-    codexBinary: "codex",
     env: buildAssistantChildEnvironment(
       { ...process.env, HOME: normalHome },
       { home: assistantHome, codexHome: assistantCodexHome },
       "must-not-reach-shell",
     ),
     expectedCodexHome: assistantCodexHome,
-    requestTimeoutMs: 30_000,
   });
   await endpoint.start();
-  t.after(() => endpoint.stop());
+  t.after(() => endpoint.closeConnection());
 
   const skills = await endpoint.request<any>("skills/list", { cwds: [workdir, nestedWorkdir], forceReload: true });
   const names = new Map<string, string[]>(skills.data.map((entry: any) => [entry.cwd, entry.skills.map((skill: any) => skill.name)]));
@@ -98,7 +109,7 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
     ephemeral: false,
     threadSource: crypto.randomUUID(),
   });
-  await endpoint.stop();
+  await endpoint.closeConnection();
   await endpoint.start();
   await assert.rejects(endpoint.request("thread/read", { threadId: volatile.thread.id, includeTurns: false }),
     (error: unknown) => error instanceof JsonRpcResponseError && error.code === -32600 && error.rpcMessage === `thread not loaded: ${volatile.thread.id}`);
@@ -113,7 +124,7 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
   });
   const name = `qiyan-bot-assistant:${nonce}`;
   await endpoint.request("thread/name/set", { threadId: started.thread.id, name });
-  await endpoint.stop();
+  await endpoint.closeConnection();
   await endpoint.start();
   const read = await endpoint.request<any>("thread/read", { threadId: started.thread.id, includeTurns: false });
   const resumed = await endpoint.request<any>("thread/resume", {
@@ -159,18 +170,16 @@ test("real assistant can call its approved manager MCP while a project worker ca
   const workerCodexHome = await mkdtemp(join(tmpdir(), "qiyan-bot-worker-home-"));
   t.after(() => rm(workerCodexHome, { recursive: true, force: true }));
   const userHome = process.env.HOME!;
-  const endpoint = new LocalEndpoint({
+  const endpoint = localEndpoint({
     id: "assistant-local",
-    codexBinary: "codex",
     env: buildAssistantChildEnvironment(process.env, { home: userHome, codexHome: process.env.CODEX_HOME ?? join(userHome, ".codex") }, token),
-    requestTimeoutMs: 30_000,
   });
-  const worker = new LocalEndpoint({ id: "local", codexBinary: "codex", env: buildWorkerChildEnvironment({ ...process.env, CODEX_HOME: workerCodexHome }), requestTimeoutMs: 30_000 });
+  const worker = localEndpoint({ id: "local", env: buildWorkerChildEnvironment({ ...process.env, CODEX_HOME: workerCodexHome }) });
   let active = { contextId: "ctx", attemptId: "attempt", turnId: "pending" };
   const mcp = new LoopbackMcpServer(tools, { current: () => active }, { host: "127.0.0.1", port: 0, token, allowedClientProcess: () => endpoint.mcpClientIdentity });
   await mcp.start(); t.after(() => mcp.stop());
-  await endpoint.start(); t.after(() => endpoint.stop());
-  await worker.start(); t.after(() => worker.stop());
+  await endpoint.start(); t.after(() => endpoint.closeConnection());
+  await worker.start(); t.after(() => worker.closeConnection());
   const workerThread = await worker.request<any>("thread/start", {
     cwd: await mkdtemp(join(tmpdir(), "qiyan-bot-worker-mcp-")), ephemeral: true,
   });

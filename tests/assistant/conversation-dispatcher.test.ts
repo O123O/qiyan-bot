@@ -22,6 +22,8 @@ import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { AssistantScheduler } from "../../src/assistant/scheduler.ts";
 import { AssistantRuntime } from "../../src/assistant/runtime.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { commitAssistantTerminalFinals } from "../../src/production-app.ts";
+import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -84,6 +86,8 @@ const chat = (id: string, conversationKey = "chat-1", attachmentIds: readonly st
 function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
   onDeferredTerminal?: (turn: TurnSnapshot) => void;
   onOperationalEvent?: (event: "assistant_turn_started" | "assistant_turn_steered" | "assistant_submission_uncertain" | "assistant_turn_terminal") => void;
+  scheduler?: AssistantScheduler;
+  membershipObserver?: { notifyMembership(contextId: string): void };
 } = {}) {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
@@ -141,6 +145,159 @@ test("starts an idle conversation and naturally steers same-conversation follow-
   await dispatcher.idle();
   await dispatcher.terminal({ id: "turn-1", status: "completed", itemsView: "full", items: [] });
   assert.deepEqual(operational, ["assistant_turn_started", "assistant_turn_steered", "assistant_turn_terminal"]);
+  await dispatcher.stop();
+});
+
+test("turn/started binds an unresolved start before the same successful response", async () => {
+  const { store, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.started({ id: "turn-a", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-a" });
+
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  assert.equal(store.lease()?.steerPaused, false);
+  await dispatcher.stop();
+});
+
+test("turn/started remains authoritative when the pending start response rejects", async () => {
+  const { store, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.started({ id: "turn-a", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] });
+
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await dispatcher.idle();
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-a" });
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  await dispatcher.stop();
+});
+
+test("a correlated completion waits for the authoritative start response before terminalizing", async () => {
+  const deferred: string[] = [];
+  let deferredCommit: Promise<unknown> | undefined;
+  const { store, pool, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => {
+    deferred.push(turn.id);
+    const terminal = {
+      id: turn.id,
+      status: turn.status,
+      itemsView: turn.itemsView,
+      items: turn.items.map((item) => ({ ...item })) as Array<Record<string, unknown>>,
+    };
+    deferredCommit = commitAssistantTerminalFinals(
+      terminal,
+      async () => [{
+        ...terminal, itemsView: "full" as const,
+        items: [{ type: "agentMessage", id: "old-final", text: "old answer", phase: "final_answer" }],
+      }],
+      () => undefined,
+    );
+  } });
+  const markedTerminal: string[] = [];
+  const markTurnTerminal = pool.markTurnTerminal.bind(pool);
+  pool.markTurnTerminal = (endpointId, threadId, turnId) => {
+    markedTerminal.push(turnId);
+    markTurnTerminal(endpointId, threadId, turnId);
+  };
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.terminal({ id: "turn-a", status: "completed", itemsView: "summary", items: [{ type: "userMessage", clientId }] });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+  assert.deepEqual(deferred, []);
+  assert.deepEqual(markedTerminal, []);
+
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "submitted");
+  assert.deepEqual(deferred, ["turn-a"]);
+  assert.deepEqual(markedTerminal, ["turn-a"]);
+  await deferredCommit;
+  await dispatcher.stop();
+});
+
+test("a client-correlated reconstructed completion cannot replace the live start response", async () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new ConversationStore(db, deliveries);
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const runner = new FakeRunner();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
+  const dispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local", threadId: "assistant", runtimeObserver: runtime, retryMs: 10,
+  });
+  await dispatcher.accept(chat("first"));
+  await dispatcher.accept(chat("outsider", "chat-2"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+
+  await dispatcher.terminal({
+    id: "rollout-2061", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+  assert.equal(store.membersForAttempt(store.lease()!.attemptId)[0]?.state, "uncertain");
+  assert.equal(store.lease()?.pauseReason, "unknown_terminal_observed");
+  assert.equal(runtime.current()?.contextId, "first");
+
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-live", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-live" });
+  assert.equal(runtime.current()?.turnId, "turn-live");
+  assert.equal(runner.steers.length, 0);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'outsider'").get()!.state, "pending");
+  await dispatcher.stop();
+});
+
+test("a notification-bound start rejects a later mismatched response without overwriting or pumping", async () => {
+  const { store, runner, dispatcher } = fixture();
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.started({ id: "turn-a", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] });
+  await dispatcher.accept(chat("follow-up"));
+
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-b", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(store.lease()?.steerPaused, true);
+  assert.equal(runner.steers.length, 0);
+  await dispatcher.stop();
+});
+
+test("a real pool response mismatch pauses the notification-bound start", async () => {
+  let resolveStart!: (value: { turn: TurnSnapshot }) => void;
+  const endpoint: AppServerEndpoint = {
+    id: "assistant-local", state: "ready",
+    request: async <T>(method: string) => method === "turn/start"
+      ? new Promise<T>((resolve) => { resolveStart = resolve as typeof resolveStart; })
+      : { thread: { status: "active", turns: [] } } as T,
+  };
+  const db = createTestDatabase();
+  const store = new ConversationStore(db, new DeliveryStore(db));
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const steers: TurnSteerParams[] = [];
+  const runner: AssistantTurnPort = {
+    start: (params, claim) => pool.startTurn("assistant-local", { ...params }, claim),
+    steer: async (params) => { steers.push(params); return { turnId: params.expectedTurnId }; },
+    readThread: async () => ({ status: "active", turns: [] }),
+  };
+  const operational: string[] = [];
+  const dispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local", threadId: "assistant",
+    onOperationalEvent: (event) => { operational.push(event); },
+  });
+  await dispatcher.accept(chat("first"));
+  const clientId = store.lease()!.clientUserMessageId;
+  await dispatcher.started({ id: "turn-a", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] });
+  await dispatcher.accept(chat("follow-up"));
+  resolveStart({ turn: { id: "turn-b", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+
+  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(store.lease()?.steerPaused, true);
+  assert.equal(steers.length, 0);
+  assert.ok(operational.includes("assistant_submission_uncertain"));
   await dispatcher.stop();
 });
 
@@ -245,7 +402,7 @@ test("stop awaits an active authoritative recovery read without a time bound", a
   assert.equal(stopped, true);
 });
 
-test("startup recovery retries an uncertain submission after a transient history failure", async () => {
+test("startup recovery retains history-only identity until an authoritative started notification", async () => {
   const { store, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
@@ -274,8 +431,12 @@ test("startup recovery retries an uncertain submission after a transient history
   });
 
   await recoveredDispatcher.recover();
+  await waitFor(() => recoveryRunner.historyReads >= 3);
+  await recoveredDispatcher.started({
+    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
   await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
-  assert.equal(recoveryRunner.historyReads, 3);
+  assert.ok(recoveryRunner.historyReads >= 3);
   assert.equal(store.lease()?.turnId, "recovered");
   await recoveredDispatcher.stop();
 });
@@ -308,6 +469,10 @@ test("a stale overlapping recovery read cannot overwrite newer authoritative cor
   newer.resolve({
     status: "active",
     turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] }],
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await recoveredDispatcher.started({
+    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }],
   });
   await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
   older.resolve({ status: "idle", turns: [] });
@@ -400,6 +565,11 @@ test("a synchronous native start failure remains fenced until durable reconcilia
   await recoveredDispatcher.idle();
 
   assert.equal(historyReads, 1);
+  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "uncertain");
+  assert.equal(store.lease()?.turnId, undefined);
+  await recoveredDispatcher.started({
+    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }],
+  });
   assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "submitted");
   assert.equal(store.lease()?.turnId, "recovered");
   await recoveredDispatcher.stop();
@@ -430,9 +600,13 @@ test("recovery-launched start keeps reconciling after ambiguous nested history",
 
   await recoveredDispatcher.recover();
   recoveryRunner.starts[0]!.result.reject(new Error("start outcome unknown"));
-  await waitFor(() => store.membersForAttempt(lease.attemptId)[0]?.state === "submitted");
+  await waitFor(() => recoveryRunner.historyReads >= 2);
+  assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "uncertain");
+  await recoveredDispatcher.started({
+    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: lease.clientUserMessageId }],
+  });
 
-  assert.equal(recoveryRunner.historyReads, 2);
+  assert.ok(recoveryRunner.historyReads >= 2);
   assert.equal(store.lease()?.turnId, "recovered");
   await recoveredDispatcher.stop();
 });
@@ -456,6 +630,10 @@ test("ordinary submission reconciliation is fenced from a newer recovery read", 
   newer.resolve({
     status: "active",
     turns: [{ id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] }],
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await dispatcher.started({
+    id: "recovered", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }],
   });
   await waitFor(() => store.membersForAttempt(store.lease()!.attemptId)[0]?.state === "submitted");
   older.resolve({ status: "idle", turns: [] });
@@ -505,7 +683,12 @@ test("holds one native steer at a time and only queues another conversation", as
 });
 
 test("terminal notification fences the lease while a steer response is pending", async () => {
-  const { store, runner, dispatcher } = fixture();
+  const deferred: string[] = [];
+  const memberships: string[] = [];
+  const { store, runner, dispatcher } = fixture(1, {
+    onDeferredTerminal: (turn) => { deferred.push(turn.id); },
+    membershipObserver: { notifyMembership: (contextId) => { memberships.push(contextId); } },
+  });
   await dispatcher.accept(chat("first"));
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
@@ -515,7 +698,236 @@ test("terminal notification fences the lease while a steer response is pending",
   runner.steers[0]!.result.resolve({ turnId: "turn-1" });
   await dispatcher.idle();
   assert.equal(store.lease()?.phase, "terminalizing");
+  assert.deepEqual(deferred, ["turn-1"]);
+  assert.ok(memberships.includes("follow-up"));
   await dispatcher.stop();
+});
+
+test("terminal notification resumes after a late nonsteerable response restores the owner input", async () => {
+  const deferred: string[] = [];
+  const { db, store, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => { deferred.push(turn.id); } });
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.accept(chat("follow-up"));
+  await dispatcher.terminal({ id: "turn-1", status: "completed", itemsView: "full", items: [] });
+  runner.steers[0]!.result.reject(new JsonRpcResponseError(-32000, "active turn cannot be steered", {
+    codexErrorInfo: { activeTurnNotSteerable: { turnId: "turn-1" } },
+  }));
+  await dispatcher.idle();
+
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'follow-up'").get()!.state, "pending");
+  assert.deepEqual({ phase: store.lease()?.phase, reason: store.lease()?.pauseReason }, { phase: "terminalizing", reason: "terminalizing" });
+  assert.deepEqual(deferred, ["turn-1"]);
+  await dispatcher.stop();
+});
+
+test("an empty completion after an admitted steer restores both chat sources", async () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const store = new ConversationStore(db, deliveries);
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const runner = new FakeRunner();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
+  const finals = new FinalMessageStore(db);
+  let deferredTerminal: Promise<void> | undefined;
+  const dispatcher = new ConversationDispatcher(store, pool, runner, {
+    endpointId: "assistant-local",
+    threadId: "assistant",
+    runtimeObserver: runtime,
+    onDeferredTerminal: (turn) => {
+      deferredTerminal = commitAssistantTerminalFinals(
+        { ...turn, items: turn.items.map((item) => ({ ...item })) as Array<Record<string, unknown>> },
+        async () => [{ ...turn, itemsView: "full" as const, items: [] }],
+        (resolved) => {
+          const messages = finals.persistTerminalTurn("assistant-local", "assistant", {
+            ...resolved,
+            completedAt: null,
+            items: resolved.items as Array<{ type: string; id: string; text?: string; phase?: string | null }>,
+          }, 10);
+          runtime.handleTerminal(resolved.id, "completed", messages.map((message) => message.body).join("\n") || undefined);
+        },
+      );
+    },
+  });
+
+  await dispatcher.accept(chat("first"));
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-empty", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.accept(chat("follow-up"));
+  await dispatcher.terminal({ id: "turn-empty", status: "completed", itemsView: "full", items: [] });
+  runner.steers[0]!.result.resolve({ turnId: "turn-empty" });
+  await waitFor(() => deferredTerminal !== undefined);
+  await deferredTerminal;
+
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assistant_attempts WHERE state = 'failed'").get()!.n, 1);
+  assert.deepEqual(
+    db.prepare("SELECT state FROM assistant_attempt_sources WHERE attempt_id = (SELECT id FROM assistant_attempts WHERE turn_id = 'turn-empty') ORDER BY source_ordinal").all().map((row) => row.state),
+    ["failed", "failed"],
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts WHERE state = 'completed'").get()!.n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM logical_final_messages").get()!.n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE kind = 'assistant_final'").get()!.n, 0);
+  const stopping = dispatcher.stop();
+  runner.starts[1]?.result.reject(new Error("stopped"));
+  await stopping;
+});
+
+test("a correlated started notification consumes a matching buffered early completion", async () => {
+  const deferred: string[] = [];
+  const { store, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => { deferred.push(turn.id); } });
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  await dispatcher.terminal({ id: "turn-a", status: "completed", itemsView: "full", items: [] });
+  await dispatcher.started({ id: "turn-a", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId }] });
+
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
+  assert.deepEqual(deferred, ["turn-a"]);
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  assert.deepEqual(deferred, ["turn-a"]);
+  await dispatcher.stop();
+});
+
+test("unrelated early completion is cleared after successful start settlement", async () => {
+  const { db, store, pool, runner, dispatcher } = fixture();
+  const runtime = new AssistantRuntime(db, new OperationStore(db), new DeliveryStore(db), { binding: route("chat-1") });
+  await dispatcher.accept(chat("first"));
+  await dispatcher.terminal({ id: "turn-b", status: "completed", itemsView: "full", items: [] });
+  runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.terminal({ id: "turn-a", status: "completed", itemsView: "full", items: [] });
+  runtime.handleTerminal("turn-a", "completed", "done");
+  await dispatcher.accept(chat("second"));
+  runner.starts[1]!.result.resolve({ turn: { id: "turn-b", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "active", turnId: "turn-b" });
+  pool.markTurnTerminal("assistant-local", "assistant", "turn-b");
+  await dispatcher.stop();
+});
+
+test("an early unknown completion survives failed start settlement without retransmission", async () => {
+  const { db, store, pool, runner, dispatcher } = fixture();
+  runner.history = { status: "idle", turns: [] };
+  await dispatcher.accept(chat("first"));
+  await dispatcher.terminal({ id: "turn-b", status: "completed", itemsView: "full", items: [] });
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await dispatcher.idle();
+  await dispatcher.enqueueInternal("retry");
+  await dispatcher.idle();
+
+  assert.equal(runner.starts.length, 1);
+  assert.equal(pool.activeTurnCount, 1);
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  await dispatcher.stop();
+});
+
+test("a late correlated completion cannot mint an identity after the start response is lost", async () => {
+  const { db, store, runner, dispatcher } = fixture();
+  runner.history = { status: "active", turns: [] };
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await dispatcher.idle();
+
+  await dispatcher.terminal({
+    id: "rollout-late", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  await dispatcher.stop();
+});
+
+test("a late completion wins over an in-flight idle-history absence proof", async () => {
+  const { db, store, runner, dispatcher } = fixture();
+  let readStarted!: () => void;
+  let releaseRead!: (value: ThreadSnapshot) => void;
+  const started = new Promise<void>((resolve) => { readStarted = resolve; });
+  const blockedRead = new Promise<ThreadSnapshot>((resolve) => { releaseRead = resolve; });
+  runner.readThread = async () => {
+    runner.historyReads += 1;
+    readStarted();
+    return blockedRead;
+  };
+  await dispatcher.accept(chat("first"));
+  const clientId = runner.starts[0]!.params.clientUserMessageId;
+  runner.starts[0]!.result.reject(new Error("response lost"));
+  await started;
+
+  await dispatcher.terminal({
+    id: "rollout-late", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  releaseRead({ status: "idle", turns: [] });
+  await dispatcher.idle();
+
+  assert.equal(runner.starts.length, 1);
+  assert.equal(runner.historyReads, 1);
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId, reason: store.lease()?.pauseReason }, {
+    phase: "starting", turnId: undefined, reason: "unknown_terminal_observed",
+  });
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
+  await dispatcher.stop();
+});
+
+test("unknown terminal evidence survives dispatcher reconstruction without recovery polling", async () => {
+  const first = fixture();
+  first.runner.history = { status: "idle", turns: [] };
+  await first.dispatcher.accept(chat("first"));
+  await first.dispatcher.terminal({ id: "turn-unknown", status: "completed", itemsView: "full", items: [] });
+  first.runner.starts[0]!.result.reject(new Error("response lost"));
+  await first.dispatcher.idle();
+  await first.dispatcher.stop();
+
+  const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
+  const recoveredPool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const recoveredRunner = new FakeRunner();
+  recoveredRunner.history = { status: "idle", turns: [] };
+  const recovered = new ConversationDispatcher(first.store, recoveredPool, recoveredRunner, {
+    endpointId: "assistant-local", threadId: "assistant", retryMs: 10,
+  });
+  await recovered.recover();
+  await recovered.idle();
+
+  assert.equal(recoveredRunner.starts.length, 0);
+  assert.equal(recoveredRunner.historyReads, 0);
+  assert.deepEqual({ phase: first.store.lease()?.phase, reason: first.store.lease()?.pauseReason }, {
+    phase: "starting", reason: "unknown_terminal_observed",
+  });
+  await recovered.stop();
+});
+
+test("direct terminal start paths account for one completed conversation period", async () => {
+  const correlatedScheduler = new AssistantScheduler();
+  let correlatedPeriods = 0;
+  correlatedScheduler.noteConversationPeriodCompleted = () => { correlatedPeriods += 1; };
+  const correlated = fixture(1, { scheduler: correlatedScheduler });
+  await correlated.dispatcher.accept(chat("first"));
+  const clientId = correlated.runner.starts[0]!.params.clientUserMessageId;
+  await correlated.dispatcher.terminal({
+    id: "turn-a", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId }],
+  });
+  assert.equal(correlatedPeriods, 0);
+  correlated.runner.starts[0]!.result.resolve({ turn: { id: "turn-a", status: "inProgress", itemsView: "full", items: [] } });
+  await correlated.dispatcher.idle();
+  assert.equal(correlatedPeriods, 1);
+  await correlated.dispatcher.stop();
+
+  const responseScheduler = new AssistantScheduler();
+  let responsePeriods = 0;
+  responseScheduler.noteConversationPeriodCompleted = () => { responsePeriods += 1; };
+  const response = fixture(1, { scheduler: responseScheduler });
+  await response.dispatcher.accept(chat("first"));
+  response.runner.starts[0]!.result.resolve({ turn: { id: "turn-b", status: "completed", itemsView: "full", items: [] } });
+  await response.dispatcher.idle();
+  assert.equal(responsePeriods, 1);
+  await response.dispatcher.stop();
 });
 
 test("terminal summary keeps an unproven steer durably unresolved with its lease", async () => {
@@ -559,7 +971,11 @@ test("terminal history restores a steer proven absent before forwarding finaliza
 
 test("terminal history admits a positively correlated steer before forwarding finalization", async () => {
   const deferred: TurnSnapshot[] = [];
-  const { db, runner, dispatcher } = fixture(1, { onDeferredTerminal: (turn) => { deferred.push(turn); } });
+  const memberships: string[] = [];
+  const { db, runner, dispatcher } = fixture(1, {
+    onDeferredTerminal: (turn) => { deferred.push(turn); },
+    membershipObserver: { notifyMembership: (contextId) => { memberships.push(contextId); } },
+  });
   await dispatcher.accept(chat("first"));
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
@@ -578,6 +994,7 @@ test("terminal history admits a positively correlated steer before forwarding fi
 
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'follow-up'").get()!.state, "submitted");
   assert.deepEqual(deferred.map((turn) => turn.id), ["turn-1"]);
+  assert.ok(memberships.includes("follow-up"));
   await dispatcher.stop();
 });
 
@@ -704,7 +1121,7 @@ test("an active thread with empty full history cannot prove an ambiguous start a
   await dispatcher.stop();
 });
 
-test("positive full-history correlation binds an ambiguous start exactly once", async () => {
+test("positive full-history correlation never mints an ambiguous start identity", async () => {
   const { db, pool, runner, dispatcher } = fixture();
   await dispatcher.accept(chat("first"));
   runner.history = {
@@ -715,12 +1132,12 @@ test("positive full-history correlation binds an ambiguous start exactly once", 
   await dispatcher.idle();
   assert.equal(runner.starts.length, 1);
   assert.equal(pool.activeTurnCount, 1);
-  assert.equal(db.prepare("SELECT turn_id FROM assistant_turn_lease").get()!.turn_id, "recovered-turn");
-  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "submitted");
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_turn_lease").get()!.turn_id, null);
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "uncertain");
   await dispatcher.stop();
 });
 
-test("terminal history correlation forwards the recovered turn for finalization", async () => {
+test("terminal history correlation cannot mint an identity or trigger finalization", async () => {
   const db = createTestDatabase();
   const store = new ConversationStore(db, new DeliveryStore(db));
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
@@ -739,7 +1156,9 @@ test("terminal history correlation forwards the recovered turn for finalization"
   };
   runner.starts[0]!.result.reject(new Error("response lost"));
   await dispatcher.idle();
-  assert.deepEqual(terminal.map((turn) => turn.id), ["recovered-terminal"]);
+  assert.deepEqual(terminal, []);
+  assert.equal(store.lease()?.phase, "starting");
+  assert.equal(store.lease()?.turnId, undefined);
   await dispatcher.stop();
 });
 

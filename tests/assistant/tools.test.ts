@@ -208,6 +208,89 @@ test("a side-effecting failure returns fixed uncertainty while retaining its ori
   assert.equal(calls, 1, "uncertain creation is never redispatched");
 });
 
+test("a pre-dispatch create checkpoint makes endpoint failure definite", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "before-dispatch", rawText: "create it", attachmentIds: [] });
+  const tools = createAssistantTools(operations, {
+    create_session: async (_args, context) => {
+      context.checkpoint({ endpoint: "devbox", mappingId: "mapping-1", dispatchStarted: false });
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH workspace helper returned an invalid response");
+    },
+  }, { maxCollectCount: 20 });
+
+  await assert.rejects(
+    tools.create_session(
+      { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "create" },
+      { nickname: "docs", endpoint: "devbox" },
+    ),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE",
+  );
+  const row = db.prepare("SELECT state, receipt_json FROM operations WHERE call_id = 'create'").get() as {
+    state: string; receipt_json: string;
+  };
+  assert.equal(row.state, "failed");
+  assert.deepEqual(JSON.parse(row.receipt_json), { endpoint: "devbox", mappingId: "mapping-1", dispatchStarted: false });
+});
+
+test("create_session waits for exact durable reconciliation instead of returning transient uncertainty", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "wait-success", rawText: "create it", attachmentIds: [] });
+  let calls = 0;
+  let waits = 0;
+  const tools = createAssistantTools(operations, {
+    create_session: async (_args, context) => {
+      calls += 1;
+      context.checkpoint({ endpoint: "devbox", dispatchStarted: true, threadId: "thread-1" });
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+    },
+  }, {
+    maxCollectCount: 20,
+    waitForTerminal: async (operationId) => {
+      waits += 1;
+      assert.equal(operations.get(operationId)?.state, "uncertain");
+      operations.succeed(operationId, { nickname: "docs", mapping_id: "mapping-1" });
+    },
+  });
+  const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "create" };
+
+  assert.deepEqual(await tools.create_session(context, { nickname: "docs", endpoint: "devbox" }), {
+    nickname: "docs", mapping_id: "mapping-1",
+  });
+  assert.deepEqual(await tools.create_session(context, { nickname: "docs", endpoint: "devbox" }), {
+    nickname: "docs", mapping_id: "mapping-1",
+  });
+  assert.equal(calls, 1, "terminal waiting never redispatches thread/start");
+  assert.equal(waits, 1, "the recovered receipt replays without another wait");
+});
+
+test("create_session reports a reconciled failure as definite", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "wait-failure", rawText: "create it", attachmentIds: [] });
+  const tools = createAssistantTools(operations, {
+    create_session: async (_args, context) => {
+      context.checkpoint({ endpoint: "devbox", dispatchStarted: true, threadId: "thread-1" });
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 1)");
+    },
+  }, {
+    maxCollectCount: 20,
+    waitForTerminal: async (operationId) => {
+      operations.failAndUnbind(operationId, { message: "allocated worker thread was lost before its rollout materialized" });
+    },
+  });
+
+  await assert.rejects(
+    tools.create_session({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "create" }, { nickname: "docs", endpoint: "devbox" }),
+    (error: unknown) => {
+      assert.equal(error instanceof AppError && error.code === "OPERATION_FAILED", true);
+      assert.equal((error as Error).message, "create_session failed: allocated worker thread was lost before its rollout materialized");
+      return true;
+    },
+  );
+});
+
 test("a create failure after native dispatch is uncertain even for a normally no-effect error code", async () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

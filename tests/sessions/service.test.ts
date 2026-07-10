@@ -36,7 +36,10 @@ class ServiceEndpoint implements AppServerEndpoint {
   cwd = "";
   goalBarrier: Promise<void> | undefined;
   onGoalRequest: (() => void) | undefined;
+  onGoalSetRequest: (() => void) | undefined;
   loseNextGoalResponse = false;
+  rejectNextGoalSetBeforeEffect = false;
+  rejectNextGoalGet = false;
   onTurnStart: (() => void) | undefined;
   async request<T>(method: string, params: any): Promise<T> {
     this.calls.push({ method, params });
@@ -44,7 +47,7 @@ class ServiceEndpoint implements AppServerEndpoint {
       if (this.failNextStart) { this.failNextStart = false; throw new Error("start failed"); }
       this.onTurnStart?.();
       this.lastClientId = params.clientUserMessageId;
-      return { turn: { id: "started-1" } } as T;
+      return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
     if (method === "thread/read") {
@@ -55,10 +58,13 @@ class ServiceEndpoint implements AppServerEndpoint {
     if (method === "thread/goal/get") {
       this.onGoalRequest?.();
       await this.goalBarrier;
+      if (this.rejectNextGoalGet) { this.rejectNextGoalGet = false; throw new Error("goal read failed"); }
       return { goal: this.goal } as T;
     }
     if (method === "model/list") return { data: [{ id: "gpt-5" }], nextCursor: null } as T;
     if (method === "thread/goal/set") {
+      this.onGoalSetRequest?.();
+      if (this.rejectNextGoalSetBeforeEffect) { this.rejectNextGoalSetBeforeEffect = false; throw new Error("goal set failed"); }
       this.goal = { ...(this.goal ?? {}), ...(params.objective ? { objective: params.objective } : {}), status: params.status, ...(params.tokenBudget ? { tokenBudget: params.tokenBudget } : {}) };
       if (this.loseNextGoalResponse) { this.loseNextGoalResponse = false; throw new Error("response lost"); }
       return { goal: this.goal } as T;
@@ -68,7 +74,10 @@ class ServiceEndpoint implements AppServerEndpoint {
   }
 }
 
-async function fixture(ownership?: { inspect(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<OwnershipInspection> }) {
+async function fixture(ownership?: {
+  inspect(identity: { endpoint: string; thread_id: string; mapping_id: string }): Promise<OwnershipInspection>;
+  authorizeTurn?(identity: { endpoint: string; thread_id: string; mapping_id: string }, turnId: string): void;
+}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "local", thread_id: "coord", project_dir: dir },
@@ -160,6 +169,16 @@ test("execution checks rollout ownership before reading or mutating the native t
   assert.deepEqual(value.endpoint.calls, []);
 });
 
+test("execution waits for a pathless rollout before native dispatch", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "pending" }) });
+
+  await assert.rejects(value.service.send("payments", "must not run"), (error: unknown) => (
+    error instanceof AppError && error.code === "SESSION_BUSY"
+  ));
+
+  assert.deepEqual(value.endpoint.calls, []);
+});
+
 test("execution rechecks rollout ownership after input preparation and immediately before dispatch", async () => {
   let external = false;
   let checks = 0;
@@ -191,6 +210,30 @@ test("interrupt ownership-fences the cached active turn before touching the App 
   });
 
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), false);
+});
+
+test("interrupt recovery resumes the exact native active turn when runtime cache is empty", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "recovered-active", status: "inProgress", items: [] }];
+
+  await value.service.interrupt("payments", "recovered-active", { recoverExactTurn: true });
+
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/interrupt"
+    && call.params.turnId === "recovered-active"));
+});
+
+test("active goal transition snapshots exact native turn ownership before marker revocation", async () => {
+  const authorized: string[] = [];
+  const value = await fixture({
+    inspect: async () => ({ state: "owned" }),
+    authorizeTurn: (_identity, turnId) => { authorized.push(turnId); },
+  });
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "goal-active", status: "inProgress", items: [] }];
+
+  assert.equal(await value.service.authorizeActiveTurn("payments"), "goal-active");
+  assert.deepEqual(authorized, ["goal-active"]);
 });
 
 test("an unclassified cached active turn cannot be steered or interrupted", async () => {
@@ -447,6 +490,23 @@ test("goal operations replace, pause, resume and cancel without exposing complet
   assert.equal("completeGoal" in service, false);
 });
 
+test("goal activation arms ownership after preflight and before native dispatch", async () => {
+  let controlled = false;
+  const value = await fixture({
+    inspect: async () => {
+      assert.equal(controlled, false, "goal control must not weaken the external-turn preflight");
+      return { state: "owned" };
+    },
+  });
+  value.endpoint.onGoalSetRequest = () => {
+    assert.equal(controlled, true, "goal control must be armed before the App Server can emit turn/started");
+  };
+
+  await value.service.setGoal("payments", "ship it", undefined, () => { controlled = true; });
+
+  assert.equal(controlled, true);
+});
+
 test("goal activation and resume are verified while pause and cancel remain available to stop unsafe work", async () => {
   const { endpoint, service, failWorkspace } = await fixture();
   failWorkspace();
@@ -464,4 +524,67 @@ test("a lost goal response is reconciled against native goal state", async () =>
   const result = await service.setGoal("payments", "ship it", 1_000) as any;
   assert.equal(result.goal.objective, "ship it");
   assert.equal(endpoint.calls.filter((call) => call.method === "thread/goal/set").length, 1);
+});
+
+test("a proven goal activation mismatch disarms ownership while an unreadable result remains armed", async () => {
+  const mismatch = await fixture();
+  let controlled = false;
+  mismatch.endpoint.rejectNextGoalSetBeforeEffect = true;
+  await assert.rejects(mismatch.service.setGoal(
+    "payments",
+    "ship it",
+    undefined,
+    () => { controlled = true; },
+    () => { controlled = false; },
+  ), /goal set failed/u);
+  assert.equal(controlled, false);
+
+  const unreadable = await fixture();
+  controlled = false;
+  unreadable.endpoint.rejectNextGoalSetBeforeEffect = true;
+  unreadable.endpoint.rejectNextGoalGet = true;
+  await assert.rejects(unreadable.service.setGoal(
+    "payments",
+    "ship it",
+    undefined,
+    () => { controlled = true; },
+    () => { controlled = false; },
+  ), /goal set failed/u);
+  assert.equal(controlled, true);
+});
+
+test("a proven goal resume mismatch disarms ownership", async () => {
+  const value = await fixture();
+  value.endpoint.goal = { objective: "ship it", status: "paused" };
+  value.endpoint.rejectNextGoalSetBeforeEffect = true;
+  let controlled = false;
+
+  await assert.rejects(value.service.resumeGoal(
+    "payments",
+    () => { controlled = true; },
+    () => { controlled = false; },
+  ), /goal set failed/u);
+
+  assert.equal(controlled, false);
+});
+
+test("goal mismatch authorizes the native active turn inside the existing execution gate", async () => {
+  const events: string[] = [];
+  const value = await fixture({
+    inspect: async () => ({ state: "owned" }),
+    authorizeTurn: (_identity, turnId) => { events.push(`authorize:${turnId}`); },
+  });
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [{ id: "goal-race", status: "inProgress", items: [] }];
+  value.endpoint.rejectNextGoalSetBeforeEffect = true;
+
+  await assert.rejects(value.service.setGoal(
+    "payments",
+    "replacement",
+    undefined,
+    () => undefined,
+    () => { events.push("mismatch"); },
+  ), /goal set failed/u);
+
+  assert.deepEqual(events, ["authorize:goal-race", "mismatch"]);
 });

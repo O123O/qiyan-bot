@@ -2,7 +2,7 @@
 
 ## Development fixture for remote-worker support
 
-This Docker Compose fixture models a separate Linux machine for testing QiYan's SSH endpoint pool. It provides key-only SSH, an independently authenticated Codex profile, and persistent remote projects. QiYan's production endpoint uses a detached tmux App Server and an SSH byte-stream bridge to its private Unix socket; the fixture check retains a short stdio probe as a prerequisite diagnostic.
+This Docker Compose fixture models a separate Linux machine for testing QiYan's SSH endpoint pool. It provides key-only SSH, an independently authenticated Codex profile, and persistent remote projects. QiYan's production endpoint uses a detached tmux App Server plus a ControlMaster-registered local Unix-socket forward to its private socket; the fixture check retains a short stdio probe as a prerequisite diagnostic.
 
 The fixture is **source checkout only**. Its Docker files, TypeScript helpers, and npm development commands are not included in the QiYan release archive.
 
@@ -40,7 +40,7 @@ npm run ssh-worker:check
 npm run ssh-worker:endpoint-check
 ```
 
-The first check validates the remote `HOME`, `CODEX_HOME`, projects directory, exact pinned Codex version, App Server `initialize` response, and `account/read`. The endpoint check starts the real detached App Server under QiYan's isolated tmux server, drops only its local transport, reconnects, and verifies the same attested runtime identity. Neither command creates a thread or sends a model task. Before login, the first check reports `authentication required`; endpoint persistence remains testable on either side of that authentication boundary.
+The first check validates the remote `HOME`, `CODEX_HOME`, projects directory, exact pinned Codex version, App Server `initialize` response, and `account/read`. The endpoint check requires that independent login, starts the real detached App Server under QiYan's isolated tmux server, registers the same ControlMaster stream-local forward used in production, creates a thread in the fixture project directory, cancels only the forward, reconnects, and verifies the same attested runtime identity. It does not send a model task. Before login, the first check reports `authentication required` and the endpoint check intentionally fails.
 
 ## Daily operation and persistence
 

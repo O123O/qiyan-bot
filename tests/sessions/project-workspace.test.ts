@@ -142,6 +142,29 @@ test("dispatch revalidation detects replacement after its canonical safety check
   await assert.rejects(value.policy.assertDispatchable(prepared), /changed unexpectedly/);
 });
 
+test("deduplicates identical protected paths during remote safety checks", async () => {
+  const value = await fixture();
+  const project = join(value.userHome, "Documents", "deduplicated");
+  await mkdir(project, { recursive: true, mode: 0o700 });
+  let protectedRealpaths = 0;
+  const host = failingHost(value.userHome, (method, path) => {
+    if (method === "realpath" && path === value.qiyanHome) protectedRealpaths += 1;
+    return undefined;
+  });
+  const policy = new ProjectWorkspacePolicy({
+    userHome: value.userHome,
+    qiyanHome: value.qiyanHome,
+    assistantWorkdir: value.qiyanHome,
+    dataDir: value.qiyanHome,
+    registryPath: join(value.qiyanHome, "sessions.json"),
+    host,
+  });
+
+  await policy.prepareExisting(project);
+
+  assert.equal(protectedRealpaths, 2, "each safety pass should inspect one unique protected path");
+});
+
 test("workspace policy preserves typed endpoint failures from finalize and dispatch revalidation", async () => {
   const value = await fixture();
   const prepared = await value.policy.prepareCreate("remote", "~/Documents/remote");

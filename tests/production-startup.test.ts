@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import type { BotConfig } from "../src/config.ts";
 import { assistantAccessWarning, buildProductionApp } from "../src/production-app.ts";
+import { TOOL_NAMES } from "../src/assistant/tools.ts";
 import type { ChatAdapter } from "../src/chat/contracts.ts";
 import { StartupPhaseError } from "../src/app.ts";
 import { createTestDatabase, openDatabase, type Database } from "../src/storage/database.ts";
@@ -358,6 +359,21 @@ test("production initializes exactly the configured Telegram, Slack, and WeChat 
     assert.deepEqual(initialized.sort(), adapters.map((adapter) => adapter.delivery.id).sort());
     assert.deepEqual(closed.sort(), adapters.map((adapter) => adapter.delivery.id).sort());
   }
+});
+
+test("the acceptance hook receives the exact production manager tool map before scheduler startup", async (t) => {
+  const { config } = await productionFixture(t);
+  let captured: string[] | undefined;
+  const app = await buildProductionApp(config, {
+    chdir: () => undefined,
+    chatAdapters: [fakeTelegramAdapter()],
+    testing: {
+      onManagerToolsBuilt: (tools) => { captured = Object.keys(tools).sort(); },
+    },
+  });
+
+  await assert.rejects(app.start(), (error: unknown) => error instanceof StartupPhaseError && error.phase === "endpoint");
+  assert.deepEqual(captured, [...TOOL_NAMES].sort());
 });
 
 async function productionFixture(t: TestContext): Promise<{ root: string; config: BotConfig }> {

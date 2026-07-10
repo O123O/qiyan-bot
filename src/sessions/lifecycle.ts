@@ -10,9 +10,9 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
-interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string }> }
+interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
 export interface LifecycleCheckpoint extends MappingIdentity {
@@ -23,11 +23,23 @@ export interface LifecycleCheckpoint extends MappingIdentity {
 }
 
 interface SessionOwnershipLifecycle {
-  initialize(identity: MappingIdentity, path: string, lease?: EndpointWorkLease): Promise<void>;
-  inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<
+  recordUnmaterialized(identity: MappingIdentity, path?: string): void;
+  initialize(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+    options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
+  ): Promise<void>;
+  authorizeTurnIfInitialized?(identity: MappingIdentity, turnId: string): boolean;
+  inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" } | OwnershipInspection
   >;
   release(identity: MappingIdentity): void;
+}
+
+interface ManagedOwnershipPreparation {
+  authorizedTurnId?: string;
+  after?: () => void | Promise<void>;
 }
 
 export function workerThreadStartParams(cwd: string, threadSource: string): { cwd: string; ephemeral: false; threadSource: string } {
@@ -44,6 +56,11 @@ export class SessionLifecycle {
     private readonly gate: ThreadGate,
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
     private readonly ownership?: SessionOwnershipLifecycle,
+    private readonly beforeManagedOwnership?: (
+      identity: MappingIdentity,
+      lease?: EndpointWorkLease,
+      thread?: ThreadView,
+    ) => Promise<void | ManagedOwnershipPreparation>,
   ) {}
 
   async create(
@@ -61,32 +78,20 @@ export class SessionLifecycle {
     await this.assertDispatchable(endpointId, project, lease);
     onDispatching?.();
     const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(project.path, threadSource), undefined, lease);
-    if (response.thread.threadSource !== threadSource) throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
+    this.requireFreshThread(response.thread, threadSource, project.path);
     const settings = this.responseSettings(response);
     onThreadCreated?.(response.thread, settings);
     await this.gate.run(endpointId, response.thread.id, async () => {
-      const managedThread = this.ownership && !response.thread.path
-        ? (await this.read(endpointId, response.thread.id, lease)).thread
-        : response.thread;
-      if (managedThread.id !== response.thread.id) throw new AppError("OPERATION_UNCERTAIN", "new thread read returned an unexpected identity");
-      await this.assertDispatchable(endpointId, project, lease);
-      await this.verifyCwd(endpointId, managedThread.cwd, project.path, lease);
-      if (managedThread.status.type !== "idle") throw new AppError("OPERATION_UNCERTAIN", `new thread ${managedThread.id} was created in ${managedThread.status.type} state`);
       const identity = {
         endpoint: endpointId,
         thread_id: response.thread.id,
         project_dir: project.path,
         mapping_id: mappingId,
       };
-      try {
-        if (this.ownership) await this.ownership.initialize(identity, this.requireRolloutPath(managedThread), lease);
-        await this.registry.createManaged(nickname, identity);
-      } catch (error) {
-        this.ownership?.release(identity);
-        throw error;
-      }
-      this.runtime.setSession(endpointId, managedThread.id, mappingId, "managed", managedThread.status.type);
-      this.runtime.beginEpoch(endpointId, managedThread.id, mappingId, this.baseline(managedThread), this.clock.now());
+      this.ownership?.recordUnmaterialized(identity, response.thread.path ?? undefined);
+      await this.registry.createManaged(nickname, identity);
+      this.runtime.setSession(endpointId, response.thread.id, mappingId, "managed", response.thread.status.type);
+      this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
     });
     return settings;
     }, existingLease);
@@ -103,13 +108,19 @@ export class SessionLifecycle {
     await this.withMutationLease(endpointId, (lease) => this.gate.run(endpointId, threadId, async () => {
       this.requireAvailable(nickname, endpointId, threadId);
       let resumed = false;
+      let resumeAttempted = false;
       let reserved: RegistrySession | undefined;
       try {
         let before: ThreadResponse;
         try { before = await this.read(endpointId, threadId, lease); }
         catch (error) {
           if (!isExactThreadNotLoaded(error, threadId)) throw error;
-          const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
+          let response: ThreadResponse;
+          try { response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease); }
+          catch (resumeError) {
+            if (isExactThreadNoRollout(resumeError, threadId)) throw this.threadNotDurable(threadId);
+            throw resumeError;
+          }
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
           before = await this.read(endpointId, threadId, lease);
@@ -130,7 +141,8 @@ export class SessionLifecycle {
         await this.registry.reserve(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
         let after = before;
-        if (!resumed) {
+        if (!resumed && this.requiresResume(before.thread)) {
+          resumeAttempted = true;
           const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", { threadId }, undefined, lease);
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
@@ -140,7 +152,9 @@ export class SessionLifecycle {
         this.requireIdle(after.thread);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
-        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease);
+        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease, {
+          allowUnmaterialized: after.thread.turns.length === 0,
+        });
         await this.registry.promote(nickname, reserved);
         this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
         this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
@@ -151,9 +165,12 @@ export class SessionLifecycle {
             if (reserved && !await this.registry.removeIfMatch(nickname, reserved)) {
               throw new Error("adopting reservation changed during rollback");
             }
-            if (reserved) this.ownership?.release(reserved);
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
+          }
+        } else if (reserved && !resumeAttempted) {
+          if (!await this.registry.removeIfMatch(nickname, reserved)) {
+            throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its reservation rollback could not be confirmed");
           }
         }
         throw error;
@@ -249,7 +266,7 @@ export class SessionLifecycle {
           await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
           this.assertExact(nickname, expected, "adopting");
           let native = before;
-          if (!resumed) {
+          if (!resumed && this.requiresResume(before.thread)) {
             const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
@@ -261,7 +278,9 @@ export class SessionLifecycle {
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           const promotable = this.assertExact(nickname, expected, "adopting");
-          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease);
+          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease, {
+            allowUnmaterialized: native.thread.turns.length === 0,
+          });
           await this.registry.promote(nickname, promotable);
           this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
           if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
@@ -273,7 +292,6 @@ export class SessionLifecycle {
             try {
               await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
               if (!await this.registry.removeIfMatch(nickname, current)) throw new Error("adopting reservation changed during rollback");
-              this.ownership?.release(current);
             } catch {
               throw new AppError("OPERATION_UNCERTAIN", "adoption recovery failed and its subscription rollback could not be confirmed");
             }
@@ -292,6 +310,7 @@ export class SessionLifecycle {
     expected: RegistrySession,
     existingLease?: EndpointWorkLease,
     canPublish: () => boolean = () => true,
+    options?: { requireDurableRollout?: boolean },
   ): Promise<ThreadResponse> {
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const assertCurrent = (): void => {
@@ -304,16 +323,6 @@ export class SessionLifecycle {
       await this.assertDispatchable(session.endpoint, project, lease);
       assertCurrent();
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
-      const guarded = await this.ownership?.inspectIfInitialized?.(session, lease);
-      assertCurrent();
-      if (guarded?.state === "external") {
-        throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
-      }
-      if (guarded?.state === "unclassified") {
-        throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} has a turn whose ownership is not yet classified`, {
-          recovery: "ownership_unclassified",
-        });
-      }
       let resumed: ThreadResponse | undefined;
       let before: ThreadResponse;
       try { before = await this.read(session.endpoint, session.thread_id, lease); }
@@ -328,13 +337,51 @@ export class SessionLifecycle {
       this.requireThreadIdentity(before.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
+      this.runtime.restoreMissingManagedSession(session.endpoint, session.thread_id, session.mapping_id);
+      const ownershipPreparation = await this.beforeManagedOwnership?.(session, lease, before.thread);
+      assertCurrent();
+      if (ownershipPreparation?.authorizedTurnId) {
+        this.ownership?.authorizeTurnIfInitialized?.(session, ownershipPreparation.authorizedTurnId);
+      }
+      const guarded = await this.ownership?.inspectIfInitialized?.(session, lease,
+        options?.requireDurableRollout ? { requireMaterialized: true } : undefined);
+      assertCurrent();
+      if (guarded?.state === "external") {
+        throw new AppError("SESSION_BUSY", `thread ${session.thread_id} has an externally started turn`, { recovery: "external_turn" });
+      }
+      if (guarded?.state === "lost") {
+        assertCurrent();
+        this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+        if (!await this.registry.removeIfMatch(nickname, session)) {
+          throw new AppError("OPERATION_UNCERTAIN", "lost volatile thread mapping changed before removal");
+        }
+        this.ownership?.release(session);
+        throw new AppError("THREAD_NOT_FOUND", `thread ${session.thread_id} had no durable rollout after restart`, {
+          recovery: "pathless_thread_lost",
+        });
+      }
+      if (guarded?.state === "pending") {
+        throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} rollout is not materialized`, {
+          recovery: "ownership_unclassified",
+        });
+      }
+      if (guarded?.state === "unclassified") {
+        throw new AppError("OPERATION_UNCERTAIN", `thread ${session.thread_id} has a turn whose ownership is not yet classified`, {
+          recovery: "ownership_unclassified",
+        });
+      }
       if (this.ownership) {
-        await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease);
+        await this.ownership.initialize(session, this.requireRolloutPath(before.thread), lease, {
+          allowUnmaterialized: options?.requireDurableRollout ? false : before.thread.turns.length === 0,
+          ...(ownershipPreparation?.authorizedTurnId ? { authorizedTurnId: ownershipPreparation.authorizedTurnId } : {}),
+        });
         assertCurrent();
       }
+      await ownershipPreparation?.after?.();
+      assertCurrent();
       this.assertExact(nickname, expected, "managed");
       let authoritative = before;
-      if (!resumed) {
+      if (!resumed && this.requiresResume(before.thread)) {
         resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
@@ -419,8 +466,14 @@ export class SessionLifecycle {
     return current;
   }
 
-  private read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
-    return this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+  private async read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
+    try {
+      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<ThreadResponse>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
   }
 
   private requireIdle(thread: ThreadView): void {
@@ -433,8 +486,34 @@ export class SessionLifecycle {
     }
   }
 
+  private requiresResume(thread: ThreadView): boolean {
+    return thread.status.type === "notLoaded" || thread.turns.length > 0;
+  }
+
+  private threadNotDurable(threadId: string): AppError {
+    return new AppError("THREAD_NOT_FOUND", "thread is no longer restorable because it has no durable rollout", {
+      recovery: "thread_not_durable", threadId,
+    });
+  }
+
   private requireThreadIdentity(thread: ThreadView, threadId: string): void {
     if (thread.id !== threadId) throw new AppError("OPERATION_UNCERTAIN", "thread recovery returned an unexpected identity");
+  }
+
+  private requireFreshThread(thread: ThreadView, threadSource: string, cwd: string, threadId?: string): void {
+    if (typeof thread.id !== "string" || thread.id.length === 0 || (threadId !== undefined && thread.id !== threadId)) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected identity");
+    }
+    if (thread.threadSource !== threadSource) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread returned an unexpected creation source");
+    }
+    if (thread.cwd !== cwd) throw new AppError("CWD_MISMATCH", "new thread returned an unexpected cwd");
+    if (thread.status.type !== "idle") {
+      throw new AppError("OPERATION_UNCERTAIN", `new thread ${thread.id} was created in ${thread.status.type} state`);
+    }
+    if (!Array.isArray(thread.turns) || thread.turns.length !== 0) {
+      throw new AppError("OPERATION_UNCERTAIN", "new thread response unexpectedly contained turns");
+    }
   }
 
   private async unsubscribeOrConfirmAbsent(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<void> {

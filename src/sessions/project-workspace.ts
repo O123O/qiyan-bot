@@ -143,12 +143,12 @@ export class ProjectWorkspacePolicy {
   private async assertSafe(candidate: string): Promise<void> {
     const userHome = await projectedCanonical(this.host, this.requestedUserHome);
     if (contains(candidate, userHome)) throw managedError("project workspace cannot be a broad parent of the user home");
-    const protectedPaths = await Promise.all([
+    const protectedPaths = await Promise.all([...new Set([
       this.requestedQiYanHome,
       this.requestedAssistantWorkdir,
       this.requestedDataDir,
       this.requestedRegistryDir,
-    ].map((path) => projectedCanonical(this.host, path)));
+    ])].map((path) => projectedCanonical(this.host, path)));
     for (const path of protectedPaths) {
       if (overlaps(candidate, path)) throw managedError("project workspace overlaps protected QiYan state");
     }

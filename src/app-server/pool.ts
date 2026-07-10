@@ -14,6 +14,16 @@ export interface TurnCapacityClaim {
   generation: number;
 }
 
+export class TurnIdentityConflictError extends AppError {
+  constructor(readonly returnedTurnId: string, readonly expectedTurnId?: string) {
+    super("OPERATION_CONFLICT", "turn/start response identity conflicts with the caller-owned claim", {
+      returnedTurnId,
+      ...(expectedTurnId ? { expectedTurnId } : {}),
+    });
+    this.name = "TurnIdentityConflictError";
+  }
+}
+
 export interface ThreadHistory {
   status?: string | { type?: string };
   turns: Array<{
@@ -314,8 +324,11 @@ export class AppServerPool {
         if (state) state.clientUserMessageId = clientUserMessageId;
         response = await this.request<T>(endpointId, "turn/start", startParams, undefined, lease);
       } catch (startError) {
+        if (callerClaim) {
+          throw new AppError("OPERATION_UNCERTAIN", "caller-owned turn/start outcome is uncertain");
+        }
         try {
-          const actual = await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, undefined, lease);
+          const actual = await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, lease);
           response = { turn: actual } as unknown as T;
         } catch (reconciliationError) {
           if (reconciliationError instanceof StartProvenAbsentError) {
@@ -325,19 +338,13 @@ export class AppServerPool {
           throw reconciliationError;
         }
       }
-
-      if (callerSuppliedCorrelation) {
-        try {
-          response = { ...response, turn: await this.findStartedTurn(endpointId, params.threadId, clientUserMessageId, response.turn.id, lease) } as T;
-        } catch (error) {
-          if (error instanceof StartProvenAbsentError) {
-            this.releaseTurnCapacityClaim(claim);
-            throw new AppError("OPERATION_CONFLICT", "turn/start response was not present in full thread history");
-          }
-          throw error;
-        }
+      try {
+        this.bindTurnCapacityClaim(claim, response.turn.id);
+      } catch (error) {
+        if (!callerClaim || !(error instanceof AppError) || error.code !== "OPERATION_CONFLICT") throw error;
+        const expected = this.claims.get(claim.id)?.turnId ?? this.terminalClaims.get(claim.id)?.turnId;
+        throw new TurnIdentityConflictError(response.turn.id, expected);
       }
-      this.bindTurnCapacityClaim(claim, response.turn.id);
       return response;
     } catch (error) {
       if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN") && !(error instanceof StartProvenAbsentError)) {
@@ -465,7 +472,7 @@ export class AppServerPool {
     });
   }
 
-  private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, candidateTurnId?: string, lease?: EndpointWorkLease): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
+  private async findStartedTurn(endpointId: string, threadId: string, clientUserMessageId: string, lease?: EndpointWorkLease): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
     const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 30_000);
     do {
       let history: { thread: ThreadHistory };
@@ -475,8 +482,7 @@ export class AppServerPool {
         throw new AppError("OPERATION_UNCERTAIN", `turn/start outcome could not be reconciled because thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
       }
       const actual = [...history.thread.turns].reverse().find((turn) =>
-        turn.items.some((item) => item.type === "userMessage" && item.clientId === clientUserMessageId)
-        || (candidateTurnId !== undefined && turn.id === candidateTurnId));
+        turn.items.some((item) => item.type === "userMessage" && item.clientId === clientUserMessageId));
       if (actual) return actual;
       if (Date.now() >= deadline) {
         const threadStatus = typeof history.thread.status === "string" ? history.thread.status : history.thread.status?.type;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { AssistantRuntime } from "../../src/assistant/runtime.ts";
 import { operationRecoveryAction } from "../../src/production-app.ts";
@@ -71,21 +72,58 @@ test("recoverable operations retain their canonical arguments and stable call id
   assert.deepEqual(store.listRecoverable().map(({ contextId, attemptId, callId, kind, args, state }) => ({ contextId, attemptId, callId, kind, args, state })), [{
     contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: { content: "hello" }, state: "dispatched",
   }]);
+  assert.equal(operation.recoveryProtocol, 1);
+  assert.equal(store.listRecoverable()[0]?.recoveryProtocol, 1);
+});
+
+test("a recovery protocol persistence mismatch rolls back the complete prepared row", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  db.exec(`CREATE TRIGGER force_wrong_recovery_protocol AFTER INSERT ON operations
+    BEGIN UPDATE operations SET recovery_protocol = 0 WHERE id = NEW.id; END;`);
+
+  assert.throws(
+    () => store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } }),
+    /recovery protocol was not persisted/u,
+  );
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM operations").get() as { count: number }).count, 0);
+
+  db.exec("DROP TRIGGER force_wrong_recovery_protocol");
+  assert.equal(store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } }).recoveryProtocol, 1);
+});
+
+test("durable operation errors are projected consistently and cleared by recovered success", () => {
+  const store = new OperationStore(createTestDatabase());
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "create_session", args: { nickname: "docs" } });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "SSH process failed (exit 1)" }, true);
+
+  for (const projected of [
+    store.get(operation.id),
+    store.findForCall("attempt", "call", "create_session"),
+    store.listForAttempt("attempt")[0],
+    store.listRecoverable()[0],
+  ]) assert.deepEqual(projected?.error, { message: "SSH process failed (exit 1)" });
+
+  store.succeed(operation.id, { nickname: "docs", mapping_id: "mapping-1" });
+  assert.equal(store.get(operation.id)?.error, undefined);
+  assert.equal(store.findForCall("attempt", "call", "create_session")?.error, undefined);
 });
 
 test("a durable current attempt is actionable after process-local tool handlers are lost", () => {
   const db = createTestDatabase();
   const store = new OperationStore(db);
-  store.createSourceContext({ id: "ctx", kind: "event_batch", sourceId: "batch", rawText: "", attachmentIds: [] });
-  const beforeRestart = new AssistantRuntime(db, store, new DeliveryStore(db), { binding: { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } });
-  beforeRestart.prepareAttempt("ctx", "attempt", "internal");
-  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_chat_message", args: {} });
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.createInternalSource({ id: "ctx", kind: "event_batch", sourceId: "batch", rawText: "", attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.acquireLease({ kind: "internal", contextId: "ctx" }, "claim");
+  conversations.reserveStart("ctx");
+  const operation = store.prepare({ contextId: "ctx", attemptId: lease.attemptId, callId: "call", kind: "send_chat_message", args: {} });
   store.markDispatched(operation.id);
 
   const afterRestart = new AssistantRuntime(db, store, new DeliveryStore(db), { binding: { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } });
-  assert.equal(afterRestart.hydrateActive()?.attemptId, "attempt");
-  assert.equal(afterRestart.hasActiveTools("attempt"), false);
-  assert.equal(operationRecoveryAction({ state: store.listRecoverable()[0]!.state, activeHandler: afterRestart.hasActiveTools("attempt") }), "attempt");
+  assert.equal(afterRestart.hydrateActive()?.attemptId, lease.attemptId);
+  assert.equal(afterRestart.hasActiveTools(lease.attemptId), false);
+  assert.equal(operationRecoveryAction({ state: store.listRecoverable()[0]!.state, activeHandler: afterRestart.hasActiveTools(lease.attemptId) }), "attempt");
 });
 
 test("failing an operation and releasing its directive are one transaction", () => {

@@ -3,7 +3,7 @@ import test from "node:test";
 import { AppServerPool, type AppServerEndpoint } from "../../src/app-server/pool.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
-import type { PermissionBlockedEvent } from "../../src/app-server/local-endpoint.ts";
+import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 class FakeEndpoint implements AppServerEndpoint {
@@ -103,22 +103,45 @@ test("implicit starts send a correlation and retain capacity when a response is 
   assert.equal(pool.activeTurnCount, 0);
 });
 
-test("a terminal notification that arrives before turn/start responds does not leak capacity", async () => {
+test("a successful turn/start response remains authoritative over a stale correlated terminal", async () => {
   let resolveStart!: (value: any) => void;
   let reads = 0;
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
     request: async <T>(method: string) => method === "turn/start"
       ? new Promise<T>((resolve) => { resolveStart = resolve; })
-      : { thread: { turns: ++reads === 1 ? [] : [{ id: "turn-early", items: [{ type: "userMessage", clientId: "message-1" }] }] } } as T,
+      : (reads += 1, { thread: { turns: [{ id: "turn-stale", status: "completed", items: [{ type: "userMessage", clientId: "message-1" }] }] } }) as T,
   };
   const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, sleep: async () => undefined });
   const starting = pool.startTurn("local", { threadId: "t1", clientUserMessageId: "message-1", input: [] });
-  pool.markTurnTerminal("local", "t1", "turn-early");
-  resolveStart({ turn: { id: "wrong-thread-like-id" } });
-  assert.equal((await starting).turn.id, "turn-early");
-  assert.equal(reads, 2);
+  pool.markTurnTerminal("local", "t1", "turn-stale");
+  resolveStart({ turn: { id: "turn-live", status: "inProgress" } });
+  assert.equal((await starting).turn.id, "turn-live");
+  assert.equal(reads, 0);
+  assert.equal(pool.activeTurnCount, 1);
+  pool.markTurnTerminal("local", "t1", "turn-live");
   assert.equal(pool.activeTurnCount, 0);
+});
+
+test("a caller-owned failed start remains provisional without pool history reconciliation", async () => {
+  let reads = 0;
+  const endpoint: AppServerEndpoint = {
+    id: "local", state: "ready",
+    request: async <T>(method: string) => {
+      if (method === "turn/start") throw new Error("response lost");
+      reads += 1;
+      return { thread: { status: "idle", turns: [] } } as T;
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1, reconciliationTimeoutMs: 0 });
+  const claim = pool.claimTurnCapacity("local", "assistant", "caller-owned");
+  await assert.rejects(
+    pool.startTurn("local", { threadId: "assistant", clientUserMessageId: "message", input: [] }, claim),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  assert.equal(reads, 0);
+  assert.equal(pool.activeTurnCount, 1);
+  pool.releaseTurnCapacityClaim(claim);
 });
 
 test("an exact caller claim can be rebound after its turn terminal races the start response", async () => {

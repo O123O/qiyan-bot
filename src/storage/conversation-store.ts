@@ -51,6 +51,8 @@ export interface ReservedSubmission extends AttemptSource {
 
 export interface ChatAcceptanceEffects { commitNativeCheckpoint?: () => void }
 
+export type SubmissionConfirmation = "bound" | "already_same" | "already_terminal_same" | "conflict";
+
 export class ConversationStore {
   constructor(
     private readonly db: Database,
@@ -179,31 +181,121 @@ export class ConversationStore {
     });
   }
 
-  markSubmitted(attemptId: string, contextId: string, turnId: string): void {
-    inTransaction(this.db, () => {
-      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'submitted', observed_turn_id = ?, updated_at = ?
-        WHERE attempt_id = ? AND context_id = ? AND state IN ('start_submitting', 'steer_submitting', 'uncertain')`)
+  confirmStart(attemptId: string, contextId: string, turnId: string, options: { terminal?: boolean } = {}): SubmissionConfirmation {
+    return inTransaction(this.db, () => {
+      const lease = this.lease();
+      const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+      const attempt = this.db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as { turn_id: unknown } | undefined;
+      if (!lease || lease.attemptId !== attemptId || lease.primaryContextId !== contextId
+        || !member || member.submissionKind !== "start" || !attempt) return "conflict";
+      if (member.state === "submitted") {
+        if (member.observedTurnId !== turnId || lease.turnId !== turnId || String(attempt.turn_id) !== turnId
+          || !new Set(["active", "terminalizing"]).has(lease.phase)) return "conflict";
+        if (options.terminal && lease.phase === "active") {
+          const changed = this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
+            WHERE singleton = 1 AND attempt_id = ? AND phase = 'active' AND turn_id = ?`).run(attemptId, turnId).changes;
+          if (changed !== 1) this.conflict("lease changed while terminalizing confirmed start");
+        }
+        return this.lease()?.phase === "terminalizing" ? "already_terminal_same" : "already_same";
+      }
+      if (!new Set(["start_submitting", "uncertain"]).has(member.state) || lease.phase !== "starting" || lease.turnId
+        || (attempt.turn_id !== null && String(attempt.turn_id) !== turnId)) return "conflict";
+      const attemptChanged = this.db.prepare(`UPDATE assistant_attempts SET turn_id = ?
+        WHERE id = ? AND state = 'active' AND (turn_id IS NULL OR turn_id = ?)`).run(turnId, attemptId, turnId).changes;
+      if (attemptChanged !== 1) this.conflict("attempt changed while binding start");
+      const memberChanged = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'submitted', observed_turn_id = ?, updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start' AND state IN ('start_submitting', 'uncertain')`)
         .run(turnId, Date.now(), attemptId, contextId).changes;
-      if (changed !== 1) this.conflict("submission is no longer unresolved");
-      this.db.prepare("UPDATE assistant_attempts SET turn_id = ? WHERE id = ?").run(turnId, attemptId);
+      if (memberChanged !== 1) this.conflict("submission changed while binding start");
       const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease
-        SET phase = CASE WHEN phase = 'terminalizing' THEN phase ELSE 'active' END,
-            turn_id = ?,
-            steer_paused = CASE WHEN phase = 'terminalizing' THEN 1 ELSE 0 END,
-            pause_reason = CASE WHEN phase = 'terminalizing' THEN pause_reason ELSE NULL END
-        WHERE singleton = 1 AND attempt_id = ? AND (turn_id IS NULL OR turn_id = ?)`)
-        .run(turnId, attemptId, turnId).changes;
-      if (leaseChanged !== 1) this.conflict("lease changed while binding submission");
+        SET phase = ?, turn_id = ?, steer_paused = ?, pause_reason = ?
+        WHERE singleton = 1 AND attempt_id = ? AND phase = 'starting' AND turn_id IS NULL`)
+        .run(options.terminal ? "terminalizing" : "active", turnId, options.terminal ? 1 : 0,
+          options.terminal ? "terminalizing" : null, attemptId).changes;
+      if (leaseChanged !== 1) this.conflict("lease changed while binding start");
+      return "bound";
     });
   }
 
+  confirmSteer(attemptId: string, contextId: string, turnId: string): SubmissionConfirmation {
+    return inTransaction(this.db, () => {
+      const lease = this.lease();
+      const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+      const attempt = this.db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as { turn_id: unknown } | undefined;
+      if (!lease || lease.attemptId !== attemptId || !member || member.submissionKind !== "steer" || !attempt) return "conflict";
+      if (member.state === "submitted") {
+        if (member.observedTurnId !== turnId || member.expectedTurnId !== turnId || lease.turnId !== turnId
+          || String(attempt.turn_id) !== turnId || !new Set(["active", "terminalizing"]).has(lease.phase)) return "conflict";
+        return lease.phase === "terminalizing" ? "already_terminal_same" : "already_same";
+      }
+      if (!new Set(["steer_submitting", "uncertain"]).has(member.state)
+        || !new Set(["active", "terminalizing"]).has(lease.phase)
+        || !lease.turnId || lease.turnId !== turnId || member.expectedTurnId !== turnId) return "conflict";
+      if (!attempt || String(attempt.turn_id) !== turnId) return "conflict";
+      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'submitted', observed_turn_id = ?, updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'steer' AND expected_turn_id = ?
+          AND state IN ('steer_submitting', 'uncertain')`)
+        .run(turnId, Date.now(), attemptId, contextId, turnId).changes;
+      if (changed !== 1) this.conflict("submission changed while confirming steer");
+      if (lease.phase === "active") {
+        const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 0, pause_reason = NULL
+          WHERE singleton = 1 AND attempt_id = ? AND phase = 'active' AND turn_id = ?`).run(attemptId, turnId).changes;
+        if (leaseChanged !== 1) this.conflict("lease changed while confirming steer");
+        return "bound";
+      }
+      return "already_terminal_same";
+    });
+  }
+
+  markSubmitted(attemptId: string, contextId: string, turnId: string): void {
+    const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+    const result = member?.submissionKind === "start"
+      ? this.confirmStart(attemptId, contextId, turnId)
+      : this.confirmSteer(attemptId, contextId, turnId);
+    if (result === "conflict") this.conflict("submission confirmation conflicts with the live lease");
+  }
+
   markUncertain(attemptId: string, contextId: string): void {
-    inTransaction(this.db, () => {
+    if (!this.markUncertainIfUnresolved(attemptId, contextId)) this.conflict("submission cannot become uncertain");
+  }
+
+  observeUnknownStartTerminal(attemptId: string, contextId: string): boolean {
+    return inTransaction(this.db, () => {
+      const lease = this.lease();
+      const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+      if (!lease || lease.attemptId !== attemptId || lease.primaryContextId !== contextId
+        || lease.phase !== "starting" || lease.turnId || !member || member.submissionKind !== "start"
+        || !new Set(["start_submitting", "uncertain"]).has(member.state)) return false;
+      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'uncertain', updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start' AND state = 'start_submitting'`)
+        .run(Date.now(), attemptId, contextId).changes;
+      if (this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'unknown_terminal_observed'
+        WHERE singleton = 1 AND attempt_id = ? AND phase = 'starting' AND turn_id IS NULL`)
+        .run(attemptId).changes !== 1) this.conflict("unknown terminal observation changed with the start lease");
+      return changed === 1;
+    });
+  }
+
+  markUncertainIfUnresolved(attemptId: string, contextId: string): boolean {
+    return inTransaction(this.db, () => {
+      const lease = this.lease();
+      const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+      if (!lease || lease.attemptId !== attemptId || !member
+        || !new Set(["start_submitting", "steer_submitting"]).has(member.state)) return false;
+      const validStart = member.submissionKind === "start" && lease.phase === "starting" && !lease.turnId;
+      const validSteer = member.submissionKind === "steer" && new Set(["active", "terminalizing"]).has(lease.phase)
+        && !!lease.turnId && member.expectedTurnId === lease.turnId;
+      if (!validStart && !validSteer) return false;
       const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'uncertain', updated_at = ?
         WHERE attempt_id = ? AND context_id = ? AND state IN ('start_submitting', 'steer_submitting')`)
         .run(Date.now(), attemptId, contextId).changes;
-      if (changed !== 1) this.conflict("submission cannot become uncertain");
-      this.db.prepare("UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'submission_uncertain' WHERE attempt_id = ?").run(attemptId);
+      if (changed !== 1) this.conflict("submission changed while marking uncertainty");
+      if (lease.phase !== "terminalizing") {
+        const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'submission_uncertain'
+          WHERE singleton = 1 AND attempt_id = ? AND phase = ?`).run(attemptId, lease.phase).changes;
+        if (leaseChanged !== 1) this.conflict("lease changed while marking uncertainty");
+      }
+      return true;
     });
   }
 
@@ -216,7 +308,10 @@ export class ConversationStore {
       if (this.db.prepare("UPDATE source_contexts SET state = 'pending' WHERE id = ? AND state = 'active'").run(contextId).changes !== 1) {
         this.conflict("source cannot be restored");
       }
-      this.db.prepare("UPDATE assistant_turn_lease SET steer_paused = 0, pause_reason = NULL WHERE attempt_id = ?").run(attemptId);
+      this.db.prepare(`UPDATE assistant_turn_lease
+        SET steer_paused = CASE WHEN phase = 'terminalizing' THEN 1 ELSE 0 END,
+            pause_reason = CASE WHEN phase = 'terminalizing' THEN 'terminalizing' ELSE NULL END
+        WHERE attempt_id = ?`).run(attemptId);
     });
   }
 

@@ -11,6 +11,7 @@ import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";
 import type { OwnershipInspection } from "../sessions/rollout-ownership.ts";
+import { isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
 
 interface TerminalTurn {
   id: string;
@@ -62,6 +63,10 @@ export interface TerminalObservation {
 
 function relayTargetKey(target: RelayTarget): string {
   return [target.endpointId, target.threadId, target.turnId, target.mappingId, target.epochId].join("\0");
+}
+
+function ownershipNeedsRetry(inspection: OwnershipInspection): boolean {
+  return inspection.state === "unclassified" || inspection.state === "pending" || inspection.state === "lost";
 }
 
 export class EventRelay {
@@ -242,7 +247,7 @@ export class EventRelay {
     const mappingBefore = this.mapping(target.endpointId, target.threadId)!;
     const firstOwnership = await this.inspectOwnership(mappingBefore.session, lease);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (firstOwnership.state === "unclassified") return "retry";
+    if (ownershipNeedsRetry(firstOwnership)) return "retry";
 
     const history = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
       target.endpointId,
@@ -257,7 +262,7 @@ export class EventRelay {
     if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
     const secondOwnership = await this.inspectOwnership(current.session, lease);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (secondOwnership.state === "unclassified") return "retry";
+    if (ownershipNeedsRetry(secondOwnership)) return "retry";
 
     const stateAfter = this.targetState(target);
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
@@ -292,20 +297,14 @@ export class EventRelay {
           || !state || !this.isDeliverableState(state.managementState) || !epoch) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
         const before = await this.inspectOwnership(session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || before.state === "unclassified") return false;
-        const response = await this.pool.request<{ thread: { turns: TerminalTurn[] } }>(
-          endpointId,
-          "thread/read",
-          { threadId: session.thread_id, includeTurns: true },
-          undefined,
-          lease,
-        );
+        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(before)) return false;
+        const response = await this.readHistory(endpointId, session.thread_id, lease);
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
         if (current.session.mapping_id !== session.mapping_id) return false;
         const after = await this.inspectOwnership(current.session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || after.state === "unclassified"
+        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(after)
           || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
         const turns = response.thread.turns;
         let index = epoch.baselineTurnId ? turns.findIndex((turn) => turn.id === epoch.baselineTurnId) + 1 : 0;
@@ -437,6 +436,26 @@ export class EventRelay {
 
   private inspectOwnership(identity: MappingIdentity, lease: EndpointWorkLease): Promise<OwnershipInspection> {
     return this.ownership?.inspect(identity, lease) ?? Promise.resolve({ state: "owned" });
+  }
+
+  private async readHistory(
+    endpointId: string,
+    threadId: string,
+    lease: EndpointWorkLease,
+  ): Promise<{ thread: { turns: TerminalTurn[] } }> {
+    try {
+      return await this.pool.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
+    } catch (error) {
+      if (!isExactThreadNotMaterialized(error, threadId)) throw error;
+      const response = await this.pool.request<{ thread: object }>(
+        endpointId,
+        "thread/read",
+        { threadId, includeTurns: false },
+        undefined,
+        lease,
+      );
+      return { ...response, thread: { ...response.thread, turns: [] } };
+    }
   }
 
   private settleTarget(

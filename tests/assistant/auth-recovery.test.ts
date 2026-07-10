@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { recordAssistantAuthenticationFailure } from "../../src/assistant/auth-recovery.ts";
+import { assistantAuthenticationStartupError, recordAssistantAuthenticationFailure } from "../../src/assistant/auth-recovery.ts";
+import { EndpointAuthenticationRequiredError } from "../../src/app-server/managed-endpoint.ts";
+import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 
@@ -19,4 +21,13 @@ test("assistant authentication warnings deduplicate within an incident", () => {
   assert.ok(ready.every((row) => row.body.includes("qiyan-bot assistant-login")));
   assert.equal(ready[0]?.binding.adapterId, "telegram");
   assert.equal(ready[1]?.binding.adapterId, "slack");
+});
+
+test("cold-start authentication failure gives the operator an actionable login command", () => {
+  const mapped = assistantAuthenticationStartupError(new EndpointAuthenticationRequiredError("assistant-local"));
+  assert.equal(mapped instanceof AppError && mapped.code === "CONFIGURATION_ERROR", true);
+  assert.match((mapped as Error).message, /qiyan-bot assistant-login/u);
+  assert.equal((mapped as AppError).details?.reason, "assistant_auth_required");
+  const ordinary = new Error("ordinary");
+  assert.equal(assistantAuthenticationStartupError(ordinary), ordinary);
 });

@@ -130,6 +130,105 @@ test("reservations pair source and membership state and allow only one unresolve
   assert.throws(() => store.reserveNextSteer(lease.attemptId), (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");
 });
 
+test("start confirmation binds once and is idempotent across notification and response races", () => {
+  const { db, store } = fixture();
+  store.acceptChatSource(message("one", binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "bound");
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "already_same");
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-b"), "conflict");
+  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.turn_id, "turn-a");
+  assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "one"), false);
+});
+
+test("a late start-confirmation CAS miss rolls back every earlier write", () => {
+  const { db, store } = fixture();
+  store.acceptChatSource(message("one", binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+  db.exec(`CREATE TRIGGER ignore_start_lease_update BEFORE UPDATE OF turn_id ON assistant_turn_lease
+    BEGIN SELECT RAISE(IGNORE); END;`);
+
+  assert.throws(() => store.confirmStart(lease.attemptId, "one", "turn-a"), /lease changed/iu);
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.turn_id, null);
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'one'").get()!.state, "start_submitting");
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+});
+
+test("a correlated completion binds a starting lease directly into terminalizing", () => {
+  const { store } = fixture();
+  store.acceptChatSource(message("one", binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a", { terminal: true }), "bound");
+  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "already_terminal_same");
+  assert.equal(store.confirmStart(lease.attemptId, "one", "turn-b"), "conflict");
+});
+
+test("steer confirmation can only join the lease's immutable exact turn", () => {
+  const { db, store } = fixture();
+  for (const id of ["one", "two"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+  store.confirmStart(lease.attemptId, "one", "turn-a");
+  store.reserveNextSteer(lease.attemptId);
+
+  assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-b"), "conflict");
+  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'two'").get()!.state, "steer_submitting");
+  assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "bound");
+  assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "already_same");
+  assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.turn_id, "turn-a");
+});
+
+test("an uncertain exact steer confirmation reopens active steering", () => {
+  const { store } = fixture();
+  for (const id of ["one", "two", "three"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+  store.confirmStart(lease.attemptId, "one", "turn-a");
+  store.reserveNextSteer(lease.attemptId);
+  assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "two"), true);
+  assert.equal(store.lease()?.steerPaused, true);
+
+  assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "bound");
+  assert.deepEqual({ paused: store.lease()?.steerPaused, reason: store.lease()?.pauseReason }, { paused: false, reason: undefined });
+  assert.equal(store.reserveNextSteer(lease.attemptId)?.contextId, "three");
+});
+
+test("a late exact steer confirmation preserves terminal fencing and reports terminal disposition", () => {
+  const { store } = fixture();
+  for (const id of ["one", "two"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+  store.confirmStart(lease.attemptId, "one", "turn-a");
+  store.reserveNextSteer(lease.attemptId);
+  store.beginTerminalizing("turn-a");
+
+  assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "two"), true);
+  assert.equal(store.lease()?.pauseReason, "terminalizing");
+  assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "already_terminal_same");
+  assert.deepEqual({ phase: store.lease()?.phase, paused: store.lease()?.steerPaused, reason: store.lease()?.pauseReason }, {
+    phase: "terminalizing", paused: true, reason: "terminalizing",
+  });
+});
+
+test("uncertainty cannot mutate an unresolved member after its lease is gone", () => {
+  const { db, store } = fixture();
+  store.acceptChatSource(message("one", binding("telegram", "chat-1")));
+  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.reserveStart("one");
+  db.prepare("DELETE FROM assistant_turn_lease WHERE singleton = 1").run();
+
+  assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "one"), false);
+  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'one'").get()!.state, "start_submitting");
+});
+
 test("arrival order is unique and a source cannot belong to two live attempts", () => {
   const { db, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));

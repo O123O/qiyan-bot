@@ -319,7 +319,23 @@ export class EndpointManager {
 
   private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
     this.cancelReconnect(record);
-    if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
+    if (record.gate.desiredState === "disconnected") {
+      record.gate.requestAutomatic();
+      const prepared = await this.prepareCandidate(endpointId);
+      const drain = await record.gate.beginDrain();
+      let replacement: ManagedAppServerEndpoint | undefined;
+      try {
+        replacement = await this.startCandidate(prepared);
+        const identity = await this.requireRuntimeIdentity(replacement);
+        checkpoint?.({ phase: "runtime_started", identity });
+        this.publishAfterReopen(record, drain, replacement);
+      } catch (error) {
+        if (replacement?.state !== "stopped") await replacement?.closeConnection().catch(() => undefined);
+        this.reopenAfterLifecycleFailure(record, drain);
+        throw error;
+      }
+      return;
+    }
     const preparedReplacement = await this.prepareCandidate(endpointId);
     const drain = await record.gate.beginDrain();
     let target: ShutdownTarget | undefined;
@@ -454,7 +470,7 @@ export class EndpointManager {
   private async requireManagedThreadsIdle(endpointId: string, endpoint: ManagedAppServerEndpoint): Promise<void> {
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
       let response: { thread?: { status?: string | { type?: string } } };
-      try { response = await endpoint.request("thread/read", { threadId, includeTurns: true }); }
+      try { response = await endpoint.request("thread/read", { threadId, includeTurns: false }); }
       catch (error) {
         if (error instanceof RpcRequestTimeoutError) throw error;
         throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });

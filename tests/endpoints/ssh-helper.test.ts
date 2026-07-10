@@ -11,6 +11,7 @@ import {
   buildInstalledHelperCommand,
   encodeRemoteBootstrapArgument,
   encodeRemoteArgument,
+  parseRemoteHelperResponse,
 } from "../../src/endpoints/ssh-runtime.ts";
 import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
@@ -41,6 +42,35 @@ test("the helper hard-codes the isolated tmux server and disables user tmux conf
   assert.match(helper, /processHasToken/u);
 });
 
+test("the helper emits one versioned response frame", async () => {
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "preflight"], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+  assert.match(result.stdout.toString("utf8"), /^\nqiyan-helper-v1:\{.*\}\n$/u);
+});
+
+test("the helper establishes a frame boundary after output without a trailing newline", async () => {
+  const result = await runBoundedProcess("sh", [
+    "-c", "printf remote-shell-banner; exec \"$@\"", "sh", process.execPath, helperPath.pathname, "preflight",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+
+  assert.doesNotThrow(() => parseRemoteHelperResponse(result.stdout, "preflight"));
+});
+
+test("helper response parsing fails closed without exposing output", () => {
+  const invalid = /SSH inspect helper returned an invalid response/u;
+  assert.throws(() => parseRemoteHelperResponse(Buffer.from("remote output only"), "inspect"), invalid);
+  assert.throws(() => parseRemoteHelperResponse(Buffer.from('\nqiyan-helper-v1:{"ok":true}\nqiyan-helper-v1:{"ok":true}\n'), "inspect"), invalid);
+  assert.throws(() => parseRemoteHelperResponse(Buffer.from("\nqiyan-helper-v1:{secret}\n"), "inspect"), invalid);
+  try {
+    parseRemoteHelperResponse(Buffer.from("\nqiyan-helper-v1:{secret}\n"), "inspect");
+    assert.fail("malformed helper response should fail");
+  } catch (error) {
+    assert.equal(String(error).includes("secret"), false);
+  }
+});
+
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {
   const uid = process.getuid?.();
   assert.ok(uid);
@@ -61,7 +91,7 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   assert.equal((await stat(`${runtimeDir}/qiyan-app-server-launcher.sh`)).mode & 0o777, 0o700);
   const inspectArg = encodeRemoteArgument(JSON.stringify({ runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}` }));
   const inspected = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
-  assert.deepEqual(JSON.parse(inspected.stdout.toString("utf8")), { status: "absent" });
+  assert.deepEqual(parseRemoteHelperResponse(inspected.stdout, "inspect"), { status: "absent" });
 
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");
@@ -69,7 +99,7 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   const rootIdentity = { rootDevice: rootState.dev.toString(10), rootInode: rootState.ino.toString(10) };
   const readArg = encodeRemoteArgument(JSON.stringify({ path: source, root: runtimeDir, ...rootIdentity, maxBytes: 1024 }));
   const read = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "read-file", readArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
-  assert.equal(Buffer.from(JSON.parse(read.stdout.toString("utf8")).dataBase64, "base64").toString(), "descriptor-safe");
+  assert.equal(Buffer.from(parseRemoteHelperResponse<{ dataBase64: string }>(read.stdout, "read-file").dataBase64, "base64").toString(), "descriptor-safe");
   await symlink(source, `${runtimeDir}/report-link.txt`);
   const linkArg = encodeRemoteArgument(JSON.stringify({ path: `${runtimeDir}/report-link.txt`, root: runtimeDir, ...rootIdentity, maxBytes: 1024 }));
   await assert.rejects(
@@ -103,7 +133,7 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   const written = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "write-file", uploadArg], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024, input: Readable.from([upload]),
   });
-  const uploaded = JSON.parse(written.stdout.toString("utf8")) as { path: string; size: number; sha256: string };
+  const uploaded = parseRemoteHelperResponse<{ path: string; size: number; sha256: string }>(written.stdout, "write-file");
   assert.equal(uploaded.path, `${runtimeDir}/files/${uploadSha}`);
   assert.equal(await readFile(uploaded.path, "utf8"), "streamed-upload");
   assert.equal((await stat(uploaded.path)).mode & 0o777, 0o600);
@@ -123,7 +153,7 @@ test("the remote helper scans rollout ownership without returning message bodies
   await writeFile(path, "\n");
   const baselineArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-remote" }] }));
   const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
-  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  const cursor = parseRemoteHelperResponse<any>(baseline.stdout, "rollout-scan").results[0].cursor;
   await appendFile(path, [
     JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "turn-remote" } }),
     JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message", message: secret, client_id: "ctx:call" } }),
@@ -134,7 +164,69 @@ test("the remote helper scans rollout ownership without returning message bodies
   const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   const body = result.stdout.toString("utf8");
   assert.equal(body.includes(secret), false);
-  assert.deepEqual(JSON.parse(body).results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call" }]);
+  assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "rollout-scan").results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call", hasUserMessage: true }]);
+});
+
+test("the remote helper reports an allowed missing rollout without masking it as SSH failure", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-lazy.jsonl");
+  const argument = encodeRemoteArgument(JSON.stringify({
+    requests: [{ path, threadId: "thread-lazy" }],
+    allowMissing: true,
+  }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(parseRemoteHelperResponse(result.stdout, "rollout-scan"), { results: [{ missing: true }] });
+});
+
+test("the remote workspace helper returns a structured missing-path error", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const missing = join(root, "missing");
+  const argument = encodeRemoteArgument(JSON.stringify({ action: "realpath", path: missing }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "workspace", argument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(parseRemoteHelperResponse(result.stdout, "workspace"), { error: { code: "ENOENT" } });
+  assert.equal(result.stderr.byteLength, 0);
+});
+
+test("the remote helper collects a completed first turn only for explicit pending-rollout promotion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-rollout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "rollout-thread-first.jsonl");
+  await writeFile(path, [
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "external-first" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "user_message" } }),
+    JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_complete", turn_id: "external-first" } }),
+    "",
+  ].join("\n"));
+  const ordinaryArgument = encodeRemoteArgument(JSON.stringify({ requests: [{ path, threadId: "thread-first" }] }));
+  const promotionArgument = encodeRemoteArgument(JSON.stringify({
+    requests: [{ path, threadId: "thread-first" }],
+    allowMissing: true,
+    collectFromStart: true,
+  }));
+
+  const ordinary = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", ordinaryArgument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+  const promotion = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", promotionArgument], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  });
+
+  assert.deepEqual(parseRemoteHelperResponse<any>(ordinary.stdout, "rollout-scan").results[0].starts, []);
+  assert.deepEqual(parseRemoteHelperResponse<any>(promotion.stdout, "rollout-scan").results[0].starts, [{ turnId: "external-first", hasUserMessage: true }]);
 });
 
 test("the remote helper reports a malformed boundary and later independent external evidence", async (t) => {
@@ -147,7 +239,7 @@ test("the remote helper reports a malformed boundary and later independent exter
   const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
   });
-  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  const cursor = parseRemoteHelperResponse<any>(baseline.stdout, "rollout-scan").results[0].cursor;
   await appendFile(path, Buffer.from([0x00, 0x00, 0x0a]));
   await appendFile(path, [
     JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "external-remote" } }),
@@ -163,10 +255,10 @@ test("the remote helper reports a malformed boundary and later independent exter
   const stderr = scanned.stderr.toString("utf8");
   assert.equal(stdout.includes(secret), false);
   assert.equal(stderr.includes(secret), false);
-  assert.deepEqual(JSON.parse(stdout).results[0], {
+  assert.deepEqual(parseRemoteHelperResponse<any>(scanned.stdout, "rollout-scan").results[0], {
     cursor,
-    starts: [{ turnId: "external-remote", clientId: "ctx:remote" }],
-    openTurn: { turnId: "external-remote", clientId: "ctx:remote" },
+    starts: [{ turnId: "external-remote", clientId: "ctx:remote", hasUserMessage: true }],
+    openTurn: { turnId: "external-remote", clientId: "ctx:remote", hasUserMessage: true },
     malformed: true,
   });
 });
@@ -180,7 +272,7 @@ test("the remote helper does not correlate turn records across a malformed bound
   const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
   });
-  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  const cursor = parseRemoteHelperResponse<any>(baseline.stdout, "rollout-scan").results[0].cursor;
   const start = `${JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "not-correlated" } })}\n`;
   await appendFile(path, start);
   const malformedOffset = cursor.offset + Buffer.byteLength(start);
@@ -191,7 +283,7 @@ test("the remote helper does not correlate turn records across a malformed bound
   const scanned = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
   });
-  assert.deepEqual(JSON.parse(scanned.stdout.toString("utf8")).results[0], {
+  assert.deepEqual(parseRemoteHelperResponse<any>(scanned.stdout, "rollout-scan").results[0], {
     cursor: { ...cursor, offset: malformedOffset },
     starts: [],
     malformed: true,
@@ -207,7 +299,7 @@ test("the remote helper ignores syntactically valid non-object JSON records", as
   const baseline = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", baselineArgument], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
   });
-  const cursor = JSON.parse(baseline.stdout.toString("utf8")).results[0].cursor;
+  const cursor = parseRemoteHelperResponse<any>(baseline.stdout, "rollout-scan").results[0].cursor;
   await appendFile(path, [
     "null", JSON.stringify("ignored"), "1", "true", "[]", "{}",
     JSON.stringify({ timestamp: "now", type: "event_msg", payload: { type: "task_started", turn_id: "after-values" } }),
@@ -219,9 +311,9 @@ test("the remote helper ignores syntactically valid non-object JSON records", as
   const scanned = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-scan", argument], {
     timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
   });
-  const result = JSON.parse(scanned.stdout.toString("utf8")).results[0];
+  const result = parseRemoteHelperResponse<any>(scanned.stdout, "rollout-scan").results[0];
   assert.equal(result.malformed, undefined);
-  assert.deepEqual(result.starts, [{ turnId: "after-values" }]);
-  assert.deepEqual(result.openTurn, { turnId: "after-values" });
+  assert.deepEqual(result.starts, [{ turnId: "after-values", hasUserMessage: true }]);
+  assert.deepEqual(result.openTurn, { turnId: "after-values", hasUserMessage: true });
   assert.equal(result.cursor.offset, (await stat(path)).size);
 });

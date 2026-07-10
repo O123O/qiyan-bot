@@ -264,7 +264,7 @@ test("all adapters share the real dispatcher while WeChat tools keep the initiat
 
   await dispatcher.terminal({ id: "turn-1", status: "completed", itemsView: "full", items: [] });
   await dispatcher.idle();
-  runtime.handleTerminal("turn-1", "completed");
+  runtime.handleTerminal("turn-1", "completed", "telegram response");
   await dispatcher.enqueueInternal("terminal");
   await dispatcher.idle();
   assert.deepEqual(runner.starts[1]?.input, [
@@ -274,7 +274,7 @@ test("all adapters share the real dispatcher while WeChat tools keep the initiat
 
   await dispatcher.terminal({ id: "turn-2", status: "completed", itemsView: "full", items: [] });
   await dispatcher.idle();
-  runtime.handleTerminal("turn-2", "completed");
+  runtime.handleTerminal("turn-2", "completed", "slack response");
   await dispatcher.enqueueInternal("terminal");
   await dispatcher.idle();
   assert.deepEqual(runner.starts[2]?.input, [
