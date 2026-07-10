@@ -563,6 +563,14 @@ function assertExclusiveAcceptanceEnvironment(): void {
   }).filter((pid) => pid !== process.pid);
   assert.deepEqual(competingPids, [], "another QiYan process is using the real endpoint namespace");
 
-  const controlMaster = spawnSync("ssh", ["-O", "check", "dfw-vscode"], { stdio: "ignore" });
-  assert.equal(controlMaster.status, 0, "the dfw-vscode SSH ControlMaster must be authenticated before acceptance");
+  const controlMaster = spawnSync("ssh", ["-o", "ConnectTimeout=10", "-O", "check", "dfw-vscode"], {
+    stdio: "ignore", timeout: 15_000, killSignal: "SIGKILL",
+  });
+  if (controlMaster.status !== 0) {
+    const direct = spawnSync("ssh", [
+      "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+      "dfw-vscode", "true",
+    ], { stdio: "ignore", timeout: 15_000, killSignal: "SIGKILL" });
+    assert.equal(direct.status, 0, "dfw-vscode requires either a live user ControlMaster or direct BatchMode authentication");
+  }
 }

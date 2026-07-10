@@ -111,6 +111,7 @@ export class SshGenerationPlanner {
     runtimeDir: string;
     hasReferences(endpointId: string): boolean | Promise<boolean>;
     checkExisting(endpointId: string, destination: SshDestination, hasReferences: boolean): void;
+    attestControlMaster(plan: SshConnectionPlan): Promise<void>;
     run?: (command: string, args: readonly string[], options: { timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal }) => Promise<BoundedProcessResult>;
   }) {}
 
@@ -118,9 +119,28 @@ export class SshGenerationPlanner {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
     const run = this.options.run ?? runBoundedProcess;
     const result = await run(this.options.sshBinary, ["-G", endpointId], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024, ...(signal ? { signal } : {}) });
-    const plan = planSshConnection(endpointId, parseSshConfig(result.stdout.toString("utf8")), this.options.runtimeDir);
+    const effective = parseSshConfig(result.stdout.toString("utf8"));
+    let plan = planSshConnection(endpointId, effective, this.options.runtimeDir);
     const references = await this.options.hasReferences(endpointId);
     this.options.checkExisting(endpointId, plan.destination, references);
+    if (!plan.ownsControlMaster) {
+      try {
+        await this.options.attestControlMaster(plan);
+        await run(this.options.sshBinary, buildControlMasterCheckArgs(plan), {
+          timeoutMs: 5_000,
+          maxOutputBytes: 64 * 1024,
+          ...(signal ? { signal } : {}),
+        });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        plan = planSshConnection(endpointId, {
+          hostname: effective.hostname,
+          user: effective.user,
+          port: effective.port,
+          controlMaster: "no",
+        }, this.options.runtimeDir);
+      }
+    }
     return { plan, pendingBinding: { endpointId, destination: { ...plan.destination } } };
   }
 }

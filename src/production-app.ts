@@ -94,7 +94,7 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { attestUserControlMaster, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -2204,6 +2204,7 @@ export async function buildProductionApp(
           runtimeDir: sshRuntimeRoot,
           hasReferences: (id) => hasEndpointIdentityReferences(id),
           checkExisting: (id, destination, references) => endpointBindings.checkExisting(id, destination, references),
+          attestControlMaster: attestUserControlMaster,
         });
         endpointManager = new EndpointManager({
           localEndpoint: endpoint,
