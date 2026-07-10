@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
-  buildControlMasterCheckArgs,
   buildControlMasterExitArgs,
   buildSshRemoteArgs,
   type SshConnectionPlan,
@@ -262,20 +261,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       }
     }
     const run = this.options.run ?? runBoundedProcess;
-    if (!this.options.plan.ownsControlMaster) {
-      await attestUserControlMaster(this.options.plan);
-      try {
-        await run(this.options.sshBinary ?? "ssh", buildControlMasterCheckArgs(this.options.plan), {
-          timeoutMs: 5_000,
-          maxOutputBytes: 64 * 1024,
-        });
-      } catch {
-        throw new AppError(
-          "ENDPOINT_UNAVAILABLE",
-          `authenticated SSH ControlMaster is unavailable: ${this.options.plan.alias}`,
-        );
-      }
-    }
+    if (!this.options.plan.ownsControlMaster) await attestUserControlMaster(this.options.plan);
     return run(this.options.sshBinary ?? "ssh", buildSshRemoteArgs(this.options.plan, command), {
       timeoutMs,
       maxOutputBytes,

@@ -118,16 +118,15 @@ async function privateRoot(t: test.TestContext): Promise<string> {
   return root;
 }
 
-test("opening requires the existing authenticated ControlMaster", async (t) => {
+test("opening trusts the selected generation and uses the authoritative forward operation", async (t) => {
   const root = await privateRoot(t);
-  const value = fixture(root, new FakeRemoteRuntime(), {
-    beforeControl: (operation) => { if (operation === "check") throw new Error("authenticated master unavailable"); },
-  });
+  const value = fixture(root);
 
-  await assert.rejects(value.runtime.open(), /authenticated SSH ControlMaster is unavailable/u);
-  assert.deepEqual(value.commands.map(controlOperation), ["check"]);
-  assert.equal(value.remote.starts, 0, "an MFA endpoint must not attempt helper authentication without its user-owned master");
+  const connection = await value.runtime.open();
+  assert.deepEqual(value.commands.map(controlOperation), ["forward"]);
+  assert.equal(value.remote.starts, 1);
   assert.deepEqual(value.remote.stops, []);
+  await connection.close();
 });
 
 test("opening preserves an actionable ControlMaster configuration error", async (t) => {
@@ -156,8 +155,8 @@ test("wire connection failure cancels the exact forward without stopping the rem
 
   await assert.rejects(value.runtime.open(), /wire connect failed/u);
 
-  assert.deepEqual(value.commands.map(controlOperation), ["check", "forward", "cancel"]);
-  const socketPath = localSocket(value.commands[1]!);
+  assert.deepEqual(value.commands.map(controlOperation), ["forward", "cancel"]);
+  const socketPath = localSocket(value.commands[0]!);
   await assert.rejects(lstat(socketPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   assert.deepEqual(value.remote.stops, []);
 });
@@ -176,9 +175,9 @@ test("open reclaims a stale master-owned forward socket left by a crashed proces
 
   const connection = await value.runtime.open();
 
-  assert.deepEqual(value.commands.map(controlOperation), ["check", "cancel", "forward"]);
+  assert.deepEqual(value.commands.map(controlOperation), ["cancel", "forward"]);
   assert.equal(stale.listening, false);
-  assert.equal(localSocket(value.commands[2]!), stalePath);
+  assert.equal(localSocket(value.commands[1]!), stalePath);
   assert.equal((await lstat(stalePath)).isSocket(), true);
   await connection.close();
 });
@@ -208,7 +207,7 @@ test("SSH runtime reuses one authenticated ControlMaster and confirms exact remo
 
   assert.deepEqual(confirmed, { runtime: identity });
   assert.equal(value.remote.starts, 1);
-  assert.deepEqual(value.commands.slice(0, 2).map(controlOperation), ["check", "forward"]);
+  assert.deepEqual(value.commands.slice(0, 1).map(controlOperation), ["forward"]);
   for (const args of value.commands) {
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
     assert.doesNotMatch(args.join(" "), /ControlMaster=auto|ControlPath=none/u);
@@ -320,15 +319,12 @@ test("exit-zero cancel that leaves the listener alive preserves cleanup ownershi
   await replacement.close();
 });
 
-test("a failed control check cannot prove cancellation while the listener still accepts", async (t) => {
+test("a failed cancel cannot prove cleanup while the listener still accepts", async (t) => {
   const root = await privateRoot(t);
   let cleanup = false;
   const value = fixture(root, new FakeRemoteRuntime(), {
     beforeControl: (operation) => {
       if (cleanup && operation === "cancel") throw new Error("cancel failed");
-      if (cleanup && operation === "check") {
-        throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
-      }
     },
   });
   const connection = await value.runtime.open();

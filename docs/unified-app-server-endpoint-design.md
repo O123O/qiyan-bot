@@ -163,7 +163,7 @@ This service does not implement initialize, authentication, notifications, or re
 - Run preflight and bootstrap the fixed remote helper assets once per runtime-service generation; repeated inspect/classify calls reuse the prepared paths and do not rerun bootstrap.
 - Ensure the detached remote `codex app-server` is healthy.
 - Capture its exact runtime identity.
-- Require the endpoint's exact authenticated ControlMaster before any user-owned-master helper operation.
+- Select and attest the endpoint's exact authenticated ControlMaster for each user-owned-master generation.
 - Register one OpenSSH stream-local forward on that master from a private local Unix socket to the private remote App Server Unix socket.
 - Connect `WebSocketWire` to the local forwarded socket and return that wire as an `AppServerConnection`.
 - Treat WebSocket closure as the event-driven connection-loss signal; no forward process or polling monitor is needed.
@@ -180,7 +180,7 @@ ssh -S <control-path> -O forward -L <private-local-socket>:<private-remote-socke
 ssh -S <control-path> -O cancel  -L <private-local-socket>:<private-remote-socket> <pinned-alias>
 ```
 
-Every helper and control command explicitly pins the same resolved `ControlPath`, host, user, and port. Each generation prefers a live configured user master and otherwise selects a private QiYan-owned master with `ControlPersist=yes`; normal service shutdown waits for in-flight open work, closes the forward, and exits only that owned master. This lets key-authenticated endpoints recover without manual master setup while still allowing one interactive MFA authentication to serve later noninteractive QiYan operations. Before probing a configured master, QiYan verifies that its socket and parent are canonical same-UID owner-only objects on a local filesystem; unsafe or NFS paths fall back without being contacted. The documented Linux path is `${XDG_RUNTIME_DIR}/qiyan-ssh-%C`, using the existing private runtime directory without setup, with `ControlPersist=yes`, `ServerAliveInterval=15`, and `ServerAliveCountMax=3` so an idle master stays usable and a dead transport fails within a bound. QiYan checks a selected user master before every helper or transfer and supplies `ControlMaster=no` on the actual command, so it never starts, stops, or replaces that master.
+Every helper and control command explicitly pins the same resolved `ControlPath`, host, user, and port. Each generation prefers a live configured user master and otherwise selects a private QiYan-owned master with `ControlPersist=yes`; normal service shutdown waits for in-flight open work, closes the forward, and exits only that owned master. This lets key-authenticated endpoints recover without manual master setup while still allowing one interactive MFA authentication to serve later noninteractive QiYan operations. Before probing or using a configured master, QiYan verifies that its socket and parent are canonical same-UID owner-only objects on a local filesystem; unsafe or NFS paths fall back without being contacted. The documented Linux path is `${XDG_RUNTIME_DIR}/qiyan-ssh-%C`, using the existing private runtime directory without setup, with `ControlPersist=yes`, `ServerAliveInterval=15`, and `ServerAliveCountMax=3` so an idle master stays usable and a dead transport fails within a bound. The actual helper or `ssh -O forward` command proves liveness; helper commands use `ControlMaster=no`, so QiYan never starts, stops, or replaces the selected user master.
 
 Control commands retain batch mode, strict host-key checking, bounded execution, and secret-safe output handling. `-O forward` must succeed before the App Server wire is opened. Each endpoint uses one short stable socket name inside its attested private directory. On open, an owner-only socket left by a crashed process is cancelled and reclaimed before the new forward is registered; an unsafe replacement fails closed. OpenSSH control-command exit status is not treated as cancellation proof. After every cancel attempt, QiYan probes the exact captured local Unix listener: an accepting listener preserves the socket and cleanup reservation, while `ENOENT` or `ECONNREFUSED` plus an exact inode recheck permits unlink. A live connection remains the runtime's active owner until listener shutdown and socket cleanup finish, so a newer generation cannot overlap an older cleanup.
 
@@ -319,8 +319,8 @@ Do not retain compatibility subclasses that reimplement or override protocol lif
 ### SSH runtime
 
 - Ensures or reconnects to one detached runtime.
-- Requires and pins one authenticated ControlMaster before user-owned-master remote work.
-- Checks every user-owned-master helper and transfer, then dispatches with `ControlMaster=no`.
+- Selects and pins one authenticated ControlMaster before user-owned-master remote work.
+- Re-attests the selected socket before helper and transfer work; the dispatched operation is the liveness proof and uses `ControlMaster=no`.
 - Registers and cancels one exact stream-local forward on that master.
 - Uses App Server wire closure as the event-driven forwarding-loss signal.
 - Safely reclaims a stale master-owned listener left by a crashed QiYan process.

@@ -10,7 +10,6 @@ import type { RpcWire } from "../app-server/rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import { localSshForwardSocketPath } from "./local-runtime.ts";
 import {
-  buildControlMasterCheckArgs,
   buildSshStreamForwardArgs,
   buildSshStreamForwardCancelArgs,
   type SshConnectionPlan,
@@ -61,10 +60,11 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
         await this.active.close();
       }
       await this.settlePendingCleanup();
-      if (!this.options.plan.ownsControlMaster) await this.requireControlMaster();
+      if (!this.options.plan.ownsControlMaster) {
+        await (this.options.attestControlMaster ?? attestUserControlMaster)(this.options.plan);
+      }
       const expected = await this.options.runtime.ensureStarted();
       if (expected.kind !== "ssh") throw new AppError("ENDPOINT_UNAVAILABLE", "remote runtime returned a non-SSH identity");
-      if (this.options.plan.ownsControlMaster) await this.requireControlMaster();
       socketPath = localSshForwardSocketPath(this.options.socketRoot, "00000000");
       await this.reclaimStaleForward(socketPath);
       forwardRequested = true;
@@ -179,19 +179,6 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
       timeoutMs: this.options.connectionTimeoutMs ?? 10_000,
       maxOutputBytes: 64 * 1024,
     });
-  }
-
-  private async requireControlMaster(): Promise<void> {
-    await (this.options.attestControlMaster ?? attestUserControlMaster)(this.options.plan);
-    try {
-      await this.runControl(buildControlMasterCheckArgs(this.options.plan));
-    }
-    catch {
-      throw new AppError(
-        "ENDPOINT_UNAVAILABLE",
-        `authenticated SSH ControlMaster is unavailable: ${this.options.plan.alias}`,
-      );
-    }
   }
 
   private async reclaimStaleForward(socketPath: string): Promise<void> {

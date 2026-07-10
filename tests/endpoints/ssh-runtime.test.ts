@@ -70,7 +70,7 @@ test("remote arguments round-trip only as bounded base64url tokens", () => {
   assert.throws(() => decodeRemoteArgument("not+base64"), /invalid/u);
 });
 
-test("user-owned helper and transfer calls check and reuse only the authenticated master", async (t) => {
+test("user-owned helper and transfer calls rely on their authoritative SSH operations", async (t) => {
   const { plan } = await privateUserMaster(t);
   const calls: Array<{ args: string[]; timeoutMs: number }> = [];
   const remote = new SshRemoteClient({
@@ -78,9 +78,8 @@ test("user-owned helper and transfer calls check and reuse only the authenticate
     helperSource: Buffer.from("helper"),
     run: async (_command, args, options) => {
       calls.push({ args: [...args], timeoutMs: options.timeoutMs });
-      const control = args[args.indexOf("-O") + 1];
       return {
-        stdout: control === "check" ? Buffer.alloc(0) : framedOk,
+        stdout: framedOk,
         stderr: Buffer.alloc(0),
       };
     },
@@ -89,8 +88,8 @@ test("user-owned helper and transfer calls check and reuse only the authenticate
   await remote.invoke("inspect", ["{}"], helperPath);
   await remote.invokeTransfer("read-file", ["{}"], { maxOutputBytes: 1024 }, helperPath);
 
-  assert.deepEqual(calls.map(({ args }) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check", "helper", "check", "helper"]);
-  assert.deepEqual(calls.map((call) => call.timeoutMs), [5_000, 300_000, 5_000, 300_000]);
+  assert.deepEqual(calls.map(({ args }) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["helper", "helper"]);
+  assert.deepEqual(calls.map((call) => call.timeoutMs), [300_000, 300_000]);
   for (const { args } of calls.filter(({ args }) => !args.includes("-O"))) {
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
     assert.ok(args.includes("ControlMaster=no"));
@@ -114,7 +113,7 @@ test("helper response framing ignores unrelated remote shell stdout", async (t) 
   assert.deepEqual(await remote.invoke("inspect", ["{}"], helperPath), { ok: true });
 });
 
-test("a failed user-owned master check dispatches no helper command", async (t) => {
+test("a failed user-owned helper operation preserves its direct SSH failure", async (t) => {
   const { plan } = await privateUserMaster(t);
   const calls: string[][] = [];
   const remote = new SshRemoteClient({
@@ -126,12 +125,12 @@ test("a failed user-owned master check dispatches no helper command", async (t) 
     },
   });
 
-  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), /authenticated SSH ControlMaster is unavailable/u);
+  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), /SSH process failed \(exit 255\)/u);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.includes("check"), true);
+  assert.equal(calls[0]!.includes("-O"), false);
 });
 
-test("a missing socket in a safe local parent reaches only the master check", async (t) => {
+test("a missing socket in a safe local parent reaches the authoritative helper operation", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-missing-master-"));
   await chmod(root, 0o700);
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -149,7 +148,7 @@ test("a missing socket in a safe local parent reaches only the master check", as
     remote.invoke("inspect", ["{}"], helperPath),
     (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE",
   );
-  assert.deepEqual(calls.map((args) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["check"]);
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? args[args.indexOf("-O") + 1] : "helper"), ["helper"]);
 });
 
 test("user-owned ControlMaster attestation rejects unsafe parents and sockets before SSH", async (t) => {
