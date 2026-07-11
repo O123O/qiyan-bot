@@ -31,6 +31,11 @@ const configValueSchema = z.object({
   ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("danger-full-access"),
 });
 
+// Every env key the config schema reads. `HOME` is a system value, not a QiYan dotenv
+// key; all others MUST be in SUPPORTED_DOTENV_KEYS or a .env carrying them is rejected
+// at startup (guarded by a consistency test).
+export const CONFIG_DOTENV_KEYS = Object.keys(configValueSchema.shape).filter((key) => key !== "HOME");
+
 function configSchema(weixinConfigured: boolean) {
   return configValueSchema.superRefine((value, context) => {
     const telegramFields = [value.TELEGRAM_BOT_TOKEN, value.TELEGRAM_OWNER_ID, value.TELEGRAM_DESTINATION_CHAT_ID];
