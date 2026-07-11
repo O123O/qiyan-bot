@@ -622,8 +622,8 @@ export const migrations: readonly Migration[] = [
   );`,
   // Provider-agnostic durable schedules (Phase 2.1). Net-new additive table: on any
   // trigger (wakeup timer / cron / monitor condition) the engine drives a turn via
-  // the unified send_to_session. single_fire_key makes each fire idempotent across
-  // restart. Codex and Claude sessions share this.
+  // the unified send_to_session. Fire idempotency lives in the durable send enqueue
+  // (unique-constraint insert), not this row. Codex and Claude sessions share this.
   `
   CREATE TABLE IF NOT EXISTS session_schedules (
     id TEXT PRIMARY KEY,

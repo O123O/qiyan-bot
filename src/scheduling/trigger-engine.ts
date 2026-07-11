@@ -85,6 +85,8 @@ export class TriggerEngine {
     if (row.kind === "monitor") {
       const triggered = await this.withTimeout(this.deps.runCheck(row));
       if (!triggered) { this.deps.store.advance(row.id, now + this.interval(row)); return; }
+      // runCheck can await; re-verify the row wasn't cancelled during its window.
+      if (this.deps.store.get(row.id)?.state !== "armed") return;
     }
     // The key binds this fire to this scheduled instant. fire() is a durable,
     // idempotent enqueue keyed by it; we advance ONLY after it resolves, so a

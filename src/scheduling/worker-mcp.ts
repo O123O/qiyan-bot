@@ -136,8 +136,15 @@ export class WorkerScheduleMcpServer {
 
 function text(message: string) { return { content: [{ type: "text" as const, text: message }] }; }
 
+const MAX_BODY_BYTES = 1024 * 1024; // parity with LoopbackMcpServer; the surface is reachable by remote workers over the ssh tunnel
+
 async function readJson(request: import("node:http").IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(chunk as Buffer);
+  let total = 0;
+  for await (const chunk of request) {
+    total += (chunk as Buffer).length;
+    if (total > MAX_BODY_BYTES) throw new Error("request body too large");
+    chunks.push(chunk as Buffer);
+  }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
 }

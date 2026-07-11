@@ -1,7 +1,8 @@
 // Durable schedule store (Phase 2.1) — the provider-agnostic source of truth for
 // wakeup/cron/monitor triggers. Net-new additive table; unrelated to the assistant's
 // conversation batcher (`assistant/scheduler.ts`). The trigger engine (2.2) reads
-// due rows and fires via send_to_session; single-fire keys make firing idempotent.
+// due rows and fires via send_to_session; firing idempotency lives in the durable
+// enqueue (a unique-constraint insert keyed by the single-fire key), not here.
 import { randomUUID } from "node:crypto";
 import type { Database } from "../storage/database.ts";
 

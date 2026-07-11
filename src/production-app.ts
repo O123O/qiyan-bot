@@ -2246,6 +2246,12 @@ export async function buildProductionApp(
           },
           goals: new ClaudeGoalStore(db),
         });
+        // A Claude endpoint id that collides with a configured remote (catalog) id
+        // would silently shadow that remote (builtins short-circuit before the
+        // catalog). Refuse the misconfiguration loudly.
+        if (claudeEndpoint && endpointCatalog.snapshot().endpoints[claudeEndpoint.id]) {
+          throw new AppError("CONFIGURATION_ERROR", `CLAUDE_CODE_ENDPOINT_ID collides with a catalog endpoint: ${claudeEndpoint.id}`);
+        }
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
