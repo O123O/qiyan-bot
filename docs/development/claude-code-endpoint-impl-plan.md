@@ -124,13 +124,23 @@ One module, provider-blind, firing via `send_to_session`. Built once, tested aga
   list_schedules/cancel_schedule`) to **worker** sessions — today `LoopbackMcpServer` is assistant-only
   (`mcp/server.ts` rejects non-assistant callers) and worker env is built by `buildWorkerChildEnvironment`
   (`production-app.ts:2218`, MCP token stripped). Sub-parts: (a) **worker auth model** + **per-session
-  identity injection** (the tool must learn which worker called); (b) **remote reachability** — a remote
-  worker's `--mcp-config` needs a QiYan MCP surface reachable from that host (URL+token, or **stdio-over-SSH**
-  tunneling on the existing ControlMaster channel) — call this out as its own concern, it's the hard part;
+  identity injection** (the tool must learn which worker called); (b) **remote reachability** — the tool logic
+  runs in the LOCAL QiYan (store + engine live there); a remote worker reaches it by **reverse-forwarding the
+  loopback MCP over the session's own SSH** (`ssh -R <remoteport>:127.0.0.1:<mcpPort>`, added to the existing
+  ControlMaster via `-O forward`), so the remote `--mcp-config` targets `http://127.0.0.1:<remoteport>/mcp`.
+  Session transport stays forward-only (unchanged) and this adds NO inbound path to the local host — the
+  tunnel terminates at loopback on both ends. **The hard part is auth, not transport:** `LoopbackMcpServer`'s
+  `allowedClientProcess` peer-PID check (`mcp/server.ts:90`) CANNOT hold for a tunneled connection (the peer
+  is `sshd`, not the worker). Remote workers need a distinct auth mode — **bearer token as sole credential,
+  minted per-session, scoped to that worker's identity, peer-PID check relaxed ONLY for the forwarded
+  listener** (never for real loopback callers). This is a security-model decision — design it explicitly.
+  (stdio alternative rejected: a remote stdio MCP command would need remote→local SSH — wrong direction,
+  inbound creds the local host may not grant.)
   (c) attach via per-invocation `--mcp-config`, additive, byte-identical per turn; drop-in descriptions;
   writes to 2.1.
   *Verify:* a worker session (Codex and Claude, **local and remote**) calls each tool; it registers a row;
-  `list`/`cancel` work.
+  `list`/`cancel` work. Remote: the forwarded-listener auth accepts the scoped token and a real loopback
+  caller presenting that same token is still rejected by the peer-PID check.
 - **2.5 Recovery**: on QiYan restart, reload the store + re-arm (timers recompute next-fire / fire missed
   one-shots per policy; monitors restart poll loops; steer queues reload; goal reloads).
   *Verify:* a `schedule_wakeup` set before a QiYan restart fires **exactly one** resumed turn after restart —
