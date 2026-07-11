@@ -1,14 +1,22 @@
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
+  ROLLOUT_APPENDED_WHILE_SCANNING,
   scanLocalRollout,
   type RolloutAccess,
   type RolloutCursor,
   type RolloutMaterialization,
   type RolloutScanResult,
 } from "../sessions/rollout-ownership.ts";
+import { scanLocalClaudeTranscript } from "../sessions/claude-transcript.ts";
 import type { RemoteRuntimeClient } from "./ssh-runtime.ts";
 import type { EndpointWorkLease } from "./types.ts";
+
+// The scanner signature shared by the Codex (`scanLocalRollout`) and Claude
+// (`scanLocalClaudeTranscript`) providers — both read a jsonl by byte offset and
+// return provider-neutral `RolloutScanResult` ownership metadata.
+type LocalScanner = (request: { path: string; threadId: string; cursor?: RolloutCursor; collectFromStart?: true }) => Promise<RolloutScanResult>;
+export type SessionProvider = "codex" | "claude";
 
 const cursorSchema = z.object({
   device: z.string().regex(/^\d+$/u),
@@ -42,13 +50,46 @@ export class RolloutAccessRouter implements RolloutAccess {
     remote(endpointId: string): { remote: RemoteRuntimeClient; helperPath: string } | undefined;
     validateLease?(endpointId: string, lease: EndpointWorkLease): boolean;
     scanLocal?: typeof scanLocalRollout;
+    // Provider dispatch (Phase 1.1). Defaults to Codex so existing endpoints are
+    // unchanged; a Claude endpoint resolves to the transcript scanner.
+    provider?(endpointId: string): SessionProvider;
+    scanLocalClaude?: typeof scanLocalClaudeTranscript;
+    // Local detection (Phase 1.1). A local Claude endpoint has an id other than the
+    // Codex `"local"`, so local-vs-remote can't be keyed on that literal alone. When
+    // omitted this defaults to the exact `"local"` id (unchanged behavior); 1.4
+    // supplies a callback that also recognizes the local Claude endpoint id.
+    local?(endpointId: string): boolean;
   }) {}
+
+  private provider(endpointId: string): SessionProvider {
+    return this.options.provider?.(endpointId) ?? "codex";
+  }
+
+  private isLocal(endpointId: string): boolean {
+    return this.options.local?.(endpointId) ?? endpointId === "local";
+  }
+
+  private localScanner(endpointId: string): LocalScanner {
+    return this.provider(endpointId) === "claude"
+      ? (this.options.scanLocalClaude ?? scanLocalClaudeTranscript)
+      : (this.options.scanLocal ?? scanLocalRollout);
+  }
+
+  // The shipped `qiyan-ssh-helper.mjs` parses Codex rollout jsonl; a remote Claude
+  // transcript needs a Claude-aware helper (or raw-bytes-back-then-parse-locally).
+  // Phase 1.1 wires the local dispatch and fails remote-Claude loudly so the
+  // remote-helper work is explicit, not silently mis-parsed.
+  private requireRemoteProviderSupported(endpointId: string): void {
+    if (this.provider(endpointId) === "claude") {
+      throw new AppError("UNSUPPORTED_CAPABILITY", `remote Claude rollout scan is not yet implemented: ${endpointId}`);
+    }
+  }
 
   async scan(endpointId: string, requests: readonly RolloutScanRequest[], lease?: EndpointWorkLease): Promise<RolloutScanResult[]> {
     if (requests.length === 0) return [];
     if (requests.length > 128) throw new AppError("CONFIGURATION_ERROR", "too many rollout scan requests");
-    if (endpointId === "local") {
-      const scan = this.options.scanLocal ?? scanLocalRollout;
+    if (this.isLocal(endpointId)) {
+      const scan = this.localScanner(endpointId);
       const results = await retryConcurrentRolloutAppend(() => {
         this.requireLease(endpointId, lease);
         return Promise.all(requests.map((request) => scan(request)));
@@ -56,6 +97,7 @@ export class RolloutAccessRouter implements RolloutAccess {
       this.requireLease(endpointId, lease);
       return results;
     }
+    this.requireRemoteProviderSupported(endpointId);
     this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
@@ -70,9 +112,9 @@ export class RolloutAccessRouter implements RolloutAccess {
 
   async scanUnmaterialized(endpointId: string, request: RolloutScanRequest, lease?: EndpointWorkLease): Promise<RolloutMaterialization> {
     if (request.cursor) throw new AppError("CONFIGURATION_ERROR", "unmaterialized rollout scan cannot use a cursor");
-    if (endpointId === "local") {
+    if (this.isLocal(endpointId)) {
       try {
-        const scan = this.options.scanLocal ?? scanLocalRollout;
+        const scan = this.localScanner(endpointId);
         const result = await retryConcurrentRolloutAppend(() => {
           this.requireLease(endpointId, lease);
           return scan({ ...request, collectFromStart: true });
@@ -85,6 +127,7 @@ export class RolloutAccessRouter implements RolloutAccess {
         return { state: "missing" };
       }
     }
+    this.requireRemoteProviderSupported(endpointId);
     this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
@@ -112,7 +155,7 @@ async function retryConcurrentRolloutAppend<T>(scan: () => Promise<T>): Promise<
   for (let attempt = 1; ; attempt += 1) {
     try { return await scan(); }
     catch (error) {
-      if (attempt >= 3 || !(error instanceof Error) || error.message !== "rollout appended while scanning") throw error;
+      if (attempt >= 3 || !(error instanceof Error) || error.message !== ROLLOUT_APPENDED_WHILE_SCANNING) throw error;
     }
   }
 }

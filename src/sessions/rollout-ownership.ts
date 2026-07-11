@@ -91,6 +91,12 @@ const rolloutReadChunkBytes = 64 * 1024;
 const maxRolloutLineBytes = 64 * 1024 * 1024;
 const maxReportedStarts = 1024;
 
+// The retry sentinel shared by every rollout/transcript scanner and the
+// `retryConcurrentRolloutAppend` harness: a scan that raced a concurrent append
+// throws THIS exact message so the harness retries into a stable snapshot. Any
+// scanner (Codex or Claude) that reports a mid-scan append MUST throw this string.
+export const ROLLOUT_APPENDED_WHILE_SCANNING = "rollout appended while scanning";
+
 function ownershipUnclassified(message: string): AppError {
   return new AppError("OPERATION_UNCERTAIN", message, { recovery: "ownership_unclassified" });
 }
@@ -403,7 +409,7 @@ export async function scanLocalRollout(request: {
     const after = await file.stat({ bigint: true });
     if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
     if (after.size < state.size) throw new Error("rollout was truncated");
-    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.size > state.size) throw new Error(ROLLOUT_APPENDED_WHILE_SCANNING);
     if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
   } finally {
