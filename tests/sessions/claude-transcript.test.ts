@@ -67,7 +67,7 @@ test("a QiYan-stamped clientId marker makes a turn owned; message body never lea
 
   const result = await scanLocalClaudeTranscript({ path, threadId: "sess-owned", collectFromStart: true });
 
-  assert.deepEqual(result.starts, [{ turnId: "p1", clientId: "context-9:call-3", hasUserMessage: true }]);
+  assert.deepEqual(result.starts, [{ turnId: "context-9:call-3", clientId: "context-9:call-3", hasUserMessage: true }]);
   assert.equal(result.openTurn, undefined);
   assert.equal(JSON.stringify(result).includes(secret), false);
 });
@@ -92,7 +92,7 @@ test("incremental scan from a cursor returns only new turns", async () => {
   await appendFile(path, toolResult() + userTurn("p2", "sdk", `second ${encodeClaudeClientMarker("ctx:2")}`) + endTurn());
   const result = await scanLocalClaudeTranscript({ path, threadId: "sess-inc", cursor: baseline.cursor });
 
-  assert.deepEqual(result.starts, [{ turnId: "p2", clientId: "ctx:2", hasUserMessage: true }]);
+  assert.deepEqual(result.starts, [{ turnId: "ctx:2", clientId: "ctx:2", hasUserMessage: true }]);
   assert.equal(result.cursor.offset, Buffer.byteLength(await readFile(path)));
 });
 
@@ -105,7 +105,7 @@ test("a malformed line is an uncertainty boundary that keeps earlier turns visib
   const result = await scanLocalClaudeTranscript({ path, threadId: "sess-malformed", collectFromStart: true });
 
   assert.equal(result.malformed, true);
-  assert.deepEqual(result.starts, [{ turnId: "p1", clientId: "ctx:1", hasUserMessage: true }]);
+  assert.deepEqual(result.starts, [{ turnId: "ctx:1", clientId: "ctx:1", hasUserMessage: true }]);
 });
 
 test("validClaudeTranscriptPath accepts <session_id>.jsonl and rejects Codex rollout names", () => {

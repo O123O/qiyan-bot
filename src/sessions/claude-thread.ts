@@ -81,13 +81,18 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     if (type === "user") {
       const promptSource = record.promptSource;
       if (typeof promptSource !== "string" || promptSource.length === 0) continue; // tool_result: mid-turn
-      const turnId = turnIdOf(record);
-      if (!turnId) continue;
+      const promptId = turnIdOf(record);
+      if (!promptId) continue;
       finalize(current);
+      const marker = extractClientMarker(record.message);
+      // turn.id is the QiYan clientUserMessageId marker when owned (so it equals the
+      // id `turn/start` returned and `turn/completed` pushes, letting the relay find
+      // the turn), else the Claude promptId for external/human turns.
+      const turnId = marker ?? promptId;
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
-        id: idOf(record) ?? `${turnId}:user`,
-        clientId: extractClientMarker(record.message) ?? null,
+        id: idOf(record) ?? `${promptId}:user`,
+        clientId: marker ?? null,
       };
       current = { turn: { id: turnId, status: "completed", itemsView: "full", items: [userItem] }, terminal: false };
       continue;

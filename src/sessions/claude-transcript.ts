@@ -127,11 +127,13 @@ class ClaudeTranscriptParser {
       // user row is a tool_result (mid-turn) and must NOT open a new turn.
       const promptSource = record.promptSource;
       if (typeof promptSource !== "string" || promptSource.length === 0) return;
-      const turnId = turnIdOf(record);
-      if (!turnId) return;
+      const promptId = turnIdOf(record);
+      if (!promptId) return;
       if (this.current) this.report(this.current);
-      const pending: PendingTurn = { turnId, hasUserMessage: true };
       const clientId = extractClientMarker(record.message);
+      // turnId is the QiYan clientId marker when owned (so it matches the turn id
+      // recorded by turn/start and reported by thread/read), else the Claude promptId.
+      const pending: PendingTurn = { turnId: clientId ?? promptId, hasUserMessage: true };
       if (clientId) pending.clientId = clientId;
       this.current = pending;
       return;
