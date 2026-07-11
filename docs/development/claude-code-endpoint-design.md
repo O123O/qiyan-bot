@@ -28,8 +28,13 @@ speaks Codex's request surface (§4.3) — not a drop-in.
 - **`--input-format stream-json` keeps the process open across turns**; one-shot `claude -p "x"` runs one turn
   and exits.
 - **`--resume <session-id>` restores full conversation context** — no memory loss. The transcript is the
-  durable artifact (the Codex-rollout analog). Cost is re-hydration (cache-creation + cold start), not lost
-  memory.
+  durable artifact (the Codex-rollout analog).
+- **Prompt caching works across separate `-p` processes** (tested): a resumed `-p` process reads cache a prior
+  process created (server-side, prefix-keyed) — measured `cache_read=15122` on a back-to-back resume. But the
+  cache has a **~5-min TTL** (extendable to 1h). So closely-spaced turns re-hydrate cheaply (`cache_read`);
+  turns spaced **beyond the TTL** (an infrequent cron/reminder) pay full `cache_creation` each fire. That
+  re-hydration is the accepted, bounded cost of fire-and-resume with no warm mode — active sessions keep
+  interactive-grade caching; only genuinely-idle-then-woken sessions pay full context load.
 - **`Monitor` is asynchronous and only fires via re-invocation** → **dead in one-shot `claude -p`** (the
   process exits with the monitor merely "armed"). Rather than keep a warm process to host it, QiYan owns
   watching via its own `monitor` MCP tool (§5).
@@ -93,6 +98,27 @@ The alternative — refactoring pool/lifecycle/relay to a provider-agnostic sess
 change §7 forbids for now; revisit only if a third provider appears. The transcript-reconstruction of
 `thread/read` and the `turn/completed` synthesis are the non-trivial parts and are the spike's real risk.
 
+**Adapter contract (must meet — verified against the code; fold into Phase-1 scope):**
+- **Endpoint-lifecycle shape:** be a **parallel `ManagedAppServerEndpoint`-shaped class** that satisfies the
+  pool/`EndpointManager` duck-typed surface (`start`, `closeConnection`, `onNotification`, `onUnavailable`,
+  `onPermissionBlocked`, `runtimeIdentity`, etc.) **but bypasses** the Codex handshake — a daemon-less Claude
+  session has no `RpcWire`, `initialize`, `initialized`, or `account/read` (`managed-endpoint.ts:93-103`).
+  Do NOT implement `AppServerRuntimeService` directly (that would trigger that handshake).
+- **`thread/read` must include `cwd`** — lifecycle verifies it everywhere (`verifyCwd`, `requireFreshThread`
+  `lifecycle.ts:510,526-536`). Supply it from the known session cwd.
+- **`clientUserMessageId` round-trip:** `turn/start` stamps a `clientUserMessageId` (`pool.ts:319`) and
+  reconciliation finds the `thread/read` item `type:"userMessage"` with matching `clientId` (`:475-486`);
+  ownership keys on `client_id` too. The synthesized user item MUST echo back QiYan's clientId.
+- **Specific item shapes:** final delivery extracts `type:"agentMessage"` + `phase:"final_answer"` (or null) +
+  `text`, keyed by `item.id` (`final-messages.ts:29`); turn identity needs `type:"userMessage"` + `clientId`.
+  The translator must emit exactly these.
+- **Error shapes:** either reproduce the exact `JsonRpcResponseError` code `-32600` messages
+  (`thread-errors.ts:3-13`) or be structured so those recovery branches are never reached (a transcript-backed
+  read has no daemon "not loaded" state — plausible). State which.
+- **Notifications must be emitted:** relay only reacts to a pushed `turn/completed` via `onNotification`
+  (`relay.ts:112`, param `{threadId, turn:{id}}`); the adapter must actively push it (and decide on
+  `onPermissionBlocked`).
+
 ### 4.4 SDK vs headless
 
 Start with the **headless `claude -p` subprocess** (mirrors QiYan's existing subprocess + jsonl patterns,
@@ -139,6 +165,16 @@ Claude session is launched so it *cannot* reach the process-bound native schedul
 Disable + guide together; do not rely on the prompt alone. (Codex sessions get the same MCP tools; Codex has
 no native scheduler to disable.)
 
+**Launch flags must be stable per session (a caching requirement, tested).** `--append-system-prompt` is a
+*per-invocation* parameter — it is not stored in the session/transcript, so it must be re-passed on **every**
+turn, and it sits at the **front of the cached prefix**, so it must be **byte-identical** each turn or the
+cache breaks from that point on. Measured: identical append → full hit (`creation≈8`, `read≈27.7k`); a changed
+append re-creates ~12.5k tokens (tools + history) **every turn**. So `ClaudeCodeRuntime` must launch each turn
+of a session with **deterministic, identical** prompt-affecting flags (`--append-system-prompt`,
+`--disallowedTools`, `--mcp-config`, model). Also confirm the disabled tool-name strings are exact — a
+mismatched name makes `--disallowedTools` a **silent no-op** (downgrades enforcement to prompt-only); assert
+in Phase 0 that the model genuinely cannot invoke each named native tool.
+
 ## 6. Ownership, durability, recovery (state machine reusable; scanner is NEW)
 
 - **Reusable:** the ownership DB tables and the `inspect`/`initialize` state machine, and the phantom-session
@@ -148,7 +184,9 @@ no native scheduler to disable.)
 - **NEW (not reuse):** the actual scanner is Codex-specific — `validRolloutPath` requires
   `rollout-*-<threadId>.jsonl` and `RolloutParser` parses Codex `event_msg` payloads
   (`task_started/user_message/task_complete/turn_id/client_id`). Claude transcripts are a different path and
-  schema, so a **new `RolloutAccess`/transcript parser + filename validator** must be written.
+  schema, so a **new `RolloutAccess`/transcript parser + filename validator** must be written — implementing
+  **both** `scan` and `scanUnmaterialized` (ownership throws if the latter is absent,
+  `rollout-ownership.ts:368-371`): the materialized and not-yet-materialized transcript cases.
 - **Confirm:** the Claude transcript must expose a per-turn **user-message marker** (equivalent to Codex's
   `hasUserMessage`/QiYan `client_id`) or external-turn classification (single-writer/A3) won't have equivalent
   evidence. Verify in the spike.
@@ -170,8 +208,11 @@ no native scheduler to disable.)
 - **Phase 0 — Spike (before any abstraction).** Drive one session end-to-end from a script: start → capture
   `session_id` → follow-up via `--resume` → stream response → confirm context retained. A/B the SDK vs
   headless. Confirm A1/A2 (auth, `~/.claude` inheritance) and inspect a real transcript for the §6 per-turn
-  user-message marker. **Verify:** two turns, second has first-turn context; SDK-vs-headless decided;
-  transcript schema documented; auth confirmed.
+  user-message marker. Also assert the native schedulers are genuinely disabled — spawn a session with
+  `--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"` and confirm the model **cannot
+  invoke** each (a mismatched name silently no-ops the flag). **Verify:** two turns, second has first-turn
+  context; SDK-vs-headless decided; transcript schema documented; auth confirmed; native scheduler tools
+  provably uninvokable.
 - **Phase 1 — Codex-protocol `ClaudeCodeRuntime` (§4.3) + event translator + transcript scanner (§6) + goal
   decision (§4.1).** **Verify:** an integration test drives a real/faked session through the adapter: start →
   turn → `turn/completed` synthesized → delivery; a resumed turn carries context; the new scanner lets the
@@ -193,6 +234,10 @@ no native scheduler to disable.)
 - R4: goal has no Claude-native equivalent (§4.1) — decide emulation vs MCP-standing-prompt in Phase 1.
 - R5: stream-json is stable but version-sensitive — pin a Claude Code version, translate defensively.
 - R6: auth/config on the worker host (API key, `~/.claude` inheritance) — confirm in Phase 0.
+- R7: **re-hydration cost** for infrequent scheduled fires (turns spaced beyond the ~5-min prompt-cache TTL
+  pay full `cache_creation`). With warm mode removed, the only mitigations are prompt-cache reuse for
+  closely-spaced turns, the extended 1-hour cache TTL, and **deterministic launch flags** (§5 — a changed
+  system prompt re-creates ~12.5k tokens/turn). Accepted, bounded cost.
 
 ## 10. What this unlocks
 
