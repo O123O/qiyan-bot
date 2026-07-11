@@ -60,10 +60,16 @@ speaks Codex's request surface (§4.3) — not a drop-in.
 - **adopt session:** register an existing `session_id`; resume validates it.
 - **submit turn:** `claude -p --resume <id> "<message>" --output-format stream-json` → stream events →
   translate to QiYan's turn/item notifications → `result` event = final message → delivery. Process exits.
-- **set goal — OPEN DESIGN POINT (not reuse):** QiYan sets Codex goals via Codex's **native** `thread/goal/*`
-  RPC and tracks native goal state (`goalControlled`). **Claude Code has no native goal engine.** So goal for
-  Claude is new app-layer work — most likely folded onto the §5 MCP mechanism (a standing "goal" prompt QiYan
-  re-injects) or a synthesized system-prompt. Resolve in Phase 1; do not assume the Codex goal path applies.
+- **goal — DIVERGES from Codex; emulate the *ownership* half, not the primitive:** QiYan uses Codex's native
+  `thread/goal/*` primarily for **turn attribution** — a goal makes QiYan-generated turns `goalControlled` →
+  classified **owned** (vs external) in the ownership logic (`rollout-ownership.ts:241,316`). Claude Code's
+  `/goal` is a *different* mechanism (a session-scoped **Stop hook** that blocks the agent from stopping until
+  a condition holds — a "keep working" loop), not a turn-attribution primitive, so it does not substitute.
+  Emulation splits in two: **(a) ownership** → already covered by the **`clientId` per-turn marker** (§4.3/§6):
+  QiYan stamps every turn it authors, so owned-vs-external is answered by the marker, not a goal — no goal
+  primitive needed. **(b) "keep pursuing" persistence** → QiYan drives turns (orchestrator owns the loop)
+  and/or the §5 `monitor`/`schedule_cron` tools; optionally a session-self-persistence Stop hook via
+  `--settings`. Resolve the persistence choice in Phase 1; the ownership half is already designed.
 - **steer — DIVERGES from Codex (no mid-turn steer):** Codex allows a steer message injected *while a turn
   runs*, incorporated at the next tool boundary (dispatcher `steer_submitting`). Claude `-p` has **no
   mid-turn steer**: fire-and-resume is atomic (one msg → one turn → exit), and even warm stream-json queues
