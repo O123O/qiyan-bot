@@ -134,9 +134,14 @@ tools any managed session (Codex or Claude) can call:
 
 - `schedule_wakeup(delay, prompt)` — one-shot timer.
 - `schedule_cron(spec, prompt)` — recurring timer.
-- `monitor(check, prompt, {interval?, timeout?})` — QiYan runs `check` on the session's endpoint on an
-  interval; on trigger it fires. Same shape as Claude's native Monitor, but **QiYan** evaluates it — this
-  replaces warm mode.
+- `monitor(check, prompt, {interval?, timeout?})` — `check` is a **shell command** (a stateless predicate)
+  that QiYan runs **on the session's endpoint** (the worker host — local or SSH, reusing that command channel,
+  with the worker's own permissions) every `interval`; **exit code 0 = condition met → fire** (resume with
+  `prompt`), non-zero = keep polling, bounded by `timeout`. Note the difference from native Monitor: native
+  takes a *blocking until-loop* command run by a live process; QiYan takes just the **predicate**, polled — so
+  it's durable (survives the session process exiting and a QiYan restart). Constraints: `check` must be
+  side-effect-free (run repeatedly); floor the `interval` (e.g. ~10–30s) so polling doesn't hammer the
+  endpoint. This replaces warm mode.
 - `list_schedules()` — list this session's pending wakeups/crons/monitors (unified across all three types;
   ↔ native `CronList` but not cron-only).
 - `cancel_schedule(id)` — cancel any pending wakeup/cron/monitor by id (↔ native `CronDelete`, all types).
