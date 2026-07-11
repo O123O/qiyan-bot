@@ -114,6 +114,7 @@ import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
 import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
 import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
 import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
+import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
@@ -2243,6 +2244,7 @@ export async function buildProductionApp(
             appendSystemPrompt: config.claudeCode.appendSystemPrompt,
             ...(config.claudeCode.model === undefined ? {} : { model: config.claudeCode.model }),
           },
+          goals: new ClaudeGoalStore(db),
         });
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
