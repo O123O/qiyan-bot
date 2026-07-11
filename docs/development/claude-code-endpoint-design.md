@@ -70,17 +70,22 @@ speaks Codex's request surface (§4.3) — not a drop-in.
   primitive needed. **(b) "keep pursuing" persistence** → QiYan drives turns (orchestrator owns the loop)
   and/or the §5 `monitor`/`schedule_cron` tools; optionally a session-self-persistence Stop hook via
   `--settings`. Resolve the persistence choice in Phase 1; the ownership half is already designed.
-- **steer — DIVERGES from Codex (adapter must emulate `turn/steer`):** there is no separate steer tool —
-  `send_to_session(…, mode: "auto"|"start"|"steer")` (`service.ts:35`) makes QiYan **pick the mode and call a
-  distinct Codex method**: `turn/start` (new turn) or **`turn/steer`** (`service.ts:58`, inject into the
-  running turn; Codex does the in-turn queueing). For Claude, `turn/start` → `claude -p --resume` works, but
-  **`turn/steer` has no native equivalent** (Claude `-p` is atomic; warm stream-json queues for the *next*
-  turn and offers only a hard interrupt, not a soft steer). So the **adapter implements `turn/steer` as
-  turn-boundary queueing** — finish the current subprocess, then start the queued message as the next turn —
-  with **interrupt (kill subprocess) + resume** as the abort escape hatch (transcript up to the abort
-  survives). Under fire-and-resume a Claude session is only "mid-turn" while QiYan awaits the subprocess, so
-  `mode:"auto"` resolves to start (idle) or queue-for-next. Confirm stream-json queue-vs-interrupt in the
-  spike.
+- **steer — DIVERGES from Codex; emulate `turn/steer` as a durable QiYan-side queue (never abort):** there is
+  no separate steer tool — `send_to_session(…, mode: "auto"|"start"|"steer")` (`service.ts:35`) makes QiYan
+  **pick the mode and call a distinct Codex method**: `turn/start` (new turn) or **`turn/steer`**
+  (`service.ts:58`, inject into the running turn; Codex holds/queues it natively). For Claude, `turn/start` →
+  `claude -p --resume` works, but **`turn/steer` has no native equivalent** and Claude has **no knowledge of a
+  pending steer** — so **QiYan owns and persists the queue** (with Codex the app-server holds it; with Claude
+  it moves into QiYan). Model:
+  - Steer while the subprocess is running → QiYan **stores the message in a durable per-session queue**;
+    **do NOT touch the running subprocess** (no abort).
+  - On `turn/completed`, QiYan **drains the queue FIFO**, driving each as the next turn (`turn/start`).
+    **Single-delivery + survives QiYan restart** (a crash mid-turn must neither lose nor double-send it).
+  - **No interrupt in the steer path.** Deliberate stopping stays a *separate* explicit action
+    (`interrupt_session` → kill subprocess), never a side effect of steering.
+  This reuses the §5 "drive a turn with a stored message" durable mechanism — steer is just triggered by
+  turn-completion instead of a timer/condition. Under fire-and-resume a Claude session is only "mid-turn"
+  while QiYan awaits the subprocess, so `mode:"auto"` resolves to start (idle) or enqueue-for-next.
 
 ### 4.2 Event translation
 
