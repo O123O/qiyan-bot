@@ -16,6 +16,7 @@ import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
 import { encodeClaudeClientMarker } from "../sessions/claude-transcript.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
+import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
@@ -37,6 +38,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     id: string;
     runner: ClaudeCommandRunner;
     launchFlags: ClaudeLaunchFlags;
+    goals?: ClaudeGoalStore;
+    now?: () => number;
   }) {
     this.id = options.id;
     this.emitter.setMaxListeners(100);
@@ -93,7 +96,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
       case "thread/name/set": return {} as T;
       case "model/list": return { models: this.options.launchFlags.model ? [{ id: this.options.launchFlags.model }] : [] } as T;
-      // turn/steer (Claude enqueue) is Phase 2.3; thread/goal/* is Phase 1.5.
+      case "thread/goal/get": return { goal: this.goals().get(this.id, requireString(args.threadId, "threadId")) } as T;
+      case "thread/goal/set": return this.goalSet(args) as T;
+      case "thread/goal/clear": { this.goals().clear(this.id, requireString(args.threadId, "threadId")); return { goal: null } as T; }
+      // turn/steer (Claude enqueue) is Phase 2.3.
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
   }
@@ -187,6 +193,27 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
 
     return { turn: { id: clientId, status: "inProgress" } };
+  }
+
+  private goals(): ClaudeGoalStore {
+    if (!this.options.goals) throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no goal store configured");
+    return this.options.goals;
+  }
+
+  // thread/goal/set carries either a fresh objective (set) or a status-only change
+  // (pause/resume/blocked/complete), mirroring the Codex goal RPC the service calls.
+  private goalSet(params: Record<string, unknown>): { goal: unknown } {
+    const threadId = requireString(params.threadId, "threadId");
+    const now = this.options.now?.() ?? Date.now();
+    if (typeof params.objective === "string" && params.objective.length > 0) {
+      return { goal: this.goals().set(this.id, threadId, {
+        objective: params.objective,
+        ...(typeof params.status === "string" ? { status: params.status } : {}),
+        ...(typeof params.tokenBudget === "number" ? { tokenBudget: params.tokenBudget } : {}),
+      }, now) };
+    }
+    if (typeof params.status === "string") return { goal: this.goals().setStatus(this.id, threadId, params.status, now) };
+    throw new AppError("CONFIGURATION_ERROR", "thread/goal/set requires an objective or a status");
   }
 
   private turnInterrupt(params: Record<string, unknown>): Record<string, never> {

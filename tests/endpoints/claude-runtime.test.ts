@@ -9,6 +9,8 @@ import {
   type ClaudeTurnStatus,
 } from "../../src/endpoints/claude-command-runner.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
+import { ClaudeGoalStore } from "../../src/sessions/claude-goals.ts";
+import { createTestDatabase } from "../../src/storage/database.ts";
 
 // A fake runner that simulates the transcript `claude -p` writes. Realistic: the
 // turn-start user row is written when the turn begins, but the terminal assistant
@@ -135,6 +137,29 @@ test("a cold-started session (on disk, not in memory) is rehydrated from the tra
   assert.equal(read.thread.turns.length, 1);
   assert.equal(read.thread.turns[0].id, "ctx:c1");
   assert.equal(read.thread.turns[0].status, "completed");
+});
+
+test("thread/goal get/set/status/clear are emulated via the goal store", async () => {
+  const goals = new ClaudeGoalStore(createTestDatabase());
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner: new FakeRunner(), launchFlags: {}, goals, now: () => 1 });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: thread.id }), { goal: null });
+  const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: thread.id, objective: "finish phase 2", status: "active" });
+  assert.equal(set.goal.objective, "finish phase 2");
+  assert.equal(set.goal.status, "active");
+
+  const paused = await rt.request<{ goal: any }>("thread/goal/set", { threadId: thread.id, status: "paused" });
+  assert.equal(paused.goal.status, "paused");
+
+  assert.deepEqual(await rt.request("thread/goal/clear", { threadId: thread.id }), { goal: null });
+});
+
+test("goal ops on a runtime with no goal store fail loud, not silently", async () => {
+  const rt = makeRuntime(new FakeRunner()); // no goals configured
+  await rt.start();
+  await assert.rejects(rt.request("thread/goal/get", { threadId: "t" }), /goal store/u);
 });
 
 test("buildClaudeArgs emits stable, byte-identical flags", () => {

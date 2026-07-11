@@ -607,4 +607,17 @@ export const migrations: readonly Migration[] = [
         CHECK(goal_control_known IN (0, 1))`);
     }
   },
+  // Emulated goal state for Claude sessions (Phase 1.5). Codex persists goals inside
+  // its app-server; a headless Claude session has no native goal engine, so QiYan
+  // stores the objective/status/budget here and the thread/goal/* handlers read it.
+  `
+  CREATE TABLE IF NOT EXISTS claude_session_goals (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL,
+    token_budget INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_id, thread_id)
+  );`,
 ];
