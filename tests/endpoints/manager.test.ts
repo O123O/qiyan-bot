@@ -731,3 +731,27 @@ test("a ready-only work lease never activates or reloads an unavailable endpoint
   assert.equal(value.reloads(), 0);
   assert.equal(value.remotes.size, 0);
 });
+
+test("a builtin (e.g. local Claude) endpoint resolves through leased mutations without the catalog", async () => {
+  const local = new FakeEndpoint("local");
+  const claude = new FakeEndpoint("claude-local");
+  let requiredCatalog = false;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    builtinEndpoints: [claude],
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => { requiredCatalog = true; throw new AppError("ENDPOINT_UNAVAILABLE", `unknown endpoint: ${id}`); },
+    },
+    createRemote: async () => { throw new Error("builtin must not go through createRemote"); },
+    hasIdentityReferences: () => false,
+    managedThreadIds: () => [],
+  });
+
+  // The leased session-mutation path (create/send/set_goal all use this) must resolve
+  // the Claude endpoint instead of throwing "unknown endpoint" via catalog.require.
+  const resolved = await manager.withWorkLease("claude-local", "session-mutation", async (endpoint) => endpoint);
+  assert.equal(resolved, claude);
+  assert.equal(claude.starts >= 1, true);
+  assert.equal(requiredCatalog, false); // never consulted the ssh catalog for a builtin
+});

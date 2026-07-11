@@ -2257,6 +2257,7 @@ export async function buildProductionApp(
         });
         endpointManager = new EndpointManager({
           localEndpoint: endpoint,
+          ...(claudeEndpoint ? { builtinEndpoints: [claudeEndpoint] } : {}),
           catalog: endpointCatalog,
           createRemote: async (definition) => {
             const generation = await planner.createGeneration(definition.id);
@@ -2283,9 +2284,10 @@ export async function buildProductionApp(
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
-          // The Claude endpoint is eager + always-ready (no daemon / no ssh work
-          // lease), so it runs the callback directly like assistant-local.
-          workLeaseProvider: (id, lease, run) => (id === assistantEndpoint.id || id === claudeEndpoint?.id) ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
+          // The Claude endpoint is a manager built-in (like "local"), so it goes
+          // through the manager's ready-work-lease; only assistant-local (not
+          // manager-registered) runs the callback directly.
+          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
         });
         recoveredEndpointIds = new EndpointCapacityRecovery({
           runtime,

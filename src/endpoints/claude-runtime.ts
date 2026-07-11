@@ -205,14 +205,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private goalSet(params: Record<string, unknown>): { goal: unknown } {
     const threadId = requireString(params.threadId, "threadId");
     const now = this.options.now?.() ?? Date.now();
+    const status = typeof params.status === "string" ? requireGoalStatus(params.status) : undefined;
     if (typeof params.objective === "string" && params.objective.length > 0) {
       return { goal: this.goals().set(this.id, threadId, {
         objective: params.objective,
-        ...(typeof params.status === "string" ? { status: params.status } : {}),
+        ...(status === undefined ? {} : { status }),
         ...(typeof params.tokenBudget === "number" ? { tokenBudget: params.tokenBudget } : {}),
       }, now) };
     }
-    if (typeof params.status === "string") return { goal: this.goals().setStatus(this.id, threadId, params.status, now) };
+    if (status !== undefined) return { goal: this.goals().setStatus(this.id, threadId, status, now) };
     throw new AppError("CONFIGURATION_ERROR", "thread/goal/set requires an objective or a status");
   }
 
@@ -229,6 +230,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 function requireString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0) throw new AppError("CONFIGURATION_ERROR", `claude endpoint: missing ${field}`);
   return value;
+}
+
+// The goal statuses QiYan's recovery/dashboard accept (production-app parseManagedGoal);
+// reject anything else at write time rather than letting recovery throw later.
+const CLAUDE_GOAL_STATUSES = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+function requireGoalStatus(status: string): string {
+  if (!CLAUDE_GOAL_STATUSES.has(status)) throw new AppError("CONFIGURATION_ERROR", `invalid goal status: ${status}`);
+  return status;
 }
 
 // Concatenate the text of the Codex-shaped input items; non-text items (files) are

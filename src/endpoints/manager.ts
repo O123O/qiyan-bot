@@ -37,10 +37,16 @@ interface EndpointRecord {
 export class EndpointManager {
   private readonly records = new Map<string, EndpointRecord>();
   private readonly endpointListeners = new Set<(endpoint: ManagedAppServerEndpoint, generation: number) => void>();
+  // Eager, always-ready endpoints resolved directly (no catalog, no daemon): "local"
+  // plus any extra built-ins (e.g. a local Claude endpoint). Registering them here is
+  // what lets leased mutations (withWorkLease → ensureReady → prepareCandidate)
+  // resolve them, instead of falling through to catalog.require and throwing.
+  private readonly builtins = new Map<string, ManagedAppServerEndpoint>();
   private closing = false;
 
   constructor(private readonly options: {
     localEndpoint: ManagedAppServerEndpoint;
+    builtinEndpoints?: readonly ManagedAppServerEndpoint[];
     catalog: CatalogReader;
     createRemote(definition: SshEndpointDefinition, hasReferences: boolean): Promise<ActivationCandidate>;
     hasIdentityReferences(endpointId: string): boolean | Promise<boolean>;
@@ -48,7 +54,9 @@ export class EndpointManager {
     managedThreadIds(endpointId: string): readonly string[] | Promise<readonly string[]>;
     schedule?(delayMs: number, run: () => void): ScheduledWork;
   }) {
-    this.records.set("local", this.newRecord("local", options.localEndpoint));
+    this.builtins.set("local", options.localEndpoint);
+    for (const endpoint of options.builtinEndpoints ?? []) this.builtins.set(endpoint.id, endpoint);
+    for (const [id, endpoint] of this.builtins) this.records.set(id, this.newRecord(id, endpoint));
   }
 
   normalize(id?: string): string { return id ?? "local"; }
@@ -405,7 +413,8 @@ export class EndpointManager {
   }
 
   private async prepareCandidate(endpointId: string): Promise<ActivationCandidate> {
-    if (endpointId === "local") return { endpoint: this.options.localEndpoint };
+    const builtin = this.builtins.get(endpointId);
+    if (builtin) return { endpoint: builtin };
     await this.options.catalog.reload();
     const definition = this.options.catalog.require(endpointId);
     return this.options.createRemote(definition, await this.options.hasIdentityReferences(endpointId));
