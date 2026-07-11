@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { AppError } from "../core/errors.ts";
 import type { Database } from "../storage/database.ts";
 import { ScheduleStore, type ScheduleRow } from "./schedule-store.ts";
 import { ScheduledSendOutbox } from "./send-outbox.ts";
@@ -41,6 +42,9 @@ export class SchedulingService {
       now: deps.now,
       fire: (row, key) => this.fire(row, key),
       runCheck: deps.runCheck,
+      // Above pool.startTurn's ~30s reconciliation budget, so a slow-but-live send
+      // isn't spuriously orphaned by the engine's op timeout.
+      opTimeoutMs: 120_000,
       ...(deps.pollIntervalMs === undefined ? {} : { pollIntervalMs: deps.pollIntervalMs }),
     });
   }
@@ -58,16 +62,31 @@ export class SchedulingService {
     await this.server.stop();
   }
 
-  // Idempotent fire: claim in the outbox (unique-constraint insert — at most once
-  // across instances), then send; release on failure so the engine re-fires.
+  // Drive one engine pass (tests / manual flush).
+  runDueOnce(): Promise<void> { return this.engine.tick(); }
+
+  // Idempotent fire. The outbox is the sole dedup ledger, so it must NOT drop the
+  // record on an ambiguous outcome (that would let a re-fire double-deliver on the
+  // shared-NFS deployment). Rules:
+  //   - claimed  → send. On success mark sent (advance). On a PROVEN-not-dispatched
+  //     error release + throw (re-fire cleanly). On any AMBIGUOUS error mark sent
+  //     anyway (the turn may have run — bias to no-double) and advance.
+  //   - delivered → someone already sent it; advance.
+  //   - in-flight → a live/crashed peer holds the claim; THROW so the schedule stays
+  //     armed (never advance) until it is proven sent or the claim goes stale and is
+  //     reclaimed. This closes the orphaned-send / lost-delivery hole.
   private async fire(row: ScheduleRow, singleFireKey: string): Promise<void> {
-    if (this.outbox.claim(singleFireKey, row.nickname, row.message, this.deps.now()) !== "claimed") return;
+    const outcome = this.outbox.claim(singleFireKey, row.nickname, row.message, this.deps.now());
+    if (outcome === "delivered") return;
+    if (outcome === "in-flight") throw new AppError("OPERATION_UNCERTAIN", `schedule send in-flight: ${singleFireKey}`);
     try {
       await this.deps.send(row.nickname, row.message, singleFireKey);
       this.outbox.markSent(singleFireKey);
     } catch (error) {
-      this.outbox.release(singleFireKey);
-      throw error;
+      if (isProvenNotDispatched(error)) { this.outbox.release(singleFireKey); throw error; }
+      // Ambiguous: the turn may already be running/done. Do NOT re-send (avoid the
+      // duplicate-delivery class this deployment is sensitive to); accept it.
+      this.outbox.markSent(singleFireKey);
     }
   }
 
@@ -94,4 +113,15 @@ export class SchedulingService {
     }), { mode: 0o600 });
     return path;
   }
+}
+
+// Errors that PROVE the turn never dispatched — safe to release + re-fire. Anything
+// else (uncertain / failed) is treated as maybe-delivered to avoid double-sending.
+const PROVEN_NOT_DISPATCHED = new Set([
+  "SESSION_BUSY", "SESSION_DETACHED", "SESSION_IDLE", "UNKNOWN_SESSION", "AMBIGUOUS_SESSION",
+  "THREAD_NOT_FOUND", "ENDPOINT_UNAVAILABLE", "ENDPOINT_IDENTITY_CHANGED", "CWD_MISMATCH",
+  "CONFIGURATION_ERROR", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED", "UNSUPPORTED_CAPABILITY",
+]);
+function isProvenNotDispatched(error: unknown): boolean {
+  return error instanceof AppError && PROVEN_NOT_DISPATCHED.has(error.code);
 }

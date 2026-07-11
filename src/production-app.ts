@@ -119,11 +119,14 @@ import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
 import { SchedulingService } from "./scheduling/scheduling-service.ts";
 import type { ScheduleRow } from "./scheduling/schedule-store.ts";
 
-// Runs a monitor schedule's shell predicate on the local host; true iff exit 0.
-// (Remote-session monitors will run over ssh once the remote runner lands.)
+// Runs a monitor schedule's shell predicate on the QiYan host; true iff exit 0. Only
+// wired for LOCAL Claude sessions (host == QiYan host), so this is not a cross-host
+// escalation. When a REMOTE worker endpoint is added, its monitors MUST run over that
+// session's ssh channel, not here — gate on endpoint locality before that ships.
+// `bash -c` (not -l) so it does not source the operator's login profile.
 function runMonitorCheck(command: string, timeoutMs = 20_000): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-lc", command], { stdio: "ignore" });
+    const child = spawn("bash", ["-c", command], { stdio: "ignore" });
     const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } resolve(false); }, timeoutMs);
     timer.unref?.();
     child.once("error", () => { clearTimeout(timer); resolve(false); });
