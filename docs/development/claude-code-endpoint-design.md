@@ -172,8 +172,14 @@ Claude session is launched so it *cannot* reach the process-bound native schedul
 - `--mcp-config <qiyan-mcp.json>` (+ `--strict-mcp-config`) — provides the `qiyan_*` scheduling/monitor tools.
 - `--append-system-prompt "…scheduling/reminders/watching MUST use the qiyan_* MCP tools; the built-in
   Monitor/ScheduleWakeup/cron tools are disabled…"` — so the model reaches for the right ones and knows why.
-Disable + guide together; do not rely on the prompt alone. (Codex sessions get the same MCP tools; Codex has
-no native scheduler to disable.)
+Disable + guide together — **the prompt redirect is REQUIRED, not optional** (tested 2026-07-11): the "when to
+use" guidance lives in the tool *descriptions*, so `--disallowedTools` removes the native scheduler tools
+cleanly (verified: init tool list had zero scheduling tools). **But skills ≠ tools** — the `/loop` skill
+survives the tool disable and the model still finds it (plus adjacent workarounds: background `Bash`, `Task*`,
+hooks). So the `--append-system-prompt` must explicitly forbid the survivors: *"do not use the /loop skill,
+background Bash tasks, or hooks for scheduling/reminders/watching — use ONLY the qiyan_* MCP tools."* Also
+investigate per-skill disabling of `/loop` in the spike. (Codex sessions get the same MCP tools; Codex has no
+native scheduler to disable.)
 
 **Launch flags must be stable per session (a caching requirement, tested).** `--append-system-prompt` is a
 *per-invocation* parameter — it is not stored in the session/transcript, so it must be re-passed on **every**
@@ -218,11 +224,13 @@ in Phase 0 that the model genuinely cannot invoke each named native tool.
 - **Phase 0 — Spike (before any abstraction).** Drive one session end-to-end from a script: start → capture
   `session_id` → follow-up via `--resume` → stream response → confirm context retained. A/B the SDK vs
   headless. Confirm A1/A2 (auth, `~/.claude` inheritance) and inspect a real transcript for the §6 per-turn
-  user-message marker. Also assert the native schedulers are genuinely disabled — spawn a session with
-  `--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"` and confirm the model **cannot
-  invoke** each (a mismatched name silently no-ops the flag). **Verify:** two turns, second has first-turn
-  context; SDK-vs-headless decided; transcript schema documented; auth confirmed; native scheduler tools
-  provably uninvokable.
+  user-message marker. Also assert the native schedulers are genuinely neutralized — spawn a session with
+  `--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"` + the redirect prompt and confirm
+  the model (a) **cannot invoke** each tool (a mismatched name silently no-ops the flag) **and** (b) has **no
+  residual scheduling path** — asked "can you schedule?", it points to the `qiyan_*` MCP tools and does **not**
+  reach for the surviving `/loop` skill or background-task/hook workarounds. **Verify:** two turns, second has
+  first-turn context; SDK-vs-headless decided; transcript schema documented; auth confirmed; native scheduling
+  provably neutralized (tools uninvokable AND no residual skill/workaround path).
 - **Phase 1 — Codex-protocol `ClaudeCodeRuntime` (§4.3) + event translator + transcript scanner (§6) + goal
   decision (§4.1).** **Verify:** an integration test drives a real/faked session through the adapter: start →
   turn → `turn/completed` synthesized → delivery; a resumed turn carries context; the new scanner lets the
