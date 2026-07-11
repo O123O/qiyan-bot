@@ -189,7 +189,9 @@ export class SessionLifecycle {
       let native: ThreadResponse | undefined;
       try { native = await this.read(session.endpoint, session.thread_id, lease); }
       catch (error) {
-        if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
+        // A never-loaded thread OR a never-materialized one (no rollout, e.g. a Claude
+        // session created but never driven) has nothing to unsubscribe — just remove it.
+        if (!isExactThreadNotLoaded(error, session.thread_id) && !isExactThreadNoRollout(error, session.thread_id)) throw error;
       }
       if (native) this.requireThreadIdentity(native.thread, session.thread_id);
       const alreadyUnsubscribed = native === undefined || native.thread.status.type === "notLoaded";
@@ -215,13 +217,19 @@ export class SessionLifecycle {
     const expected = this.requireManaged(nickname);
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
-      const native = await this.read(session.endpoint, session.thread_id, lease);
-      this.requireIdle(native.thread);
+      // A never-materialized thread (no durable rollout) has nothing to read, verify, or
+      // natively archive — dropping the dangling registry entry is the whole operation. A
+      // Claude session created but never driven a turn is the case this hits (Codex
+      // materializes its rollout at create).
+      let native: ThreadResponse | undefined;
+      try { native = await this.read(session.endpoint, session.thread_id, lease); }
+      catch (error) { if (!isExactThreadNoRollout(error, session.thread_id)) throw error; }
+      if (native) this.requireIdle(native.thread);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transition_intent"));
       await this.registry.transition(nickname, session, "archiving");
-      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archiving", native.thread.status.type);
+      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archiving", native?.thread.status.type ?? "notLoaded");
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transitioned"));
-      await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id }, undefined, lease);
+      if (native) await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id }, undefined, lease);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "native_archived"));
       this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
       if (!await this.registry.removeIfMatch(nickname, session)) {
@@ -430,7 +438,9 @@ export class SessionLifecycle {
           this.requireThreadIdentity(native.thread, current.thread_id);
           alreadyUnsubscribed = native.thread.status.type === "notLoaded";
         } catch (error) {
-          if (!isExactThreadNotLoaded(error, current.thread_id)) throw error;
+          // Tolerate a thread that was never loaded or never materialized (no rollout):
+          // there is nothing to unsubscribe, so treat it as already absent and remove it.
+          if (!isExactThreadNotLoaded(error, current.thread_id) && !isExactThreadNoRollout(error, current.thread_id)) throw error;
           alreadyUnsubscribed = true;
         }
         if (!alreadyUnsubscribed) {

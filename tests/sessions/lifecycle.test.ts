@@ -1166,6 +1166,33 @@ test("archive is idle-only, invokes native archive, removes the mapping, and nev
   assert.equal(endpoint.calls.some((call) => call.method === "thread/delete"), false);
 });
 
+test("archive clears a never-materialized (no rollout) thread without a native archive", async () => {
+  // A Claude session created but never driven a turn has no transcript; thread/read throws
+  // "no rollout found". Archive must still drop the dangling registry entry (previously it
+  // threw at the read, leaving the session unarchivable — "durable removal not committed").
+  const { registry, endpoint, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  endpoint.status = "idle";
+  endpoint.calls.length = 0;
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1"));
+  const checkpoints: string[] = [];
+  await lifecycle.archive("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_archived", "removed"]);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), false);
+});
+
+test("unadopt clears a never-materialized (no rollout) thread without unsubscribing", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  endpoint.status = "idle";
+  endpoint.calls.length = 0;
+  endpoint.readErrors.push(new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1"));
+  await lifecycle.unadopt("payments");
+  assert.equal(registry.get("payments"), undefined);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false);
+});
+
 test("removal reconciliation accepts exact absence only for unadoption", async () => {
   const unadopting = await fixture();
   await unadopting.registry.createManaged("payments", {
