@@ -111,6 +111,9 @@ import {
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
+import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
+import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
+import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
@@ -1791,6 +1794,7 @@ export async function buildProductionApp(
   let finals!: FinalMessageStore;
   let endpoint!: ManagedAppServerEndpoint;
   let assistantEndpoint!: ManagedAppServerEndpoint;
+  let claudeEndpoint: ClaudeCodeRuntime | undefined;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;
@@ -2228,6 +2232,18 @@ export async function buildProductionApp(
           }),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
+        // Opt-in local Claude Code endpoint (Phase 1.4). Eager + always-ready like
+        // "local" (no daemon); absent config.claudeCode it is never constructed and
+        // the composition is unchanged.
+        claudeEndpoint = config.claudeCode === undefined ? undefined : new ClaudeCodeRuntime({
+          id: config.claudeCode.endpointId,
+          runner: new LocalClaudeCommandRunner({ command: config.claudeCode.command }),
+          launchFlags: {
+            disallowedTools: config.claudeCode.disallowedTools,
+            appendSystemPrompt: config.claudeCode.appendSystemPrompt,
+            ...(config.claudeCode.model === undefined ? {} : { model: config.claudeCode.model }),
+          },
+        });
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
@@ -2262,10 +2278,12 @@ export async function buildProductionApp(
           commitBinding: (binding, references) => endpointBindings.commitAfterActivation(binding.endpointId, binding.destination, references),
           managedThreadIds: (id) => Object.values(registry.snapshot().sessions).filter((session) => session.endpoint === id).map((session) => session.thread_id),
         });
-        pool = new AppServerPool([endpoint, assistantEndpoint], {
+        pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
-          workLeaseProvider: (id, lease, run) => id === assistantEndpoint.id ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
+          // The Claude endpoint is eager + always-ready (no daemon / no ssh work
+          // lease), so it runs the callback directly like assistant-local.
+          workLeaseProvider: (id, lease, run) => (id === assistantEndpoint.id || id === claudeEndpoint?.id) ? run(lease) : endpointManager.runWithReadyWorkLease(id, lease, run),
         });
         recoveredEndpointIds = new EndpointCapacityRecovery({
           runtime,
@@ -2313,12 +2331,18 @@ export async function buildProductionApp(
         }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
+        const claudeEndpointId = config.claudeCode?.endpointId;
         const rolloutAccess = new RolloutAccessRouter({
           remote: (id) => {
             const context = remoteContexts.get(id);
             return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath } : undefined;
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
+          // Provider dispatch: the Claude endpoint uses the transcript scanner; it is
+          // a local endpoint (its scans must not route to the ssh helper).
+          provider: (id) => id === claudeEndpointId ? "claude" : "codex",
+          local: (id) => id === "local" || id === claudeEndpointId,
+          scanLocalClaude: scanLocalClaudeTranscript,
         });
         ownership = new SessionOwnershipGuard(
           db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),

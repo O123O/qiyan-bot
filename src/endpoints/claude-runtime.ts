@@ -117,12 +117,21 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 
   private async threadRead(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
-    return { thread: await this.reconstruct(threadId) };
+    return { thread: await this.withPath(threadId, await this.reconstruct(threadId)) };
   }
 
   private async threadResume(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
-    return { thread: await this.reconstruct(threadId) };
+    return { thread: await this.withPath(threadId, await this.reconstruct(threadId)) };
+  }
+
+  // Attach the transcript path so the ownership path-resolver (which reads
+  // thread.path from thread/read) can materialize a Claude session. Undefined
+  // before the first turn — same "pending" outcome as an unmaterialized Codex thread.
+  private async withPath(threadId: string, view: ClaudeThreadView): Promise<ClaudeThreadView> {
+    const state = this.threads.get(threadId);
+    const path = await this.options.runner.transcriptPath(threadId, state?.cwd ?? "");
+    return path === undefined ? view : { ...view, path };
   }
 
   private async reconstruct(threadId: string): Promise<ClaudeThreadView> {

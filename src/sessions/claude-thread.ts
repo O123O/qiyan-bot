@@ -42,6 +42,7 @@ export interface ClaudeThreadView {
   turns: ClaudeThreadTurn[];
   threadSource?: string;
   model?: string;
+  path?: string;
 }
 
 export interface ReconstructClaudeThreadParams {

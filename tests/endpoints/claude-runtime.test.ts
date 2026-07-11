@@ -41,6 +41,7 @@ class FakeRunner implements ClaudeCommandRunner {
     entry.settle(status);
   }
   async readTranscript(threadId: string) { return this.transcripts.get(threadId) ?? []; }
+  async transcriptPath(threadId: string) { return this.transcripts.has(threadId) ? `/fake/${threadId}.jsonl` : undefined; }
 }
 
 function makeRuntime(runner: ClaudeCommandRunner) {

@@ -36,6 +36,9 @@ export interface ClaudeCommandRunner {
   startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle;
   // Returns the parsed transcript records for a session, or [] if none exists yet.
   readTranscript(threadId: string, cwd: string): Promise<unknown[]>;
+  // The transcript file path (used as the ownership "rollout path"), or undefined
+  // before the session is materialized.
+  transcriptPath(threadId: string, cwd: string): Promise<string | undefined>;
 }
 
 // Builds the stable, deterministic `claude -p` argv for a turn. Exported for tests
@@ -97,8 +100,8 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
     return { done, interrupt: () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } } };
   }
 
-  async readTranscript(threadId: string, _cwd: string): Promise<unknown[]> {
-    const path = await this.transcriptPath(threadId);
+  async readTranscript(threadId: string, cwd: string): Promise<unknown[]> {
+    const path = await this.transcriptPath(threadId, cwd);
     if (!path) return [];
     let text: string;
     try { text = await readFile(path, "utf8"); }
@@ -115,7 +118,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
 
   // A session's transcript is `<home>/.claude/projects/<cwd-hash>/<threadId>.jsonl`.
   // Rather than reproduce Claude's cwd-hashing, find the file by its unique session id.
-  private async transcriptPath(threadId: string): Promise<string | undefined> {
+  async transcriptPath(threadId: string, _cwd?: string): Promise<string | undefined> {
     const cached = this.pathCache.get(threadId);
     if (cached) return cached;
     const projects = join(this.options.home ?? homedir(), ".claude", "projects");

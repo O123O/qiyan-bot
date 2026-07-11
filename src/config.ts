@@ -17,6 +17,11 @@ const configValueSchema = z.object({
   DATA_DIR: z.string().min(1).optional(),
   SESSION_REGISTRY_PATH: z.string().min(1).optional(),
   CODEX_BINARY: z.string().default("codex"),
+  // Opt-in local Claude Code endpoint (Phase 1.4). Absent CLAUDE_CODE_ENDPOINT_ID,
+  // no Claude endpoint is constructed and behavior is unchanged.
+  CLAUDE_CODE_ENDPOINT_ID: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).refine((v) => v !== "local" && v !== "assistant-local", "reserved endpoint id").optional(),
+  CLAUDE_BINARY: z.string().default("claude"),
+  CLAUDE_CODE_MODEL: z.string().min(1).optional(),
   MAX_CONCURRENT_TURNS: positiveInt.default(4),
   MAX_COLLECT_COUNT: positiveInt.max(100).default(20),
   MCP_HOST: z.literal("127.0.0.1").default("127.0.0.1"),
@@ -66,9 +71,24 @@ export interface ChatConfig {
   weixin?: { configured: true };
 }
 
+// Fixed enforcement defaults for a managed Claude session (design §5): the native
+// schedulers are disabled and the model is redirected to QiYan's tools.
+export const CLAUDE_DISABLED_TOOLS = ["Monitor", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete"] as const;
+export const CLAUDE_REDIRECT_PROMPT =
+  "You have NO built-in scheduling ability. For any scheduled, recurring, or condition-watching work you MUST use the QiYan MCP tools (schedule_wakeup, schedule_cron, monitor). Never use built-in Monitor/ScheduleWakeup/cron tools, the /loop skill, background tasks, or hooks.";
+
+export interface ClaudeCodeConfig {
+  endpointId: string;
+  command: string;
+  model?: string;
+  disallowedTools: readonly string[];
+  appendSystemPrompt: string;
+}
+
 export interface BotConfig {
   qiyanHome: string;
   chat: ChatConfig;
+  claudeCode?: ClaudeCodeConfig;
   userHome: string;
   assistantWorkdir: string;
   dataDir: string;
@@ -132,6 +152,15 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     dataDir,
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
     endpointCatalogPath: resolve(join(defaultRoot, "endpoints.json")),
+    ...(parsed.CLAUDE_CODE_ENDPOINT_ID === undefined ? {} : {
+      claudeCode: {
+        endpointId: parsed.CLAUDE_CODE_ENDPOINT_ID,
+        command: parsed.CLAUDE_BINARY,
+        disallowedTools: CLAUDE_DISABLED_TOOLS,
+        appendSystemPrompt: CLAUDE_REDIRECT_PROMPT,
+        ...(parsed.CLAUDE_CODE_MODEL === undefined ? {} : { model: parsed.CLAUDE_CODE_MODEL }),
+      } satisfies ClaudeCodeConfig,
+    }),
     codexBinary: parsed.CODEX_BINARY,
     maxConcurrentTurns: parsed.MAX_CONCURRENT_TURNS,
     maxCollectCount: parsed.MAX_COLLECT_COUNT,
