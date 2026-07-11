@@ -79,6 +79,20 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
   return [...baseArgs(plan, true), plan.alias, ...command];
 }
 
+// Runs a single opaque shell command string over the endpoint's existing ControlMaster
+// (established eagerly at bootstrap). Unlike buildSshRemoteArgs, the command is NOT
+// tokenized/validated per token — the caller (SshClaudeCommandRunner) builds it with
+// POSIX single-quoting, so it is one argv element handed to the remote login shell. A
+// newline inside those single quotes is a literal, so it is allowed (a multi-line
+// --append-system-prompt is valid); only a NUL, which cannot occur in an argv element,
+// is rejected. Uses baseArgs(plan,false): reuse the master, never establish one here.
+export function buildSshStreamArgs(plan: SshConnectionPlan, remoteCommand: string): string[] {
+  if (remoteCommand.length === 0 || remoteCommand.includes("\0")) {
+    throw new AppError("CONFIGURATION_ERROR", "unsafe SSH stream command");
+  }
+  return [...baseArgs(plan, false), plan.alias, remoteCommand];
+}
+
 export function buildSshStreamForwardArgs(plan: SshConnectionPlan, localSocket: string, remoteSocket: string): string[] {
   const forwarding = streamForwarding(localSocket, remoteSocket);
   return [

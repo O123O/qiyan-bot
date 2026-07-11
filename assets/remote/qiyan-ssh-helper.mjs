@@ -10,6 +10,9 @@ const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
+// QiYan's per-turn ownership marker in a Claude message body (see claude-transcript.ts).
+// Declared with the other top-level consts so it is initialized before the entry `try`.
+const CLAUDE_CLIENT_MARKER = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
 
@@ -27,6 +30,7 @@ try {
     case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
     case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
     case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
+    case "claude-rollout-scan": result = await scanClaudeTranscripts(decodeJson(encoded, 1)); break;
     case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
     default: throw new Error("unsupported helper operation");
   }
@@ -286,6 +290,195 @@ function publicRolloutStart(turn) {
     turnId: turn.turnId,
     ...(turn.clientId ? { clientId: turn.clientId } : {}),
     ...(turn.sawUserMessage ? { hasUserMessage: true } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// Claude transcript ownership scan — a FAITHFUL transliteration of
+// `scanLocalClaudeTranscript` (src/sessions/claude-transcript.ts). It reads a Claude
+// `<session_id>.jsonl` by byte offset, emitting ONLY per-turn ownership metadata (never
+// bodies). It diverges from the Codex parser above in four ways (all intentional, all
+// from the local scanner): turn model (user promptSource / assistant stop_reason, not
+// event_msg), turn-end = any non-tool_use stop_reason, the open turn always advances the
+// cursor (no rewind), and — the sole remote hardening not in the local scanner — a uid
+// check on the transcript file. Any change here MUST stay byte-identical to the local
+// scanner's RolloutScanResult (enforced by tests/endpoints/ssh-claude-scan.test.ts).
+
+async function scanClaudeTranscripts(value) {
+  if (!Array.isArray(value?.requests) || value.requests.length < 1 || value.requests.length > 128) throw new Error("invalid claude transcript scan request");
+  if (value.allowMissing !== undefined && value.allowMissing !== true) throw new Error("invalid claude transcript scan request");
+  if (value.collectFromStart !== undefined && value.collectFromStart !== true) throw new Error("invalid claude transcript scan request");
+  if (value.collectFromStart === true && value.allowMissing !== true) throw new Error("invalid claude transcript scan request");
+  const collectFromStart = value.collectFromStart === true;
+  return {
+    results: await Promise.all(value.requests.map((request) => value.allowMissing === true
+      ? scanClaudeTranscriptAllowMissing(request, collectFromStart)
+      : scanClaudeTranscript(request, collectFromStart))),
+  };
+}
+
+async function scanClaudeTranscriptAllowMissing(request, collectFromStart) {
+  try { return await scanClaudeTranscript(request, collectFromStart); }
+  catch (error) { if (error?.code === "ENOENT") return { missing: true }; throw error; }
+}
+
+async function scanClaudeTranscript(request, collectFromStart = false) {
+  for (let attempt = 1; ; attempt += 1) {
+    try { return await scanClaudeTranscriptSnapshot(request, collectFromStart); }
+    catch (error) {
+      // Shared sentinel with the Codex scan so the retry harness keys on it identically.
+      if (attempt >= 3 || error?.message !== "rollout appended while scanning") throw error;
+    }
+  }
+}
+
+async function scanClaudeTranscriptSnapshot(request, collectFromStart = false) {
+  const path = request?.path;
+  const threadId = request?.threadId;
+  const cursor = request?.cursor;
+  const name = typeof path === "string" ? basename(path) : "";
+  if (typeof path !== "string" || !isAbsolute(path) || typeof threadId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(threadId) || name !== `${threadId}.jsonl`) throw new Error("invalid claude transcript scan request");
+  if (cursor !== undefined && (cursor === null || typeof cursor !== "object" || !DECIMAL.test(cursor.device ?? "")
+    || !DECIMAL.test(cursor.inode ?? "") || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0)) throw new Error("invalid claude transcript cursor");
+  const offset = cursor?.offset ?? 0;
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const state = await file.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!state.isFile() || (uid !== undefined && state.uid !== BigInt(uid)) || state.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("invalid claude transcript file");
+    const device = state.dev.toString(10);
+    const inode = state.ino.toString(10);
+    if (cursor && (cursor.device !== device || cursor.inode !== inode)) throw new Error("claude transcript identity changed");
+    if (BigInt(offset) > state.size) throw new Error("claude transcript was truncated");
+    const parsed = await parseClaudeTranscriptFile(file, offset, Number(state.size), cursor !== undefined || collectFromStart);
+    const after = await file.stat({ bigint: true });
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("claude transcript identity changed");
+    if (after.size < state.size) throw new Error("claude transcript was truncated");
+    if (after.size > state.size) throw new Error("rollout appended while scanning");
+    if (after.mtimeNs !== state.mtimeNs) throw new Error("claude transcript changed while scanning");
+    return parsed.result({ device, inode, offset });
+  } finally { await file.close(); }
+}
+
+async function parseClaudeTranscriptFile(file, offset, size, collectStarts) {
+  const parser = createClaudeTranscriptParser(offset, collectStarts);
+  let position = offset;
+  let carry = Buffer.alloc(0);
+  let carryStart = offset;
+  while (position < size) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - position));
+    const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, position);
+    if (bytesRead === 0) throw new Error("claude transcript was truncated");
+    position += bytesRead;
+    const bytes = carry.byteLength === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
+    let lineStart = 0;
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      if (bytes[index] !== 0x0a) continue;
+      parser.consume(bytes.subarray(lineStart, index), carryStart + lineStart, carryStart + index + 1);
+      lineStart = index + 1;
+    }
+    carryStart += lineStart;
+    carry = Buffer.from(bytes.subarray(lineStart));
+    if (carry.byteLength > 64 * 1024 * 1024) throw new Error("claude transcript line exceeds the maximum size");
+  }
+  return parser;
+}
+
+function createClaudeTranscriptParser(baseOffset, collectStarts) {
+  const starts = [];
+  let current;
+  let parsedEnd = baseOffset;
+  let malformedOffset;
+  function report(turn) {
+    if (!collectStarts) return;
+    if (starts.length >= 1024) throw new Error("claude transcript scan contains too many turns");
+    starts.push(publicClaudeStart(turn));
+  }
+  function consume(raw, lineStart, lineEnd) {
+    parsedEnd = lineEnd;
+    if (raw.byteLength === 0) return;
+    let value;
+    try { value = JSON.parse(raw.toString("utf8")); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      // Every Claude turn carries a user message, so an already-observed turn is always
+      // reported across a malformed boundary (unlike Codex, which gates on sawUserMessage).
+      malformedOffset ??= lineStart;
+      if (current) report(current);
+      current = undefined;
+      return;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const type = value.type;
+    if (type === "user") {
+      // Only a non-empty promptSource marks a genuine turn start; a null-promptSource
+      // user row is a tool_result (mid-turn) and must NOT open a new turn.
+      const promptSource = value.promptSource;
+      if (typeof promptSource !== "string" || promptSource.length === 0) return;
+      const promptId = claudeTurnId(value);
+      if (!promptId) return;
+      if (current) report(current);
+      const clientId = extractClaudeClientMarker(value.message);
+      current = { turnId: clientId ?? promptId, hasUserMessage: true };
+      if (clientId) current.clientId = clientId;
+      return;
+    }
+    if (type === "assistant" && current && isClaudeTurnEnd(value)) {
+      report(current);
+      current = undefined;
+    }
+  }
+  function result(identity) {
+    // An open (interrupted) turn is a real observed turn: report it, surface it as
+    // openTurn, and ALWAYS advance the cursor past it (no rewind — mirrors the local scanner).
+    if (current) report(current);
+    const cursorOffset = malformedOffset === undefined ? parsedEnd : Math.min(parsedEnd, malformedOffset);
+    return {
+      cursor: { ...identity, offset: cursorOffset },
+      starts,
+      ...(current ? { openTurn: publicClaudeStart(current) } : {}),
+      ...(malformedOffset === undefined ? {} : { malformed: true }),
+    };
+  }
+  return { consume, result };
+}
+
+function claudeTurnId(record) {
+  if (typeof record.promptId === "string" && record.promptId.length > 0) return record.promptId;
+  if (typeof record.uuid === "string" && record.uuid.length > 0) return record.uuid;
+  return undefined;
+}
+
+// A turn continues only across a tool call (stop_reason "tool_use"); ANY other concrete
+// stop_reason terminates it. A null/absent stop_reason leaves the turn open.
+function isClaudeTurnEnd(record) {
+  const message = record.message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  const stopReason = message.stop_reason;
+  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use";
+}
+
+// Extracts ONLY QiYan's own clientId marker from the message content; the body is never returned.
+function extractClaudeClientMarker(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+  const content = message.content;
+  let text = "";
+  if (typeof content === "string") text = content;
+  else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && typeof block.text === "string") text += `${block.text}\n`;
+    }
+  }
+  const match = CLAUDE_CLIENT_MARKER.exec(text);
+  return match ? match[1] : undefined;
+}
+
+function publicClaudeStart(turn) {
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientId ? { clientId: turn.clientId } : {}),
+    ...(turn.hasUserMessage ? { hasUserMessage: true } : {}),
   };
 }
 

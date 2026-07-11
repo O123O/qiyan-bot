@@ -96,7 +96,8 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { attestUserControlMaster, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -113,7 +114,7 @@ import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
 import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
-import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
+import { LocalClaudeCommandRunner, type ClaudeLaunchFlags } from "./endpoints/claude-command-runner.ts";
 import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
 import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
 import { ClaudeGoalDriver } from "./sessions/claude-goal-driver.ts";
@@ -2294,14 +2295,17 @@ export async function buildProductionApp(
           hasPendingDrive: (session) => scheduling!.hasPendingGoalDrive(session),
           onStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
         }) : undefined;
+        // Launch policy (disallowed tools, system prompt, model) applies to Claude
+        // sessions regardless of host, so the local and remote endpoints share it.
+        const claudeLaunchFlags: ClaudeLaunchFlags = claudeCodeConfig === undefined ? {} : {
+          disallowedTools: claudeCodeConfig.disallowedTools,
+          appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
+          ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
+        };
         claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
           id: claudeCodeConfig.endpointId,
           runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),
-          launchFlags: {
-            disallowedTools: claudeCodeConfig.disallowedTools,
-            appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
-            ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
-          },
+          launchFlags: claudeLaunchFlags,
           ...(claudeGoals ? { goals: claudeGoals } : {}),
           ...(scheduling ? {
             workerMcpConfigPath: async (threadId: string) => {
@@ -2349,6 +2353,19 @@ export async function buildProductionApp(
           createRemote: async (definition) => {
             const generation = await planner.createGeneration(definition.id);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
+            if (definition.type === "claude-code") {
+              // A Claude endpoint has no app-server to lazily prepare, so bootstrap the
+              // helper eagerly here (installs it + establishes the ControlMaster) — the
+              // ownership scan / workspace ops need the installed helper immediately.
+              const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+              const claudeRemoteEndpoint = new ClaudeCodeRuntime({
+                id: definition.id,
+                runner: new SshClaudeCommandRunner({ plan: generation.plan }),
+                launchFlags: claudeLaunchFlags,
+              });
+              remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
+              return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
+            }
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
             const socketRoot = await prepareLocalSshEndpointSocketRoot(sshRuntimeRoot, definition.id);
             const remoteEndpoint = new ManagedAppServerEndpoint({

@@ -32,6 +32,14 @@ test("uses endpoint keys as SSH aliases and defaults the projects root", async (
   assert.throws(() => catalog.require("local"), /built-in endpoint/u);
 });
 
+test("recognizes a claude-code endpoint and preserves its type through require", async (t) => {
+  const root = await privateTemp(t);
+  const path = join(root, "endpoints.json");
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: { dfw: { type: "claude-code", projects_root: "/work" } } }), { mode: 0o600 });
+  const catalog = await EndpointCatalog.open(path);
+  assert.deepEqual(catalog.require("dfw"), { id: "dfw", type: "claude-code", projectsRoot: "/work" });
+});
+
 test("rejects unknown fields, unsafe roots, reserved aliases, broad modes, and symlinks", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
@@ -41,6 +49,8 @@ test("rejects unknown fields, unsafe roots, reserved aliases, broad modes, and s
     await assert.rejects(EndpointCatalog.open(path), pattern);
   };
   await invalid({ version: 1, endpoints: { devbox: { type: "ssh", extra: true } } }, /extra/u);
+  await invalid({ version: 1, endpoints: { devbox: { type: "docker" } } }, /devbox/u);
+  await invalid({ version: 1, endpoints: { devbox: { type: "claude-code", extra: true } } }, /extra/u);
   await invalid({ version: 1, endpoints: { devbox: { type: "ssh", projects_root: "relative" } } }, /projects_root/u);
   await invalid({ version: 1, endpoints: { local: { type: "ssh" } } }, /local/u);
   await rm(path, { force: true });

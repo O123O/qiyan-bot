@@ -75,14 +75,11 @@ export class RolloutAccessRouter implements RolloutAccess {
       : (this.options.scanLocal ?? scanLocalRollout);
   }
 
-  // The shipped `qiyan-ssh-helper.mjs` parses Codex rollout jsonl; a remote Claude
-  // transcript needs a Claude-aware helper (or raw-bytes-back-then-parse-locally).
-  // Phase 1.1 wires the local dispatch and fails remote-Claude loudly so the
-  // remote-helper work is explicit, not silently mis-parsed.
-  private requireRemoteProviderSupported(endpointId: string): void {
-    if (this.provider(endpointId) === "claude") {
-      throw new AppError("UNSUPPORTED_CAPABILITY", `remote Claude rollout scan is not yet implemented: ${endpointId}`);
-    }
+  // The remote helper ships both a Codex (`rollout-scan`) and a Claude
+  // (`claude-rollout-scan`) parser; dispatch the op by the endpoint's provider so a
+  // remote Claude transcript is read by the Claude-aware parser, not mis-parsed as Codex.
+  private remoteScanOperation(endpointId: string): "rollout-scan" | "claude-rollout-scan" {
+    return this.provider(endpointId) === "claude" ? "claude-rollout-scan" : "rollout-scan";
   }
 
   async scan(endpointId: string, requests: readonly RolloutScanRequest[], lease?: EndpointWorkLease): Promise<RolloutScanResult[]> {
@@ -97,11 +94,10 @@ export class RolloutAccessRouter implements RolloutAccess {
       this.requireLease(endpointId, lease);
       return results;
     }
-    this.requireRemoteProviderSupported(endpointId);
     this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
-    const response = await context.remote.invoke("rollout-scan", [JSON.stringify({ requests })], context.helperPath);
+    const response = await context.remote.invoke(this.remoteScanOperation(endpointId), [JSON.stringify({ requests })], context.helperPath);
     this.requireLease(endpointId, lease);
     const parsed = responseSchema.safeParse(response);
     if (!parsed.success || parsed.data.results.length !== requests.length) {
@@ -127,11 +123,10 @@ export class RolloutAccessRouter implements RolloutAccess {
         return { state: "missing" };
       }
     }
-    this.requireRemoteProviderSupported(endpointId);
     this.requireLease(endpointId, lease);
     const context = this.options.remote(endpointId);
     if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
-    const response = await context.remote.invoke("rollout-scan", [JSON.stringify({
+    const response = await context.remote.invoke(this.remoteScanOperation(endpointId), [JSON.stringify({
       requests: [request],
       allowMissing: true,
       collectFromStart: true,

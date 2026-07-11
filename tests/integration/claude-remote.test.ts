@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { AppServerPool } from "../../src/app-server/pool.ts";
 import { ClaudeCodeRuntime } from "../../src/endpoints/claude-runtime.ts";
 import { SshClaudeCommandRunner } from "../../src/endpoints/ssh-claude-command-runner.ts";
+import { parseSshConfig, planSshConnection } from "../../src/endpoints/ssh-config.ts";
+import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
 // Real end-to-end against `claude -p` on a REMOTE host over ssh (ControlMaster).
 // RUN_CLAUDE_REMOTE_INTEGRATION=1 CLAUDE_REMOTE_HOST=dfw-vscode
@@ -10,7 +15,9 @@ const host = process.env.CLAUDE_REMOTE_HOST;
 const enabled = process.env.RUN_CLAUDE_REMOTE_INTEGRATION === "1" && !!host;
 
 test("a remote Claude session drives through the pool over ssh", { skip: !enabled, timeout: 180_000 }, async (t) => {
-  const endpoint = new ClaudeCodeRuntime({ id: "claude-remote", runner: new SshClaudeCommandRunner({ host: host! }), launchFlags: {} });
+  const effective = parseSshConfig((await runBoundedProcess("ssh", ["-G", host!], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024 })).stdout.toString("utf8"));
+  const plan = planSshConnection(host!, effective, await mkdtemp(join(tmpdir(), "qiyan-claude-remote-")));
+  const endpoint = new ClaudeCodeRuntime({ id: "claude-remote", runner: new SshClaudeCommandRunner({ plan }), launchFlags: {} });
   t.after(() => endpoint.closeConnection());
   await endpoint.start();
 

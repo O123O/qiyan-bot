@@ -178,15 +178,27 @@ test("provider dispatch routes a Claude endpoint's local scan to the transcript 
   assert.deepEqual(calls, ["/home/u/.claude/projects/x/sess-1.jsonl"]);
 });
 
-test("remote Claude rollout scan fails loudly until the Claude-aware helper exists", async () => {
+test("remote Claude rollout scan dispatches the Claude-aware helper op, not the Codex one", async () => {
+  const ops: string[] = [];
+  const claudeResult = { cursor: { device: "1", inode: "2", offset: 10 }, starts: [{ turnId: "ctx:1", clientId: "ctx:1", hasUserMessage: true as const }] };
   const router = new RolloutAccessRouter({
-    remote: () => ({ helperPath: "/tmp/h.mjs", remote: { bootstrap: async () => undefined, invoke: async <T>() => ({ results: [] }) as T } }),
+    remote: () => ({ helperPath: "/tmp/h.mjs", remote: { bootstrap: async () => undefined, invoke: async <T>(op: string) => { ops.push(op); return { results: [claudeResult] } as T; } } }),
     provider: () => "claude",
   });
-  await assert.rejects(
-    router.scan("devbox", [{ path: "/home/u/.claude/projects/x/sess-1.jsonl", threadId: "sess-1" }]),
-    (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY",
-  );
+  const result = await router.scan("devbox", [{ path: "/home/u/.claude/projects/x/sess-1.jsonl", threadId: "sess-1" }]);
+  assert.deepEqual(result, [claudeResult]);
+  assert.deepEqual(ops, ["claude-rollout-scan"]);
+});
+
+test("a remote Codex rollout scan still dispatches the Codex helper op", async () => {
+  const ops: string[] = [];
+  const codexResult = { cursor: { device: "1", inode: "2", offset: 4 }, starts: [] };
+  const router = new RolloutAccessRouter({
+    remote: () => ({ helperPath: "/tmp/h.mjs", remote: { bootstrap: async () => undefined, invoke: async <T>(op: string) => { ops.push(op); return { results: [codexResult] } as T; } } }),
+    provider: () => "codex",
+  });
+  await router.scan("devbox", [{ path: "/tmp/rollout-x-thread.jsonl", threadId: "thread" }]);
+  assert.deepEqual(ops, ["rollout-scan"]);
 });
 
 test("a Claude local scan retries on the shared concurrent-append sentinel", async () => {

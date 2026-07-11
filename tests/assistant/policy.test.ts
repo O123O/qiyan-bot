@@ -79,6 +79,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /clear `pending_follow_up` with `null` when resolved/iu);
   assert.match(policy, /automatically maintained `auto_session_info`/iu);
   assert.match(policy, /automatic values may be `null`.*do not invent/isu);
+  assert.match(policy, /Endpoints have a \*\*provider\*\*, `codex` or `claude`/iu);
+  assert.match(policy, /each entry `type` is `ssh` \(Codex\) or `claude-code` \(Claude\)/iu);
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
   assert.match(policy, /no `?watch_session`? tool/iu);
   assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);
@@ -102,7 +104,9 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.doesNotMatch(policy, /^### (?:Create and name new work|Discover and adopt existing work|Read complete status|Record supervision intent)$/mu);
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
   assert.doesNotMatch(policy, /qiyan-bot:(?:managed|user)/u);
-  assert.ok(Buffer.byteLength(policy, "utf8") < 7_000, "assistant policy exceeded the concise prompt budget");
+  // Budget raised from 7_000 to accommodate the permanent endpoint-provider model
+  // (codex/claude + the remote ssh/claude-code catalog types); the doc stays concise.
+  assert.ok(Buffer.byteLength(policy, "utf8") < 7_300, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
