@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import { ClaudeCodeRuntime } from "../../src/endpoints/claude-runtime.ts";
 import { SshClaudeCommandRunner } from "../../src/endpoints/ssh-claude-command-runner.ts";
 import { parseSshConfig, planSshConnection } from "../../src/endpoints/ssh-config.ts";
 import { runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+import { prepareRemoteHost, SshRemoteClient } from "../../src/endpoints/ssh-runtime.ts";
 
 // Real end-to-end against `claude -p` on a REMOTE host over ssh (ControlMaster).
 // RUN_CLAUDE_REMOTE_INTEGRATION=1 CLAUDE_REMOTE_HOST=dfw-vscode
@@ -44,4 +45,24 @@ test("a remote Claude session drives through the pool over ssh", { skip: !enable
   const read2 = await endpoint.request<any>("thread/read", { threadId: thread.id, includeTurns: true });
   const final2 = read2.thread.turns.at(-1).items.find((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
   assert.match(final2.text, /REMOTEOK/u);
+
+  // Ownership scan over ssh: bootstrap the helper on the remote and run claude-rollout-scan
+  // over the transcript this session just wrote. Both QiYan-driven turns must classify as
+  // OWNED (their clientId markers present) — this exercises the full remote owner-scan path
+  // (helper bootstrap + claude-rollout-scan over the ControlMaster), not just the runner.
+  const helperSource = await readFile(new URL("../../assets/remote/qiyan-ssh-helper.mjs", import.meta.url));
+  const remote = new SshRemoteClient({ plan, helperSource });
+  const remoteHost = await prepareRemoteHost({ endpointId: "claude-remote", remote });
+  const scanPath = await new SshClaudeCommandRunner({ plan }).transcriptPath(thread.id, "/tmp");
+  assert.ok(scanPath, "remote transcript path resolved");
+  const scan = await remote.invoke<any>("claude-rollout-scan", [JSON.stringify({
+    requests: [{ path: scanPath, threadId: thread.id }],
+    allowMissing: true,
+    collectFromStart: true,
+  })], remoteHost.remoteHelperPath);
+  const owned = scan.results[0].starts as Array<{ clientId?: string }>;
+  assert.ok(owned.some((s) => s.clientId === "rmt-1"), "turn rmt-1 classified owned over ssh");
+  assert.ok(owned.some((s) => s.clientId === "rmt-2"), "turn rmt-2 classified owned over ssh");
+  // No externally-typed turn was injected, so none should read as external (all owned).
+  assert.equal(owned.every((s) => typeof s.clientId === "string"), true);
 });
