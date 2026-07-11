@@ -154,3 +154,9 @@ test("WeChat credentials are stripped from children and never accepted from dote
     assert.equal(SUPPORTED_DOTENV_KEYS.has(name), false);
   }
 });
+
+test("every config-schema dotenv key is in the SUPPORTED_DOTENV_KEYS allowlist", async () => {
+  const { CONFIG_DOTENV_KEYS } = await import("../src/config.ts");
+  const missing = CONFIG_DOTENV_KEYS.filter((key) => !SUPPORTED_DOTENV_KEYS.has(key));
+  assert.deepEqual(missing, [], `config schema keys missing from the dotenv allowlist: ${missing.join(", ")}`);
+});
