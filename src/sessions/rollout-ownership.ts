@@ -52,6 +52,11 @@ export type OwnershipInspection =
 export type RolloutPathResolution =
   | { state: "resolved"; path: string }
   | { state: "pending" }
+  // No rollout exists and none will until the first turn runs (e.g. a Claude session, whose
+  // transcript is written only by `claude -p`). Distinct from "pending" (a transient window
+  // where a path is expected to bind shortly, as for Codex) so the guard can safely dispatch
+  // the first turn instead of deadlocking waiting for a rollout the first turn itself creates.
+  | { state: "unstarted" }
   | { state: "lost" };
 
 export type RolloutPathResolver = (
@@ -221,6 +226,17 @@ export class SessionOwnershipGuard {
     if (!existing.rolloutPath) {
       if (!this.resolvePath) return { state: "pending" };
       const resolution = await this.resolvePath(identity, lease);
+      if (resolution.state === "unstarted") {
+        // The endpoint reports no rollout exists and none will until the first turn runs
+        // (a Claude session's transcript is only written by the first `claude -p`). No turn —
+        // ours or external — has run, so there is nothing to conflict with and the first
+        // dispatch is safe; this mirrors the "missing" materialization case below (path known
+        // but file absent). A Codex thread instead binds its path shortly after create, so its
+        // pathless window is a transient "pending" (below), NOT "unstarted".
+        if (requireMaterialized) return { state: "lost" };
+        if (requireClassifiedTurn) throw ownershipUnclassified("pending rollout does not prove the native turns are owned");
+        return { state: "owned" };
+      }
       if (resolution.state !== "resolved") return resolution;
       this.recordUnmaterialized(identity, resolution.path);
       existing = this.row(identity)!;

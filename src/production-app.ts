@@ -67,7 +67,7 @@ import {
   type ExternalOwnershipReleaseStatus,
   type ExternalTurnIncident,
 } from "./sessions/ownership-watcher.ts";
-import { createAppServerRolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
+import { createAppServerRolloutPathResolver, type RolloutPathResolver, SessionOwnershipGuard } from "./sessions/rollout-ownership.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -2465,8 +2465,19 @@ export async function buildProductionApp(
           local: isLocalEndpoint,
           scanLocalClaude: scanLocalClaudeTranscript,
         });
+        // A Claude session's transcript is only written by the first `claude -p`, so its
+        // rollout path is unresolvable ("pending") until then — but that is terminal-safe (no
+        // turn has run), not a transient binding window like Codex. Report it as "unstarted"
+        // so the ownership guard lets the first turn dispatch instead of deadlocking.
+        const baseRolloutPathResolver = createAppServerRolloutPathResolver(pool);
+        const rolloutPathResolver: RolloutPathResolver = async (identity, lease) => {
+          const resolution = await baseRolloutPathResolver(identity, lease);
+          return resolution.state === "pending" && sessionProvider(identity.endpoint) === "claude"
+            ? { state: "unstarted" }
+            : resolution;
+        };
         ownership = new SessionOwnershipGuard(
-          db, runtime, operations, rolloutAccess, createAppServerRolloutPathResolver(pool),
+          db, runtime, operations, rolloutAccess, rolloutPathResolver,
         );
         lifecycle = new SessionLifecycle(
           pool,

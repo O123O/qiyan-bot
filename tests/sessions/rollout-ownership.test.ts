@@ -614,6 +614,28 @@ test("a pathless created thread stays pending until its exact rollout path can b
   ) as { rollout_path: string }).rollout_path, resolvedPath);
 });
 
+test("an unstarted thread (no rollout until the first turn) dispatches its first turn as owned", async () => {
+  // A Claude session's transcript is only written by the first `claude -p`, so its rollout
+  // path is unresolvable until then. The resolver reports this as "unstarted" (vs the transient
+  // "pending" of a Codex thread binding its path), and the guard must let the first turn run
+  // instead of deadlocking on "waiting for its rollout to materialize".
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "claude-local", thread_id: "thread-unstarted", mapping_id: "mapping-unstarted" };
+  let scans = 0;
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async () => { throw new Error("materialized scan is not expected"); },
+    scanUnmaterialized: async () => { scans += 1; return { state: "missing" }; },
+  }, async () => ({ state: "unstarted" }));
+
+  guard.recordUnmaterialized(identity);
+  // No rollout exists yet → safe first dispatch, and no scan is attempted (nothing to scan).
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(scans, 0);
+  // But recovery that requires a durable rollout still treats an unstarted thread as lost.
+  assert.deepEqual(await guard.inspect(identity, undefined, { requireMaterialized: true }), { state: "lost" });
+});
+
 test("a committed pathless mapping resumes a durable thread or terminally detects its missing rollout", async (t) => {
   const identity = { endpoint: "local", thread_id: "thread-restart", mapping_id: "mapping-restart" };
   await t.test("resumable", async () => {
