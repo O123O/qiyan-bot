@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import { RolloutAccessRouter } from "../../src/endpoints/rollout-access.ts";
 
 test("SSH rollout scans use one bounded metadata-only helper call", async () => {
@@ -159,4 +160,31 @@ test("SSH rollout scans accept only the literal malformed boundary flag", async 
       await assert.rejects(router.scan("devbox", [{ path: "/tmp/rollout-thread.jsonl", threadId: "thread" }]), /invalid data/u);
     });
   }
+});
+
+test("provider dispatch routes a Claude endpoint's local scan to the transcript scanner", async () => {
+  const calls: string[] = [];
+  const claudeResult = { cursor: { device: "1", inode: "2", offset: 10 }, starts: [{ turnId: "p1", clientId: "ctx:1", hasUserMessage: true as const }] };
+  const router = new RolloutAccessRouter({
+    remote: () => undefined,
+    provider: (endpointId) => endpointId === "local" ? "claude" : "codex",
+    scanLocalClaude: async (request) => { calls.push(request.path); return claudeResult; },
+    scanLocal: async () => { throw new Error("codex scanner must not run for a claude endpoint"); },
+  });
+
+  const result = await router.scan("local", [{ path: "/home/u/.claude/projects/x/sess-1.jsonl", threadId: "sess-1" }]);
+
+  assert.deepEqual(result, [claudeResult]);
+  assert.deepEqual(calls, ["/home/u/.claude/projects/x/sess-1.jsonl"]);
+});
+
+test("remote Claude rollout scan fails loudly until the Claude-aware helper exists", async () => {
+  const router = new RolloutAccessRouter({
+    remote: () => ({ helperPath: "/tmp/h.mjs", remote: { bootstrap: async () => undefined, invoke: async <T>() => ({ results: [] }) as T } }),
+    provider: () => "claude",
+  });
+  await assert.rejects(
+    router.scan("devbox", [{ path: "/home/u/.claude/projects/x/sess-1.jsonl", threadId: "sess-1" }]),
+    (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY",
+  );
 });
