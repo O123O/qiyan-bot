@@ -141,6 +141,16 @@ tools any managed session (Codex or Claude) can call:
 Firing (uniform, both providers): QiYan durably records `(session id, schedule/condition, prompt)`; when it
 fires it **resumes the session and drives one turn** with the prompt.
 
+**How the MCP tools are attached (decision):** per-invocation `--mcp-config` (a file/JSON on the `claude -p`
+command), **not** `~/.claude.json` or a project `.mcp.json`. Rationale: the QiYan tools must exist **only when
+QiYan drives a turn** — if the user later resumes the session themselves (`claude --resume <id>` without the
+flag), the QiYan MCP is simply absent and the session is clean (historical QiYan tool calls in the transcript
+are inert). Do **not** use `--strict-mcp-config` — QiYan's tools are **additive** so the worker keeps the
+user's own `~/.claude` MCP (inherit-home-settings). Keep the `--mcp-config` byte-identical every QiYan turn
+(MCP tool defs are in the cached prefix — a change re-creates cache like a changed system prompt). For a
+**remote** worker the `--mcp-config` must point at a QiYan MCP surface reachable from that host (URL+token, or
+a stdio launcher tunneling over the existing SSH channel) — see the worker-facing MCP item below.
+
 **This is net-new plumbing, not reuse** (corrected from rev 1):
 - **Worker-facing MCP surface.** Today `LoopbackMcpServer` is assistant-only — it requires an assistant source
   context and rejects other callers (`mcp/server.ts:152-164`), and workers are spawned with the MCP token
