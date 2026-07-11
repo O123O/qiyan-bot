@@ -1,164 +1,203 @@
 # Design: Managing Claude Code sessions (a Claude Code endpoint)
 
-Status: draft (for review)
+Status: draft (rev 2, review-corrected)
 Goal: let QiYan manage **Claude Code** sessions the way it manages Codex — start/adopt a session, send a
-message, stream the response, set a goal, and schedule/watch — running headless on the cluster, reusing
-QiYan's existing session/ownership/recovery machinery.
+message, stream the response, set a goal, and schedule/monitor — running headless on the cluster, reusing
+QiYan's session/ownership/recovery machinery where it genuinely can.
 
-This doc is grounded in **behavior verified by test on 2026-07-11** (see §2), not assumptions. Karpathy:
-minimal first slice, explicit assumptions, verifiable success criteria, no speculative abstraction.
+Grounded in **behavior verified by test on 2026-07-11** (§2). Karpathy: minimal first slice, explicit
+assumptions, verifiable success criteria, no speculative abstraction. Rev 2 corrects over-claimed "reuse":
+lifecycle/relay/pool are tightly coupled to the Codex JSON-RPC protocol, so the integration is a
+**Codex-protocol adapter**, and the MCP scheduling/monitor layer is a **new build**, not reuse.
 
 ## 1. The core difference from Codex
 
-- **Codex** = one long-running `codex app-server` daemon per endpoint, hosting **many threads** via a
-  JSON-RPC protocol (`thread/start`, `thread/resume`, submit turn, streaming notifications). QiYan drives it
-  through `ManagedAppServerEndpoint` + `RpcClient` over a jsonl/websocket wire.
-- **Claude Code** = **no daemon.** You drive it per-session, either as the **Agent SDK** in-process
-  (`@anthropic-ai/claude-agent-sdk`) or as a **headless CLI subprocess** (`claude -p`). A session is a
-  transcript on disk (`~/.claude/projects/<cwd-hash>/<session-id>.jsonl`), resumable by id.
+- **Codex** = one long-running `codex app-server` daemon per endpoint hosting **many threads** via a JSON-RPC
+  protocol (`thread/start`, `thread/read`, `thread/resume`, `turn/start`, notifications). QiYan drives it via
+  `pool.request(endpointId, method, params)` and reacts to `turn/completed`.
+- **Claude Code** = **no daemon.** Driven per-session as a headless CLI subprocess (`claude -p --resume`) or
+  the Agent SDK. A session is a transcript on disk (`~/.claude/projects/<cwd-hash>/<session-id>.jsonl`),
+  resumable by id.
 
-So the integration is **one runtime-per-session**, not one-daemon-many-threads. Everything else (session
-lifecycle, ownership, recovery, delivery) can be reused because it only needs: start session, resume session,
-submit turn, stream events, and a durable per-session artifact.
+So the integration is **one runtime-per-session**. The reuse is real but sits **behind an adapter** that
+speaks Codex's request surface (§4.3) — not a drop-in.
 
-## 2. Verified findings (tested today — build on these)
+## 2. Verified findings (tested today)
 
-- `claude -p` is authenticated on the host (returns results with `session_id`, cost, usage).
-- **`--input-format stream-json` keeps the process open across turns** (persistent multi-turn; exits on stdin
-  EOF). One-shot `claude -p "x"` runs one turn and exits.
+- `claude -p` is authenticated on the host (returns `session_id`, cost, usage).
+- **`--input-format stream-json` keeps the process open across turns**; one-shot `claude -p "x"` runs one turn
+  and exits.
 - **`--resume <session-id>` restores full conversation context** — no memory loss. The transcript is the
-  durable artifact (Claude Code's analog of a Codex rollout). Cost is re-hydration (cache-creation tokens +
-  cold start), not lost memory.
-- **`Monitor` is asynchronous and only fires via re-invocation** → it is **dead in one-shot `claude -p`**
-  (the process exits with the monitor merely "armed"; it never fires). Native `Monitor`/self-firing cron need
-  a **warm process** to receive the re-invocation.
-- **Subagents survive a process restart with full context.** Verified across three separate `claude -p`
-  invocations: the parent re-attached to the same subagent by id via continuation, and the subagent recounted
-  its first-turn instruction verbatim two restarts later. Correction to an earlier assumption: *completed*
+  durable artifact (the Codex-rollout analog). Cost is re-hydration (cache-creation + cold start), not lost
+  memory.
+- **`Monitor` is asynchronous and only fires via re-invocation** → **dead in one-shot `claude -p`** (the
+  process exits with the monitor merely "armed"). Rather than keep a warm process to host it, QiYan owns
+  watching via its own `monitor` MCP tool (§5).
+- **Subagents survive a process restart with full context** (verified across three `claude -p` invocations;
+  the parent re-attached by id and the subagent recounted its first-turn instruction verbatim). *Completed*
   subagents are transcript-backed and durable; only *in-flight* background work is ephemeral on resume.
 
-## 3. Assumptions (confirm)
+## 3. Assumptions (confirm in the spike)
 
 - A1. Headless auth is **API key** (`ANTHROPIC_API_KEY`) or an existing host credential; not interactive OAuth.
-- A2. Managed Claude Code sessions should **inherit the user's `~/.claude` config** (CLAUDE.md, skills, MCP) —
-  i.e. *not* `--bare` — consistent with the "rely on the user's home settings" decision for Codex workers.
-- A3. One QiYan owns a session at a time (single-writer), enforced by QiYan's existing lease/ownership — Claude
-  Code itself does not lock sessions.
-- A4. Default execution is **fire-and-resume** (process exits between turns); warm sessions are the exception.
+- A2. Managed sessions **inherit the user's `~/.claude` config** (CLAUDE.md, skills, MCP) — not `--bare` —
+  consistent with "rely on the user's home settings" for Codex workers.
+- A3. Single-writer per session, enforced by QiYan's lease/ownership **plus** a Claude-specific external-turn
+  detector that does not exist yet (§6) — do not assume this is free.
+- A4. All sessions are **fire-and-resume** (process exits between turns). There is **no warm mode** (§5).
 
-## 4. The minimal design
+## 4. The design
 
-### 4.1 Turn = one `claude -p --resume` invocation (the core, fire-and-resume)
+### 4.1 Turn = one `claude -p --resume` invocation (fire-and-resume core)
 
-The simplest thing that works, and it maps 1:1 onto QiYan's session/turn model:
-
-- **start session:** `claude -p "<first message>" --output-format stream-json --input-format text` (from the
-  session's `cwd`) → capture `session_id` from the `system/init` event. Register it as a managed session
-  (the transcript is the durable artifact, like a rollout).
-- **adopt session:** register an existing `session_id` (transcript on disk) — resume validates it.
+- **start session:** `claude -p "<first message>" --output-format stream-json` from the session `cwd` →
+  capture `session_id` from `system/init`. Register a managed session (transcript = durable artifact).
+- **adopt session:** register an existing `session_id`; resume validates it.
 - **submit turn:** `claude -p --resume <id> "<message>" --output-format stream-json` → stream events →
-  translate to QiYan's turn/item notifications → the final `result` event is the turn's final message
-  (→ QiYan delivery). Process exits when the turn completes.
-- **set goal:** injected as a prompt/system-prompt at the app layer (same as QiYan does over Codex).
-
-No persistent process, no daemon. Session state lives in the transcript; QiYan owns lifecycle + scheduling.
-This is the whole MVP.
+  translate to QiYan's turn/item notifications → `result` event = final message → delivery. Process exits.
+- **set goal — OPEN DESIGN POINT (not reuse):** QiYan sets Codex goals via Codex's **native** `thread/goal/*`
+  RPC and tracks native goal state (`goalControlled`). **Claude Code has no native goal engine.** So goal for
+  Claude is new app-layer work — most likely folded onto the §5 MCP mechanism (a standing "goal" prompt QiYan
+  re-injects) or a synthesized system-prompt. Resolve in Phase 1; do not assume the Codex goal path applies.
 
 ### 4.2 Event translation
 
-Map the stream-json event set onto QiYan's existing turn/item notification model:
-`system/init` → session identity/started; `stream_event`/assistant/tool events → item events;
-`result` → turn completed + final message. A thin translator (mirrors what QiYan already does for Codex
-`turn/*`/`item/*`). Keep it a pure function for testability.
+A pure translator maps stream-json (`system/init`, `stream_event`/assistant/tool events, `result`) onto
+QiYan's turn/item notification shapes. This is where the adapter (§4.3) manufactures the Codex-shaped
+`turn/completed` notification and the `thread/read` turn/item structure.
 
-### 4.3 Runtime abstraction
+### 4.3 Runtime = a **Codex-protocol adapter** (decision; not runtime-agnostic)
 
-Introduce a `ClaudeCodeRuntime` that manages **per-session subprocess invocations** and implements enough of
-QiYan's endpoint surface to plug into the pool/lifecycle/relay. It is a sibling of the Codex
-`LocalAppServerRuntime`/`SshAppServerRuntime`, but session-oriented (one process per turn) rather than
-server-oriented (one daemon many threads). Reuse: subprocess management, jsonl parsing, and the
-session/ownership/recovery machinery. Do NOT try to force it behind `ManagedAppServerEndpoint`'s
-daemon-shaped `request(method, params)` — model it as a session-turn runtime.
+The pool's only seam is `AppServerEndpoint.request(method, params)` (`pool.ts:4-8`), and — critically —
+**lifecycle and relay never hold an endpoint object; they call `pool.request(endpointId, "<codex-method>", …)`
+with hardcoded Codex method strings and consume Codex-shaped responses**: `thread/start`, `thread/read`
+(+`includeTurns`, returning `{status:{type}, turns:[{id,status,items:[{type,phase,text}]}], threadSource,
+path, itemsView}`), `thread/resume`, `turn/start`, `turn/interrupt`, `thread/archive`, `thread/unsubscribe`,
+`thread/goal/*`; and relay reacts only to the `turn/completed` notification (`relay.ts:112`) then re-reads
+history (`relay.ts:252`).
 
-### 4.4 SDK vs headless — recommendation
+Therefore a Claude runtime **cannot** "plug in without going behind `request()`." We choose the
+**least-blast-radius option: a `ClaudeCodeRuntime` that implements Codex's request surface** over per-session
+subprocesses, honoring §7 (no changes to shared session/delivery internals). It must:
 
-Start with **headless `claude -p` subprocess** (fire-and-resume): it mirrors QiYan's existing subprocess +
-jsonl patterns, keeps sessions out-of-process (crash isolation), and needs no persistent process. Note the
-**TS Agent SDK** (`@anthropic-ai/claude-agent-sdk`) as a strong alternative (typed events, native resume,
-hooks/permissions/MCP in-process) — evaluate it in the spike; pick one before building the abstraction.
+- `thread/start` → spawn `claude -p`, return a Codex-shaped thread from the captured `session_id`.
+- `thread/read` (+includeTurns) → **reconstruct** turns/items/`itemsView`/`status.type` **from the transcript
+  on disk** (the process has exited between turns, so there is no live server to query).
+- `thread/resume` → validate the transcript resumes.
+- `turn/start` → `claude -p --resume <id> "<msg>"`; stream → translate; **synthesize a `turn/completed`
+  notification** so relay fires unchanged.
+- `turn/interrupt` → kill the subprocess; `thread/archive`/`thread/unsubscribe` → no-op/local.
+- `thread/goal/*` → per §4.1 (open; likely emulated, since Claude has no native goal).
 
-## 5. Provider-agnostic scheduling & watching (QiYan MCP tools) — the key piece
+The alternative — refactoring pool/lifecycle/relay to a provider-agnostic session interface — is a large
+change §7 forbids for now; revisit only if a third provider appears. The transcript-reconstruction of
+`thread/read` and the `turn/completed` synthesis are the non-trivial parts and are the spike's real risk.
 
-Do **not** rely on either runtime's native scheduler (Codex has none; Claude Code's is process-bound and dies
-on exit — verified §2). Instead expose QiYan **MCP tools** that both Codex and Claude sessions call:
-`schedule_wakeup(delay, prompt)`, `schedule_cron(spec, prompt)`, `watch(condition, prompt)`.
+### 4.4 SDK vs headless
 
-- On call, QiYan **durably records** (session id + schedule/condition + prompt).
-- When it fires (timer, or QiYan-evaluated condition), QiYan **resumes the session and drives a turn** with
-  the stored prompt — reusing `send_to_session`/resume and the **idempotent-delivery/ownership** machinery so
-  a fire is single-delivery.
-- Provider-agnostic (MCP is common to both), durable (survives process + QiYan restart), and it lets sessions
-  stay fire-and-resume. QiYan becomes the scheduler/watcher of record — the correct place, and the same as its
-  goal mechanism today. `watch` is the only non-trivial part: QiYan evaluates the condition (poll on the
-  worker endpoint) on an interval and resumes on trigger.
+Start with the **headless `claude -p` subprocess** (mirrors QiYan's existing subprocess + jsonl patterns,
+keeps sessions out-of-process). Evaluate the **TS Agent SDK** (`@anthropic-ai/claude-agent-sdk`, typed
+events/resume/hooks) in the spike and pick one before building the adapter.
 
-This unifies cron/reminders/watchers across Codex + Claude and removes any need for warm processes for
-scheduling.
+## 5. Scheduling AND monitoring are QiYan MCP tools (a NEW BUILD — the largest piece)
 
-## 6. Warm mode (opt-in, for live monitors only)
+Do **not** rely on native schedulers/monitors (Codex has none; Claude Code's is process-bound and dies on
+exit — §2), and do **not** keep sessions warm: **you can't predict which sessions need a monitor**, so
+warm-vs-cold is guesswork. Every session is fire-and-resume; QiYan owns all scheduling/watching via three MCP
+tools any managed session (Codex or Claude) can call:
 
-For a session that needs sub-second reactive `Monitor` or is being driven with rapid turns, run it warm:
-hold a `--input-format stream-json` process open so the runtime is alive to receive Monitor/cron
-re-invocations and to skip re-hydration cost. QiYan keeps the pipe open and relays events. Costs a live
-process per warm session and is less restart-safe (in-flight monitors lost on crash). Reserve for the few
-sessions that need it; everything else is fire-and-resume.
+- `schedule_wakeup(delay, prompt)` — one-shot timer.
+- `schedule_cron(spec, prompt)` — recurring timer.
+- `monitor(check, prompt, {interval?, timeout?})` — QiYan runs `check` on the session's endpoint on an
+  interval; on trigger it fires. Same shape as Claude's native Monitor, but **QiYan** evaluates it — this
+  replaces warm mode.
 
-## 7. Ownership, durability, recovery (reuse what exists)
+Firing (uniform, both providers): QiYan durably records `(session id, schedule/condition, prompt)`; when it
+fires it **resumes the session and drives one turn** with the prompt.
 
-- **Durable artifact:** the transcript `.jsonl` is the rollout analog. "Does the session have a durable
-  rollout" → "does the transcript exist / does `--resume` succeed." The phantom-session gate we just built maps
-  directly (drop a session whose transcript never materialized).
-- **Single-writer:** QiYan's lease/ownership prevents two drivers on one session (Claude Code won't).
-- **Subagents:** durable across restart (§2) — so a persistent sub-worker can be a continued subagent (parent
-  holds its id) OR a separate managed session; both survive restart.
-- **cwd/worktree:** sessions are cwd-scoped — matches QiYan's `project_dir`; use worktrees for isolation.
+**This is net-new plumbing, not reuse** (corrected from rev 1):
+- **Worker-facing MCP surface.** Today `LoopbackMcpServer` is assistant-only — it requires an assistant source
+  context and rejects other callers (`mcp/server.ts:152-164`), and workers are spawned with the MCP token
+  stripped (`production-app.ts:2218`). Exposing these tools to worker sessions needs a worker-facing MCP
+  endpoint, a **worker auth model** (the current one authorizes the assistant PID), and **per-session identity
+  injection** (the tool must know which worker called).
+- **Durable schedule storage.** None exists — `assistant/scheduler.ts` is in-memory only and doesn't survive
+  restart. Needs a new table + a firing loop.
+- **Single-fire semantics** with **its own idempotency key** — a scheduler-initiated wakeup is self-originated,
+  a different key than relay's per-observed-`turn/completed` delivery. Don't conflate the two.
 
-## 8. Non-goals
+`monitor` polling is the extra cost: bound the interval; prefer endpoint-native events where available.
 
-- No reimplementation of Claude Code's scheduler/monitor (use QiYan MCP tools, §5).
-- No changes to Codex handling or the shared session/delivery internals.
-- No warm-process-by-default (opt-in only, §6).
-- Not a generic multi-provider framework yet — just a second concrete runtime alongside Codex.
+**Enforcement — disable the native tools, not just discourage them (verified flags):** a QiYan-managed
+Claude session is launched so it *cannot* reach the process-bound native schedulers:
+- `--disallowedTools "Monitor ScheduleWakeup CronCreate CronList CronDelete"` — hard-removes the native
+  cron/wakeup/monitor tools from the session (the model can't call them). (`--allowedTools`/`--tools` whitelist
+  is an alternative.)
+- `--mcp-config <qiyan-mcp.json>` (+ `--strict-mcp-config`) — provides the `qiyan_*` scheduling/monitor tools.
+- `--append-system-prompt "…scheduling/reminders/watching MUST use the qiyan_* MCP tools; the built-in
+  Monitor/ScheduleWakeup/cron tools are disabled…"` — so the model reaches for the right ones and knows why.
+Disable + guide together; do not rely on the prompt alone. (Codex sessions get the same MCP tools; Codex has
+no native scheduler to disable.)
 
-## 9. Plan & verifiable success criteria
+## 6. Ownership, durability, recovery (state machine reusable; scanner is NEW)
 
-- **Phase 0 — Spike (do first, before any abstraction):** drive one session end-to-end from a script:
-  start → capture `session_id` → send a follow-up via `--resume` → stream the response → confirm context
-  retained. Also A/B the Agent SDK vs headless for ergonomics.
-  **Verify:** two turns, second turn demonstrably has first-turn context; decide SDK-vs-headless.
-- **Phase 1 — `ClaudeCodeRuntime` (fire-and-resume) + event translator.** Start/adopt/submit-turn as managed
-  sessions; translate events to turn/item notifications; deliver the final message.
-  **Verify:** an integration test drives a real (or faked) session: start → turn → delivery, and a resumed
-  turn carries context. Ownership/phantom gate applies (a never-materialized session is dropped).
-- **Phase 2 — QiYan MCP scheduling/watch tools + durable firing.** `schedule_wakeup/cron/watch` record
-  durably; QiYan fires by resuming + driving a turn, single-delivery.
-  **Verify:** a scheduled wakeup fires exactly one resumed turn after a QiYan restart (survives restart);
-  works against both a Codex and a Claude session.
-- **Phase 3 (opt-in) — warm mode** for live monitors. **Verify:** a held-open stream-json session receives a
-  native Monitor fire (the §2 complementary test), and QiYan relays it.
+- **Reusable:** the ownership DB tables and the `inspect`/`initialize` state machine, and the phantom-session
+  gate — `reconcileManaged`'s `requireDurableRollout` → `ownership.inspect({requireMaterialized})` →
+  `{state:"lost"}` when the artifact never materialized (`lifecycle.ts:346-361`, `rollout-ownership.ts`). And
+  `RolloutAccess` is already an interface (`rollout-access.ts:40`).
+- **NEW (not reuse):** the actual scanner is Codex-specific — `validRolloutPath` requires
+  `rollout-*-<threadId>.jsonl` and `RolloutParser` parses Codex `event_msg` payloads
+  (`task_started/user_message/task_complete/turn_id/client_id`). Claude transcripts are a different path and
+  schema, so a **new `RolloutAccess`/transcript parser + filename validator** must be written.
+- **Confirm:** the Claude transcript must expose a per-turn **user-message marker** (equivalent to Codex's
+  `hasUserMessage`/QiYan `client_id`) or external-turn classification (single-writer/A3) won't have equivalent
+  evidence. Verify in the spike.
+- **Durable artifact:** transcript existence / `--resume` success = "has a durable rollout"; the phantom gate
+  then drops a session whose transcript never materialized. **Subagents** are durable across restart (§2), so
+  a persistent sub-worker can be a continued subagent (parent holds the id) or a separate managed session.
+- **cwd/worktree:** sessions are cwd-scoped — matches `project_dir`; use worktrees for isolation.
 
-## 10. Risks
+## 7. Non-goals
 
-- R1: SDK vs headless is a real fork — resolve in Phase 0, don't build both.
-- R2: `watch` polling cost/latency — bound the interval; prefer event hooks where the worker exposes them.
-- R3: re-hydration cost on frequent resumes of large sessions — mitigate with warm mode for hot sessions and
-  prompt-cache reuse.
-- R4: auth/config on the worker host (API key, `~/.claude` inheritance) — confirm in Phase 0.
-- R5: stream-json is a stable contract but version-sensitive; pin a Claude Code version and translate defensively.
+- No changes to the shared session/delivery internals — the Codex-protocol **adapter** (§4.3) is precisely how
+  we reuse them without touching them.
+- **No warm processes at all** — every session is fire-and-resume; monitoring is a QiYan MCP tool (§5).
+- No provider-agnostic pool/lifecycle/relay refactor yet (deferred until a third provider).
+- No reimplementation of Claude Code's native scheduler/monitor.
 
-## 11. What this unlocks
+## 8. Plan & verifiable success criteria
+
+- **Phase 0 — Spike (before any abstraction).** Drive one session end-to-end from a script: start → capture
+  `session_id` → follow-up via `--resume` → stream response → confirm context retained. A/B the SDK vs
+  headless. Confirm A1/A2 (auth, `~/.claude` inheritance) and inspect a real transcript for the §6 per-turn
+  user-message marker. **Verify:** two turns, second has first-turn context; SDK-vs-headless decided;
+  transcript schema documented; auth confirmed.
+- **Phase 1 — Codex-protocol `ClaudeCodeRuntime` (§4.3) + event translator + transcript scanner (§6) + goal
+  decision (§4.1).** **Verify:** an integration test drives a real/faked session through the adapter: start →
+  turn → `turn/completed` synthesized → delivery; a resumed turn carries context; the new scanner lets the
+  phantom gate drop a never-materialized session (this criterion depends on the scanner, so it lives here, not
+  earlier).
+- **Phase 2 — QiYan MCP scheduling/monitor tools (§5, new build):** worker-facing MCP surface + worker auth +
+  session identity; durable schedule table; firing loop with its own single-fire key; `monitor` poll.
+  **Verify:** a scheduled wakeup fires exactly one resumed turn **after a QiYan restart** (durability), and a
+  `monitor` fires on condition — both against a Codex session **and** a Claude session.
+
+## 9. Risks
+
+- R1 (top): the §4.3 adapter — transcript-reconstructed `thread/read` and synthesized `turn/completed` — is
+  the hardest part; de-risk in Phase 0/1 with a faked runtime driving the real lifecycle/relay.
+- R2: §5 is a large new build (worker MCP + auth + durable schedule + firing loop) — scope it as such, not as
+  reuse.
+- R3: the §6 scanner needs the Claude transcript schema; if it lacks a clean per-turn user-message marker,
+  external-turn detection (A3) weakens — confirm early.
+- R4: goal has no Claude-native equivalent (§4.1) — decide emulation vs MCP-standing-prompt in Phase 1.
+- R5: stream-json is stable but version-sensitive — pin a Claude Code version, translate defensively.
+- R6: auth/config on the worker host (API key, `~/.claude` inheritance) — confirm in Phase 0.
+
+## 10. What this unlocks
 
 QiYan manages Codex and Claude Code sessions uniformly — start/adopt/send/goal + durable cron/reminders/
-watchers via the same MCP tools — with per-turn fire-and-resume by default and warm sessions only where a live
-monitor is required. Subagents work inside turns and survive restarts, so multi-agent work composes under a
-managed session.
+monitors via the same MCP tools — with per-turn fire-and-resume everywhere and no warm processes. Subagents
+work inside turns and survive restarts, so multi-agent work composes under a managed session. The cost is
+honest: a Codex-protocol adapter, a new transcript scanner, and a new worker-facing MCP scheduling layer —
+none of which are free, all of which are bounded.
