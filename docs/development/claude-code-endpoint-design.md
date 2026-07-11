@@ -174,12 +174,33 @@ Start with the **headless `claude -p` subprocess** (mirrors QiYan's existing sub
 keeps sessions out-of-process). Evaluate the **TS Agent SDK** (`@anthropic-ai/claude-agent-sdk`, typed
 events/resume/hooks) in the spike and pick one before building the adapter.
 
-## 5. Scheduling AND monitoring are QiYan MCP tools (a NEW BUILD — the largest piece)
+## 5. Scheduling, monitoring, and steer — one provider-agnostic layer over `send_to_session`
+
+**The core modularity decision (keeps the code clean):** this whole capability is a **provider-agnostic layer
+that, on any trigger, calls the already-unified `send_to_session(session, message)`.** It **never knows Codex
+vs Claude** — that divergence is entirely sealed *below* `send_to_session` (pool + adapter). Consequences:
+- **Both providers gain it.** Codex has no native wakeup/cron/monitor either, so this is **net-new for both,
+  from one codebase** — a capability upgrade, not a Claude workaround.
+- **Zero provider branching in the scheduling code.** The messy bits (subprocess vs daemon, steer emulation,
+  transcript reconstruction) stay inside the adapter; the scheduler only ever calls `send_to_session`.
+
+**Four things collapse into ONE pattern** — a durable `(session, message)` + a **trigger** → on fire,
+`send_to_session` — differing only in the trigger: `schedule_wakeup` = absolute time; `schedule_cron` =
+recurring time; `monitor` = a `check` predicate polling true; **steer** (§4.1) = the session's turn completing.
+Steer is not special — it is the scheduling engine with a "turn-completed" trigger. So: **one durable store +
+one firing path (`send_to_session`) + four trigger sources.**
+
+**Module boundaries (what prevents the mess):** (1) **schedule store** (durable DB: `session, trigger,
+message, single-fire key`; provider-agnostic); (2) **MCP tools** (the worker-facing registration surface,
+below); (3) **trigger engine** (QiYan-internal: timers + condition poller + turn-completion hook → on fire,
+`send_to_session`; single-fire idempotent; provider-agnostic); (4) **`send_to_session`** (existing unified
+dispatch; Codex/Claude live only below here). Registration flows up (agent → MCP → store); firing flows down
+(engine → `send_to_session` → provider). The only provider-aware code is the adapter.
 
 Do **not** rely on native schedulers/monitors (Codex has none; Claude Code's is process-bound and dies on
 exit — §2), and do **not** keep sessions warm: **you can't predict which sessions need a monitor**, so
-warm-vs-cold is guesswork. Every session is fire-and-resume; QiYan owns all scheduling/watching via three MCP
-tools any managed session (Codex or Claude) can call:
+warm-vs-cold is guesswork. Every session is fire-and-resume. The registration surface — three MCP tools any
+managed session (Codex or Claude) can call:
 
 - `schedule_wakeup(delay, prompt)` — one-shot timer.
 - `schedule_cron(spec, prompt)` — recurring timer.
@@ -200,8 +221,11 @@ list/delete) because in QiYan's durable model every wakeup/cron/monitor is a per
 see and cancel. No `update` (cancel+recreate). Optional: `schedule_wakeup`+`schedule_cron` could merge into one
 `schedule(when,…)`, but keeping them separate matches the native mental model so they read as true drop-ins.
 
-Firing (uniform, both providers): QiYan durably records `(session id, schedule/condition, prompt)`; when it
-fires it **resumes the session and drives one turn** with the prompt.
+Firing (uniform, both providers): QiYan durably records `(session id, trigger, message, single-fire key)`;
+when the trigger fires, the engine **calls `send_to_session(session, message)`** — the same unified tool the
+assistant uses. It does NOT special-case the provider; `send_to_session` dispatches to Codex `turn/start` or
+the Claude adapter. If the session is mid-turn at fire time, delivery follows the steer rule (§4.1: enqueue,
+deliver as the next turn) — so a fire never interrupts a running turn.
 
 **How the MCP tools are attached (decision):** per-invocation `--mcp-config` (a file/JSON on the `claude -p`
 command), **not** `~/.claude.json` or a project `.mcp.json`. Rationale: the QiYan tools must exist **only when
