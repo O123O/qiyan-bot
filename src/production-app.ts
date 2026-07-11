@@ -1816,6 +1816,7 @@ export async function buildProductionApp(
   let assistantEndpoint!: ManagedAppServerEndpoint;
   let claudeEndpoint: ClaudeCodeRuntime | undefined;
   let scheduling: SchedulingService | undefined;
+  let claudeGoals: ClaudeGoalStore | undefined;
   let claudeGoalDriver: ClaudeGoalDriver | undefined;
   const CLAUDE_MAX_GOAL_TURNS = 25;
   let endpointCatalog!: EndpointCatalog;
@@ -2261,7 +2262,16 @@ export async function buildProductionApp(
         const claudeCodeConfig = config.claudeCode;
         // Shared across the runtime (thread/goal/*), the scheduling service (the
         // worker set_goal_status tool), and the goal driver (auto-drive).
-        const claudeGoals = claudeCodeConfig === undefined ? undefined : new ClaudeGoalStore(db);
+        claudeGoals = claudeCodeConfig === undefined ? undefined : new ClaudeGoalStore(db);
+        // Refresh the dashboard after a worker/driver goal-status change (those bypass
+        // the manager tools' observeGoal).
+        const refreshClaudeGoalObservation = (nickname: string): void => {
+          if (!claudeGoals || !claudeCodeConfig) return;
+          const session = registry.get(nickname);
+          if (!session || session.endpoint !== claudeCodeConfig.endpointId) return;
+          observeGoal(nickname, { goal: claudeGoals.get(claudeCodeConfig.endpointId, session.thread_id) });
+          void renderDashboardSafely();
+        };
         scheduling = claudeCodeConfig === undefined ? undefined : new SchedulingService({
           db,
           now: () => Date.now(),
@@ -2270,7 +2280,7 @@ export async function buildProductionApp(
           // clientUserMessageId for idempotent delivery).
           send: (nickname, message, key) => sessions.send(nickname, message, { mode: "auto", clientUserMessageId: key }).then(() => undefined),
           runCheck: (row: ScheduleRow) => runMonitorCheck(row.spec),
-          ...(claudeGoals ? { goals: claudeGoals } : {}),
+          ...(claudeGoals ? { goals: claudeGoals, onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname) } : {}),
         });
         // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
         // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
@@ -2281,6 +2291,8 @@ export async function buildProductionApp(
           now: () => Date.now(),
           maxDrivenTurns: CLAUDE_MAX_GOAL_TURNS,
           enqueue: (session, message) => scheduling!.enqueueGoalDrive(session, message),
+          hasPendingDrive: (session) => scheduling!.hasPendingGoalDrive(session),
+          onStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
         }) : undefined;
         claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
           id: claudeCodeConfig.endpointId,
@@ -2715,6 +2727,16 @@ export async function buildProductionApp(
         // Provider-agnostic schedule engine + worker MCP surface (Phase 2). Recovery
         // re-arms durable schedules on start; fires drive send_to_session.
         if (scheduling) await scheduling.start();
+        // Re-kick active Claude goals whose drive turn was in flight at restart (no
+        // pending schedule, no live turn) so goal enforcement is restart-durable.
+        const claudeGoalId = config.claudeCode?.endpointId;
+        if (claudeGoalDriver && claudeGoals && claudeGoalId !== undefined) {
+          const active = claudeGoals.listActive(claudeGoalId)
+            .map((g) => registry.getByIdentity(claudeGoalId, g.threadId))
+            .filter((found): found is NonNullable<typeof found> => found !== undefined)
+            .map((found) => ({ nickname: found.nickname, endpointId: claudeGoalId, threadId: found.session.thread_id }));
+          claudeGoalDriver.resumeActive(active);
+        }
       },
       stop: async () => {
         stopping = true;

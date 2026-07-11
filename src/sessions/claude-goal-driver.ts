@@ -19,8 +19,13 @@ export class ClaudeGoalDriver {
     // Deliver a goal-pursuit turn to the session (wired to the durable scheduling
     // enqueue, so it lands as the next turn and survives restart).
     enqueue(session: GoalDriveSession, message: string): void;
+    // True if a goal drive is already pending for the session (dedup — one lane).
+    hasPendingDrive(session: GoalDriveSession): boolean;
     now(): number;
     maxDrivenTurns: number;
+    // Notified when the driver itself changes status (cap → budgetLimited) so the
+    // dashboard can be refreshed.
+    onStatusChanged?(session: GoalDriveSession): void;
   }) {}
 
   // Kick the loop when an objective is (re)set active — delivers the announcement so
@@ -34,14 +39,26 @@ export class ClaudeGoalDriver {
     this.driveIfActive(session, false);
   }
 
+  // Startup re-kick: an active goal whose drive turn was in flight at restart leaves no
+  // pending schedule and gets no live turn/completed, so it would stall. Re-drive it
+  // (deduped, so it's a no-op if a drive is already pending).
+  resumeActive(sessions: readonly GoalDriveSession[]): void {
+    for (const session of sessions) this.driveIfActive(session, true);
+  }
+
   private driveIfActive(session: GoalDriveSession, initial: boolean): void {
     const goal = this.deps.goals.get(session.endpointId, session.threadId);
     if (goal?.status !== "active") return; // complete / blocked / paused / budgetLimited → stop
+    // Dedup BEFORE burning a cap slot: at most one goal drive pending per session, so a
+    // completing user/steer turn (or activate racing a completion) can't accumulate
+    // drive lanes or consume extra budget.
+    if (this.deps.hasPendingDrive(session)) return;
     const driven = this.deps.goals.recordDrivenTurn(session.endpointId, session.threadId, this.deps.now());
     if (driven > this.deps.maxDrivenTurns) {
       // The worker never marked the goal done — pause it (a human/assistant can resume)
       // rather than driving forever.
       this.deps.goals.setStatus(session.endpointId, session.threadId, "budgetLimited", this.deps.now());
+      this.deps.onStatusChanged?.(session);
       return;
     }
     const remaining = this.deps.maxDrivenTurns - driven;

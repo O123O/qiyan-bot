@@ -41,11 +41,20 @@ export class ClaudeGoalStore {
   }
 
   // Update only the status (pause/resume/blocked/complete) of an existing goal.
+  // Transitioning back to "active" (e.g. resume_goal after the cap paused it) resets
+  // the auto-drive counter, so resume actually continues rather than instantly re-caps.
   setStatus(endpointId: string, threadId: string, status: string, now: number): ClaudeGoal | null {
+    const resetDriven = status === "active" ? ", driven_turns = 0" : "";
     this.db.prepare(
-      "UPDATE claude_session_goals SET status = ?, updated_at = ? WHERE endpoint_id = ? AND thread_id = ?",
+      `UPDATE claude_session_goals SET status = ?, updated_at = ?${resetDriven} WHERE endpoint_id = ? AND thread_id = ?`,
     ).run(status, now, endpointId, threadId);
     return this.get(endpointId, threadId);
+  }
+
+  // Sessions on this endpoint with an actively-driving goal (for startup re-kick).
+  listActive(endpointId: string): Array<{ endpointId: string; threadId: string }> {
+    return (this.db.prepare("SELECT thread_id FROM claude_session_goals WHERE endpoint_id = ? AND status = 'active'").all(endpointId) as Array<{ thread_id: string }>)
+      .map((row) => ({ endpointId, threadId: String(row.thread_id) }));
   }
 
   clear(endpointId: string, threadId: string): void {

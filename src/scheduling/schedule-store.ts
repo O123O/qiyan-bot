@@ -66,6 +66,12 @@ export class ScheduleStore {
     return (this.db.prepare("SELECT * FROM session_schedules WHERE endpoint_id = ? AND thread_id = ? AND state = 'armed' ORDER BY created_at").all(endpointId, threadId) as Array<Record<string, unknown>>).map(fromRow);
   }
 
+  // Does the session already have an armed schedule with this spec? Used to dedup goal
+  // drives so at most one is pending per session (one drive lane).
+  hasArmedSpec(endpointId: string, threadId: string, spec: string): boolean {
+    return this.db.prepare("SELECT 1 FROM session_schedules WHERE endpoint_id = ? AND thread_id = ? AND spec = ? AND state = 'armed' LIMIT 1").get(endpointId, threadId, spec) !== undefined;
+  }
+
   // Armed timer rows whose next_fire_at has passed. Monitors (next_fire_at holds the
   // next poll time) are included so the engine can run their check.
   due(now: number): ScheduleRow[] {

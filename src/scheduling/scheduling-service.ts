@@ -27,7 +27,14 @@ export interface SchedulingServiceDeps {
   // Enables the set_goal_status worker tool: the worker marks its own goal
   // complete/blocked, and QiYan's goal driver stops.
   goals?: ClaudeGoalStore;
+  // Notified after a worker marks its goal via set_goal_status, so the dashboard is
+  // refreshed (the worker write bypasses the manager tools' observeGoal).
+  onGoalStatusChanged?(session: WorkerScheduleSession): void;
 }
+
+// Inter-drive pacing for goal auto-drive turns (F3/F6): bounds a failing goal to one
+// claude turn per this interval rather than at poll speed.
+const GOAL_DRIVE_DELAY_MS = 5_000;
 
 export class SchedulingService {
   readonly store: ScheduleStore;
@@ -42,7 +49,10 @@ export class SchedulingService {
     this.outbox = new ScheduledSendOutbox(deps.db);
     this.server = new WorkerScheduleMcpServer({
       store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token),
-      ...(deps.goals ? { setGoalStatus: (session, status) => deps.goals!.setStatus(session.endpointId, session.threadId, status, deps.now()) } : {}),
+      ...(deps.goals ? { setGoalStatus: (session, status) => {
+        deps.goals!.setStatus(session.endpointId, session.threadId, status, deps.now());
+        deps.onGoalStatusChanged?.(session);
+      } } : {}),
     });
     this.engine = new TriggerEngine({
       store: this.store,
@@ -103,9 +113,15 @@ export class SchedulingService {
     this.enqueueImmediate(session, "steer", message);
   }
 
-  // Goal auto-drive: deliver the next goal-pursuit turn (same durable immediate path).
+  // Goal auto-drive: deliver the next goal-pursuit turn. Paced by a small delay so a
+  // failing/looping goal can't spawn back-to-back claude turns at poll speed.
   enqueueGoalDrive(session: WorkerScheduleSession, message: string): void {
-    this.enqueueImmediate(session, "goal", message);
+    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "goal", message, nextFireAt: this.deps.now() + GOAL_DRIVE_DELAY_MS }, this.deps.now());
+  }
+
+  // Is a goal drive already pending for this session? (dedup — one drive lane.)
+  hasPendingGoalDrive(session: WorkerScheduleSession): boolean {
+    return this.store.hasArmedSpec(session.endpointId, session.threadId, "goal");
   }
 
   private enqueueImmediate(session: WorkerScheduleSession, spec: string, message: string): void {

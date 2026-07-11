@@ -9,8 +9,13 @@ const session = { nickname: "s1", endpointId: "claude-local", threadId: "t1" };
 function harness(maxDrivenTurns = 3) {
   const goals = new ClaudeGoalStore(createTestDatabase());
   const enqueued: string[] = [];
-  const driver = new ClaudeGoalDriver({ goals, now: () => 1, maxDrivenTurns, enqueue: (_s, message) => enqueued.push(message) });
-  return { goals, driver, enqueued };
+  let pending = false;
+  const driver = new ClaudeGoalDriver({
+    goals, now: () => 1, maxDrivenTurns,
+    enqueue: (_s, message) => enqueued.push(message),
+    hasPendingDrive: () => pending,
+  });
+  return { goals, driver, enqueued, setPending: (v: boolean) => { pending = v; } };
 }
 
 test("no goal → no drive", () => {
@@ -59,6 +64,28 @@ test("the backstop cap pauses a goal the worker never ends (budgetLimited)", () 
   for (let i = 0; i < 6; i += 1) h.driver.onTurnCompleted(session);
   assert.equal(h.enqueued.length, 3); // drove 3, then capped
   assert.equal(h.goals.get("claude-local", "t1")?.status, "budgetLimited");
+});
+
+test("a pending drive dedups — no extra lane and no cap burn", () => {
+  const h = harness(3);
+  h.goals.set("claude-local", "t1", { objective: "x" }, 1);
+  h.setPending(true); // a goal drive is already queued
+  h.driver.onTurnCompleted(session);
+  h.driver.onTurnCompleted(session);
+  assert.equal(h.enqueued.length, 0); // deduped
+  assert.equal(h.goals.recordDrivenTurn("claude-local", "t1", 1), 1); // counter untouched (still fresh)
+});
+
+test("resume after the cap continues the goal (does not instantly re-cap)", () => {
+  const h = harness(3);
+  h.goals.set("claude-local", "t1", { objective: "x" }, 1);
+  for (let i = 0; i < 6; i += 1) h.driver.onTurnCompleted(session); // hit the cap
+  assert.equal(h.goals.get("claude-local", "t1")?.status, "budgetLimited");
+
+  h.goals.setStatus("claude-local", "t1", "active", 2); // resume_goal resets the counter
+  h.driver.activate(session);
+  assert.equal(h.enqueued.length, 4); // drives again instead of re-capping
+  assert.equal(h.goals.get("claude-local", "t1")?.status, "active");
 });
 
 test("re-setting a fresh objective resets the drive counter", () => {
