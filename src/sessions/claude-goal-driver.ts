@@ -41,9 +41,10 @@ export class ClaudeGoalDriver {
 
   // Startup re-kick: an active goal whose drive turn was in flight at restart leaves no
   // pending schedule and gets no live turn/completed, so it would stall. Re-drive it
-  // (deduped, so it's a no-op if a drive is already pending).
+  // with the CONTINUE nudge (the worker already knows the goal) — deduped, so a no-op
+  // if a drive is already pending.
   resumeActive(sessions: readonly GoalDriveSession[]): void {
-    for (const session of sessions) this.driveIfActive(session, true);
+    for (const session of sessions) this.driveIfActive(session, false);
   }
 
   private driveIfActive(session: GoalDriveSession, initial: boolean): void {
