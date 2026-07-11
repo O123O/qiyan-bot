@@ -1664,13 +1664,20 @@ export function reportOperationalSafely(sink: OperationalEventSink, event: Opera
   catch { /* operational logging must not change runtime behavior */ }
 }
 
-export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity: RuntimeIdentity } | undefined {
+export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
   if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
   if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
   try {
-    return { endpoint: item.endpoint, phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started", identity: parseRuntimeIdentity(item.identity) };
+    // A daemonless endpoint (Claude) checkpoints with no runtime identity, so `identity` is
+    // absent from the persisted receipt — accept that instead of failing the parse (which
+    // would strand the recovery and permanently lock out the endpoint's lifecycle ops).
+    return {
+      endpoint: item.endpoint,
+      phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
+      ...(item.identity === undefined ? {} : { identity: parseRuntimeIdentity(item.identity) }),
+    };
   } catch { return undefined; }
 }
 

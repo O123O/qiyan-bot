@@ -208,7 +208,7 @@ export class EndpointManager {
   async recoverDisconnect(
     id: string,
     phase: "draining" | "idle_proven" | "runtime_stopped",
-    expectedIdentity: RuntimeIdentity,
+    expectedIdentity: RuntimeIdentity | undefined,
     checkpoint?: (value: unknown) => void,
   ): Promise<void> {
     const record = this.record(id);
@@ -232,7 +232,7 @@ export class EndpointManager {
           drain.disconnect();
           return;
         }
-        if (!sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        if (!sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
         let endpoint = candidate.endpoint;
         if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(candidate);
@@ -257,7 +257,7 @@ export class EndpointManager {
   async recoverRestart(
     id: string,
     phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
-    expectedIdentity: RuntimeIdentity,
+    expectedIdentity: RuntimeIdentity | undefined,
     checkpoint?: (value: unknown) => void,
   ): Promise<void> {
     const record = this.record(id);
@@ -277,10 +277,16 @@ export class EndpointManager {
           replacementEndpoint = replacement.endpoint.state === "ready"
             ? replacement.endpoint
             : await this.startCandidate(replacement);
+          if (replacementEndpoint.daemonless) {
+            // No identity to prove; just re-ready the adapter and republish.
+            if (phase === "runtime_stopped") checkpoint?.({ phase: "runtime_started", identity: undefined });
+            this.publishAfterReopen(record, drain, replacementEndpoint);
+            return;
+          }
           const identity = phase === "runtime_started"
             ? await this.requireRuntimeIdentity(replacementEndpoint)
-            : await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity);
-          if (phase === "runtime_started" && !sameRuntimeIdentity(identity, expectedIdentity)) {
+            : await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity!);
+          if (phase === "runtime_started" && !sameRuntimeIdentity(identity, expectedIdentity!)) {
             throw new AppError("OPERATION_UNCERTAIN", `checkpointed replacement runtime identity changed: ${id}`);
           }
           if (phase === "runtime_stopped") checkpoint?.({ phase: "runtime_started", identity });
@@ -288,6 +294,17 @@ export class EndpointManager {
           return;
         }
         const target = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
+        if (target.endpoint.daemonless) {
+          // No runtime identity to reconcile: close the old adapter, re-ready a fresh one.
+          await target.endpoint.closeConnection().catch(() => undefined);
+          checkpoint?.({ phase: "runtime_stopped", identity: undefined });
+          runtimeStopped = true;
+          const started = await this.startCandidate(replacement);
+          replacementEndpoint = started;
+          checkpoint?.({ phase: "runtime_started", identity: undefined });
+          this.publishAfterReopen(record, drain, started);
+          return;
+        }
         const actual = await target.endpoint.runtimeIdentity();
         if (!actual) {
           await target.endpoint.closeConnection();
@@ -295,12 +312,12 @@ export class EndpointManager {
           runtimeStopped = true;
           const started = await this.startCandidate(replacement);
           replacementEndpoint = started;
-          const identity = await this.requireReplacementIdentity(started, expectedIdentity);
+          const identity = await this.requireReplacementIdentity(started, expectedIdentity!);
           checkpoint?.({ phase: "runtime_started", identity });
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        if (!sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        if (!sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
         let endpoint = target.endpoint;
         if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(target);
@@ -313,7 +330,7 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_stopped", identity: actual });
         const started = await this.startCandidate(replacement);
         replacementEndpoint = started;
-        const identity = await this.requireReplacementIdentity(started, expectedIdentity);
+        const identity = await this.requireReplacementIdentity(started, expectedIdentity!);
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, started);
       } catch (error) {

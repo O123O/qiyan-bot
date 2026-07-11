@@ -9,6 +9,7 @@ import { AppError } from "../../src/core/errors.ts";
 import { createOperationReconciliationLoop, operationRecoveryFailureDisposition } from "../../src/production-app.ts";
 
 class FakeEndpoint implements ManagedAppServerEndpoint {
+  daemonless = false;
   state: ManagedAppServerEndpoint["state"] = "stopped";
   starts = 0;
   connectionCloses = 0;
@@ -447,6 +448,38 @@ test("restart recovery durably checkpoints the stopped and replacement runtime i
   await value.manager.recoverRestart("devbox", "draining", identity, (checkpoint) => checkpoints.push(checkpoint));
 
   assert.deepEqual(checkpoints.map((checkpoint) => (checkpoint as { phase: string }).phase), ["runtime_stopped", "runtime_started"]);
+});
+
+test("restart recovery of a daemonless endpoint completes without a runtime identity", async () => {
+  // Regression: a daemonless (Claude) endpoint checkpoints with no identity, so recovery runs
+  // with expectedIdentity=undefined. It must re-ready the adapter without the identity proof
+  // (otherwise the op is stranded forever and locks out all future restart/disconnect).
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  remote.daemonless = true;
+  remote.identityAvailable = false;
+  const before = remote.starts;
+  const checkpoints: unknown[] = [];
+
+  await value.manager.recoverRestart("devbox", "draining", undefined, (checkpoint) => checkpoints.push(checkpoint));
+
+  assert.deepEqual(checkpoints.map((checkpoint) => (checkpoint as { phase: string; identity?: unknown })), [
+    { phase: "runtime_stopped", identity: undefined },
+    { phase: "runtime_started", identity: undefined },
+  ]);
+  assert.ok(remote.starts > before, "daemonless endpoint was not re-readied");
+  assert.equal(remote.state, "ready");
+});
+
+test("disconnect recovery of a daemonless endpoint completes without a runtime identity", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  remote.daemonless = true;
+  remote.identityAvailable = false;
+
+  await value.manager.recoverDisconnect("devbox", "draining", undefined);
+
+  assert.equal(remote.connectionCloses > 0, true, "daemonless endpoint was not closed on disconnect recovery");
 });
 
 test("runtime-stopped restart recovery refuses to relabel the old runtime as its replacement", async () => {

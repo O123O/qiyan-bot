@@ -2361,6 +2361,9 @@ test("endpoint lifecycle recovery checkpoints require an exact phase and runtime
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, extra: true }), undefined);
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "unknown" }), undefined);
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, identity: { ...checkpoint.identity, token: "bad" } }), undefined);
+  // A daemonless (Claude) endpoint checkpoints with no identity; the parse must accept it
+  // (else the recovery strands the op and locks out the endpoint's lifecycle operations).
+  assert.deepEqual(parseEndpointLifecycleCheckpoint({ endpoint: "claude-local", phase: "draining" }), { endpoint: "claude-local", phase: "draining" });
 });
 
 test("removal recovery follows the checkpointed mapping generation across crash windows and nickname reuse", () => {
