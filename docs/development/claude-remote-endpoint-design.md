@@ -173,12 +173,23 @@ Claude endpoint's *management* works without it; only the worker's self-scheduli
 buildable/leasable but whose ownership scan still throws `UNSUPPORTED_CAPABILITY`
 (`rollout-access.ts:82-86`) is fail-closed but would wedge adoption/recovery. So the scan is not a later step.
 
-0. **Preflight split** (§3.2 item 0) — lean host-preflight (no codex/tmux) + separate Codex capability probe.
-   *Verify:* Codex remote host bootstrap unchanged (capability probe still enforced on the Codex `start` path);
-   a host with no `codex`/`tmux` passes host-preflight.
+0. **Preflight split** (§3.2 item 0) — keep the `preflight` op name returning `uid`/`home`/`shell`, just **drop
+   its codex/tmux enforcement**, and embed the `command -v codex tmux` capability probe **inside the existing
+   `start` op** (zero new ops — `start` already receives `shell`, runs only on the Codex path, and spawns
+   tmux/codex immediately after). Mechanical must-dos (reviewer): **(i)** repin `REMOTE_HELPER_SHA256`
+   (`ssh-runtime.ts:15`) — any helper edit changes the digest enforced by `requireDigest`/`bootstrap`; **(ii)**
+   drop the now-unused `codexPath`/`tmuxPath` from `preflightSchema` (`ssh-runtime.ts:27-28`, nothing reads them);
+   **(iii)** if any new op name is introduced, add it to the `helperOperations` allowlist on **both** sides
+   (`ssh-runtime.ts:22` + helper switch). *Verify:* run `tests/endpoints/ssh-helper.test.ts`,
+   `ssh-runtime.test.ts`, `tests/integration/ssh-endpoint.test.ts`; Codex bootstrap unchanged (capability probe
+   still enforced on the Codex `start` path); a host with no `codex`/`tmux` passes host-preflight.
 1. **`RemoteHost` refactor** (§3.2) — introduce `RemoteHost`; `SshRuntime` composes one internally (getters
-   delegate); consumers read `context.host`. *Verify (GATE):* the **full existing Codex remote test suite stays
-   green** (this is a behavior-preserving refactor of the incident-sensitive path).
+   delegate); consumers read `context.host`. `SshRuntime.prepare()` builds/caches the `RemoteHost` (host-preflight
+   + bootstrap) and **keeps holding `shell`/`session` alongside it** — the host owns
+   `home`/`uid`-derived-dirs/`helperPath`/`remote`; `SshRuntime` layers `session`/`shell`/`remoteSocketPath`
+   (`= ${host.remoteRuntimeDir}/app-server.sock`, still Codex-only, consumed by `SshAppServerRuntime`) on top.
+   *Verify (GATE):* the **full existing Codex remote test suite stays green** (this is a behavior-preserving
+   refactor of the incident-sensitive path).
 2. **Catalog + createRemote + ownership scan (atomic)** — §3.1 union; §3.3 claude-code branch +
    `buildSshStreamArgs` + attestation + runner refactor; §3.4 helper `claude-rollout-scan` + router routing
    (remove the `UNSUPPORTED` stub). *Verify:* catalog-union unit tests; a fake-runner composition test that a
@@ -193,7 +204,8 @@ buildable/leasable but whose ownership scan still throws `UNSUPPORTED_CAPABILITY
 ## 6. Risks
 - **Safety-critical layer.** This touches SSH + ownership (the duplicate-delivery layer). The `RemoteHost`
   extraction has real blast radius on the Codex remote path — the Codex remote tests must stay green throughout.
-- **Decoupling shape.** (A) vs (B) is the main review decision; (A) is cleaner but larger.
+- **Decoupling shape.** Resolved to the composed-`RemoteHost` option (§3.2) — minimal blast radius; the getters
+  are the only externally-consumed surface that moves.
 - **Helper port fidelity.** The remote `claude-rollout-scan` must byte-for-byte match `scanLocalClaudeTranscript`
   (same turn model, marker, cursor, sentinel) or ownership diverges local-vs-remote.
 
@@ -204,4 +216,6 @@ buildable/leasable but whose ownership scan still throws `UNSUPPORTED_CAPABILITY
   `cd <cwd>`, and the `workspace` helper op is provider-agnostic.
 - Ship §3.5 (remote worker scheduling over `ssh -R`) with this, or strictly separate? → **separate** (a remote
   endpoint's management needs no reverse tunnel).
-- Remaining: exact `preflight` split shape (one op with a `capabilities?` flag vs two ops) — decide in step 0.
+- ~~Exact `preflight` split shape~~ → **resolved (review):** keep the `preflight` op returning
+  `uid`/`home`/`shell` (drop codex/tmux enforcement) and embed the `command -v codex tmux` probe inside the
+  existing `start` op — zero new ops, no `helperOperations` allowlist churn. See step 0.
