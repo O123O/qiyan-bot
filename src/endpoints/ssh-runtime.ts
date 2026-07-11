@@ -12,20 +12,18 @@ import {
 import { runBoundedProcess, type BoundedProcessResult } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "88c85fa042ff0966732df3a5ab286c5976f260d9f855fd241d244f8e92e28def";
+export const REMOTE_HELPER_SHA256 = "85c081164ce2c93d93395f53f033e97406b29142715a325351f9a553d7540bb6";
 export const REMOTE_LAUNCHER_SHA256 = "db138ff3173f9b72d1fa8cc5fbc94c4958247691a401232d84edf0e3417bd334";
 
 const MAX_REMOTE_ARGUMENT_BYTES = 16 * 1024;
 const NFS_SUPER_MAGIC = 0x6969;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "claude-rollout-scan", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
   shell: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
-  codexPath: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
-  tmuxPath: z.string().regex(/^\/[A-Za-z0-9_./+-]+$/u),
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent") }).strict(),
@@ -104,7 +102,41 @@ export interface SshRuntimeController {
   stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }
 
-export class SshRuntime implements SshRuntimeController {
+// The provider-neutral host facts a remote endpoint's consumers need (workspace router,
+// worker file bridge, ownership scan). A Codex remote satisfies this via SshRuntime; a
+// Claude remote (no app-server) builds a lean one over the same bootstrapped helper.
+export interface RemoteHost {
+  readonly remoteHome: string;
+  readonly remoteRuntimeDir: string;
+  readonly remoteHelperPath: string;
+  readonly remote: RemoteRuntimeClient;
+}
+
+// Runs the provider-neutral host bootstrap (preflight → install helper) and returns the
+// derived host facts. Both SshRuntime (Codex) and the remote Claude endpoint use this so
+// the helper lands at the SAME uid-scoped path on both providers — ownership scans and
+// workspace ops resolve the identical `qiyan-ssh-helper.mjs`.
+export async function prepareRemoteHost(options: {
+  endpointId: string;
+  remote: RemoteRuntimeClient;
+  assetRoot?: string;
+}): Promise<RemoteHost & { shell: string }> {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
+  const preflight = preflightSchema.parse(await options.remote.invoke("preflight", []));
+  const endpointHash = createHash("sha256").update(options.endpointId).digest("hex").slice(0, 24);
+  const remoteRuntimeDir = `/tmp/qiyan-${preflight.uid}/${endpointHash}`;
+  const assets = await loadRemoteAssets(options.assetRoot);
+  await options.remote.bootstrap({ runtimeDir: remoteRuntimeDir, ...assets });
+  return {
+    remoteHome: preflight.home,
+    remoteRuntimeDir,
+    remoteHelperPath: `${remoteRuntimeDir}/qiyan-ssh-helper.mjs`,
+    remote: options.remote,
+    shell: preflight.shell,
+  };
+}
+
+export class SshRuntime implements SshRuntimeController, RemoteHost {
   private prepared?: { runtimeDir: string; helperPath: string; session: string; shell: string; home: string };
 
   constructor(private readonly options: { endpointId: string; remote: RemoteRuntimeClient; assetRoot?: string }) {
@@ -127,6 +159,7 @@ export class SshRuntime implements SshRuntimeController {
     if (!this.prepared) throw new AppError("ENDPOINT_UNAVAILABLE", "SSH runtime is not prepared");
     return this.prepared.home;
   }
+  get remote(): RemoteRuntimeClient { return this.options.remote; }
 
   async ensureStarted(): Promise<RuntimeIdentity> {
     const prepared = await this.prepare();
@@ -166,20 +199,16 @@ export class SshRuntime implements SshRuntimeController {
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
     if (this.prepared) return this.prepared;
-    const preflight = preflightSchema.parse(await this.options.remote.invoke("preflight", []));
+    const host = await prepareRemoteHost({ endpointId: this.options.endpointId, remote: this.options.remote, ...(this.options.assetRoot ? { assetRoot: this.options.assetRoot } : {}) });
     const endpointHash = createHash("sha256").update(this.options.endpointId).digest("hex").slice(0, 24);
-    const runtimeDir = `/tmp/qiyan-${preflight.uid}/${endpointHash}`;
-    const prepared = {
-      runtimeDir,
-      helperPath: `${runtimeDir}/qiyan-ssh-helper.mjs`,
+    this.prepared = {
+      runtimeDir: host.remoteRuntimeDir,
+      helperPath: host.remoteHelperPath,
       session: `qiyan-${endpointHash}`,
-      shell: preflight.shell,
-      home: preflight.home,
+      shell: host.shell,
+      home: host.remoteHome,
     };
-    const assets = await loadRemoteAssets(this.options.assetRoot);
-    await this.options.remote.bootstrap({ runtimeDir, ...assets });
-    this.prepared = prepared;
-    return prepared;
+    return this.prepared;
   }
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<

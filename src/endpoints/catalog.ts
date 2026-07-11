@@ -7,8 +7,15 @@ import { AppError } from "../core/errors.ts";
 const MAX_CATALOG_BYTES = 1024 * 1024;
 const endpointId = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).refine((value) => value !== "local" && value !== "assistant-local", "reserved endpoint id");
 const projectRoot = z.string().refine((value) => value.startsWith("~/") || isAbsolute(value), "must be absolute or begin with ~/");
-const entry = z.object({ type: z.literal("ssh"), projects_root: projectRoot.optional() }).strict();
+// A remote endpoint is one host + one provider: `ssh` runs a Codex app-server, `claude-code`
+// runs a headless `claude -p` over the same ControlMaster. Both share the projects_root shape.
+const entry = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("ssh"), projects_root: projectRoot.optional() }).strict(),
+  z.object({ type: z.literal("claude-code"), projects_root: projectRoot.optional() }).strict(),
+]);
 const documentSchema = z.object({ version: z.literal(1), endpoints: z.record(endpointId, entry) }).strict();
+
+export type RemoteEndpointType = "ssh" | "claude-code";
 
 export interface SshEndpointDefinition {
   id: string;
@@ -16,9 +23,17 @@ export interface SshEndpointDefinition {
   projectsRoot: string;
 }
 
+export interface ClaudeEndpointDefinition {
+  id: string;
+  type: "claude-code";
+  projectsRoot: string;
+}
+
+export type RemoteEndpointDefinition = SshEndpointDefinition | ClaudeEndpointDefinition;
+
 export interface EndpointCatalogDocument {
   version: 1;
-  endpoints: Record<string, { type: "ssh"; projects_root?: string }>;
+  endpoints: Record<string, { type: RemoteEndpointType; projects_root?: string }>;
 }
 
 export class EndpointCatalog {
@@ -37,11 +52,11 @@ export class EndpointCatalog {
 
   snapshot(): EndpointCatalogDocument { return structuredClone(this.document); }
 
-  require(id: string): SshEndpointDefinition {
+  require(id: string): RemoteEndpointDefinition {
     if (id === "local" || id === "assistant-local") throw new AppError("CONFIGURATION_ERROR", `${id} is a built-in endpoint`);
     const value = this.document.endpoints[id];
     if (!value) throw new AppError("ENDPOINT_UNAVAILABLE", `unknown endpoint: ${id}`);
-    return { id, type: "ssh", projectsRoot: value.projects_root ?? "~/qiyan-projects" };
+    return { id, type: value.type, projectsRoot: value.projects_root ?? "~/qiyan-projects" };
   }
 }
 

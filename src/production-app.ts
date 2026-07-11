@@ -96,7 +96,8 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { attestUserControlMaster, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -113,7 +114,7 @@ import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { RolloutAccessRouter } from "./endpoints/rollout-access.ts";
 import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
-import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
+import { LocalClaudeCommandRunner, type ClaudeLaunchFlags } from "./endpoints/claude-command-runner.ts";
 import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
 import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
 import { ClaudeGoalDriver } from "./sessions/claude-goal-driver.ts";
@@ -1856,7 +1857,7 @@ export async function buildProductionApp(
   const projectEndpointSubscriptions = new Map<string, Array<() => void>>();
   const projectEndpointRecoveries = new Map<string, Promise<void>>();
   const projectReadyRetryTimers = new Map<string, { generation: number; timer: ReturnType<typeof setTimeout> }>();
-  type RemoteContext = { runtime: SshRuntime; remote: SshRemoteClient; projectsRoot: string };
+  type RemoteContext = { host: RemoteHost; remote: SshRemoteClient; projectsRoot: string };
   const remoteContexts = new Map<string, RemoteContext>();
   const remoteCandidateContexts = new WeakMap<ManagedEndpointContract, RemoteContext>();
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2294,14 +2295,17 @@ export async function buildProductionApp(
           hasPendingDrive: (session) => scheduling!.hasPendingGoalDrive(session),
           onStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
         }) : undefined;
+        // Launch policy (disallowed tools, system prompt, model) applies to Claude
+        // sessions regardless of host, so the local and remote endpoints share it.
+        const claudeLaunchFlags: ClaudeLaunchFlags = claudeCodeConfig === undefined ? {} : {
+          disallowedTools: claudeCodeConfig.disallowedTools,
+          appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
+          ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
+        };
         claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
           id: claudeCodeConfig.endpointId,
           runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),
-          launchFlags: {
-            disallowedTools: claudeCodeConfig.disallowedTools,
-            appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
-            ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
-          },
+          launchFlags: claudeLaunchFlags,
           ...(claudeGoals ? { goals: claudeGoals } : {}),
           ...(scheduling ? {
             workerMcpConfigPath: async (threadId: string) => {
@@ -2349,6 +2353,19 @@ export async function buildProductionApp(
           createRemote: async (definition) => {
             const generation = await planner.createGeneration(definition.id);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
+            if (definition.type === "claude-code") {
+              // A Claude endpoint has no app-server to lazily prepare, so bootstrap the
+              // helper eagerly here (installs it + establishes the ControlMaster) — the
+              // ownership scan / workspace ops need the installed helper immediately.
+              const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+              const claudeRemoteEndpoint = new ClaudeCodeRuntime({
+                id: definition.id,
+                runner: new SshClaudeCommandRunner({ plan: generation.plan }),
+                launchFlags: claudeLaunchFlags,
+              });
+              remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
+              return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
+            }
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
             const socketRoot = await prepareLocalSshEndpointSocketRoot(sshRuntimeRoot, definition.id);
             const remoteEndpoint = new ManagedAppServerEndpoint({
@@ -2361,7 +2378,7 @@ export async function buildProductionApp(
               }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
             });
-            remoteCandidateContexts.set(remoteEndpoint, { runtime: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
+            remoteCandidateContexts.set(remoteEndpoint, { host: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
           },
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
@@ -2388,16 +2405,16 @@ export async function buildProductionApp(
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
-          const home = context.runtime.remoteHome;
+          const home = context.host.remoteHome;
           const projectsRoot = context.projectsRoot.startsWith("~/") ? posix.resolve(home, context.projectsRoot.slice(2)) : posix.resolve(context.projectsRoot);
           return new ProjectWorkspacePolicy({
             userHome: home,
-            qiyanHome: context.runtime.remoteRuntimeDir,
-            assistantWorkdir: context.runtime.remoteRuntimeDir,
-            dataDir: context.runtime.remoteRuntimeDir,
-            registryPath: posix.join(context.runtime.remoteRuntimeDir, "sessions.json"),
+            qiyanHome: context.host.remoteRuntimeDir,
+            assistantWorkdir: context.host.remoteRuntimeDir,
+            dataDir: context.host.remoteRuntimeDir,
+            registryPath: posix.join(context.host.remoteRuntimeDir, "sessions.json"),
             defaultProjectsRoot: projectsRoot,
-            host: new SshHost(id, context.remote, context.runtime.remoteHelperPath),
+            host: new SshHost(id, context.remote, context.host.remoteHelperPath),
           });
         }, (id, lease) => endpointManager.validateWorkLease(lease, id));
         workerFiles = new WorkerFileBridge({
@@ -2407,7 +2424,7 @@ export async function buildProductionApp(
           workspaces: workspaceRouter,
           remote: (id) => {
             const context = remoteContexts.get(id);
-            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath, runtimeDir: context.runtime.remoteRuntimeDir } : undefined;
+            return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath, runtimeDir: context.host.remoteRuntimeDir } : undefined;
           },
           maxFileBytes: config.attachmentMaxBytes,
         });
@@ -2426,7 +2443,7 @@ export async function buildProductionApp(
         const rolloutAccess = new RolloutAccessRouter({
           remote: (id) => {
             const context = remoteContexts.get(id);
-            return context ? { remote: context.remote, helperPath: context.runtime.remoteHelperPath } : undefined;
+            return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath } : undefined;
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
           // Provider dispatch (shared helper): Claude endpoints use the transcript

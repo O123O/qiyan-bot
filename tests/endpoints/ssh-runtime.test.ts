@@ -51,7 +51,7 @@ class FakeRemote implements RemoteRuntimeClient {
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
   async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
     this.calls.push({ operation, args: [...args] });
-    if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", codexPath: "/usr/bin/codex", tmuxPath: "/usr/bin/tmux" } as T;
+    if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash" } as T;
     if (operation === "inspect") return { status: this.status, ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}) } as T;
     if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
