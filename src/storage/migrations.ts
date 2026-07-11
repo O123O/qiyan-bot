@@ -636,7 +636,6 @@ export const migrations: readonly Migration[] = [
     state TEXT NOT NULL,
     next_fire_at INTEGER,
     interval_ms INTEGER,
-    last_single_fire_key TEXT,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS session_schedules_due ON session_schedules(state, next_fire_at);`,

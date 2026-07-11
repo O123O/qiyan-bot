@@ -13,20 +13,27 @@ import type { ScheduleRow, ScheduleStore } from "./schedule-store.ts";
 
 export interface TriggerEngineDeps {
   store: ScheduleStore;
-  // Drive a turn on the target session (production-app wires this to the durable
-  // send_to_session operation). Must be idempotent-safe; the engine also guards.
-  fire(row: ScheduleRow): Promise<void>;
+  // Drive a turn on the target session. `singleFireKey` binds this fire to this
+  // scheduled instant; production-app wires this to a DURABLE, idempotent
+  // send_to_session enqueue keyed by that key. At-least-once: the engine only marks
+  // the row advanced AFTER fire() resolves, so a throw/crash re-fires next tick; the
+  // durable enqueue's dedup on `singleFireKey` makes the redelivery a no-op.
+  fire(row: ScheduleRow, singleFireKey: string): Promise<void>;
   // Run a monitor's shell predicate on the session's endpoint; true iff exit 0.
   runCheck(row: ScheduleRow): Promise<boolean>;
   now(): number;
   // Injectable timer for tests; defaults to setTimeout.
   setTimer?(fn: () => void, ms: number): { cancel(): void };
   pollIntervalMs?: number;
+  // Bounds a single runCheck/fire so one hung monitor shell or slow send can't stall
+  // the whole engine (head-of-line). A timed-out op throws → retried next tick.
+  opTimeoutMs?: number;
   onError?(error: unknown, row: ScheduleRow): void;
 }
 
 const DEFAULT_POLL_MS = 1000;
 const MIN_INTERVAL_MS = 1000;
+const DEFAULT_OP_TIMEOUT_MS = 30_000;
 
 export class TriggerEngine {
   private timer: { cancel(): void } | undefined;
@@ -72,20 +79,31 @@ export class TriggerEngine {
 
   private async process(row: ScheduleRow): Promise<void> {
     const now = this.deps.now();
+    // Re-read state right before acting: a cancel_schedule during a prior row's await
+    // could have disarmed this row after due() snapshotted it (TOCTOU).
+    if (this.deps.store.get(row.id)?.state !== "armed") return;
     if (row.kind === "monitor") {
-      const triggered = await this.deps.runCheck(row);
+      const triggered = await this.withTimeout(this.deps.runCheck(row));
       if (!triggered) { this.deps.store.advance(row.id, now + this.interval(row)); return; }
     }
-    // Single-fire idempotency: the key binds this row to this scheduled instant, so a
-    // restart mid-fire cannot double-deliver.
+    // The key binds this fire to this scheduled instant. fire() is a durable,
+    // idempotent enqueue keyed by it; we advance ONLY after it resolves, so a
+    // throw/crash re-fires next tick and the enqueue dedups the redelivery
+    // (at-least-once + idempotent, not the previous at-most-once).
     const key = `${row.id}:${row.nextFireAt ?? now}`;
-    if (this.deps.store.claimFire(row.id, key)) {
-      await this.deps.fire(row);
-    }
+    await this.withTimeout(this.deps.fire(row, key));
     this.deps.store.advance(row.id, row.kind === "wakeup" ? null : now + this.interval(row));
   }
 
   private interval(row: ScheduleRow): number {
     return Math.max(MIN_INTERVAL_MS, row.intervalMs ?? DEFAULT_POLL_MS);
+  }
+
+  private async withTimeout<T>(op: Promise<T>): Promise<T> {
+    const ms = this.deps.opTimeoutMs ?? DEFAULT_OP_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("schedule op timed out")), ms); timer.unref?.(); });
+    try { return await Promise.race([op, timeout]); }
+    finally { clearTimeout(timer!); }
   }
 }

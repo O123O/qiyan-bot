@@ -8,19 +8,23 @@ function harness() {
   const store = new ScheduleStore(createTestDatabase());
   let clock = 10_000;
   const fired: ScheduleRow[] = [];
+  const firedKeys: string[] = [];
   const checks: string[] = [];
   let checkResult = true;
+  let failFires = 0;
   const engine = new TriggerEngine({
     store,
     now: () => clock,
-    fire: async (row) => { fired.push(row); },
+    fire: async (row, key) => { if (failFires > 0) { failFires -= 1; throw new Error("send failed"); } fired.push(row); firedKeys.push(key); },
     runCheck: async (row) => { checks.push(row.id); return checkResult; },
     setTimer: () => ({ cancel: () => undefined }), // no auto-loop; tests drive tick()
+    onError: () => undefined,
   });
   return {
-    store, engine, fired, checks,
+    store, engine, fired, firedKeys, checks,
     at: (t: number) => { clock = t; },
     setCheck: (v: boolean) => { checkResult = v; },
+    failNextFires: (n: number) => { failFires = n; },
   };
 }
 
@@ -89,8 +93,30 @@ test("recovery: a schedule missed while QiYan was down fires on the first tick",
 test("cancel disarms a schedule so it never fires", async () => {
   const h = harness();
   const row = h.store.create({ ...base, kind: "wakeup", spec: "20000", nextFireAt: 20_000 }, 10_000);
-  assert.equal(h.store.cancel(row.id), true);
+  assert.equal(h.store.cancel("claude-local", "t1", row.id), true);
   h.at(20_000); await h.engine.tick();
   assert.equal(h.fired.length, 0);
   assert.equal(h.store.listForSession("claude-local", "t1").length, 0);
+});
+
+test("at-least-once: a fire that fails is retried next tick until it delivers", async () => {
+  const h = harness();
+  h.store.create({ ...base, kind: "wakeup", spec: "20000", nextFireAt: 20_000 }, 10_000);
+  h.failNextFires(1); // first fire throws (transient send failure)
+  h.at(20_000); await h.engine.tick();
+  assert.equal(h.fired.length, 0); // not delivered, and NOT advanced/suppressed
+
+  await h.engine.tick(); // retry
+  assert.equal(h.fired.length, 1); // eventually delivered — no permanent loss
+});
+
+test("a schedule cancelled mid-tick (after due snapshot) does not fire", async () => {
+  const h = harness();
+  const a = h.store.create({ ...base, threadId: "t1", kind: "wakeup", spec: "20000", nextFireAt: 20_000 }, 10_000);
+  const b = h.store.create({ ...base, threadId: "t2", kind: "wakeup", spec: "20000", nextFireAt: 20_000 }, 10_000);
+  // cancel b before the tick processes it (simulates a worker cancel during the loop)
+  h.store.cancel("claude-local", "t2", b.id);
+  h.at(20_000); await h.engine.tick();
+  assert.equal(h.fired.length, 1);
+  assert.equal(h.fired[0]?.id, a.id);
 });

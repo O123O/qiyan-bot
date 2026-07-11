@@ -37,10 +37,15 @@ export class WorkerScheduleMcpServer {
   constructor(private readonly options: WorkerScheduleMcpOptions) {}
 
   get port(): number { return this.actualPort; }
-  url(token: string): string { return `http://127.0.0.1:${this.actualPort}/mcp`; void token; }
+  get url(): string { return `http://127.0.0.1:${this.actualPort}/mcp`; }
 
   async start(): Promise<void> {
     if (this.http) return;
+    // Bind ONLY to loopback: this surface is bearer-token-authenticated (no peer-PID
+    // check like the assistant LoopbackMcpServer), which is acceptable precisely
+    // because loopback is not reachable across the a1..a8 NFS nodes. A non-loopback
+    // bind would expose worker scheduling to the network — refuse it.
+    if ((this.options.host ?? "127.0.0.1") !== "127.0.0.1") throw new Error("worker scheduling MCP must bind only to 127.0.0.1");
     const http = createServer((request, response) => void this.handle(request, response));
     await new Promise<void>((resolve, reject) => {
       http.once("error", reject);
@@ -115,13 +120,16 @@ export class WorkerScheduleMcpServer {
       description: "Cancel one of your schedules by id (from list_schedules).",
       inputSchema: { id: z.string().min(1) },
     }, async (args) => {
-      const owned = this.options.store.listForSession(session.endpointId, session.threadId).some((r) => r.id === args.id);
-      if (!owned) return text(`no such active schedule: ${args.id}`);
-      return text(this.options.store.cancel(args.id) ? `cancelled ${args.id}` : `already inactive: ${args.id}`);
+      return text(this.options.store.cancel(session.endpointId, session.threadId, args.id)
+        ? `cancelled ${args.id}`
+        : `no such active schedule: ${args.id}`);
     });
 
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined } as never);
-    await mcp.connect(transport as never);
+    // SDK 1.29 models stateless mode as an explicitly-undefined generator, which
+    // conflicts with exactOptionalPropertyTypes despite being the documented API
+    // (same workaround as LoopbackMcpServer).
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined } as any);
+    await mcp.connect(transport as any);
     return { transport };
   }
 }

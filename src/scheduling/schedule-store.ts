@@ -39,8 +39,8 @@ export class ScheduleStore {
   create(schedule: NewSchedule, now: number): ScheduleRow {
     const id = randomUUID();
     this.db.prepare(
-      `INSERT INTO session_schedules(id, nickname, endpoint_id, thread_id, kind, spec, message, state, next_fire_at, interval_ms, last_single_fire_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, NULL, ?)`,
+      `INSERT INTO session_schedules(id, nickname, endpoint_id, thread_id, kind, spec, message, state, next_fire_at, interval_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?)`,
     ).run(id, schedule.nickname, schedule.endpointId, schedule.threadId, schedule.kind, schedule.spec, schedule.message,
       schedule.nextFireAt, schedule.intervalMs ?? null, now);
     return this.require(id);
@@ -71,23 +71,17 @@ export class ScheduleStore {
     return (this.db.prepare("SELECT * FROM session_schedules WHERE state = 'armed' AND next_fire_at IS NOT NULL AND next_fire_at <= ? ORDER BY next_fire_at").all(now) as Array<Record<string, unknown>>).map(fromRow);
   }
 
-  // Records a fire idempotently: only proceeds if this single-fire key hasn't already
-  // been recorded for this row. Returns true if this call owns the fire.
-  claimFire(id: string, singleFireKey: string): boolean {
-    const changed = this.db.prepare(
-      "UPDATE session_schedules SET last_single_fire_key = ? WHERE id = ? AND (last_single_fire_key IS NULL OR last_single_fire_key != ?)",
-    ).run(singleFireKey, id, singleFireKey).changes;
-    return changed === 1;
-  }
-
-  // After a fire: a one-shot wakeup is done; a recurring cron/monitor re-arms.
+  // After a fire: a one-shot wakeup is done; a recurring cron/monitor re-arms. Guarded
+  // on state='armed' so it can never clobber a row cancelled mid-tick.
   advance(id: string, nextFireAt: number | null): void {
-    if (nextFireAt === null) this.db.prepare("UPDATE session_schedules SET state = 'done', next_fire_at = NULL WHERE id = ?").run(id);
-    else this.db.prepare("UPDATE session_schedules SET next_fire_at = ? WHERE id = ?").run(nextFireAt, id);
+    if (nextFireAt === null) this.db.prepare("UPDATE session_schedules SET state = 'done', next_fire_at = NULL WHERE id = ? AND state = 'armed'").run(id);
+    else this.db.prepare("UPDATE session_schedules SET next_fire_at = ? WHERE id = ? AND state = 'armed'").run(nextFireAt, id);
   }
 
-  cancel(id: string): boolean {
-    return this.db.prepare("UPDATE session_schedules SET state = 'cancelled' WHERE id = ? AND state = 'armed'").run(id).changes === 1;
+  // Self-guarding: only the owning session can cancel its own armed schedule.
+  cancel(endpointId: string, threadId: string, id: string): boolean {
+    return this.db.prepare("UPDATE session_schedules SET state = 'cancelled' WHERE id = ? AND endpoint_id = ? AND thread_id = ? AND state = 'armed'")
+      .run(id, endpointId, threadId).changes === 1;
   }
 }
 
