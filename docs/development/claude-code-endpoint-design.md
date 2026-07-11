@@ -119,7 +119,25 @@ change §7 forbids for now; revisit only if a third provider appears. The transc
   (`relay.ts:112`, param `{threadId, turn:{id}}`); the adapter must actively push it (and decide on
   `onPermissionBlocked`).
 
-### 4.4 SDK vs headless
+### 4.4 The existing assistant manager tools work unchanged for both providers (the adapter payoff)
+
+The assistant's manager tools (`send_to_session`, `get_session_status`, `adopt_session`, `get_chat_history`,
+`list_managed_sessions`, `unadopt_session`, …) call QiYan's session layer (service → lifecycle →
+`pool.request`), never Codex directly. Because the adapter (§4.3) makes a Claude session present the Codex
+request surface, these tools are **provider-blind and require no change**. Mapping:
+- `send_to_session(nick, msg)` → `turn/start` → adapter runs `claude -p --resume <id> <STABLE flags> "msg"`;
+  on completion the adapter **synthesizes `turn/completed`** → the response returns through QiYan's normal
+  relay/delivery path (async, same as Codex — not a synchronous tool return).
+- `get_chat_history` / `get_session_status` → `thread/read` → adapter **reconstructs turns/items from the
+  session `.jsonl` transcript**. "Old responses" = the transcript, read on demand. This is the *same*
+  reconstruction QiYan's own delivery uses — **one implementation serves both** the assistant's history reads
+  and QiYan's final-message extraction.
+- `adopt_session` → `thread/resume`; `unadopt`/`archive` → local/no-op per §4.3.
+
+So the unified-tools requirement is satisfied *by construction* — it is the reason to choose the adapter over
+a refactor. The cost is concentrated in the one transcript-reconstruction (§4.3/§6), reused everywhere.
+
+### 4.5 SDK vs headless
 
 Start with the **headless `claude -p` subprocess** (mirrors QiYan's existing subprocess + jsonl patterns,
 keeps sessions out-of-process). Evaluate the **TS Agent SDK** (`@anthropic-ai/claude-agent-sdk`, typed
