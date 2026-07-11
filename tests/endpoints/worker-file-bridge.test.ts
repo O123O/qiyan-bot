@@ -189,3 +189,26 @@ test("rejects a replaced project root before opening a remote file", async () =>
   }), /workspace changed/u);
   assert.equal(value.remoteReads(), 0);
 });
+
+test("a local Claude endpoint handles attachments in-process, never over the ssh transport", async () => {
+  // Regression: the local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID) is local but not the
+  // Codex "local" id, so the bridge must route it through the in-process path — not the
+  // ssh transport, which has no host for it ("SSH file transport is unavailable").
+  let remoteConsulted = false;
+  const bridge = new WorkerFileBridge({
+    attachments: { toUserInput: () => ({ type: "localImage" as const, path: "/local/pic.png" }) } as never,
+    registry: { getByIdentity: () => ({ nickname: "n", session: { endpoint: "claude-local", thread_id: "t", mapping_id: "m", project_dir: "/p", lifecycle_state: "managed" } }) } as never,
+    endpoints: { validateWorkLease: () => true } as never,
+    workspaces: {} as never,
+    remote: () => { remoteConsulted = true; return undefined; },
+    isLocal: (id) => id === "local" || id === "claude-local",
+    maxFileBytes: 1024,
+  });
+  const out = await bridge.toWorkerInput({
+    lease: {} as never,
+    mapping: { endpoint: "claude-local", thread_id: "t", mapping_id: "m" } as never,
+    projectRoot: "/p", scopeId: "s", attachmentId: "a" as never,
+  });
+  assert.deepEqual(out, { type: "localImage", path: "/local/pic.png" });
+  assert.equal(remoteConsulted, false, "a local endpoint must not touch the ssh file transport");
+});

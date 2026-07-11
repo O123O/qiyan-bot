@@ -2400,8 +2400,14 @@ export async function buildProductionApp(
           pool,
           quarantine: (operation, reason) => operations.failAndUnbind(operation.id, { message: reason }),
         }).restoreBeforeIngress();
+        // A local endpoint runs on QiYan's own host with no ssh: the Codex "local" plus the
+        // optional local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID). Both resolve to the local
+        // project workspace and count as local for ownership scans. Shared so the workspace
+        // router and the rollout-access router cannot diverge (they did — see the local Claude
+        // "SSH workspace host is unavailable" regression).
+        const isLocalEndpoint = (id: string): boolean => id === "local" || id === claudeCodeConfig?.endpointId;
         workspaceRouter = new WorkspaceRouter(async (id) => {
-          if (id === "local") return projectWorkspaces;
+          if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
@@ -2426,6 +2432,7 @@ export async function buildProductionApp(
             const context = remoteContexts.get(id);
             return context ? { remote: context.remote, helperPath: context.host.remoteHelperPath, runtimeDir: context.host.remoteRuntimeDir } : undefined;
           },
+          isLocal: isLocalEndpoint,
           maxFileBytes: config.attachmentMaxBytes,
         });
         const durableLease = conversations.lease();
@@ -2439,7 +2446,6 @@ export async function buildProductionApp(
         }
         discovery = new SessionDiscovery(db, pool);
         threadGate = new ThreadGate();
-        const claudeEndpointId = config.claudeCode?.endpointId;
         const rolloutAccess = new RolloutAccessRouter({
           remote: (id) => {
             const context = remoteContexts.get(id);
@@ -2450,7 +2456,7 @@ export async function buildProductionApp(
           // scanner. Only the built-in local Claude endpoint is local; a catalog
           // claude-code endpoint is remote (scans over ssh).
           provider: (id) => sessionProvider(id),
-          local: (id) => id === "local" || id === claudeEndpointId,
+          local: isLocalEndpoint,
           scanLocalClaude: scanLocalClaudeTranscript,
         });
         ownership = new SessionOwnershipGuard(

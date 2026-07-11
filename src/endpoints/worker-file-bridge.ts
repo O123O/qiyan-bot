@@ -33,8 +33,16 @@ export class WorkerFileBridge {
     endpoints: Pick<EndpointManager, "validateWorkLease" | "withWorkLease" | "runWithWorkLease">;
     workspaces: Pick<WorkspaceRouter, "prepareExisting" | "assertDispatchable">;
     remote(endpointId: string): RemoteFileContext | undefined;
+    // Whether an endpoint runs on QiYan's own host (files handled in-process, not over ssh).
+    // Defaults to the Codex `"local"` id; production also passes the local Claude endpoint id
+    // so its files aren't mis-sent through the (nonexistent) ssh transport.
+    isLocal?(endpointId: string): boolean;
     maxFileBytes: number;
   }) {}
+
+  private isLocal(endpointId: string): boolean {
+    return this.options.isLocal?.(endpointId) ?? endpointId === "local";
+  }
 
   async toWorkerInput(input: {
     lease: EndpointWorkLease;
@@ -45,7 +53,7 @@ export class WorkerFileBridge {
   }): Promise<{ type: "localImage"; path: string } | { type: "mention"; name: string; path: string }> {
     this.assertCurrent(input.mapping, input.projectRoot);
     this.assertLease(input.lease, input.mapping.endpoint);
-    if (input.mapping.endpoint === "local") return this.options.attachments.toUserInput(input.scopeId, input.attachmentId);
+    if (this.isLocal(input.mapping.endpoint)) return this.options.attachments.toUserInput(input.scopeId, input.attachmentId);
     const context = this.requireRemote(input.mapping.endpoint);
     const stored = this.options.attachments.get(input.scopeId, input.attachmentId);
     if (!stored) throw new AppError("ATTACHMENT_INVALID", "unknown or out-of-scope attachment handle");
@@ -79,7 +87,7 @@ export class WorkerFileBridge {
     if (input.mapping.endpoint !== input.endpointId) throw new AppError("SESSION_DETACHED", "managed session endpoint changed");
     const existing = this.options.attachments.get(input.scopeId, input.requestedId);
     if (existing) return existing;
-    if (input.endpointId === "local") {
+    if (this.isLocal(input.endpointId)) {
       return this.withFileLease(input.endpointId, input.lease, async (lease) => {
         this.assertCurrent(input.mapping, input.projectRoot);
         this.assertLease(lease, input.endpointId);
