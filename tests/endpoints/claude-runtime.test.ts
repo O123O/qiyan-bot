@@ -44,6 +44,9 @@ class FakeRunner implements ClaudeCommandRunner {
   }
   async readTranscript(threadId: string) { return this.transcripts.get(threadId) ?? []; }
   async transcriptPath(threadId: string) { return this.transcripts.has(threadId) ? `/fake/${threadId}.jsonl` : undefined; }
+  async listThreads(cwd?: string) {
+    return [...this.transcripts.keys()].map((id) => ({ id, cwd: cwd ?? "/fake", updatedAt: 0, preview: "" }));
+  }
 }
 
 function makeRuntime(runner: ClaudeCommandRunner) {
@@ -181,7 +184,7 @@ test("turn/steer durably enqueues the message (never aborts the running turn)", 
 test("buildClaudeArgs emits stable, byte-identical flags", () => {
   const base: ClaudeTurnRequest = {
     threadId: "sid-1", cwd: "/w", message: "hi", resume: false,
-    flags: { appendSystemPrompt: "SP", disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8" },
+    flags: { appendSystemPrompt: "SP", disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8", effort: "high" },
   };
   assert.deepEqual(buildClaudeArgs(base), [
     "-p", "--output-format", "stream-json", "--verbose",
@@ -190,7 +193,64 @@ test("buildClaudeArgs emits stable, byte-identical flags", () => {
     "--disallowedTools", "Monitor ScheduleWakeup",
     "--mcp-config", "/tmp/m.json", "--strict-mcp-config",
     "--model", "claude-opus-4-8",
+    "--effort", "high",
   ]);
   assert.equal(buildClaudeArgs({ ...base, resume: true }).includes("--resume"), true);
   assert.equal(buildClaudeArgs(base).includes("hi"), false); // prompt goes over stdin, never argv
+});
+
+test("model/list returns the curated catalog in Codex {data,nextCursor} shape with efforts", async () => {
+  const rt = makeRuntime(new FakeRunner());
+  await rt.start();
+  const result = await rt.request<{ data: any[]; nextCursor: null }>("model/list", {});
+  assert.equal(result.nextCursor, null);
+  assert.ok(result.data.length > 0, "catalog is non-empty (unblocks set_session_model)");
+  assert.ok(result.data.some((m) => m.id === "claude-opus-4-8" && m.isDefault), "configured model present + default");
+  assert.ok(result.data.every((m) => m.supportedReasoningEfforts.some((e: any) => e.reasoningEffort === "high" && m.supportedReasoningEfforts.some((x: any) => x.reasoningEffort === "xhigh"))));
+});
+
+test("turn/start applies per-session model + effort over the endpoint defaults", async () => {
+  const runner = new FakeRunner();
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c1", input: "hi", model: "haiku", effort: "high" });
+  const req = runner.requests.at(-1)!;
+  assert.equal(req.flags.model, "haiku", "per-session --model overrides launchFlags.model");
+  assert.equal(req.flags.effort, "high", "per-session --effort applied");
+  runner.complete();
+});
+
+test("thread/read reports active while the subprocess runs, idle after", async () => {
+  const runner = new FakeRunner();
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c1", input: "hi" });
+  const running = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(running.thread.status.type, "active");
+  runner.complete();
+  await new Promise((resolve) => setImmediate(resolve)); // let the completion handler clear state.running
+  const idle = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(idle.thread.status.type, "idle");
+});
+
+test("thread/list splits archived tombstones and hides them from the default page", async () => {
+  const { createTestDatabase } = await import("../../src/storage/database.ts");
+  const { ClaudeArchiveStore } = await import("../../src/sessions/claude-archives.ts");
+  const runner = new FakeRunner();
+  // Two discoverable threads via the runner's listThreads.
+  await runner.readTranscript("t-keep"); runner["transcripts"].set("t-keep", [{ cwd: "/w" }]);
+  runner["transcripts"].set("t-gone", [{ cwd: "/w" }]);
+  const archives = new ClaudeArchiveStore(createTestDatabase());
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner, launchFlags: {}, archives });
+  await rt.start();
+  archives.add("claude-local", "t-gone");
+  const live = await rt.request<{ data: any[] }>("thread/list", { cwd: "/w", archived: false });
+  assert.deepEqual(live.data.map((t) => t.id).sort(), ["t-keep"], "archived thread hidden from default listing");
+  const archived = await rt.request<{ data: any[] }>("thread/list", { cwd: "/w", archived: true });
+  assert.deepEqual(archived.data.map((t) => t.id), ["t-gone"]);
+  // A re-adopt (thread/resume) revives it.
+  await rt.request("thread/resume", { threadId: "t-gone" }).catch(() => undefined);
+  assert.equal(archives.has("claude-local", "t-gone"), false, "resume cleared the tombstone");
 });

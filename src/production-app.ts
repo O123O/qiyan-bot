@@ -118,6 +118,7 @@ import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
 import { LocalClaudeCommandRunner, type ClaudeLaunchFlags } from "./endpoints/claude-command-runner.ts";
 import { scanLocalClaudeTranscript } from "./sessions/claude-transcript.ts";
 import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
+import { ClaudeArchiveStore } from "./sessions/claude-archives.ts";
 import { ClaudeGoalDriver } from "./sessions/claude-goal-driver.ts";
 import { SchedulingService } from "./scheduling/scheduling-service.ts";
 import type { ScheduleRow } from "./scheduling/schedule-store.ts";
@@ -1835,6 +1836,7 @@ export async function buildProductionApp(
   let claudeEndpoint: ClaudeCodeRuntime | undefined;
   let scheduling: SchedulingService | undefined;
   let claudeGoals: ClaudeGoalStore | undefined;
+  let claudeArchives: ClaudeArchiveStore | undefined;
   let claudeGoalDriver: ClaudeGoalDriver | undefined;
   const CLAUDE_MAX_GOAL_TURNS = 25;
   let endpointCatalog!: EndpointCatalog;
@@ -2284,6 +2286,7 @@ export async function buildProductionApp(
         // endpoints.json, so a startup-snapshot gate would leave it without goals/scheduling.
         // The cost when no Claude endpoint exists is one idle loopback MCP + one poll loop.
         claudeGoals = new ClaudeGoalStore(db);
+        claudeArchives = new ClaudeArchiveStore(db);
         // Refresh the dashboard after a worker/driver goal-status change (those bypass
         // the manager tools' observeGoal). Provider-based, so it covers remote Claude too.
         const refreshClaudeGoalObservation = (nickname: string): void => {
@@ -2324,6 +2327,7 @@ export async function buildProductionApp(
         // separately (local: loopback; remote: reverse tunnel).
         const claudeGoalRuntimeOptions = (endpointId: string) => ({
           goals: claudeGoals!,
+          archives: claudeArchives!,
           steer: async (threadId: string, message: string): Promise<void> => {
             const found = registry.getByIdentity(endpointId, threadId);
             if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId, threadId }, message);
@@ -2582,7 +2586,7 @@ export async function buildProductionApp(
             if (authorizedTurnId || after) return { ...(authorizedTurnId ? { authorizedTurnId } : {}), ...(after ? { after } : {}) };
           },
         );
-        sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership);
+        sessions = new SessionService(pool, registry, runtime, finals, deliveries, workspaceRouter, threadGate, endpointManager, ownership, (id) => sessionProvider(id) !== "claude");
         observations = new SessionObservationProcessor(dashboardStore, registry, runtime, {
           now: () => Date.now(),
           readThread: async (endpointId, threadId, lease) => (await pool.request<any>(
@@ -3725,7 +3729,9 @@ export async function buildProductionApp(
             }
             const checkpoint = operation.receipt as { pendingSettings?: { model?: string; effort?: string }; settingsObservationSequence?: number } | undefined;
             const appliedSettings = args.mode === "start" && checkpoint && Object.hasOwn(checkpoint, "pendingSettings") ? checkpoint.pendingSettings ?? {} : undefined;
-            if (appliedSettings) runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, appliedSettings);
+            // Same guard as the live send: Claude's model/effort are sticky (no server to
+            // persist them), so consuming on recovery would silently erase them. Shared method.
+            if (appliedSettings) sessions.consumeSettingsIfNative(session.endpoint, session.thread_id, session.mapping_id, appliedSettings);
             const receipt = { nickname: args.nickname, mode: args.mode, turnId: turn.id, terminal: isTerminalStatus(turn.status), ...(appliedSettings ? { appliedSettings } : {}) };
             await succeedRecovered(operation, receipt, () => {
               observeLastSent(args.nickname, args, { mode: args.mode, turnId: turn.id }, operation.sequence);

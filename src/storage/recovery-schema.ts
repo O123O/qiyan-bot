@@ -7,6 +7,7 @@ export const RECOVERY_TABLES = [
   "assistant_attempts",
   "assistant_turn_lease",
   "attachments",
+  "claude_archived_threads",
   "claude_session_goals",
   "conversation_cutover",
   "deliveries",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -506,6 +506,30 @@ test("the exact production MCP map succeeds for every local and remote manager a
     { endpoint: "claude-local", nickname: `mcp-claude-local-${suffix}` },
     ...(claudeRemoteAlias ? [{ endpoint: claudeRemoteAlias, nickname: `mcp-claude-remote-${suffix}` }] : []),
   ] as const;
+
+  // Ground-truth check that a per-session model actually reached `claude -p`: the resolved model
+  // id is recorded on the transcript's assistant records (NOT the appliedSettings echo that
+  // masked the original no-op). Reads the transcript on the host (local fs / remote ssh).
+  const claudeTranscriptModels = async (endpoint: string, threadId: string): Promise<string[]> => {
+    let text = "";
+    if (endpoint === "claude-local") {
+      const projects = join(userHome, ".claude", "projects");
+      for (const dir of await readdir(projects).catch(() => [] as string[])) {
+        const candidate = join(projects, dir, `${threadId}.jsonl`);
+        try { text = await readFile(candidate, "utf8"); break; } catch { /* keep looking */ }
+      }
+    } else {
+      const result = spawnSync("ssh", [endpoint, `find ~/.claude/projects -name ${threadId}.jsonl -exec cat {} +`], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+      text = result.stdout ?? "";
+    }
+    const models = new Set<string>();
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      try { const record = JSON.parse(line); const model = record?.message?.model; if (typeof model === "string") models.add(model); } catch { /* partial */ }
+    }
+    return [...models];
+  };
   for (const fixture of claudeFixtures) {
     const created = await call("create_session", { nickname: fixture.nickname, endpoint: fixture.endpoint }, fixture.endpoint);
     assert.equal(created.nickname, fixture.nickname, `${fixture.endpoint} create`);
@@ -537,6 +561,13 @@ test("the exact production MCP map succeeds for every local and remote manager a
 
     const waitForIdle = (label: string): Promise<void> => waitFor(() => (db.prepare(`SELECT native_status FROM session_runtime
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined)?.native_status === "idle", workerTimeoutMs, label);
+    const deliverTurn = (turnId: string, label: string): Promise<{ id: string }> => waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages
+      WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ? LIMIT 1`).get(fixture.endpoint, session.thread_id, turnId) as { id: string } | undefined, workerTimeoutMs, label);
+
+    // ---- discover_sessions must enumerate Claude sessions (regression: threw UNSUPPORTED).
+    // Model-independent (no turn), so it runs here while the session is live. ----
+    const discovered = await call("discover_sessions", { endpoint: fixture.endpoint, cwd: session.project_dir, limit: 20 }, fixture.endpoint);
+    assert.ok(discovered.sessions.some((item: any) => item.id === session.thread_id), `${fixture.nickname} discover_sessions missing the live session`);
 
     // Goals + auto-drive (Tier A — same for local and remote): set_goal enqueues a pursuit
     // turn via the driver, which the schedule engine fires as an autonomous send (recorded
@@ -564,6 +595,31 @@ test("the exact production MCP map succeeds for every local and remote manager a
     await waitFor(() => scheduleCount() > beforeSchedule, workerTimeoutMs, `${fixture.nickname} worker schedule_wakeup did not persist (MCP unreachable?)`);
     await waitForIdle(`${fixture.nickname} post-schedule idle`);
 
+    // ---- Per-session model + effort must ACTUALLY reach `claude -p` (regressions: set_session_model
+    // threw on empty list_models; set_reasoning_effort was a silent no-op). Proof is the resolved
+    // model id on the transcript, NOT the appliedSettings echo. Runs AFTER the tool-dependent goal/
+    // scheduling steps because it sets a STICKY smaller model that would degrade tool-calling. ----
+    const catalog = await call("list_models", { endpoint: fixture.endpoint }, fixture.endpoint);
+    assert.ok(catalog.data.length > 0, `${fixture.nickname} list_models is empty`);
+    await call("set_reasoning_effort", { nickname: fixture.nickname, effort: "high" }, fixture.endpoint);
+    await call("set_session_model", { nickname: fixture.nickname, model: "haiku" }, fixture.endpoint);
+    const modelAsk = "Reply with exactly MODELSET.";
+    const modelSend = await call("send_to_session", { nickname: fixture.nickname, content: modelAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${modelAsk}`);
+    await deliverTurn(modelSend.turnId, `${fixture.nickname} model turn delivered`);
+    await waitForIdle(`${fixture.nickname} model turn idle`);
+    assert.ok((await claudeTranscriptModels(fixture.endpoint, session.thread_id)).some((m) => /haiku/iu.test(m)),
+      `${fixture.nickname} set_session_model not applied to claude -p`);
+    // Sticky: a SECOND turn without re-setting still runs on haiku (Claude settings are NOT consumed).
+    const stickyAsk = "Reply with exactly MODELSTICK.";
+    const stickySend = await call("send_to_session", { nickname: fixture.nickname, content: stickyAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${stickyAsk}`);
+    await deliverTurn(stickySend.turnId, `${fixture.nickname} sticky turn delivered`);
+    await waitForIdle(`${fixture.nickname} sticky turn idle`);
+    assert.ok((await claudeTranscriptModels(fixture.endpoint, session.thread_id)).some((m) => /haiku/iu.test(m)),
+      `${fixture.nickname} sticky model lost on the next turn (settings were consumed)`);
+    // An invalid effort is rejected, not silently accepted.
+    await assert.rejects(call("set_reasoning_effort", { nickname: fixture.nickname, effort: "ludicrous" }, fixture.endpoint),
+      /effort|not supported|unknown/iu, `${fixture.nickname} invalid effort not rejected`);
+
     // daemonless restart/disconnect with the session still managed: must not strand the
     // endpoint "draining" and must restore the managed session (no runtime identity to prove).
     await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
@@ -578,6 +634,11 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.ok((await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname], `${fixture.nickname} re-adopt`);
     await call("archive_session", { nickname: fixture.nickname }, fixture.endpoint);
     assert.equal((await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname], undefined, `${fixture.nickname} archive`);
+    // Real archive (not just unadopt): the transcript survives on disk but discover now tombstones
+    // it — the emulated archived state, matching Codex's native archive.
+    const postArchive = await call("discover_sessions", { endpoint: fixture.endpoint, cwd: session.project_dir, limit: 20 }, fixture.endpoint);
+    const archivedEntry = postArchive.sessions.find((item: any) => item.id === session.thread_id);
+    assert.ok(archivedEntry && archivedEntry.archived === true, `${fixture.nickname} archived Claude thread not tombstoned in discover (archive ≈ unadopt)`);
 
     // never-materialized: create then archive with no turn (no transcript / no rollout).
     const ephemeral = `${fixture.nickname}-empty`;
