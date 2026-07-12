@@ -63,7 +63,7 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   create_session: "Create a new managed worker session on an endpoint (omit project_dir for default_projects_root/<nickname>).",
   adopt_session: "Adopt an existing native thread under a nickname (validates its native cwd; never repoints).",
   rename_session: "Rename a managed session's nickname (backend-side only; native thread unchanged).",
-  unadopt_session: "Release a session WITHOUT archiving its native thread — it stays discoverable/re-adoptable.",
+  unadopt_session: "Release a session WITHOUT archiving its native thread or deleting project files — it stays discoverable/re-adoptable.",
   archive_session: "Release a session and mark its native thread archived (still returned by discover_sessions, flagged archived; unadopt leaves it unarchived).",
   send_to_session: "Send a message to a worker as a new turn (start) or onto the active turn (steer). Used by /pass.",
   read_worker_message: "Read one worker message's full body by id (notifications are metadata-only until read).",
