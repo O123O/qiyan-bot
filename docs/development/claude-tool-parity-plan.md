@@ -89,6 +89,13 @@ Extend the gated acceptance harness (`mcp-production-actions.test.ts`) Claude bl
 - Unit tests: `claude-models` catalog shape; `ClaudeArchiveStore`; runner `listThreads` (local dir scan +
   remote helper op); `buildClaudeArgs` emits `--model`/`--effort`; `turnStart` prefers per-turn settings.
 
+## TODO / follow-ups
+- **Model list is NOT real-time.** `list_models` returns a static curated alias catalog
+  (`src/endpoints/claude-models.ts`) because Claude Code has no non-interactive model-list command
+  (open feature request anthropics/claude-code#12612). It doesn't reflect the host's actual model
+  access/new releases and can go stale. Switch to the live Claude list once that request ships;
+  meanwhile keep the aliases in sync with the Claude Code model-config docs.
+
 ## Out of scope / reported, not fixed
 - Mid-turn steer (no Claude equivalent).
 - Remote per-endpoint launch flags from the catalog definition (separate follow-up; catalog has no such

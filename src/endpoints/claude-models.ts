@@ -1,3 +1,9 @@
+// TODO(claude-model-list): this catalog is STATIC, not real-time — it does not reflect the host's
+// actual available models, account/org access, or new releases; it can go stale as Claude ships
+// models. Replace it with the live Claude model list once Claude Code exposes one non-interactively
+// (open feature request anthropics/claude-code#12612 — `claude model list`); until then keep the
+// documented aliases here in sync with the model-config docs.
+//
 // Curated Claude model catalog. Claude Code has NO `models` list API (verified: the CLI has no
 // `models`/`config get` command — it's an open feature request), so QiYan cannot discover models
 // dynamically. This static list of the documented `--model` aliases is what `model/list` returns
