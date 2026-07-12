@@ -9,48 +9,85 @@ export interface ToolCallContext { sourceContextId: string; attemptId: string; t
 export type ToolHandler = (context: ToolCallContext, args: unknown) => Promise<unknown>;
 export interface ToolActionContext extends ToolCallContext { effectiveSourceContextId: string; operationId: string; operationCreatedAt: number; operationSequence: number; checkpoint(receipt: unknown): void }
 
-const nickname = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u);
+const nickname = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).describe("the managed session's short unique nickname");
+const endpoint = () => z.string().describe("endpoint id (e.g. 'local', 'claude-local', a catalog id); omit for the default endpoint");
 export const ASSISTANT_TOOL_SCHEMAS = {
   list_managed_sessions: z.object({}).strict(),
-  discover_sessions: z.object({ endpoint: z.string().optional(), search: z.string().optional(), cwd: z.string().optional(), cursor: z.string().optional(), limit: z.number().int().positive().max(100).optional() }).strict(),
+  discover_sessions: z.object({ endpoint: endpoint().optional(), search: z.string().describe("filter by a substring of the id/cwd/preview").optional(), cwd: z.string().describe("only sessions whose working directory equals this path").optional(), cursor: z.string().describe("pagination cursor from a previous call").optional(), limit: z.number().int().positive().max(100).describe("max results (1-100)").optional() }).strict(),
   get_session_status: z.object({ nickname: nickname }).strict(),
-  create_session: z.object({ nickname, project_dir: z.string().min(1).optional(), endpoint: z.string().optional() }).strict(),
-  adopt_session: z.object({ nickname, thread_id: z.string().min(1), endpoint: z.string().optional() }).strict(),
+  create_session: z.object({ nickname, project_dir: z.string().min(1).describe("absolute project directory; omit to use default_projects_root/<nickname>").optional(), endpoint: endpoint().optional() }).strict(),
+  adopt_session: z.object({ nickname, thread_id: z.string().min(1).describe("native thread id to adopt (from discover_sessions)"), endpoint: endpoint().optional() }).strict(),
   rename_session: z.object({ old_nickname: nickname, new_nickname: nickname }).strict(),
   unadopt_session: z.object({ nickname }).strict(), archive_session: z.object({ nickname }).strict(),
-  send_to_session: z.object({ nickname, content: z.string(), attachment_ids: z.array(z.string()).default([]), mode: z.enum(["start", "steer"]) }).strict(),
-  read_worker_message: z.object({ nickname, message_id: z.string().min(1) }).strict(),
-  collect_messages: z.object({ nickname, count: z.number().int().positive() }).strict(),
-  interrupt_session: z.object({ nickname, turn_id: z.string().optional() }).strict(),
-  list_models: z.object({ endpoint: z.string().optional() }).strict(),
-  disconnect_endpoint: z.object({ endpoint: z.string().min(1).default("local") }).strict(),
-  restart_endpoint: z.object({ endpoint: z.string().min(1).default("local") }).strict(),
-  set_session_model: z.object({ nickname, model: z.string().min(1) }).strict(),
-  set_reasoning_effort: z.object({ nickname, effort: z.string().min(1) }).strict(),
+  send_to_session: z.object({ nickname, content: z.string().describe("the message text to send to the worker"), attachment_ids: z.array(z.string()).describe("attachment ids to include, in order").default([]), mode: z.enum(["start", "steer"]).describe("'start' = new turn (fails if one is running); 'steer' = queue onto the active turn") }).strict(),
+  read_worker_message: z.object({ nickname, message_id: z.string().min(1).describe("worker message id (from a notification)") }).strict(),
+  collect_messages: z.object({ nickname, count: z.number().int().positive().describe("how many of the most-recent final messages to deliver (max 20)") }).strict(),
+  interrupt_session: z.object({ nickname, turn_id: z.string().describe("specific turn to interrupt; omit for the active turn").optional() }).strict(),
+  list_models: z.object({ endpoint: endpoint().optional() }).strict(),
+  disconnect_endpoint: z.object({ endpoint: endpoint().min(1).default("local") }).strict(),
+  restart_endpoint: z.object({ endpoint: endpoint().min(1).default("local") }).strict(),
+  set_session_model: z.object({ nickname, model: z.string().min(1).describe("a model id from list_models; 'default' follows the account/org default") }).strict(),
+  set_reasoning_effort: z.object({ nickname, effort: z.string().min(1).describe("a value from list_models.supportedReasoningEfforts (Claude: low|medium|high|xhigh|max)") }).strict(),
   get_goal: z.object({ nickname }).strict(),
-  set_goal: z.object({ nickname, objective: z.string().min(1), token_budget: z.number().int().positive().optional() }).strict(),
+  set_goal: z.object({ nickname, objective: z.string().min(1).describe("what the worker should accomplish (replaces any current goal)"), token_budget: z.number().int().positive().describe("optional token budget bounding the goal (Codex)").optional() }).strict(),
   pause_goal: z.object({ nickname }).strict(), resume_goal: z.object({ nickname }).strict(),
-  cancel_goal: z.object({ nickname, interrupt_active_turn: z.boolean().optional() }).strict(),
+  cancel_goal: z.object({ nickname, interrupt_active_turn: z.boolean().describe("also stop the currently running goal turn").optional() }).strict(),
   update_session_notes: z.object({
     nickname,
-    project_summary: z.string().max(4_000).nullable().optional(),
-    supervision_objective: z.string().max(4_000).nullable().optional(),
-    pending_follow_up: z.string().max(4_000).nullable().optional(),
+    project_summary: z.string().max(4_000).describe("concise summary of the worker's project; null to clear").nullable().optional(),
+    supervision_objective: z.string().max(4_000).describe("standing supervision goal for this session; null to clear").nullable().optional(),
+    pending_follow_up: z.string().max(4_000).describe("the next follow-up you owe; null to clear when resolved").nullable().optional(),
   }).strict().refine((value) => Object.keys(value).some((key) => key !== "nickname"), "at least one manager note field is required"),
-  send_chat_message: z.object({ content: z.string() }).strict(),
-  prepare_chat_attachment: z.object({ owner: z.string().min(1), relative_path: z.string().min(1) }).strict(),
-  send_chat_attachment: z.object({ file_handle: z.string().min(1), caption: z.string().optional() }).strict(),
+  send_chat_message: z.object({ content: z.string().describe("message text to send to the current chat/user") }).strict(),
+  prepare_chat_attachment: z.object({ owner: z.string().min(1).describe("owning session nickname, or 'assistant' for the assistant's own workdir"), relative_path: z.string().min(1).describe("file path relative to the owner's root directory") }).strict(),
+  send_chat_attachment: z.object({ file_handle: z.string().min(1).describe("file_handle from prepare_chat_attachment"), caption: z.string().describe("optional caption").optional() }).strict(),
   get_chat_history: z.object({
-    scope: z.enum(["conversation", "channel"]),
-    count: z.number().int().positive().max(100),
-    before: z.string().min(1).optional(),
+    scope: z.enum(["conversation", "channel"]).describe("'conversation' = this thread; 'channel' = the whole channel"),
+    count: z.number().int().positive().max(100).describe("how many messages to read (1-100)"),
+    before: z.string().min(1).describe("only messages before this cursor/id").optional(),
   }).strict(),
-  search_slack: z.object({ query: z.string().min(1), date_from: z.string().optional(), date_to: z.string().optional() }).strict(),
-  get_slack_mentions: z.object({ date_from: z.string() }).strict(),
+  search_slack: z.object({ query: z.string().min(1).describe("search text"), date_from: z.string().describe("ISO date lower bound").optional(), date_to: z.string().describe("ISO date upper bound").optional() }).strict(),
+  get_slack_mentions: z.object({ date_from: z.string().describe("ISO date to list mentions since") }).strict(),
 } as const;
 
 export const TOOL_NAMES = Object.freeze(Object.keys(ASSISTANT_TOOL_SCHEMAS)) as readonly (keyof typeof ASSISTANT_TOOL_SCHEMAS)[];
 export type AssistantToolName = keyof typeof ASSISTANT_TOOL_SCHEMAS;
+
+// Per-tool descriptions surfaced to the assistant's MCP client (the manager MCP server falls
+// back to a generic string for tools not listed here). Use these to document behavior the
+// assistant must know but can't infer from the schema.
+export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
+  list_managed_sessions: "List all managed sessions (nickname, endpoint, provider codex|claude, thread, project dir). Use get_session_status for live status.",
+  discover_sessions: "Find existing native threads on an endpoint that can be adopted (most-recent-first). Returns thread ids for adopt_session; creates nothing.",
+  get_session_status: "Live status of a managed session: native_status, active turn, model/effort, goal, notes.",
+  create_session: "Create a new managed worker session on an endpoint (omit project_dir for default_projects_root/<nickname>).",
+  adopt_session: "Adopt an existing native thread under a nickname (validates its native cwd; never repoints).",
+  rename_session: "Rename a managed session's nickname (backend-side only; native thread unchanged).",
+  unadopt_session: "Release a session WITHOUT archiving its native thread — it stays discoverable/re-adoptable.",
+  archive_session: "Release a session and mark its native thread archived (still returned by discover_sessions, flagged archived; unadopt leaves it unarchived).",
+  send_to_session: "Send a message to a worker as a new turn (start) or onto the active turn (steer). Used by /pass.",
+  read_worker_message: "Read one worker message's full body by id (notifications are metadata-only until read).",
+  collect_messages: "Deliver the worker's last N final message bodies into chat. Used by /collect.",
+  interrupt_session: "Interrupt the worker's active turn (explicit user intent / authorized supervision only).",
+  list_models: "List an endpoint's selectable models and their supported reasoning efforts. Call before set_session_model / set_reasoning_effort.",
+  disconnect_endpoint: "Disconnect an endpoint's runtime; managed sessions recover on next use.",
+  restart_endpoint: "Restart an endpoint's runtime and restore its managed sessions.",
+  set_session_model: "Set a session's model for its next new turn onward (sticky for Claude). Use a list_models value; 'default' = account default.",
+  set_reasoning_effort: "Set a session's reasoning effort for its next new turn (sticky for Claude); values from list_models.supportedReasoningEfforts.",
+  get_goal: "Read the session's current goal (objective + status) or null.",
+  set_goal: "Set/replace a worker's goal; the backend auto-drives it after each turn until the worker ends it via set_goal_status — or (Claude) up to 50 turns then it pauses budgetLimited (resume_goal continues). Never mark a goal complete yourself.",
+  pause_goal: "Pause the goal so the backend stops auto-driving it (resume_goal continues).",
+  resume_goal: "Resume a paused/budgetLimited goal (resets the auto-continue counter).",
+  cancel_goal: "Clear the session's goal (interrupt_active_turn also stops the running goal turn).",
+  update_session_notes: "Set your manager notes (project_summary / supervision_objective / pending_follow_up); null clears a field.",
+  send_chat_message: "Send a message to the current chat/user.",
+  prepare_chat_attachment: "Stage a worker's file for chat; returns a file_handle for send_chat_attachment.",
+  send_chat_attachment: "Send a prepared attachment (file_handle) to chat with an optional caption.",
+  get_chat_history: "Read recent chat history (conversation or channel), up to count messages.",
+  search_slack: "Search Slack messages (query, optional date range).",
+  get_slack_mentions: "List Slack mentions of you since date_from.",
+};
+
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
 export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["search_slack", "get_slack_mentions"]);

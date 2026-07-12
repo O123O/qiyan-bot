@@ -7,7 +7,7 @@ import { z } from "zod";
 import { BOT_SECRET_ENV_NAMES } from "../config-source.ts";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
 import type { AssistantToolName, ToolCallContext, ToolHandler } from "../assistant/tools.ts";
-import { ASSISTANT_TOOL_SCHEMAS, TOOL_NAMES } from "../assistant/tools.ts";
+import { ASSISTANT_TOOL_SCHEMAS, TOOL_DESCRIPTIONS, TOOL_NAMES } from "../assistant/tools.ts";
 import { APP_VERSION } from "../version.ts";
 
 const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -152,7 +152,7 @@ export class LoopbackMcpServer {
       { instructions: "Assistant-only manager tools. Choose the correct managed session, ask the user when ambiguous, and use ordinary send/collect tools for /pass and /collect." },
     );
     for (const name of TOOL_NAMES) {
-      mcp.registerTool(name, { description: `QiYan assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
+      mcp.registerTool(name, { description: TOOL_DESCRIPTIONS[name] ?? `QiYan assistant operation: ${name.replaceAll("_", " ")}`, inputSchema: ASSISTANT_TOOL_SCHEMAS[name] as any }, async (args: any, extra: any) => {
         await this.options.beforeToolCall?.();
         const active = this.contexts.current();
         if (!active) throw new Error("No active assistant source context");

@@ -1838,7 +1838,7 @@ export async function buildProductionApp(
   let claudeGoals: ClaudeGoalStore | undefined;
   let claudeArchives: ClaudeArchiveStore | undefined;
   let claudeGoalDriver: ClaudeGoalDriver | undefined;
-  const CLAUDE_MAX_GOAL_TURNS = 25;
+  const CLAUDE_MAX_GOAL_TURNS = 50;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;

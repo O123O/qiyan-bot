@@ -92,7 +92,7 @@ export class WorkerScheduleMcpServer {
 
     mcp.registerTool("schedule_wakeup", {
       description: "Schedule a one-time wakeup: after delay_seconds, QiYan sends you `message` as a new turn so you can continue. Use for reminders / deferred work.",
-      inputSchema: { delay_seconds: z.number().int().positive(), message: z.string().min(1) },
+      inputSchema: { delay_seconds: z.number().int().positive().describe("seconds from now to wake you"), message: z.string().min(1).describe("the message QiYan sends you as the new turn") },
     }, async (args) => {
       const row = this.options.store.create({ ...common, kind: "wakeup", spec: String(args.delay_seconds), message: args.message, nextFireAt: this.options.now() + args.delay_seconds * 1000 }, this.options.now());
       return text(`scheduled wakeup ${row.id} in ${args.delay_seconds}s`);
@@ -100,7 +100,7 @@ export class WorkerScheduleMcpServer {
 
     mcp.registerTool("schedule_cron", {
       description: "Schedule a recurring wakeup every interval_seconds: QiYan repeatedly sends you `message` as a new turn. Use for periodic checks.",
-      inputSchema: { interval_seconds: z.number().int().min(1), message: z.string().min(1) },
+      inputSchema: { interval_seconds: z.number().int().min(1).describe("seconds between each wakeup"), message: z.string().min(1).describe("the message sent to you each interval") },
     }, async (args) => {
       const ms = args.interval_seconds * 1000;
       const row = this.options.store.create({ ...common, kind: "cron", spec: String(args.interval_seconds), message: args.message, nextFireAt: this.options.now() + ms, intervalMs: ms }, this.options.now());
@@ -112,7 +112,7 @@ export class WorkerScheduleMcpServer {
     // the check runs on the worker's host, which is false).
     if (this.options.supportsMonitor?.(session) ?? true) mcp.registerTool("monitor", {
       description: "Watch a condition: QiYan runs `check` (a shell command) every poll_seconds on your session's host; when it exits 0, QiYan sends you `message` as a new turn. Use to wait for a build, a file, a job.",
-      inputSchema: { check: z.string().min(1), message: z.string().min(1), poll_seconds: z.number().int().min(1).optional() },
+      inputSchema: { check: z.string().min(1).describe("shell command run on your host; exit 0 = condition met"), message: z.string().min(1).describe("the message sent to you when the check passes"), poll_seconds: z.number().int().min(1).describe("seconds between checks").optional() },
     }, async (args) => {
       const ms = (args.poll_seconds ?? 30) * 1000;
       const row = this.options.store.create({ ...common, kind: "monitor", spec: args.check, message: args.message, nextFireAt: this.options.now() + ms, intervalMs: ms }, this.options.now());
@@ -129,7 +129,7 @@ export class WorkerScheduleMcpServer {
 
     mcp.registerTool("cancel_schedule", {
       description: "Cancel one of your schedules by id (from list_schedules).",
-      inputSchema: { id: z.string().min(1) },
+      inputSchema: { id: z.string().min(1).describe("schedule id from list_schedules") },
     }, async (args) => {
       return text(this.options.store.cancel(session.endpointId, session.threadId, args.id)
         ? `cancelled ${args.id}`
@@ -140,7 +140,7 @@ export class WorkerScheduleMcpServer {
       const setGoalStatus = this.options.setGoalStatus;
       mcp.registerTool("set_goal_status", {
         description: "Report the status of YOUR current goal so QiYan stops driving you. Use status=\"complete\" when the goal is fully accomplished, or \"blocked\" when you cannot make progress without help.",
-        inputSchema: { status: z.enum(["complete", "blocked"]) },
+        inputSchema: { status: z.enum(["complete", "blocked"]).describe("'complete' = goal accomplished; 'blocked' = cannot progress without help") },
       }, async (args) => {
         setGoalStatus(session, args.status);
         return text(`goal marked ${args.status}`);
