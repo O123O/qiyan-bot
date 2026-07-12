@@ -98,6 +98,7 @@ import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
+import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -2277,19 +2278,21 @@ export async function buildProductionApp(
         // "local" (no daemon); absent config.claudeCode it is never constructed and
         // the composition is unchanged.
         const claudeCodeConfig = config.claudeCode;
-        // Shared across the runtime (thread/goal/*), the scheduling service (the
-        // worker set_goal_status tool), and the goal driver (auto-drive).
-        claudeGoals = claudeCodeConfig === undefined ? undefined : new ClaudeGoalStore(db);
+        // Goals + scheduling serve EVERY Claude endpoint (the local one and any catalog
+        // claude-code endpoint), keyed by (endpointId, threadId). Construct the stack
+        // unconditionally: a remote Claude endpoint is added at runtime by writing
+        // endpoints.json, so a startup-snapshot gate would leave it without goals/scheduling.
+        // The cost when no Claude endpoint exists is one idle loopback MCP + one poll loop.
+        claudeGoals = new ClaudeGoalStore(db);
         // Refresh the dashboard after a worker/driver goal-status change (those bypass
-        // the manager tools' observeGoal).
+        // the manager tools' observeGoal). Provider-based, so it covers remote Claude too.
         const refreshClaudeGoalObservation = (nickname: string): void => {
-          if (!claudeGoals || !claudeCodeConfig) return;
           const session = registry.get(nickname);
-          if (!session || session.endpoint !== claudeCodeConfig.endpointId) return;
-          observeGoal(nickname, { goal: claudeGoals.get(claudeCodeConfig.endpointId, session.thread_id) });
+          if (!session || sessionProvider(session.endpoint) !== "claude") return;
+          observeGoal(nickname, { goal: claudeGoals!.get(session.endpoint, session.thread_id) });
           void renderDashboardSafely();
         };
-        scheduling = claudeCodeConfig === undefined ? undefined : new SchedulingService({
+        scheduling = new SchedulingService({
           db,
           now: () => Date.now(),
           mcpConfigDir: join(dataDir, "claude-worker-mcp"),
@@ -2297,20 +2300,47 @@ export async function buildProductionApp(
           // clientUserMessageId for idempotent delivery).
           send: (nickname, message, key) => sessions.send(nickname, message, { mode: "auto", clientUserMessageId: key }).then(() => undefined),
           runCheck: (row: ScheduleRow) => runMonitorCheck(row.spec),
-          ...(claudeGoals ? { goals: claudeGoals, onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname) } : {}),
+          goals: claudeGoals,
+          onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
+          // `monitor` runs its check on the QiYan host, so it is offered ONLY to the local
+          // Claude worker; a remote worker's endpoint id is a catalog id, so it never gets it.
+          supportsMonitor: (session) => session.endpointId === claudeCodeConfig?.endpointId,
         });
         // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
         // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
         // set_goal_status MCP tool. QiYan drives the next turn after each completion
-        // while the goal is active.
-        claudeGoalDriver = (claudeCodeConfig && scheduling && claudeGoals) ? new ClaudeGoalDriver({
+        // while the goal is active. Endpoint-agnostic — drives local and remote Claude alike.
+        claudeGoalDriver = new ClaudeGoalDriver({
           goals: claudeGoals,
           now: () => Date.now(),
           maxDrivenTurns: CLAUDE_MAX_GOAL_TURNS,
           enqueue: (session, message) => scheduling!.enqueueGoalDrive(session, message),
           hasPendingDrive: (session) => scheduling!.hasPendingGoalDrive(session),
           onStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
-        }) : undefined;
+        });
+        // Goal + steer options wired into a Claude runtime (local or remote). Both are
+        // QiYan-side and host-agnostic; steer = durable enqueue delivered as the next turn
+        // (Claude has no mid-turn injection). workerMcpConfigPath is added per-endpoint
+        // separately (local: loopback; remote: reverse tunnel).
+        const claudeGoalRuntimeOptions = (endpointId: string) => ({
+          goals: claudeGoals!,
+          steer: async (threadId: string, message: string): Promise<void> => {
+            const found = registry.getByIdentity(endpointId, threadId);
+            if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId, threadId }, message);
+          },
+        });
+        // Route a Claude endpoint's completed turns to the goal driver (auto-drive). The
+        // runtime self-emits turn/completed, so subscribing on the endpoint object works for
+        // both local (builtin) and remote (createRemote) Claude endpoints.
+        const subscribeClaudeGoalDriver = (endpoint: ClaudeCodeRuntime, endpointId: string): void => {
+          unsubscribers.push(endpoint.onNotification((method, params) => {
+            if (method !== "turn/completed") return;
+            const threadId = (params as { threadId?: string }).threadId;
+            if (typeof threadId !== "string") return;
+            const found = registry.getByIdentity(endpointId, threadId);
+            if (found) claudeGoalDriver!.onTurnCompleted({ nickname: found.nickname, endpointId, threadId });
+          }));
+        };
         // Launch policy (disallowed tools, system prompt, model) applies to Claude
         // sessions regardless of host, so the local and remote endpoints share it.
         const claudeLaunchFlags: ClaudeLaunchFlags = claudeCodeConfig === undefined ? {} : {
@@ -2322,17 +2352,12 @@ export async function buildProductionApp(
           id: claudeCodeConfig.endpointId,
           runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),
           launchFlags: claudeLaunchFlags,
-          ...(claudeGoals ? { goals: claudeGoals } : {}),
-          ...(scheduling ? {
-            workerMcpConfigPath: async (threadId: string) => {
-              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
-              return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
-            },
-            steer: async (threadId: string, message: string) => {
-              const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
-              if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }, message);
-            },
-          } : {}),
+          ...claudeGoalRuntimeOptions(claudeCodeConfig.endpointId),
+          // Local: the worker reaches the loopback MCP directly (no tunnel).
+          workerMcpConfigPath: async (threadId: string) => {
+            const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
+            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
+          },
         });
         // A Claude endpoint id that collides with a configured remote (catalog) id
         // would silently shadow that remote (builtins short-circuit before the
@@ -2342,17 +2367,9 @@ export async function buildProductionApp(
         }
         // Drive the goal loop: after each completed Claude turn, if the goal is still
         // active, enqueue the next pursuit turn. Stops when the worker's set_goal_status
-        // flips the status (or the backstop cap pauses it).
-        if (claudeEndpoint && claudeGoalDriver && claudeCodeConfig) {
-          const claudeId = claudeCodeConfig.endpointId;
-          unsubscribers.push(claudeEndpoint.onNotification((method, params) => {
-            if (method !== "turn/completed") return;
-            const threadId = (params as { threadId?: string }).threadId;
-            if (typeof threadId !== "string") return;
-            const found = registry.getByIdentity(claudeId, threadId);
-            if (found) claudeGoalDriver!.onTurnCompleted({ nickname: found.nickname, endpointId: claudeId, threadId });
-          }));
-        }
+        // flips the status (or the backstop cap pauses it). (The remote endpoint is
+        // subscribed the same way inside createRemote.)
+        if (claudeEndpoint) subscribeClaudeGoalDriver(claudeEndpoint, claudeCodeConfig!.endpointId);
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
@@ -2374,11 +2391,52 @@ export async function buildProductionApp(
               // helper eagerly here (installs it + establishes the ControlMaster) — the
               // ownership scan / workspace ops need the installed helper immediately.
               const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+              // Tier B: expose QiYan's worker-MCP on the remote host via an ssh -R reverse
+              // tunnel over this endpoint's ControlMaster, so the remote worker can self-schedule.
+              // The remote listen port is allocated dynamically by the remote sshd (read back
+              // after ensure()); the worker learns it from the URL in its per-session config.
+              const tunnel = new RemoteWorkerTunnel({
+                plan: generation.plan, localPort: scheduling!.mcpPort,
+              });
+              const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
+                const found = registry.getByIdentity(definition.id, threadId);
+                if (!found) return undefined;
+                // Self-scheduling is best-effort: the reverse tunnel must NOT be a single point of
+                // failure for basic remote messaging. If establishing it (or writing the config)
+                // fails, run the turn WITHOUT the scheduling tools rather than failing the whole
+                // turn. The degradation is surfaced as an operational warning (not silent), and the
+                // acceptance test's schedule-step assertion still fails loudly on a real regression.
+                try {
+                  await tunnel.ensure();
+                  const content = scheduling!.workerMcpConfigContent(
+                    { nickname: found.nickname, endpointId: definition.id, threadId },
+                    `http://127.0.0.1:${tunnel.remotePort}/mcp`,
+                  );
+                  // Write the token-bearing config to the REMOTE runtime dir (content-addressed
+                  // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
+                  const buffer = Buffer.from(content, "utf8");
+                  const result = await remote.invokeTransfer<{ path: string }>("write-file",
+                    [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
+                    { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
+                  return result.path;
+                } catch (error) {
+                  reportOperationalSafely(report, {
+                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel",
+                    reason: error instanceof Error ? error.message : String(error),
+                  });
+                  return undefined;
+                }
+              };
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
                 runner: new SshClaudeCommandRunner({ plan: generation.plan }),
                 launchFlags: claudeLaunchFlags,
+                // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
+                // over the reverse tunnel (Tier B).
+                ...claudeGoalRuntimeOptions(definition.id),
+                workerMcpConfigPath: remoteWorkerMcpConfigPath,
               });
+              subscribeClaudeGoalDriver(claudeRemoteEndpoint, definition.id);
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
@@ -2768,23 +2826,29 @@ export async function buildProductionApp(
     {
       name: "scheduler",
       start: async () => {
+        // The provider-agnostic schedule engine + worker MCP surface (Phase 2) is an
+        // independent subsystem from the assistant's autonomous dispatcher, so it starts
+        // even when the latter is held (tests set holdAssistantScheduler to suppress the
+        // proactive assistant, NOT worker goal-drive / self-scheduling). Recovery re-arms
+        // durable schedules on start; fires drive send_to_session.
+        if (scheduling) await scheduling.start();
+        // Re-kick active Claude goals whose drive turn was in flight at restart (no
+        // pending schedule, no live turn) so goal enforcement is restart-durable. listActive
+        // is per endpointId, so enumerate every Claude endpoint present in the registry
+        // (local + any remote catalog claude-code), not just the local one.
+        if (claudeGoalDriver && claudeGoals) {
+          const claudeEndpointIds = new Set(Object.values(registry.snapshot().sessions)
+            .filter((s) => sessionProvider(s.endpoint) === "claude").map((s) => s.endpoint));
+          const active = [...claudeEndpointIds].flatMap((endpointId) => claudeGoals!.listActive(endpointId)
+            .map((g) => registry.getByIdentity(endpointId, g.threadId))
+            .filter((found): found is NonNullable<typeof found> => found !== undefined)
+            .map((found) => ({ nickname: found.nickname, endpointId, threadId: found.session.thread_id })));
+          claudeGoalDriver.resumeActive(active);
+        }
         if (options.testing?.holdAssistantScheduler) return;
         schedulerAccepting = true;
         await enqueuePendingEvents();
         await dispatcher.enqueueInternal("startup");
-        // Provider-agnostic schedule engine + worker MCP surface (Phase 2). Recovery
-        // re-arms durable schedules on start; fires drive send_to_session.
-        if (scheduling) await scheduling.start();
-        // Re-kick active Claude goals whose drive turn was in flight at restart (no
-        // pending schedule, no live turn) so goal enforcement is restart-durable.
-        const claudeGoalId = config.claudeCode?.endpointId;
-        if (claudeGoalDriver && claudeGoals && claudeGoalId !== undefined) {
-          const active = claudeGoals.listActive(claudeGoalId)
-            .map((g) => registry.getByIdentity(claudeGoalId, g.threadId))
-            .filter((found): found is NonNullable<typeof found> => found !== undefined)
-            .map((found) => ({ nickname: found.nickname, endpointId: claudeGoalId, threadId: found.session.thread_id }));
-          claudeGoalDriver.resumeActive(active);
-        }
       },
       stop: async () => {
         stopping = true;
@@ -3291,10 +3355,11 @@ export async function buildProductionApp(
   // Kick the Claude goal auto-drive when a goal is set/resumed via the MCP manager
   // tools. No-op for Codex sessions (native goal engine) and when Claude is disabled.
   function activateClaudeGoalIfClaude(nickname: string): void {
-    const claudeId = config.claudeCode?.endpointId;
-    if (!claudeGoalDriver || claudeId === undefined) return;
+    if (!claudeGoalDriver) return;
     const session = registry.get(nickname);
-    if (session?.endpoint === claudeId) claudeGoalDriver.activate({ nickname, endpointId: claudeId, threadId: session.thread_id });
+    if (session && sessionProvider(session.endpoint) === "claude") {
+      claudeGoalDriver.activate({ nickname, endpointId: session.endpoint, threadId: session.thread_id });
+    }
   }
 
   function projectEndpoint(requested?: string): string {

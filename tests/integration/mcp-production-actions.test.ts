@@ -535,6 +535,35 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.ok(ownRow && !ownRow.external_turn_id, `${fixture.nickname} first turn was misclassified external`);
     await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
 
+    const waitForIdle = (label: string): Promise<void> => waitFor(() => (db.prepare(`SELECT native_status FROM session_runtime
+      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined)?.native_status === "idle", workerTimeoutMs, label);
+
+    // Goals + auto-drive (Tier A — same for local and remote): set_goal enqueues a pursuit
+    // turn via the driver, which the schedule engine fires as an autonomous send (recorded
+    // 'sent' in the send outbox). That outbox row is the deterministic, QiYan-side proof the
+    // goal is being driven; cancel then bounds it. (This is exactly what regressed when the
+    // worker/goal engine was gated behind holdAssistantScheduler.)
+    const drives = db.prepare(`SELECT COUNT(*) AS count FROM scheduled_sends WHERE nickname = ? AND state = 'sent'`);
+    const driveCount = (): number => (drives.get(fixture.nickname) as { count: number }).count;
+    const beforeGoal = driveCount();
+    const objective = "Reply with the single word CONTINUE, nothing else.";
+    await call("set_goal", { nickname: fixture.nickname, objective }, fixture.endpoint);
+    await waitFor(() => driveCount() > beforeGoal, workerTimeoutMs, `${fixture.nickname} goal auto-drive did not fire a pursuit turn`);
+    assert.equal((await call("get_goal", { nickname: fixture.nickname }, fixture.endpoint)).goal.objective, objective);
+    await call("cancel_goal", { nickname: fixture.nickname, interrupt_active_turn: true }, fixture.endpoint);
+    await waitForIdle(`${fixture.nickname} cancelled goal idle`);
+
+    // Worker self-scheduling: instruct the worker to call its own schedule_wakeup MCP tool →
+    // a durable schedule persists. Local reaches the loopback MCP directly; remote reaches it
+    // over the ssh -R reverse tunnel. A far-future delay so it never fires during the test.
+    const schedules = db.prepare(`SELECT COUNT(*) AS count FROM session_schedules WHERE endpoint_id = ? AND thread_id = ?`);
+    const scheduleCount = (): number => (schedules.get(fixture.endpoint, session.thread_id) as { count: number }).count;
+    const beforeSchedule = scheduleCount();
+    const scheduleAsk = "Use your schedule_wakeup tool with delay_seconds 3600 and message CONTINUE. Then reply exactly SCHEDULEDOK.";
+    await call("send_to_session", { nickname: fixture.nickname, content: scheduleAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${scheduleAsk}`);
+    await waitFor(() => scheduleCount() > beforeSchedule, workerTimeoutMs, `${fixture.nickname} worker schedule_wakeup did not persist (MCP unreachable?)`);
+    await waitForIdle(`${fixture.nickname} post-schedule idle`);
+
     // daemonless restart/disconnect with the session still managed: must not strand the
     // endpoint "draining" and must restore the managed session (no runtime identity to prove).
     await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);

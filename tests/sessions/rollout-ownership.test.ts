@@ -228,6 +228,35 @@ test("goal control leaves an unproven open turn unclassified until user evidence
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "pending-goal-turn" });
 });
 
+test("a scheduler-driven turn is owned via its send-outbox key, not misread as external", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-scheduled.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-scheduled", mapping_id: "mapping-scheduled" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  // QiYan drives a goal auto-drive / worker-wakeup turn through the durable send outbox, keyed
+  // by the single-fire key the runtime stamps as the turn's qiyan-cid marker. That turn is NOT
+  // an MCP send_to_session operation, and (for a Claude transcript) every turn reports a user
+  // message — so without recognizing the outbox key it is misread as external and the session
+  // is detached. The outbox row proves QiYan drove it.
+  const scheduleKey = "sched-0001:1783831169876";
+  db.prepare("INSERT INTO scheduled_sends(single_fire_key, nickname, message, state, claimed_at) VALUES (?, 'worker', 'continue', 'sent', 0)").run(scheduleKey);
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: scheduleKey }),
+    line("event_msg", { type: "user_message", client_id: scheduleKey }),
+    line("event_msg", { type: "task_complete", turn_id: scheduleKey }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(guard.ownsTurn(identity, scheduleKey), true);
+});
+
 test("goal control recognizes a completed autonomous turn when its notification was missed", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-goal-completed.jsonl");

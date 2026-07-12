@@ -30,6 +30,9 @@ export interface SchedulingServiceDeps {
   // Notified after a worker marks its goal via set_goal_status, so the dashboard is
   // refreshed (the worker write bypasses the manager tools' observeGoal).
   onGoalStatusChanged?(session: WorkerScheduleSession): void;
+  // Whether the `monitor` tool is available to a session — false for a remote worker, whose
+  // check would run on the QiYan host, not the worker's (see remote-worker-scheduling §3.5).
+  supportsMonitor?(session: WorkerScheduleSession): boolean;
 }
 
 // Inter-drive pacing for goal auto-drive turns (F3/F6): bounds a failing goal to one
@@ -49,6 +52,7 @@ export class SchedulingService {
     this.outbox = new ScheduledSendOutbox(deps.db);
     this.server = new WorkerScheduleMcpServer({
       store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token),
+      ...(deps.supportsMonitor ? { supportsMonitor: deps.supportsMonitor } : {}),
       ...(deps.goals ? { setGoalStatus: (session, status) => {
         deps.goals!.setStatus(session.endpointId, session.threadId, status, deps.now());
         deps.onGoalStatusChanged?.(session);
@@ -131,7 +135,12 @@ export class SchedulingService {
   // Register a worker session so it can reach the scheduling tools; returns the stable
   // per-session --mcp-config path (byte-identical across the session's turns, so it
   // doesn't break the prompt cache). Idempotent per session.
-  async workerMcpConfigPath(session: WorkerScheduleSession): Promise<string> {
+  // The loopback port the worker MCP listens on (for the remote reverse tunnel's local end).
+  get mcpPort(): number { return this.server.port; }
+
+  // The stable per-session bearer token (minted on first use). A remote worker's config uses
+  // the same token; the token→session map resolves the caller regardless of which tunnel.
+  workerMcpToken(session: WorkerScheduleSession): string {
     const sessionKey = `${session.endpointId}\0${session.threadId}`;
     let token = this.tokenBySession.get(sessionKey);
     if (!token) {
@@ -139,14 +148,24 @@ export class SchedulingService {
       this.tokenBySession.set(sessionKey, token);
       this.sessionByToken.set(token, session);
     }
+    return token;
+  }
+
+  // The --mcp-config JSON pointing the worker at `url`. Local uses the loopback url; a remote
+  // worker uses `http://127.0.0.1:<remotePort>/mcp` (its reverse-tunneled port).
+  workerMcpConfigContent(session: WorkerScheduleSession, url: string): string {
+    return JSON.stringify({
+      mcpServers: { "qiyan-worker-scheduling": { type: "http", url, headers: { Authorization: `Bearer ${this.workerMcpToken(session)}` } } },
+    });
+  }
+
+  async workerMcpConfigPath(session: WorkerScheduleSession): Promise<string> {
     // Ensure the config dir exists independently of start() ordering — a session's first
     // turn can write here before (or without) the scheduler component's start() mkdir,
     // e.g. the very first Claude session on a fresh dataDir.
     await mkdir(this.deps.mcpConfigDir, { recursive: true, mode: 0o700 });
     const path = join(this.deps.mcpConfigDir, `${session.threadId}.json`);
-    await writeFile(path, JSON.stringify({
-      mcpServers: { "qiyan-worker-scheduling": { type: "http", url: this.server.url, headers: { Authorization: `Bearer ${token}` } } },
-    }), { mode: 0o600 });
+    await writeFile(path, this.workerMcpConfigContent(session, this.server.url), { mode: 0o600 });
     return path;
   }
 }

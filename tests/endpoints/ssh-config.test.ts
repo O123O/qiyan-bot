@@ -7,6 +7,8 @@ import {
   buildSshArgs,
   buildSshStreamForwardCancelArgs,
   buildSshStreamForwardArgs,
+  buildSshReverseForwardArgs,
+  buildSshReverseForwardCancelArgs,
   parseSshConfig,
   planSshConnection,
 } from "../../src/endpoints/ssh-config.ts";
@@ -59,6 +61,25 @@ test("stream-local forwarding is registered and cancelled on the authenticated C
   }
   assert.ok(forward.includes(`${local}:${remote}`));
   assert.ok(cancel.includes(`${local}:${remote}`));
+});
+
+test("reverse forwarding binds a REMOTE loopback port (bind-not-relax) on the ControlMaster", () => {
+  const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
+  // remotePort 0 = ask the remote sshd to allocate a free port (the tunnel reads it back)
+  const forward = buildSshReverseForwardArgs(plan, 0, 40001);
+  const cancel = buildSshReverseForwardCancelArgs(plan, 34567, 40001);
+  assert.deepEqual(forward.slice(forward.indexOf("-O"), forward.indexOf("-O") + 2), ["-O", "forward"]);
+  assert.deepEqual(cancel.slice(cancel.indexOf("-O"), cancel.indexOf("-O") + 2), ["-O", "cancel"]);
+  // remote binds to 127.0.0.1 (never 0.0.0.0) → only the remote host's processes can connect
+  assert.deepEqual(forward.slice(forward.indexOf("-R"), forward.indexOf("-R") + 2), ["-R", "127.0.0.1:0:127.0.0.1:40001"]);
+  // cancel must carry the EXACT allocated spec — the only form ssh accepts to remove a forward
+  assert.ok(cancel.includes("127.0.0.1:34567:127.0.0.1:40001"));
+  assert.ok(forward.includes("ExitOnForwardFailure=yes"));
+  assert.equal(forward.at(-1), "devbox");
+  assert.doesNotMatch(forward.join(" "), /GatewayPorts=yes|0\.0\.0\.0/u);
+  for (const bad of [[-1, 40001], [65_536, 1], [1, 0], [1, -1]] as const) {
+    assert.throws(() => buildSshReverseForwardArgs(plan, bad[0], bad[1]), /reverse-forward port/u);
+  }
 });
 
 test("rejects malformed effective configuration and unsafe aliases", () => {

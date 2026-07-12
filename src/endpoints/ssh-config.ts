@@ -110,6 +110,38 @@ export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSo
   return [...baseArgs(plan, false), "-O", "cancel", "-L", streamForwarding(localSocket, remoteSocket), plan.alias];
 }
 
+// Reverse-forward (`-R`) a REMOTE loopback TCP port to a LOCAL port over the ControlMaster —
+// exposes QiYan's loopback worker-MCP on the remote host so a remote `claude -p` worker can
+// reach it. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
+// `GatewayPorts no` this is bind-not-relax: only processes ON the remote host can connect,
+// never the network. Auth is the per-session bearer token in the worker's --mcp-config.
+// A remotePort of 0 asks the remote sshd to allocate a free port (reported on stdout); this
+// avoids a fixed port that a stale forward from a prior instance could squat (a forward can
+// only be cancelled with its EXACT original spec, so a fixed remote port is unreclaimable
+// once the original local port is forgotten).
+export function buildSshReverseForwardArgs(plan: SshConnectionPlan, remotePort: number, localPort: number): string[] {
+  return [
+    ...baseArgs(plan, false),
+    "-o", "ExitOnForwardFailure=yes",
+    "-O", "forward",
+    "-R", reverseForwarding(remotePort, localPort),
+    plan.alias,
+  ];
+}
+
+export function buildSshReverseForwardCancelArgs(plan: SshConnectionPlan, remotePort: number, localPort: number): string[] {
+  return [...baseArgs(plan, false), "-O", "cancel", "-R", reverseForwarding(remotePort, localPort), plan.alias];
+}
+
+function reverseForwarding(remotePort: number, localPort: number): string {
+  // remotePort 0 = dynamic allocation (listen side); localPort must be a real bound port.
+  if (!Number.isInteger(remotePort) || remotePort < 0 || remotePort > 65_535
+    || !Number.isInteger(localPort) || localPort < 1 || localPort > 65_535) {
+    throw new AppError("CONFIGURATION_ERROR", "invalid SSH reverse-forward port");
+  }
+  return `127.0.0.1:${remotePort}:127.0.0.1:${localPort}`;
+}
+
 export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
   return [...baseArgs(plan, false), "-O", "check", plan.alias];
 }

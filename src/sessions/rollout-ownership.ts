@@ -300,7 +300,7 @@ export class SessionOwnershipGuard {
   }
 
   ownsTurn(identity: MappingIdentity, turnId: string): boolean {
-    if (this.operations.ownsWorkerTurn({ turnId })) return true;
+    if (this.ownsDrivenTurn({ turnId })) return true;
     return this.db.prepare(`SELECT 1 FROM session_rollout_owned_turns
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ? AND turn_id = ?`)
       .get(identity.endpoint, identity.thread_id, identity.mapping_id, turnId) !== undefined;
@@ -318,7 +318,18 @@ export class SessionOwnershipGuard {
   }
 
   private ownsObservedTurn(identity: MappingIdentity, turn: RolloutTurnStart): boolean {
-    return this.operations.ownsWorkerTurn(turn) || this.isAuthorizedTurn(identity, turn.turnId);
+    return this.ownsDrivenTurn(turn) || this.isAuthorizedTurn(identity, turn.turnId);
+  }
+
+  // A turn QiYan itself drove: either an MCP send_to_session operation, or a scheduler fire
+  // (goal auto-drive, steer, or worker wakeup). The latter is not an operation — it is recorded
+  // in the durable send outbox keyed by the single-fire key the runtime stamps as the turn's
+  // qiyan-cid marker (== clientId, == turnId). A Claude transcript reports a user message on
+  // every turn, so without this the scheduler-driven turn is misread as external and detached.
+  private ownsDrivenTurn(turn: { turnId: string; clientId?: string }): boolean {
+    if (this.operations.ownsWorkerTurn(turn)) return true;
+    return this.db.prepare("SELECT 1 FROM scheduled_sends WHERE single_fire_key IN (?, ?) LIMIT 1")
+      .get(turn.clientId ?? turn.turnId, turn.turnId) !== undefined;
   }
 
   private isAuthorizedTurn(identity: MappingIdentity, turnId: string): boolean {
@@ -333,7 +344,7 @@ export class SessionOwnershipGuard {
     goalControlled: boolean,
     authorizedTurnId?: string,
   ): "owned" | "external" | "unclassified" {
-    if (this.operations.ownsWorkerTurn(turn)) return "owned";
+    if (this.ownsDrivenTurn(turn)) return "owned";
     if (turn.hasUserMessage === true) return "external";
     if (turn.turnId === authorizedTurnId || this.isAuthorizedTurn(identity, turn.turnId) || goalControlled) return "owned";
     return "unclassified";
