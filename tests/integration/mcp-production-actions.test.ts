@@ -126,7 +126,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     // Enable the local Claude endpoint so the Claude lifecycle runs through the same real
     // manager/service/ownership stack as Codex (this coverage was the gap that let the
     // local-Claude create/first-turn/delivery/archive bugs ship).
-    claudeCode: { endpointId: "claude-local", command: "claude", disallowedTools: [], appendSystemPrompt: "You are a managed QiYan worker; follow the user's instructions exactly." },
+    claudeCode: { endpointId: "claude-local", command: "claude" },
   };
   const adapter = new AcceptanceAdapter();
   let tools: Readonly<Record<AssistantToolName, ToolHandler>> | undefined;

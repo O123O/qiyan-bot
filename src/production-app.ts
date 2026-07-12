@@ -27,6 +27,7 @@ import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
+import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
@@ -2356,13 +2357,11 @@ export async function buildProductionApp(
             if (found) claudeGoalDriver!.onTurnCompleted({ nickname: found.nickname, endpointId, threadId });
           }));
         };
-        // Launch policy (disallowed tools, system prompt, model) applies to Claude
-        // sessions regardless of host, so the local and remote endpoints share it.
-        const claudeLaunchFlags: ClaudeLaunchFlags = claudeCodeConfig === undefined ? {} : {
-          disallowedTools: claudeCodeConfig.disallowedTools,
-          appendSystemPrompt: claudeCodeConfig.appendSystemPrompt,
-          ...(claudeCodeConfig.model === undefined ? {} : { model: claudeCodeConfig.model }),
-        };
+        // The launch policy (disabled built-in scheduling tools + redirect prompt) applies to
+        // EVERY Claude session, local or remote, regardless of whether a local endpoint is
+        // configured — deriving it only from the local config left a remote-only deployment
+        // running its remote workers with the native tools enabled and no redirect.
+        const claudeLaunchFlags: ClaudeLaunchFlags = claudeLaunchPolicy(claudeCodeConfig?.model);
         claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
           id: claudeCodeConfig.endpointId,
           runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { loadConfig, loadAssistantLoginConfig } from "../src/config.ts";
+import { loadConfig, loadAssistantLoginConfig, claudeLaunchPolicy, CLAUDE_DISABLED_TOOLS, CLAUDE_REDIRECT_PROMPT } from "../src/config.ts";
 
 function baseEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
@@ -186,4 +186,19 @@ test("the example environment preserves canonical full-access HOME defaults", as
   assert.doesNotMatch(example, /^ASSISTANT_SANDBOX_MODE=(?!danger-full-access$)/mu);
   assert.match(example, /all four Slack values/iu);
   assert.doesNotMatch(example, /SLACK_TEAM_ID/u);
+});
+
+test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the redirect regardless of a local endpoint", () => {
+  // The policy is unconditional — a remote-only deployment (no CLAUDE_CODE_ENDPOINT_ID) must still
+  // apply it, so a remote worker never keeps the native Monitor/ScheduleWakeup/cron tools.
+  for (const model of [undefined, "haiku"] as const) {
+    const policy = claudeLaunchPolicy(model);
+    assert.deepEqual([...policy.disallowedTools], [...CLAUDE_DISABLED_TOOLS]);
+    for (const tool of ["Monitor", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete"]) {
+      assert.ok(policy.disallowedTools.includes(tool), `${tool} must be disabled`);
+    }
+    assert.equal(policy.appendSystemPrompt, CLAUDE_REDIRECT_PROMPT);
+  }
+  assert.equal(claudeLaunchPolicy().model, undefined);
+  assert.equal(claudeLaunchPolicy("haiku").model, "haiku");
 });

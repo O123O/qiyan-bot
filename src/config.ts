@@ -82,12 +82,19 @@ export const CLAUDE_DISABLED_TOOLS = ["Monitor", "ScheduleWakeup", "CronCreate",
 export const CLAUDE_REDIRECT_PROMPT =
   "You have NO built-in scheduling ability. For any scheduled, recurring, or condition-watching work you MUST use the QiYan MCP tools (schedule_wakeup, schedule_cron, monitor). Never use built-in Monitor/ScheduleWakeup/cron tools, the /loop skill, background tasks, or hooks.";
 
+// The launch policy applied to EVERY managed Claude session — local AND remote — so a worker
+// never keeps Claude's native scheduling tools (which QiYan can't observe) and always gets the
+// redirect. It is NOT conditional on a local endpoint being configured: a remote-only deployment
+// (no CLAUDE_CODE_ENDPOINT_ID) must apply it to its remote workers too. `model` is the only
+// per-endpoint override.
+export function claudeLaunchPolicy(model?: string): { disallowedTools: readonly string[]; appendSystemPrompt: string; model?: string } {
+  return { disallowedTools: CLAUDE_DISABLED_TOOLS, appendSystemPrompt: CLAUDE_REDIRECT_PROMPT, ...(model === undefined ? {} : { model }) };
+}
+
 export interface ClaudeCodeConfig {
   endpointId: string;
   command: string;
   model?: string;
-  disallowedTools: readonly string[];
-  appendSystemPrompt: string;
 }
 
 export interface BotConfig {
@@ -161,8 +168,6 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
       claudeCode: {
         endpointId: parsed.CLAUDE_CODE_ENDPOINT_ID,
         command: parsed.CLAUDE_BINARY,
-        disallowedTools: CLAUDE_DISABLED_TOOLS,
-        appendSystemPrompt: CLAUDE_REDIRECT_PROMPT,
         ...(parsed.CLAUDE_CODE_MODEL === undefined ? {} : { model: parsed.CLAUDE_CODE_MODEL }),
       } satisfies ClaudeCodeConfig,
     }),
