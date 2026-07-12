@@ -110,6 +110,32 @@ export function buildSshStreamForwardCancelArgs(plan: SshConnectionPlan, localSo
   return [...baseArgs(plan, false), "-O", "cancel", "-L", streamForwarding(localSocket, remoteSocket), plan.alias];
 }
 
+// Reverse-forward (`-R`) a REMOTE loopback TCP port to a LOCAL port over the ControlMaster —
+// exposes QiYan's loopback worker-MCP on the remote host so a remote `claude -p` worker can
+// reach it. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
+// `GatewayPorts no` this is bind-not-relax: only processes ON the remote host can connect,
+// never the network. Auth is the per-session bearer token in the worker's --mcp-config.
+export function buildSshReverseForwardArgs(plan: SshConnectionPlan, remotePort: number, localPort: number): string[] {
+  return [
+    ...baseArgs(plan, false),
+    "-o", "ExitOnForwardFailure=yes",
+    "-O", "forward",
+    "-R", reverseForwarding(remotePort, localPort),
+    plan.alias,
+  ];
+}
+
+export function buildSshReverseForwardCancelArgs(plan: SshConnectionPlan, remotePort: number, localPort: number): string[] {
+  return [...baseArgs(plan, false), "-O", "cancel", "-R", reverseForwarding(remotePort, localPort), plan.alias];
+}
+
+function reverseForwarding(remotePort: number, localPort: number): string {
+  if (![remotePort, localPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65_535)) {
+    throw new AppError("CONFIGURATION_ERROR", "invalid SSH reverse-forward port");
+  }
+  return `127.0.0.1:${remotePort}:127.0.0.1:${localPort}`;
+}
+
 export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
   return [...baseArgs(plan, false), "-O", "check", plan.alias];
 }

@@ -98,6 +98,7 @@ import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
+import { RemoteWorkerTunnel, remoteWorkerMcpPort } from "./endpoints/remote-worker-tunnel.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshEndpointSocketRoot, prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -2301,6 +2302,9 @@ export async function buildProductionApp(
           runCheck: (row: ScheduleRow) => runMonitorCheck(row.spec),
           goals: claudeGoals,
           onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
+          // `monitor` runs its check on the QiYan host, so it is offered ONLY to the local
+          // Claude worker; a remote worker's endpoint id is a catalog id, so it never gets it.
+          supportsMonitor: (session) => session.endpointId === claudeCodeConfig?.endpointId,
         });
         // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
         // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
@@ -2387,14 +2391,35 @@ export async function buildProductionApp(
               // helper eagerly here (installs it + establishes the ControlMaster) — the
               // ownership scan / workspace ops need the installed helper immediately.
               const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+              // Tier B: expose QiYan's worker-MCP on the remote host via an ssh -R reverse
+              // tunnel over this endpoint's ControlMaster, so the remote worker can self-schedule.
+              const tunnel = new RemoteWorkerTunnel({
+                plan: generation.plan, remotePort: remoteWorkerMcpPort(definition.id), localPort: scheduling!.mcpPort,
+              });
+              const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
+                const found = registry.getByIdentity(definition.id, threadId);
+                if (!found) return undefined;
+                await tunnel.ensure();
+                const content = scheduling!.workerMcpConfigContent(
+                  { nickname: found.nickname, endpointId: definition.id, threadId },
+                  `http://127.0.0.1:${tunnel.remotePort}/mcp`,
+                );
+                // Write the token-bearing config to the REMOTE runtime dir (content-addressed
+                // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
+                const buffer = Buffer.from(content, "utf8");
+                const result = await remote.invokeTransfer<{ path: string }>("write-file",
+                  [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
+                  { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
+                return result.path;
+              };
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
                 runner: new SshClaudeCommandRunner({ plan: generation.plan }),
                 launchFlags: claudeLaunchFlags,
-                // Goals + steer are QiYan-side, so a remote Claude endpoint gets them too
-                // (Tier A). Worker self-scheduling (workerMcpConfigPath over an ssh -R tunnel)
-                // is wired separately (Tier B).
+                // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
+                // over the reverse tunnel (Tier B).
                 ...claudeGoalRuntimeOptions(definition.id),
+                workerMcpConfigPath: remoteWorkerMcpConfigPath,
               });
               subscribeClaudeGoalDriver(claudeRemoteEndpoint, definition.id);
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
