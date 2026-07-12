@@ -588,3 +588,27 @@ test("goal mismatch authorizes the native active turn inside the existing execut
 
   assert.deepEqual(events, ["authorize:goal-race", "mismatch"]);
 });
+
+test("consumeSettingsIfNative clears pending settings for a native (Codex) endpoint but keeps them sticky for Claude", () => {
+  // This is the single shared guard behind BOTH the live send AND the crashed-send recovery
+  // path in production-app — the site the parity plan flagged as the blocking regression.
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  for (const endpoint of ["codex-ep", "claude-local"]) {
+    runtime.setSession(endpoint, "thread", "m", "managed", "idle");
+    runtime.setModel(endpoint, "thread", "m", "some-model");
+    runtime.setEffort(endpoint, "thread", "m", "high");
+  }
+  const service = new SessionService(
+    undefined as never, undefined as never, runtime, undefined as never, undefined as never,
+    undefined as never, undefined as never, undefined, undefined,
+    (id) => id !== "claude-local", // Codex persists natively; Claude does not
+  );
+
+  service.consumeSettingsIfNative("codex-ep", "thread", "m", { model: "some-model", effort: "high" });
+  assert.deepEqual(runtime.settings("codex-ep", "thread", "m"), {}, "Codex pending settings consumed");
+
+  service.consumeSettingsIfNative("claude-local", "thread", "m", { model: "some-model", effort: "high" });
+  assert.deepEqual(runtime.settings("claude-local", "thread", "m"), { model: "some-model", effort: "high" },
+    "Claude settings stay sticky (never consumed) so they re-apply every turn / survive recovery");
+});

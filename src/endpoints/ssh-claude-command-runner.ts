@@ -4,7 +4,7 @@
 // implements the same ClaudeCommandRunner seam as the local runner, so the runtime is
 // unchanged.
 import { spawn, type ChildProcess } from "node:child_process";
-import { buildClaudeArgs, type ClaudeCommandRunner, type ClaudeTurnHandle, type ClaudeTurnRequest } from "./claude-command-runner.ts";
+import { buildClaudeArgs, claudePreviewFromRecords, type ClaudeCommandRunner, type ClaudeThreadMeta, type ClaudeTurnHandle, type ClaudeTurnRequest } from "./claude-command-runner.ts";
 import { buildSshStreamArgs, type SshConnectionPlan } from "./ssh-config.ts";
 import { attestUserControlMaster } from "./ssh-runtime.ts";
 
@@ -75,6 +75,50 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
     if (!found) return undefined;
     this.pathCache.set(threadId, found);
     return found;
+  }
+
+  async listThreads(cwd?: string): Promise<ClaudeThreadMeta[]> {
+    // One round-trip: per transcript emit a header (mtime + path) then ONLY the first USER
+    // record — which carries both the cwd and the first user message the preview needs. This
+    // keeps assistant/tool output (secrets) ON the host: only id/cwd/updatedAt/preview ever
+    // cross the wire, and never any session's model output — not even for the human's own
+    // unrelated cli/vscode sessions the scan also sees. Paths in the Claude store contain no
+    // spaces (cwd-hash dir + <session-id>.jsonl), so the header is space-split.
+    const script = "find ~/.claude/projects -maxdepth 2 -name '*.jsonl' 2>/dev/null | "
+      + "while IFS= read -r f; do echo \"__QIYAN_H__ $(stat -c %Y \"$f\" 2>/dev/null) $f\"; "
+      // `-E '"type": ?"user"'` tolerates compact OR pretty-printed serialization, so a future
+      // format change can't SILENTLY drop every remote session from discover.
+      + "grep -m1 -E '\"type\": ?\"user\"' \"$f\" 2>/dev/null; echo __QIYAN_EOT__; done";
+    const text = await this.runCapture(script);
+    const out: ClaudeThreadMeta[] = [];
+    for (const block of text.split("__QIYAN_EOT__\n")) {
+      const headerAt = block.indexOf("__QIYAN_H__ ");
+      if (headerAt < 0) continue;
+      const afterHeader = block.slice(headerAt + "__QIYAN_H__ ".length);
+      const newline = afterHeader.indexOf("\n");
+      if (newline < 0) continue;
+      const header = afterHeader.slice(0, newline).split(" ");
+      const mtime = Number(header[0]);
+      const path = header.slice(1).join(" ");
+      const id = path.split("/").pop()?.replace(/\.jsonl$/u, "") ?? "";
+      if (!id) continue;
+      const records: unknown[] = [];
+      let recordCwd: string | undefined;
+      for (const line of afterHeader.slice(newline + 1).split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let record: unknown;
+        try { record = JSON.parse(trimmed); } catch { continue; }
+        records.push(record);
+        if (recordCwd === undefined && record && typeof record === "object") {
+          const value = (record as Record<string, unknown>).cwd;
+          if (typeof value === "string" && value.length > 0) recordCwd = value;
+        }
+      }
+      if (recordCwd === undefined || (cwd !== undefined && recordCwd !== cwd)) continue;
+      out.push({ id, cwd: recordCwd, updatedAt: (Number.isFinite(mtime) ? mtime : 0) * 1000, preview: claudePreviewFromRecords(records) });
+    }
+    return out;
   }
 
   private async runCapture(remoteCommand: string): Promise<string> {

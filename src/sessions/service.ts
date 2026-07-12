@@ -29,6 +29,10 @@ export class SessionService {
     private readonly gate: ThreadGate,
     private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
     private readonly ownership?: SessionOwnershipCheck,
+    // Does the endpoint's backend persist model/effort itself (Codex app-server), so a turn
+    // CONSUMES the pending setting? For Claude there is no server: the setting must stay sticky
+    // in the RuntimeStore and re-apply every turn, so this returns false and consume is skipped.
+    private readonly settingsPersistNatively: (endpointId: string) => boolean = () => true,
   ) {}
 
   async send(nickname: string, text: string, options: {
@@ -76,7 +80,7 @@ export class SessionService {
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
       }, undefined, lease);
-      this.runtime.consumeSettings(session.endpoint, session.thread_id, session.mapping_id, settings);
+      this.consumeSettingsIfNative(session.endpoint, session.thread_id, session.mapping_id, settings);
       const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
       if (!terminal) this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
       return { mode: "start" as const, turnId: response.turn.id, terminal, appliedSettings: settings };
@@ -202,6 +206,14 @@ export class SessionService {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
     this.runtime.setEffort(session.endpoint, session.thread_id, session.mapping_id, effort);
+  }
+
+  // Consume the pending model/effort ONLY when the endpoint's backend persists them itself
+  // (Codex app-server). For Claude they are sticky (no server), so this is a no-op and the
+  // value re-applies every turn. Shared by the live send AND the crashed-send recovery path
+  // (production-app) so the two consume sites can never diverge on the provider guard.
+  consumeSettingsIfNative(endpointId: string, threadId: string, mappingId: string, settings: { model?: string; effort?: string }): void {
+    if (this.settingsPersistNatively(endpointId)) this.runtime.consumeSettings(endpointId, threadId, mappingId, settings);
   }
 
   getGoal(nickname: string): Promise<unknown> {

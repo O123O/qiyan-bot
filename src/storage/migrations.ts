@@ -661,4 +661,14 @@ export const migrations: readonly Migration[] = [
       db.exec("ALTER TABLE claude_session_goals ADD COLUMN driven_turns INTEGER NOT NULL DEFAULT 0");
     }
   },
+  // Emulated archive tombstones for Claude sessions. Claude has no native archive, so an
+  // archived thread is recorded here and the runtime's thread/list (discover) hides it,
+  // matching Codex archive semantics. Cleared when the thread is driven or re-adopted.
+  `
+  CREATE TABLE IF NOT EXISTS claude_archived_threads (
+    endpoint_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    archived_at INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_id, thread_id)
+  );`,
 ];

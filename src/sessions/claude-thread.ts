@@ -54,6 +54,10 @@ export interface ReconstructClaudeThreadParams {
   // Turn ids the runtime knows were interrupted (subprocess killed). An open turn
   // not listed here is reported `inProgress`.
   interruptedTurnIds?: ReadonlySet<string>;
+  // The turn whose `claude -p` subprocess is running right now (in-memory, authoritative).
+  // A turn can be executing before `claude` flushes its user row, so disk reconstruction
+  // alone can read `idle`; overlaying this forces the thread `active`.
+  runningTurnId?: string;
 }
 
 interface TurnAccumulator {
@@ -126,6 +130,12 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       if (present.has(id)) continue;
       turns.push({ id, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${id}:user`, clientId: id }] });
     }
+  }
+
+  if (params.runningTurnId !== undefined && !turns.some((turn) => turn.id === params.runningTurnId && turn.status === "inProgress")) {
+    const existing = turns.find((turn) => turn.id === params.runningTurnId);
+    if (existing) existing.status = "inProgress";
+    else turns.push({ id: params.runningTurnId, status: "inProgress", itemsView: "full", items: [{ type: "userMessage", id: `${params.runningTurnId}:user`, clientId: params.runningTurnId }] });
   }
 
   const active = turns.some((turn) => turn.status === "inProgress");

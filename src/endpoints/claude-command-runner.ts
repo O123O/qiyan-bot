@@ -3,7 +3,7 @@
 // `claude -p` directly; a future ssh runner will run `ssh <host> claude -p` over the
 // existing ControlMaster (1.4). The runtime above depends only on this interface.
 import { spawn } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -14,8 +14,20 @@ export interface ClaudeLaunchFlags {
   disallowedTools?: readonly string[];
   mcpConfig?: readonly string[];
   model?: string;
+  effort?: string;
   permissionMode?: string;
 }
+
+// Metadata for one discoverable Claude session (thread). Deliberately body-free beyond a
+// short preview — never carries assistant/tool output (a transcript exfil surface).
+export interface ClaudeThreadMeta {
+  id: string;
+  cwd: string;
+  updatedAt: number;
+  preview: string;
+}
+
+export const CLAUDE_PREVIEW_MAX = 200;
 
 export interface ClaudeTurnRequest {
   threadId: string;   // Claude session id
@@ -39,6 +51,9 @@ export interface ClaudeCommandRunner {
   // The transcript file path (used as the ownership "rollout path"), or undefined
   // before the session is materialized.
   transcriptPath(threadId: string, cwd: string): Promise<string | undefined>;
+  // Enumerate discoverable sessions, optionally filtered to a project cwd. Claude has no
+  // list API, so this scans the transcript store; only id/cwd/updatedAt/preview leave the host.
+  listThreads(cwd?: string): Promise<ClaudeThreadMeta[]>;
 }
 
 // Builds the stable, deterministic `claude -p` argv for a turn. Exported for tests
@@ -54,8 +69,27 @@ export function buildClaudeArgs(request: ClaudeTurnRequest): string[] {
   for (const config of flags.mcpConfig ?? []) args.push("--mcp-config", config);
   if (flags.mcpConfig && flags.mcpConfig.length > 0) args.push("--strict-mcp-config");
   if (flags.model !== undefined) args.push("--model", flags.model);
+  if (flags.effort !== undefined) args.push("--effort", flags.effort);
   if (flags.permissionMode !== undefined) args.push("--permission-mode", flags.permissionMode);
   return args;
+}
+
+// The first user message of a transcript, trimmed to a short preview — never assistant/tool
+// output. Mirrors Codex discovery's body-free preview. Exported for the runner impls + tests.
+export function claudePreviewFromRecords(records: unknown[]): string {
+  for (const raw of records) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    if (record.type !== "user") continue;
+    const message = (record.message ?? {}) as Record<string, unknown>;
+    const content = message.content;
+    const text = typeof content === "string" ? content
+      : Array.isArray(content) ? content.map((part) => (part && typeof part === "object" && (part as any).type === "text" ? String((part as any).text ?? "") : "")).join(" ")
+      : "";
+    const trimmed = text.replace(/<!--\s*qiyan-cid:[^>]*-->/gu, "").replace(/\s+/gu, " ").trim();
+    if (trimmed) return trimmed.slice(0, CLAUDE_PREVIEW_MAX);
+  }
+  return "";
 }
 
 export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
@@ -134,4 +168,50 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
     }
     return undefined;
   }
+
+  async listThreads(cwd?: string): Promise<ClaudeThreadMeta[]> {
+    const projects = join(this.options.home ?? homedir(), ".claude", "projects");
+    let dirs: string[];
+    try { dirs = await readdir(projects); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+    const out: ClaudeThreadMeta[] = [];
+    for (const dir of dirs) {
+      let entries: string[];
+      try { entries = await readdir(join(projects, dir)); } catch { continue; }
+      for (const entry of entries) {
+        if (!entry.endsWith(".jsonl")) continue;
+        const meta = await readClaudeThreadMeta(entry.slice(0, -6), join(projects, dir, entry));
+        if (meta && (cwd === undefined || meta.cwd === cwd)) out.push(meta);
+      }
+    }
+    return out;
+  }
+}
+
+// Reads one transcript for its discovery metadata (cwd from the records — NOT the dir's
+// cwd-hash, which the runtime deliberately does not reproduce; updatedAt from mtime; a
+// body-free preview). Returns undefined for an unreadable / non-materialized transcript.
+async function readClaudeThreadMeta(id: string, path: string): Promise<ClaudeThreadMeta | undefined> {
+  let text: string;
+  let updatedAt: number;
+  try { text = await readFile(path, "utf8"); updatedAt = (await stat(path)).mtimeMs; }
+  catch { return undefined; }
+  const records: unknown[] = [];
+  let cwd: string | undefined;
+  // Only the head up to the first user record is needed (cwd + the preview source); stop there
+  // so a large transcript isn't fully parsed on every discover, and no later bodies are examined.
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let record: unknown;
+    try { record = JSON.parse(trimmed); } catch { continue; }
+    records.push(record);
+    if (record && typeof record === "object") {
+      const value = (record as Record<string, unknown>).cwd;
+      if (cwd === undefined && typeof value === "string" && value.length > 0) cwd = value;
+      if ((record as Record<string, unknown>).type === "user") break;
+    }
+  }
+  if (cwd === undefined) return undefined;
+  return { id, cwd, updatedAt, preview: claudePreviewFromRecords(records) };
 }

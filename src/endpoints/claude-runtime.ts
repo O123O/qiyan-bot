@@ -17,6 +17,8 @@ import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
 import { encodeClaudeClientMarker } from "../sessions/claude-transcript.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
+import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
+import { claudeModelCatalog } from "./claude-models.ts";
 import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
@@ -43,6 +45,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     runner: ClaudeCommandRunner;
     launchFlags: ClaudeLaunchFlags;
     goals?: ClaudeGoalStore;
+    // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
+    // thread here so thread/list (discover) hides it, matching Codex archive semantics.
+    archives?: ClaudeArchiveStore;
     now?: () => number;
     // Returns the stable per-session --mcp-config path exposing the worker scheduling
     // tools, or undefined. Attached to every turn (byte-identical per session).
@@ -102,10 +107,20 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/resume": return this.threadResume(args) as unknown as T;
       case "turn/start": return await this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
-      case "thread/archive": { const id = typeof args.threadId === "string" ? args.threadId : ""; this.threads.get(id)?.running?.handle.interrupt(); this.threads.delete(id); return {} as T; }
+      case "thread/list": return await this.threadList(args) as T;
+      case "thread/archive": {
+        const id = typeof args.threadId === "string" ? args.threadId : "";
+        this.threads.get(id)?.running?.handle.interrupt();
+        this.threads.delete(id);
+        // Claude has no native archive: tombstone the thread so discover hides it (Codex parity).
+        if (id) this.options.archives?.add(this.id, id, this.options.now?.());
+        return {} as T;
+      }
       case "thread/unsubscribe": return { status: "unsubscribed" } as T;
       case "thread/name/set": return {} as T;
-      case "model/list": return { models: this.options.launchFlags.model ? [{ id: this.options.launchFlags.model }] : [] } as T;
+      // Claude has no model-list API; return the curated catalog (Codex `{data,nextCursor}` shape)
+      // so set_session_model / the model picker have real entries to validate against.
+      case "model/list": return { data: claudeModelCatalog(this.options.launchFlags.model), nextCursor: null } as T;
       // An endpoint without a goal store (e.g. a remote Claude endpoint — goals are scoped to
       // the local endpoint) simply has no goal; reading it must not fail get_session_status.
       case "thread/goal/get": return { goal: this.options.goals ? this.options.goals.get(this.id, requireString(args.threadId, "threadId")) : null } as T;
@@ -140,6 +155,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 
   private async threadResume(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
+    // Re-adopting a thread un-tombstones it (Codex parity: resuming an archived thread revives it).
+    this.options.archives?.remove(this.id, threadId);
     return { thread: await this.withPath(threadId, await this.reconstruct(threadId)) };
   }
 
@@ -169,9 +186,23 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,
+      ...(state.running === undefined ? {} : { runningTurnId: state.running.turnId }),
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
       ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
     });
+  }
+
+  // Discover sessions for the endpoint (Claude has no thread/list API — enumerate the
+  // transcript store via the runner). Emulated archive tombstones split the two `archived`
+  // pages the discovery layer requests. One page, no cursor — Claude session counts are small.
+  private async threadList(params: Record<string, unknown>): Promise<{ data: unknown[]; nextCursor: null }> {
+    const cwd = typeof params.cwd === "string" ? params.cwd : undefined;
+    const wantArchived = params.archived === true;
+    const metas = await this.options.runner.listThreads(cwd);
+    const data = metas
+      .filter((meta) => (this.options.archives?.has(this.id, meta.id) ?? false) === wantArchived)
+      .map((meta) => ({ id: meta.id, cwd: meta.cwd, updatedAt: meta.updatedAt, preview: meta.preview }));
+    return { data, nextCursor: null };
   }
 
   private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
@@ -183,11 +214,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (state.running) throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
+    // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
+    this.options.archives?.remove(this.id, threadId);
 
-    // Attach the worker scheduling tools (stable per session → cache-safe).
+    // Per-session model/effort: `service.send` spreads the sticky settings into these params;
+    // prefer them over the endpoint-wide launch defaults (Claude applies them as `--model`/
+    // `--effort` per invocation). Attach the worker scheduling tools (stable per session).
     const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
-    const flags: ClaudeLaunchFlags = workerConfig === undefined ? this.options.launchFlags
-      : { ...this.options.launchFlags, mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] };
+    const flags: ClaudeLaunchFlags = {
+      ...this.options.launchFlags,
+      ...(typeof params.model === "string" ? { model: params.model } : {}),
+      ...(typeof params.effort === "string" ? { effort: params.effort } : {}),
+      ...(workerConfig === undefined ? {} : { mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] }),
+    };
 
     const handle = this.options.runner.startTurn({
       threadId, cwd: state.cwd, message, resume: state.materialized, flags,
