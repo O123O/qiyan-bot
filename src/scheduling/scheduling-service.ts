@@ -97,6 +97,16 @@ export class SchedulingService {
   //     armed (never advance) until it is proven sent or the claim goes stale and is
   //     reclaimed. This closes the orphaned-send / lost-delivery hole.
   private async fire(row: ScheduleRow, singleFireKey: string): Promise<void> {
+    // A goal auto-drive send (spec "goal", paced GOAL_DRIVE_DELAY_MS after the prior turn) is
+    // stale if the goal stopped being active between enqueue and now — cancel_goal (deletes the
+    // goal), pause_goal, or the worker marking it complete|blocked. Drop it here, the single fire
+    // choke point, so a stopped goal never drives another turn (nor collides with a later manual
+    // send). This mirrors the driver's own active-check, so every stop path quiesces driving
+    // without having to find and cancel the pending row.
+    // `kind === "wakeup"` distinguishes a goal drive from a worker `monitor` whose free-form
+    // check string could also be "goal" (that row is kind "monitor").
+    if (row.kind === "wakeup" && row.spec === "goal" && this.deps.goals
+      && this.deps.goals.get(row.endpointId, row.threadId)?.status !== "active") return;
     const outcome = this.outbox.claim(singleFireKey, row.nickname, row.message, this.deps.now());
     if (outcome === "delivered") return;
     if (outcome === "in-flight") throw new AppError("OPERATION_UNCERTAIN", `schedule send in-flight: ${singleFireKey}`);
