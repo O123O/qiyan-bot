@@ -2295,6 +2295,11 @@ export async function buildProductionApp(
           observeGoal(nickname, { goal: claudeGoals!.get(session.endpoint, session.thread_id) });
           void renderDashboardSafely();
         };
+        // A `monitor` check must run on the SESSION's own host. The local Claude worker runs
+        // it here (runMonitorCheck); each remote Claude endpoint registers its ssh runner
+        // below so the check runs over ssh on the worker's host. `monitor` is offered only to
+        // sessions whose host has a registered runner (see supportsMonitor).
+        const monitorCheckRunners = new Map<string, (command: string) => Promise<boolean>>();
         scheduling = new SchedulingService({
           db,
           now: () => Date.now(),
@@ -2302,12 +2307,18 @@ export async function buildProductionApp(
           // Fire drives a turn via the durable send_to_session (singleFireKey ==
           // clientUserMessageId for idempotent delivery).
           send: (nickname, message, key) => sessions.send(nickname, message, { mode: "auto", clientUserMessageId: key }).then(() => undefined),
-          runCheck: (row: ScheduleRow) => runMonitorCheck(row.spec),
+          // A monitor check MUST run on the session's own host. If no runner is registered for
+          // the endpoint (its runner is only registered once the endpoint is active — so a
+          // durable monitor whose endpoint is unavailable/unrecovered has none), treat the
+          // condition as UNMET rather than running a remote worker's shell check here. Returning
+          // false re-arms the poll, so the monitor self-heals once the endpoint is re-activated.
+          runCheck: (row: ScheduleRow) => { const check = monitorCheckRunners.get(row.endpointId); return check ? check(row.spec) : Promise.resolve(false); },
           goals: claudeGoals,
           onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
-          // `monitor` runs its check on the QiYan host, so it is offered ONLY to the local
-          // Claude worker; a remote worker's endpoint id is a catalog id, so it never gets it.
-          supportsMonitor: (session) => session.endpointId === claudeCodeConfig?.endpointId,
+          // `monitor` is offered to any Claude session whose host can run the check — the
+          // local worker (checked here) and every remote worker (checked over ssh). Both
+          // register a runner in monitorCheckRunners.
+          supportsMonitor: (session) => monitorCheckRunners.has(session.endpointId),
         });
         // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
         // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
@@ -2374,6 +2385,8 @@ export async function buildProductionApp(
         // flips the status (or the backstop cap pauses it). (The remote endpoint is
         // subscribed the same way inside createRemote.)
         if (claudeEndpoint) subscribeClaudeGoalDriver(claudeEndpoint, claudeCodeConfig!.endpointId);
+        // The local worker's `monitor` check runs on this host.
+        if (claudeCodeConfig) monitorCheckRunners.set(claudeCodeConfig.endpointId, (command) => runMonitorCheck(command));
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
@@ -2431,9 +2444,12 @@ export async function buildProductionApp(
                   return undefined;
                 }
               };
+              const claudeRemoteRunner = new SshClaudeCommandRunner({ plan: generation.plan });
+              // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
+              monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
-                runner: new SshClaudeCommandRunner({ plan: generation.plan }),
+                runner: claudeRemoteRunner,
                 launchFlags: claudeLaunchFlags,
                 // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
                 // over the reverse tunnel (Tier B).

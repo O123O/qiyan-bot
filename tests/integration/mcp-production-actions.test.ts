@@ -595,6 +595,36 @@ test("the exact production MCP map succeeds for every local and remote manager a
     await waitFor(() => scheduleCount() > beforeSchedule, workerTimeoutMs, `${fixture.nickname} worker schedule_wakeup did not persist (MCP unreachable?)`);
     await waitForIdle(`${fixture.nickname} post-schedule idle`);
 
+    // Worker `monitor`: the check must run on the SESSION's OWN host — locally here, over ssh
+    // for a remote worker (previously `monitor` was gated OFF for remote). Prove routing AND
+    // host by seeding a marker file on the fixture's host, then having the worker monitor
+    // `test -f <marker>`. It fires ONLY if the check evaluated on THAT host and saw the marker,
+    // which delivers `message` as a durable send (a new 'sent' row). Deleting the marker after
+    // the first fire makes the recurring check fail again, so it stops re-firing.
+    const markerFile = `/tmp/qiyan-monitor-${suffix}-${session.thread_id}`;
+    const seedMarker = fixture.endpoint === "claude-local"
+      ? async () => { await writeFile(markerFile, "ok"); }
+      : async () => { assert.equal(spawnSync("ssh", [fixture.endpoint, "touch", "--", markerFile]).status, 0, `seed marker on ${fixture.endpoint}`); };
+    const removeMarker = fixture.endpoint === "claude-local"
+      ? async () => { await rm(markerFile, { force: true }); }
+      : async () => { assert.equal(spawnSync("ssh", [fixture.endpoint, "rm", "-f", "--", markerFile]).status, 0, `remove marker on ${fixture.endpoint}`); };
+    await seedMarker();
+    const monitorSpec = `test -f ${markerFile}`;
+    const monitors = db.prepare(`SELECT COUNT(*) AS count FROM session_schedules WHERE endpoint_id = ? AND thread_id = ? AND kind = 'monitor' AND spec = ?`);
+    const monitorCount = (): number => (monitors.get(fixture.endpoint, session.thread_id, monitorSpec) as { count: number }).count;
+    const sends = db.prepare(`SELECT COUNT(*) AS count FROM scheduled_sends WHERE nickname = ? AND state = 'sent'`);
+    const sendCount = (): number => (sends.get(fixture.nickname) as { count: number }).count;
+    const beforeFire = sendCount();
+    const monitorAsk = `Use your monitor tool with check ${JSON.stringify(monitorSpec)}, poll_seconds 2, and message MONITORFIRED. Then reply exactly MONITOROK.`;
+    await call("send_to_session", { nickname: fixture.nickname, content: monitorAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${monitorAsk}`);
+    await waitFor(() => monitorCount() > 0, workerTimeoutMs, `${fixture.nickname} worker monitor did not persist (tool missing for this host?)`);
+    await waitFor(() => sendCount() > beforeFire, workerTimeoutMs, `${fixture.nickname} monitor check never fired (did it run on ${fixture.endpoint}'s host?)`);
+    // Stop the recurring monitor before the marker is gone so it never re-polls (a remote check
+    // is an ssh round-trip every poll) during the remaining steps; then clean up the marker.
+    db.prepare(`UPDATE session_schedules SET state = 'cancelled' WHERE endpoint_id = ? AND thread_id = ? AND kind = 'monitor' AND state = 'armed'`).run(fixture.endpoint, session.thread_id);
+    await removeMarker();
+    await waitForIdle(`${fixture.nickname} post-monitor idle`);
+
     // ---- Per-session model + effort must ACTUALLY reach `claude -p` (regressions: set_session_model
     // threw on empty list_models; set_reasoning_effort was a silent no-op). Proof is the resolved
     // model id on the transcript, NOT the appliedSettings echo. Runs AFTER the tool-dependent goal/

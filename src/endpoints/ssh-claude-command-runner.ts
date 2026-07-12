@@ -132,4 +132,27 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
       child.once("close", () => resolve(out));
     });
   }
+
+  // Run a `monitor` check on the REMOTE worker's host. Resolves true only when the
+  // command exits 0 (condition met); an attest/ssh failure resolves false so a dead
+  // ControlMaster never fires a monitor. Mirrors the local runMonitorCheck semantics.
+  // On timeout the local ssh client is killed but the remote command is not signalled
+  // (no PTY), so a monitor check must be a fast predicate, not a long-running command.
+  async runShellCheck(command: string, timeoutMs = 20_000): Promise<boolean> {
+    try { await this.attest(); }
+    catch { return false; }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean) => { if (settled) return; settled = true; clearTimeout(timer); resolve(ok); };
+      const timer = setTimeout(() => { try { child?.kill("SIGKILL"); } catch { /* already gone */ } finish(false); }, timeoutMs);
+      timer.unref?.();
+      let child: ReturnType<typeof this.spawnSsh> | undefined;
+      try { child = this.spawnSsh(`bash -c ${shq(command)}`); }
+      catch { finish(false); return; }
+      child.stdout?.resume(); // drain; only the exit code matters
+      child.stdin!.end();
+      child.once("error", () => finish(false));
+      child.once("close", (code) => finish(code === 0));
+    });
+  }
 }

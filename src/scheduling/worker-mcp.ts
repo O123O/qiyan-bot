@@ -27,9 +27,9 @@ export interface WorkerScheduleMcpOptions {
   // native goal engine and the assistant is not a worker). When present, exposes the
   // set_goal_status tool.
   setGoalStatus?(session: WorkerScheduleSession, status: "complete" | "blocked"): void;
-  // Whether `monitor` is usable by the calling session. Its shell check runs on the QiYan
-  // host, so a REMOTE worker (whose files live on another host) must not use it — the tool
-  // description promises the check runs "on your session's host", which would be a lie.
+  // Whether `monitor` is usable by the calling session. It is offered only when the session's
+  // own host can run the check (locally for the local worker, over ssh for a remote worker), so
+  // the tool description's "on your session's host" promise always holds. Default: usable.
   supportsMonitor?(session: WorkerScheduleSession): boolean;
   host?: "127.0.0.1";
   port?: number;
@@ -107,9 +107,9 @@ export class WorkerScheduleMcpServer {
       return text(`scheduled recurring ${row.id} every ${args.interval_seconds}s`);
     });
 
-    // `monitor` runs its shell check on the QiYan host, so it is registered ONLY for a session
-    // that lives there — a remote worker never sees it (its description would otherwise promise
-    // the check runs on the worker's host, which is false).
+    // `monitor` runs its shell check on the SESSION's own host — locally for the local worker,
+    // over ssh for a remote worker. It is registered only when a host check runner exists
+    // (supportsMonitor), so the description's "on your session's host" promise always holds.
     if (this.options.supportsMonitor?.(session) ?? true) mcp.registerTool("monitor", {
       description: "Watch a condition: QiYan runs `check` (a shell command) every poll_seconds on your session's host; when it exits 0, QiYan sends you `message` as a new turn. Use to wait for a build, a file, a job.",
       inputSchema: { check: z.string().min(1).describe("shell command run on your host; exit 0 = condition met"), message: z.string().min(1).describe("the message sent to you when the check passes"), poll_seconds: z.number().int().min(1).describe("seconds between checks").optional() },

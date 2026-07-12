@@ -66,3 +66,24 @@ test("a remote Claude session drives through the pool over ssh", { skip: !enable
   // No externally-typed turn was injected, so none should read as external (all owned).
   assert.equal(owned.every((s) => typeof s.clientId === "string"), true);
 });
+
+// A worker `monitor` check must evaluate on the REMOTE host (over ssh), not the QiYan host.
+// runShellCheck resolves true only when the remote command exits 0, so a create/observe/remove
+// round-trip on the remote filesystem proves it both runs remotely and maps the exit code.
+test("a remote monitor check runs on the remote host over ssh", { skip: !enabled, timeout: 60_000 }, async () => {
+  const effective = parseSshConfig((await runBoundedProcess("ssh", ["-G", host!], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024 })).stdout.toString("utf8"));
+  const plan = planSshConnection(host!, effective, await mkdtemp(join(tmpdir(), "qiyan-claude-check-")));
+  const runner = new SshClaudeCommandRunner({ plan });
+  // Exit code → boolean mapping.
+  assert.equal(await runner.runShellCheck("true"), true);
+  assert.equal(await runner.runShellCheck("false"), false);
+  assert.equal(await runner.runShellCheck("exit 3"), false);
+  // Real remote filesystem state: the check sees a marker only after it is created ON the
+  // remote host, and stops seeing it once removed there.
+  const marker = `/tmp/qiyan-check-${process.pid}-${Date.now()}`;
+  assert.equal(await runner.runShellCheck(`test ! -e ${marker}`), true);
+  assert.equal(await runner.runShellCheck(`touch -- ${marker} && test -f ${marker}`), true);
+  assert.equal(await runner.runShellCheck(`test -f ${marker}`), true);
+  assert.equal(await runner.runShellCheck(`rm -f -- ${marker} && test ! -e ${marker}`), true);
+  assert.equal(await runner.runShellCheck(`test -f ${marker}`), false);
+});
