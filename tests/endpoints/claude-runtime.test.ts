@@ -254,3 +254,23 @@ test("thread/list splits archived tombstones and hides them from the default pag
   await rt.request("thread/resume", { threadId: "t-gone" }).catch(() => undefined);
   assert.equal(archives.has("claude-local", "t-gone"), false, "resume cleared the tombstone");
 });
+
+test("turn input renders file attachments as readable paths for `claude -p`", async () => {
+  const runner = new FakeRunner();
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  // The worker file bridge stages each attachment as a localImage/mention item whose path is
+  // valid on the worker's host; the Claude adapter must forward that path (not drop it) so
+  // `claude` can read the file.
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:att", input: [
+    { type: "text", text: "look at these" },
+    { type: "localImage", path: "/runtime/files/abc.png" },
+    { type: "mention", name: "report.pdf", path: "/runtime/files/def" },
+  ] });
+  const message = runner.requests[0]!.message;
+  assert.match(message, /look at these/u);
+  assert.match(message, /\/runtime\/files\/abc\.png/u, "image attachment path forwarded");
+  assert.match(message, /report\.pdf/u, "mention display name forwarded");
+  assert.match(message, /\/runtime\/files\/def/u, "mention attachment path forwarded");
+});

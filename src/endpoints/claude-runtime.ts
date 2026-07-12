@@ -308,17 +308,27 @@ function requireGoalStatus(status: string): string {
   return status;
 }
 
-// Concatenate the text of the Codex-shaped input items; non-text items (files) are
-// not yet supported by the Claude adapter.
+// Render the Codex-shaped input items as text for `claude -p`. Text items pass through;
+// file attachments become a path reference — the worker file bridge has already staged the
+// file at a path valid on THIS worker's host (local fs, or the remote runtime dir for a
+// remote worker), and `claude` reads files by path (its Read tool handles text and images).
 function inputToText(input: unknown): string {
   if (typeof input === "string") return input;
   if (!Array.isArray(input)) return "";
   const parts: string[] = [];
   for (const item of input) {
-    if (item && typeof item === "object" && (item as Record<string, unknown>).type === "text") {
-      const text = (item as Record<string, unknown>).text;
-      if (typeof text === "string") parts.push(text);
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name : undefined;
+    if (record.type === "text") {
+      if (typeof record.text === "string") parts.push(record.text);
+    } else if ((record.type === "localImage" || record.type === "mention") && typeof record.path === "string") {
+      parts.push(name ? `[Attached file "${name}" (read it at ${record.path})]` : `[Attached file: read it at ${record.path}]`);
+    } else if (record.type === "image" && typeof record.url === "string") {
+      parts.push(`[Attached image: ${record.url}]`);
     }
+    // `skill` items are intentionally omitted: the worker send path never emits them (only text +
+    // localImage/mention from the file bridge), and a skill reference has no meaning for `claude -p`.
   }
   return parts.join("\n");
 }

@@ -2415,6 +2415,9 @@ export async function buildProductionApp(
               const tunnel = new RemoteWorkerTunnel({
                 plan: generation.plan, localPort: scheduling!.mcpPort,
               });
+              // Warn the user once per session when the tunnel degrades (below), so the loss of
+              // self-scheduling is visible, not just an operational log line.
+              const tunnelWarned = new Set<string>();
               const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
                 const found = registry.getByIdentity(definition.id, threadId);
                 if (!found) return undefined;
@@ -2437,10 +2440,26 @@ export async function buildProductionApp(
                     { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
                   return result.path;
                 } catch (error) {
+                  const reason = error instanceof Error ? error.message : String(error);
                   reportOperationalSafely(report, {
-                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel",
-                    reason: error instanceof Error ? error.message : String(error),
+                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel", reason,
                   });
+                  // The reverse tunnel (Tier B) only carries the worker's SELF-scheduling tools; the
+                  // worker's turns and QiYan-side goal drive/steer (Tier A) go over the ControlMaster
+                  // and are unaffected. Surface the degradation to the user once per session — but,
+                  // like the operational log above, this MUST NOT fail the turn (this whole branch
+                  // exists to degrade gracefully), so swallow any delivery/binding error and add to
+                  // the dedup set only after a successful prepare (so a throw doesn't lose the warning).
+                  try {
+                    if (deliveries && !tunnelWarned.has(threadId)) {
+                      deliveries.prepare({
+                        id: `worker-scheduling-unavailable:${definition.id}:${threadId}`,
+                        kind: "worker_warning", binding: currentOwnerBinding(), mandatory: true,
+                        body: `[${found.nickname}] the remote worker can't reach QiYan's scheduling tools (reverse tunnel failed: ${reason}). It still runs turns and pursues its goal, but can't set its own wakeups, crons, or monitors this turn.`,
+                      });
+                      tunnelWarned.add(threadId);
+                    }
+                  } catch { /* surfacing the warning must not fail the turn */ }
                   return undefined;
                 }
               };
