@@ -39,7 +39,7 @@ export const ASSISTANT_TOOL_SCHEMAS = {
     pending_follow_up: z.string().max(4_000).describe("the next follow-up you owe; null to clear when resolved").nullable().optional(),
   }).strict().refine((value) => Object.keys(value).some((key) => key !== "nickname"), "at least one manager note field is required"),
   send_chat_message: z.object({ content: z.string().describe("message text to send to the current chat/user") }).strict(),
-  prepare_chat_attachment: z.object({ owner: z.string().min(1).describe("owning session nickname, or 'assistant' for the assistant's own workdir"), relative_path: z.string().min(1).describe("file path relative to the owner's project directory") }).strict(),
+  prepare_chat_attachment: z.object({ owner: z.string().min(1).describe("owning session nickname, or 'assistant' for the assistant's own workdir"), relative_path: z.string().min(1).describe("file path relative to the owner's root directory") }).strict(),
   send_chat_attachment: z.object({ file_handle: z.string().min(1).describe("file_handle from prepare_chat_attachment"), caption: z.string().describe("optional caption").optional() }).strict(),
   get_chat_history: z.object({
     scope: z.enum(["conversation", "channel"]).describe("'conversation' = this thread; 'channel' = the whole channel"),
