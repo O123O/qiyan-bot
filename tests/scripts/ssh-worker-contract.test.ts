@@ -119,11 +119,13 @@ test("effective SSH policy enables only local stream-local forwarding", async (t
 
   const { stdout } = await execFileAsync(sshd, ["-T", "-f", path, "-C", "user=codex,host=localhost,addr=127.0.0.1"]);
 
-  assert.match(stdout, /^allowstreamlocalforwarding local$/mu);
-  assert.match(stdout, /^allowtcpforwarding no$/mu);
-  assert.match(stdout, /^allowagentforwarding no$/mu);
-  assert.match(stdout, /^x11forwarding no$/mu);
-  assert.match(stdout, /^permittunnel no$/mu);
+  // OpenSSH 10.4 may preserve keyword casing in `sshd -T` output. Keywords are
+  // case-insensitive, so validate the effective values without pinning casing.
+  assert.match(stdout, /^allowstreamlocalforwarding local$/imu);
+  assert.match(stdout, /^allowtcpforwarding no$/imu);
+  assert.match(stdout, /^allowagentforwarding no$/imu);
+  assert.match(stdout, /^x11forwarding no$/imu);
+  assert.match(stdout, /^permittunnel no$/imu);
 });
 
 test("SSH worker entrypoint provisions only fixture-owned SSH state", async () => {

@@ -16,7 +16,10 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
   const temp = await mkdtemp(join(tmpdir(), "qiyan-bot-package-"));
   context.after(() => rm(temp, { recursive: true, force: true }));
   const packed = await execFileAsync("npm", ["pack", "--json", "--pack-destination", temp], { cwd: root });
-  const metadata = JSON.parse(packed.stdout) as Array<{ filename: string }>;
+  const parsedMetadata = JSON.parse(packed.stdout) as Array<{ filename: string }> | Record<string, { filename: string }>;
+  // npm 12 keys pack metadata by package name; earlier supported npm versions
+  // return the same entries as an array.
+  const metadata = Array.isArray(parsedMetadata) ? parsedMetadata : Object.values(parsedMetadata);
   assert.equal(metadata.length, 1);
   const archive = join(temp, metadata[0]!.filename);
   const listing = (await execFileAsync("tar", ["-tzf", archive])).stdout.split("\n").filter(Boolean);
