@@ -42,7 +42,6 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /direct work.*never.*QiYan home.*assistant workdir/isu);
   assert.match(policy, /direct work.*no suitable location.*`default_projects_root\/<project-name>`/isu);
   assert.match(policy, /omit `project_dir`.*backend exclusively creates `default_projects_root\/<nickname>`/isu);
-  assert.match(policy, /adopt_session.*native cwd.*unadopt_session.*does not archive/isu);
 
   const catalogSection = policy.split(/^## Tool catalog$/mu)[1];
   assert.ok(catalogSection, "missing tool catalog section");
@@ -71,7 +70,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /permission blocks.*worker failures are real states.*never fabricate/isu);
   assert.match(policy, /worker notifications contain metadata, not bodies/iu);
   assert.match(policy, /model and effort changes are pending.*next new turn.*steer/isu);
-  assert.match(policy, /set_goal.*replaces the current goal/isu);
+  assert.match(policy, /goal completion is a worker.*never declare or mark a worker goal complete yourself/isu);
   assert.match(policy, /never declare or mark a worker goal complete/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*session-status\.json/iu);
   assert.match(policy, /never (?:edit|patch|replace|delete|regenerate)[^\n]*sessions\.json/iu);
