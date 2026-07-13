@@ -58,8 +58,21 @@ Create `~/.qiyan-bot/endpoints.json` as strict JSON with owner-only permissions:
   "version": 1,
   "endpoints": {
     "devbox": {
-      "type": "ssh",
+      "provider": "codex",
+      "transport": "ssh",
+      "host": "devbox",
       "projects_root": "~/qiyan-projects"
+    },
+    "claude-local": {
+      "provider": "claude",
+      "transport": "local",
+      "model": "opus"
+    },
+    "devbox-claude": {
+      "provider": "claude",
+      "transport": "ssh",
+      "host": "devbox",
+      "model": "sonnet"
     }
   }
 }
@@ -69,7 +82,7 @@ Create `~/.qiyan-bot/endpoints.json` as strict JSON with owner-only permissions:
 chmod 600 "$HOME/.qiyan-bot/endpoints.json"
 ```
 
-The object key must match the SSH alias. `projects_root` is optional and defaults to `~/qiyan-projects` on that host. QiYan reads the catalog when an inactive endpoint is requested, so edits do not require a bot restart. A malformed file is rejected with its field path.
+Every configurable endpoint — local or remote, Codex or Claude — is declared here. Each entry has a `provider` (`codex` | `claude`) and a `transport` (`local` | `ssh`), which are independent. `host` is the SSH alias, required for `ssh` and forbidden for `local`; the map key is the endpoint id (decoupled from the alias). `projects_root` is optional (default `~/qiyan-projects`), forbidden for `local`. Claude entries may pin `model` and `effort`. Codex runs only over `ssh` (a local Codex worker is the built-in `local` endpoint). At most one `claude`/`local` endpoint is allowed. Remote (`ssh`) endpoints are read on demand — edits take effect without a restart; **local endpoint changes require a restart**. A malformed file is rejected with its field path.
 
 You can then ask QiYan to create or adopt a session on `devbox`, inspect its models, disconnect it, or restart it. `disconnect_endpoint` and `restart_endpoint` default to local when no endpoint is supplied. Disconnect/restart refuses active or unprovable managed threads.
 

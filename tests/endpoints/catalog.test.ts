@@ -23,24 +23,29 @@ test("bootstraps a private empty endpoint catalog", async (t) => {
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { version: 1, endpoints: {} });
 });
 
-test("uses endpoint keys as SSH aliases and defaults the projects root", async (t) => {
+test("resolves a codex/ssh endpoint (host explicit), defaults the projects root, rejects built-ins", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
-  await writeFile(path, JSON.stringify({ version: 1, endpoints: { devbox: { type: "ssh" } } }), { mode: 0o600 });
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "devbox-alias" } } }), { mode: 0o600 });
   const catalog = await EndpointCatalog.open(path);
-  assert.deepEqual(catalog.require("devbox"), { id: "devbox", type: "ssh", projectsRoot: "~/qiyan-projects" });
+  assert.deepEqual(catalog.require("devbox"), { id: "devbox", provider: "codex", transport: "ssh", host: "devbox-alias", projectsRoot: "~/qiyan-projects" });
   assert.throws(() => catalog.require("local"), /built-in endpoint/u);
 });
 
-test("recognizes a claude-code endpoint and preserves its type through require", async (t) => {
+test("resolves claude endpoints — local (no host) and ssh (host + model/effort); definitions() lists all", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
-  await writeFile(path, JSON.stringify({ version: 1, endpoints: { dfw: { type: "claude-code", projects_root: "/work" } } }), { mode: 0o600 });
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: {
+    "claude-local": { provider: "claude", transport: "local", model: "opus" },
+    "dfw": { provider: "claude", transport: "ssh", host: "dfw-alias", projects_root: "/work", model: "sonnet", effort: "high" },
+  } }), { mode: 0o600 });
   const catalog = await EndpointCatalog.open(path);
-  assert.deepEqual(catalog.require("dfw"), { id: "dfw", type: "claude-code", projectsRoot: "/work" });
+  assert.deepEqual(catalog.require("claude-local"), { id: "claude-local", provider: "claude", transport: "local", projectsRoot: "~/qiyan-projects", model: "opus" });
+  assert.deepEqual(catalog.require("dfw"), { id: "dfw", provider: "claude", transport: "ssh", host: "dfw-alias", projectsRoot: "/work", model: "sonnet", effort: "high" });
+  assert.deepEqual(catalog.definitions().map((d) => `${d.id}:${d.provider}:${d.transport}`).sort(), ["claude-local:claude:local", "dfw:claude:ssh"]);
 });
 
-test("rejects unknown fields, unsafe roots, reserved aliases, broad modes, and symlinks", async (t) => {
+test("rejects unknown fields, bad provider/transport combos, unsafe roots, reserved ids, broad modes, and symlinks", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
   const invalid = async (value: unknown, pattern: RegExp) => {
@@ -48,11 +53,16 @@ test("rejects unknown fields, unsafe roots, reserved aliases, broad modes, and s
     await writeFile(path, JSON.stringify(value), { mode: 0o600 });
     await assert.rejects(EndpointCatalog.open(path), pattern);
   };
-  await invalid({ version: 1, endpoints: { devbox: { type: "ssh", extra: true } } }, /extra/u);
-  await invalid({ version: 1, endpoints: { devbox: { type: "docker" } } }, /devbox/u);
-  await invalid({ version: 1, endpoints: { devbox: { type: "claude-code", extra: true } } }, /extra/u);
-  await invalid({ version: 1, endpoints: { devbox: { type: "ssh", projects_root: "relative" } } }, /projects_root/u);
-  await invalid({ version: 1, endpoints: { local: { type: "ssh" } } }, /local/u);
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", extra: true } } }, /extra/u);
+  await invalid({ version: 1, endpoints: { devbox: { provider: "docker", transport: "ssh", host: "h" } } }, /devbox/u);
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "local" } } }, /devbox/u); // codex is ssh-only
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh" } } }, /devbox/u); // codex requires host
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", model: "opus" } } }, /model/u); // model is claude-only
+  await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "ssh" } } }, /host/u); // ssh requires host
+  await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "local", host: "h" } } }, /host/u); // local forbids host
+  await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "local", projects_root: "/w" } } }, /projects_root/u); // local forbids projects_root
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", projects_root: "relative" } } }, /projects_root/u);
+  await invalid({ version: 1, endpoints: { local: { provider: "claude", transport: "local" } } }, /local/u); // reserved id
   await rm(path, { force: true });
   await writeFile(path, JSON.stringify({ version: 1, endpoints: {} }), { mode: 0o644 });
   await assert.rejects(EndpointCatalog.open(path), /mode 0600/u);
@@ -66,7 +76,7 @@ test("rejects unknown fields, unsafe roots, reserved aliases, broad modes, and s
 test("reload validates changed bytes and preserves the prior snapshot on failure", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
-  await writeFile(path, JSON.stringify({ version: 1, endpoints: { one: { type: "ssh", projects_root: "/work" } } }), { mode: 0o600 });
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: { one: { provider: "codex", transport: "ssh", host: "one", projects_root: "/work" } } }), { mode: 0o600 });
   const catalog = await EndpointCatalog.open(path);
   await writeFile(path, "{", { mode: 0o600 });
   await assert.rejects(catalog.reload(), /invalid endpoint catalog/u);

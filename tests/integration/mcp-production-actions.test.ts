@@ -99,8 +99,10 @@ test("the exact production MCP map succeeds for every local and remote manager a
   await writeFile(join(qiyanHome, "endpoints.json"), `${JSON.stringify({
     version: 1,
     endpoints: {
-      "dfw-vscode": { type: "ssh", projects_root: "~/qiyan-projects" },
-      ...(claudeRemoteAlias ? { [claudeRemoteAlias]: { type: "claude-code", projects_root: "~/qiyan-projects" } } : {}),
+      // The local Claude endpoint is now an endpoints.json entry (was config.claudeCode / env).
+      "claude-local": { provider: "claude", transport: "local" },
+      "dfw-vscode": { provider: "codex", transport: "ssh", host: "dfw-vscode", projects_root: "~/qiyan-projects" },
+      ...(claudeRemoteAlias ? { [claudeRemoteAlias]: { provider: "claude", transport: "ssh", host: claudeRemoteAlias, projects_root: "~/qiyan-projects" } } : {}),
     },
   }, null, 2)}\n`, { mode: 0o600 });
 
@@ -123,10 +125,8 @@ test("the exact production MCP map succeeds for every local and remote manager a
     attachmentMaxBytes: 1024 * 1024,
     attachmentStoreMaxBytes: 8 * 1024 * 1024,
     assistantSandboxMode: "read-only",
-    // Enable the local Claude endpoint so the Claude lifecycle runs through the same real
-    // manager/service/ownership stack as Codex (this coverage was the gap that let the
-    // local-Claude create/first-turn/delivery/archive bugs ship).
-    claudeCode: { endpointId: "claude-local", command: "claude" },
+    // The local Claude endpoint (`claude-local`) is declared in endpoints.json above, so the
+    // Claude lifecycle runs through the same real manager/service/ownership stack as Codex.
   };
   const adapter = new AcceptanceAdapter();
   let tools: Readonly<Record<AssistantToolName, ToolHandler>> | undefined;

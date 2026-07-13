@@ -1,13 +1,13 @@
 import { AppError } from "../core/errors.ts";
 import { RpcRequestTimeoutError } from "../app-server/rpc-client.ts";
-import type { RemoteEndpointDefinition } from "./catalog.ts";
+import type { EndpointDefinition } from "./catalog.ts";
 import { EndpointAdmissionGate, type EndpointDesiredState } from "./admission-gate.ts";
 import type { PendingDestinationBinding } from "./ssh-config.ts";
 import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
 interface CatalogReader {
   reload(): Promise<void>;
-  require(id: string): RemoteEndpointDefinition;
+  require(id: string): EndpointDefinition;
 }
 
 interface ActivationCandidate {
@@ -49,7 +49,7 @@ export class EndpointManager {
     localEndpoint: ManagedAppServerEndpoint;
     builtinEndpoints?: readonly ManagedAppServerEndpoint[];
     catalog: CatalogReader;
-    createRemote(definition: RemoteEndpointDefinition, hasReferences: boolean): Promise<ActivationCandidate>;
+    createRemote(definition: EndpointDefinition, hasReferences: boolean): Promise<ActivationCandidate>;
     hasIdentityReferences(endpointId: string): boolean | Promise<boolean>;
     commitBinding?(binding: PendingDestinationBinding, hasReferences: boolean): void | Promise<void>;
     managedThreadIds(endpointId: string): readonly string[] | Promise<readonly string[]>;

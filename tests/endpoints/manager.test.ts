@@ -63,7 +63,7 @@ function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly st
     localEndpoint: local,
     catalog: {
       reload: async () => undefined,
-      require: (id: string) => ({ id, type: "ssh" as const, projectsRoot: "~/qiyan-projects" }),
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
     },
     createRemote: async () => {
       const endpoint = candidates[index++];
@@ -85,7 +85,7 @@ function fixture() {
     localEndpoint: local,
     catalog: {
       reload: async () => { reloads += 1; },
-      require: (id: string) => ({ id, type: "ssh" as const, projectsRoot: "~/qiyan-projects" }),
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
     },
     createRemote: async (definition) => {
       const endpoint = remotes.get(definition.id) ?? new FakeEndpoint(definition.id);
@@ -137,7 +137,7 @@ test("an unavailable referenced endpoint keeps retrying without blocking startup
   const scheduled: Array<() => void> = [];
   const manager = new EndpointManager({
     localEndpoint: local,
-    catalog: { reload: async () => undefined, require: () => ({ id: "offline", type: "ssh" as const, projectsRoot: "~/qiyan-projects" }) },
+    catalog: { reload: async () => undefined, require: () => ({ id: "offline", provider: "codex" as const, transport: "ssh" as const, host: "offline", projectsRoot: "~/qiyan-projects" }) },
     createRemote: async () => ({ endpoint: remote }),
     hasIdentityReferences: () => true,
     managedThreadIds: () => [],
@@ -275,7 +275,7 @@ test("shutdown fences a reconnect whose identity-reference check resolves late",
   const scheduled: Array<() => void> = [];
   const manager = new EndpointManager({
     localEndpoint: local,
-    catalog: { reload: async () => undefined, require: () => ({ id: "devbox", type: "ssh" as const, projectsRoot: "~/qiyan-projects" }) },
+    catalog: { reload: async () => undefined, require: () => ({ id: "devbox", provider: "codex" as const, transport: "ssh" as const, host: "devbox", projectsRoot: "~/qiyan-projects" }) },
     createRemote: async () => ({ endpoint: remote }),
     hasIdentityReferences: () => referenceChecks++ === 0 ? true : references,
     managedThreadIds: () => [],

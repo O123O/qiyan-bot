@@ -117,9 +117,9 @@ test("re-resolves SSH configuration and checks the durable binding on every gene
       return { stdout: Buffer.from(`hostname ${hostname}\nuser xin\nport 22\ncontrolmaster no\ncontrolpath none\n`), stderr: Buffer.alloc(0) };
     },
   });
-  const first = await planner.createGeneration("devbox");
+  const first = await planner.createGeneration("devbox", "devbox");
   hostname = "host-two";
-  const second = await planner.createGeneration("devbox");
+  const second = await planner.createGeneration("devbox", "devbox");
   assert.equal(first.pendingBinding.destination.hostname, "host-one");
   assert.equal(second.pendingBinding.destination.hostname, "host-two");
   assert.deepEqual(checked, [
@@ -151,12 +151,12 @@ test("generation reuses a live user master and falls back to an owned master whe
     },
   });
 
-  const reused = await planner.createGeneration("devbox");
+  const reused = await planner.createGeneration("devbox", "devbox");
   assert.equal(reused.plan.ownsControlMaster, false);
   assert.equal(reused.plan.controlPath, "/private/user-master");
 
   userMasterAvailable = false;
-  const fallback = await planner.createGeneration("devbox");
+  const fallback = await planner.createGeneration("devbox", "devbox");
   assert.equal(fallback.plan.ownsControlMaster, true);
   assert.match(fallback.plan.controlPath!, /^\/private\/runtime\/ssh\/[a-f0-9]{24}$/u);
   assert.ok(buildSshArgs(fallback.plan, []).includes("ControlMaster=auto"));
@@ -183,7 +183,7 @@ test("generation attests a configured user master before probing it", async () =
     },
   });
 
-  const generation = await planner.createGeneration("devbox");
+  const generation = await planner.createGeneration("devbox", "devbox");
   assert.equal(generation.plan.ownsControlMaster, true);
   assert.deepEqual(events, ["config", "attest"]);
 });
@@ -213,6 +213,6 @@ test("generation cancellation never becomes an owned-master fallback", async () 
       },
     });
 
-    await assert.rejects(planner.createGeneration("devbox", controller.signal), /cancelled during/u);
+    await assert.rejects(planner.createGeneration("devbox", "devbox", controller.signal), /cancelled during/u);
   }
 });

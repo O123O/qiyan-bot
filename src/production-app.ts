@@ -150,9 +150,9 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
   return mode === "danger-full-access" ? fullAccessWarning : undefined;
 }
 
-// An endpoint runs on QiYan's own host (no ssh) when it is the Codex `"local"` endpoint or
-// the configured local Claude endpoint (CLAUDE_CODE_ENDPOINT_ID). Local endpoints resolve to
-// the local project workspace and in-process file handling; every other id is remote (ssh).
+// An endpoint runs on QiYan's own host (no ssh) when it is the Codex `"local"` endpoint or the
+// local Claude endpoint (the endpoints.json entry with transport:"local"). Local endpoints resolve
+// to the local project workspace and in-process file handling; every other id is remote (ssh).
 // One predicate for the workspace router, rollout-access, and the worker file bridge so they
 // cannot diverge (they did — the local Claude endpoint was mis-sent through the ssh path).
 export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: string): boolean {
@@ -2277,12 +2277,19 @@ export async function buildProductionApp(
           }),
           minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
         });
-        // Opt-in local Claude Code endpoint (Phase 1.4). Eager + always-ready like
-        // "local" (no daemon); absent config.claudeCode it is never constructed and
-        // the composition is unchanged.
-        const claudeCodeConfig = config.claudeCode;
-        // Goals + scheduling serve EVERY Claude endpoint (the local one and any catalog
-        // claude-code endpoint), keyed by (endpointId, threadId). Construct the stack
+        // The local Claude endpoint (an endpoints.json entry with transport:"local") is eager +
+        // always-ready like "local" (no daemon); absent such an entry it is never constructed
+        // and the composition is unchanged.
+        // The local Claude endpoint (if any) is an endpoints.json entry with provider:claude,
+        // transport:local. At most one is allowed — the wiring below (single builtin, scalar id,
+        // one monitor runner) is singular; a second such entry is a loud misconfiguration.
+        const localClaudeDefs = endpointCatalog.definitions().filter((definition) => definition.provider === "claude" && definition.transport === "local");
+        if (localClaudeDefs.length > 1) {
+          throw new AppError("CONFIGURATION_ERROR", `at most one local Claude endpoint (provider:claude, transport:local) is allowed; found: ${localClaudeDefs.map((definition) => definition.id).join(", ")}`);
+        }
+        const localClaudeDef = localClaudeDefs[0];
+        // Goals + scheduling serve EVERY Claude endpoint (the local one and any remote
+        // claude endpoint), keyed by (endpointId, threadId). Construct the stack
         // unconditionally: a remote Claude endpoint is added at runtime by writing
         // endpoints.json, so a startup-snapshot gate would leave it without goals/scheduling.
         // The cost when no Claude endpoint exists is one idle loopback MCP + one poll loop.
@@ -2358,34 +2365,26 @@ export async function buildProductionApp(
           }));
         };
         // The launch policy (disabled built-in scheduling tools + redirect prompt) applies to
-        // EVERY Claude session, local or remote, regardless of whether a local endpoint is
-        // configured — deriving it only from the local config left a remote-only deployment
-        // running its remote workers with the native tools enabled and no redirect.
-        const claudeLaunchFlags: ClaudeLaunchFlags = claudeLaunchPolicy(claudeCodeConfig?.model);
-        claudeEndpoint = claudeCodeConfig === undefined ? undefined : new ClaudeCodeRuntime({
-          id: claudeCodeConfig.endpointId,
-          runner: new LocalClaudeCommandRunner({ command: claudeCodeConfig.command }),
-          launchFlags: claudeLaunchFlags,
-          ...claudeGoalRuntimeOptions(claudeCodeConfig.endpointId),
+        // EVERY Claude session, local or remote; model/effort are the per-endpoint overrides from
+        // the endpoint's endpoints.json entry.
+        claudeEndpoint = localClaudeDef === undefined ? undefined : new ClaudeCodeRuntime({
+          id: localClaudeDef.id,
+          runner: new LocalClaudeCommandRunner({ command: localClaudeDef.command ?? "claude" }),
+          launchFlags: claudeLaunchPolicy(localClaudeDef.model, localClaudeDef.effort),
+          ...claudeGoalRuntimeOptions(localClaudeDef.id),
           // Local: the worker reaches the loopback MCP directly (no tunnel).
           workerMcpConfigPath: async (threadId: string) => {
-            const found = registry.getByIdentity(claudeCodeConfig.endpointId, threadId);
-            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: claudeCodeConfig.endpointId, threadId }) : undefined;
+            const found = registry.getByIdentity(localClaudeDef.id, threadId);
+            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: localClaudeDef.id, threadId }) : undefined;
           },
         });
-        // A Claude endpoint id that collides with a configured remote (catalog) id
-        // would silently shadow that remote (builtins short-circuit before the
-        // catalog). Refuse the misconfiguration loudly.
-        if (claudeEndpoint && endpointCatalog.snapshot().endpoints[claudeEndpoint.id]) {
-          throw new AppError("CONFIGURATION_ERROR", `CLAUDE_CODE_ENDPOINT_ID collides with a catalog endpoint: ${claudeEndpoint.id}`);
-        }
         // Drive the goal loop: after each completed Claude turn, if the goal is still
         // active, enqueue the next pursuit turn. Stops when the worker's set_goal_status
         // flips the status (or the backstop cap pauses it). (The remote endpoint is
         // subscribed the same way inside createRemote.)
-        if (claudeEndpoint) subscribeClaudeGoalDriver(claudeEndpoint, claudeCodeConfig!.endpointId);
+        if (claudeEndpoint) subscribeClaudeGoalDriver(claudeEndpoint, localClaudeDef!.id);
         // The local worker's `monitor` check runs on this host.
-        if (claudeCodeConfig) monitorCheckRunners.set(claudeCodeConfig.endpointId, (command) => runMonitorCheck(command));
+        if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
@@ -2400,9 +2399,16 @@ export async function buildProductionApp(
           ...(claudeEndpoint ? { builtinEndpoints: [claudeEndpoint] } : {}),
           catalog: endpointCatalog,
           createRemote: async (definition) => {
-            const generation = await planner.createGeneration(definition.id);
+            // Local endpoints are built at startup as builtins; only ssh endpoints reach here. A
+            // transport:local entry added to endpoints.json after startup is not in the frozen
+            // builtins map — reject it loudly rather than mis-run it as remote ssh (it has no host).
+            if (definition.transport === "local") {
+              throw new AppError("CONFIGURATION_ERROR", `local endpoint '${definition.id}' cannot be activated remotely; local endpoint changes require a restart`);
+            }
+            // host drives the ssh alias (ssh -G, ControlMaster path); id stays the identity/binding key.
+            const generation = await planner.createGeneration(definition.id, definition.host!);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
-            if (definition.type === "claude-code") {
+            if (definition.provider === "claude") {
               // A Claude endpoint has no app-server to lazily prepare, so bootstrap the
               // helper eagerly here (installs it + establishes the ControlMaster) — the
               // ownership scan / workspace ops need the installed helper immediately.
@@ -2468,7 +2474,7 @@ export async function buildProductionApp(
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
                 runner: claudeRemoteRunner,
-                launchFlags: claudeLaunchFlags,
+                launchFlags: claudeLaunchPolicy(definition.model, definition.effort),
                 // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
                 // over the reverse tunnel (Tier B).
                 ...claudeGoalRuntimeOptions(definition.id),
@@ -2514,7 +2520,7 @@ export async function buildProductionApp(
         }).restoreBeforeIngress();
         // Bind the shared locality predicate to this deployment's local Claude endpoint id,
         // then inject it into the workspace router, rollout-access, and worker file bridge.
-        const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, claudeCodeConfig?.endpointId);
+        const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, localClaudeDef?.id);
         workspaceRouter = new WorkspaceRouter(async (id) => {
           if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
@@ -2562,8 +2568,8 @@ export async function buildProductionApp(
           },
           validateLease: (id, lease) => endpointManager.validateWorkLease(lease, id),
           // Provider dispatch (shared helper): Claude endpoints use the transcript
-          // scanner. Only the built-in local Claude endpoint is local; a catalog
-          // claude-code endpoint is remote (scans over ssh).
+          // scanner. Only the local Claude endpoint (transport:"local") is local; an ssh
+          // claude endpoint is remote (scans over ssh).
           provider: (id) => sessionProvider(id),
           local: isLocalEndpoint,
           scanLocalClaude: scanLocalClaudeTranscript,
@@ -2873,7 +2879,7 @@ export async function buildProductionApp(
         // Re-kick active Claude goals whose drive turn was in flight at restart (no
         // pending schedule, no live turn) so goal enforcement is restart-durable. listActive
         // is per endpointId, so enumerate every Claude endpoint present in the registry
-        // (local + any remote catalog claude-code), not just the local one.
+        // (local + any remote ssh claude endpoint), not just the local one.
         if (claudeGoalDriver && claudeGoals) {
           const claudeEndpointIds = new Set(Object.values(registry.snapshot().sessions)
             .filter((s) => sessionProvider(s.endpoint) === "claude").map((s) => s.endpoint));
@@ -3406,15 +3412,16 @@ export async function buildProductionApp(
     return endpointId;
   }
 
-  // The provider (runtime kind) of an endpoint. An endpoint is Codex or Claude, fixed
-  // at definition time: the local Claude endpoint is bound by config; a remote Claude
-  // endpoint is a catalog `type:"claude-code"` entry; everything else is Codex.
+  // The provider (runtime kind) of an endpoint. Fixed at definition time: the built-in
+  // `local`/`assistant-local` endpoints are Codex; every other endpoint (local Claude and all
+  // remotes) is a catalog entry whose `provider` field is authoritative.
   function sessionProvider(endpointId: string): "codex" | "claude" {
-    if (config.claudeCode !== undefined && endpointId === config.claudeCode.endpointId) return "claude";
+    // The built-in `local`/`assistant-local` endpoints are Codex; every other endpoint (local
+    // Claude and all remotes) is a catalog entry whose `provider` is authoritative.
     if (endpointId !== "local" && endpointId !== assistantEndpoint.id) {
       try {
-        const entry = endpointCatalog.snapshot().endpoints[endpointId] as { type?: string } | undefined;
-        if (entry?.type === "claude-code") return "claude";
+        const entry = endpointCatalog.snapshot().endpoints[endpointId] as { provider?: string } | undefined;
+        if (entry?.provider === "claude") return "claude";
       } catch { /* catalog unavailable — treat as codex */ }
     }
     return "codex";

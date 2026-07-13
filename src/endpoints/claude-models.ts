@@ -13,7 +13,7 @@
 //
 // `default` is the special alias that CLEARS any model override and reverts to your account's
 // recommended model (or the org default) — i.e. "follow the user's setting". It is the catalog
-// default unless the endpoint pins one via CLAUDE_CODE_MODEL.
+// default unless the endpoint pins one via its endpoints.json `model`.
 //
 // Context windows (per the models overview): opus/sonnet/fable are 1M-token; haiku is 200k.
 // Effort defaults to `high` on Opus 4.8 / Claude Code, so that is the catalog default effort.
@@ -55,7 +55,7 @@ function entry(id: string, displayName: string, isDefault: boolean): ClaudeCatal
   };
 }
 
-// The catalog for an endpoint. The default entry is the endpoint's pinned `CLAUDE_CODE_MODEL`
+// The catalog for an endpoint. The default entry is the endpoint's pinned `model`
 // when set, else `default` (the account/org recommended model). A configured model that isn't
 // already an alias is prepended so it's selectable; a configured alias is just marked default
 // (not duplicated).

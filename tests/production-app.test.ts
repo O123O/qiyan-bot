@@ -383,7 +383,7 @@ test("durable operation endpoints survive restart as startup identity references
   const identityReferenceChecks: boolean[] = [];
   const manager = new EndpointManager({
     localEndpoint: local as never,
-    catalog: { reload: async () => undefined, require: (id: string) => ({ id, type: "ssh" as const, projectsRoot: "~/projects" }) },
+    catalog: { reload: async () => undefined, require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/projects" }) },
     createRemote: async (_definition, hasReferences) => { identityReferenceChecks.push(hasReferences); return { endpoint: remote as never }; },
     hasIdentityReferences: (endpointId) => references.includes(endpointId),
     managedThreadIds: () => [],

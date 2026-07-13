@@ -17,11 +17,7 @@ const configValueSchema = z.object({
   DATA_DIR: z.string().min(1).optional(),
   SESSION_REGISTRY_PATH: z.string().min(1).optional(),
   CODEX_BINARY: z.string().default("codex"),
-  // Opt-in local Claude Code endpoint (Phase 1.4). Absent CLAUDE_CODE_ENDPOINT_ID,
-  // no Claude endpoint is constructed and behavior is unchanged.
-  CLAUDE_CODE_ENDPOINT_ID: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).refine((v) => v !== "local" && v !== "assistant-local", "reserved endpoint id").optional(),
-  CLAUDE_BINARY: z.string().default("claude"),
-  CLAUDE_CODE_MODEL: z.string().min(1).optional(),
+  // Claude endpoints (local and remote) are configured in endpoints.json, not via env.
   MAX_CONCURRENT_TURNS: positiveInt.default(4),
   MAX_COLLECT_COUNT: positiveInt.max(100).default(20),
   MCP_HOST: z.literal("127.0.0.1").default("127.0.0.1"),
@@ -85,22 +81,18 @@ export const CLAUDE_REDIRECT_PROMPT =
 // The launch policy applied to EVERY managed Claude session — local AND remote — so a worker
 // never keeps Claude's native scheduling tools (which QiYan can't observe) and always gets the
 // redirect. It is NOT conditional on a local endpoint being configured: a remote-only deployment
-// (no CLAUDE_CODE_ENDPOINT_ID) must apply it to its remote workers too. `model` is the only
-// per-endpoint override.
-export function claudeLaunchPolicy(model?: string): { disallowedTools: readonly string[]; appendSystemPrompt: string; model?: string } {
-  return { disallowedTools: CLAUDE_DISABLED_TOOLS, appendSystemPrompt: CLAUDE_REDIRECT_PROMPT, ...(model === undefined ? {} : { model }) };
-}
-
-export interface ClaudeCodeConfig {
-  endpointId: string;
-  command: string;
-  model?: string;
+// (a remote-only deployment) must apply it too. `model`/`effort` are the per-endpoint overrides,
+// sourced from the endpoint's endpoints.json entry.
+export function claudeLaunchPolicy(model?: string, effort?: string): { disallowedTools: readonly string[]; appendSystemPrompt: string; model?: string; effort?: string } {
+  return {
+    disallowedTools: CLAUDE_DISABLED_TOOLS, appendSystemPrompt: CLAUDE_REDIRECT_PROMPT,
+    ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }),
+  };
 }
 
 export interface BotConfig {
   qiyanHome: string;
   chat: ChatConfig;
-  claudeCode?: ClaudeCodeConfig;
   userHome: string;
   assistantWorkdir: string;
   dataDir: string;
@@ -164,13 +156,6 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     dataDir,
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
     endpointCatalogPath: resolve(join(defaultRoot, "endpoints.json")),
-    ...(parsed.CLAUDE_CODE_ENDPOINT_ID === undefined ? {} : {
-      claudeCode: {
-        endpointId: parsed.CLAUDE_CODE_ENDPOINT_ID,
-        command: parsed.CLAUDE_BINARY,
-        ...(parsed.CLAUDE_CODE_MODEL === undefined ? {} : { model: parsed.CLAUDE_CODE_MODEL }),
-      } satisfies ClaudeCodeConfig,
-    }),
     codexBinary: parsed.CODEX_BINARY,
     maxConcurrentTurns: parsed.MAX_CONCURRENT_TURNS,
     maxCollectCount: parsed.MAX_COLLECT_COUNT,

@@ -161,12 +161,15 @@ export class SshGenerationPlanner {
     run?: (command: string, args: readonly string[], options: { timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal }) => Promise<BoundedProcessResult>;
   }) {}
 
-  async createGeneration(endpointId: string, signal?: AbortSignal): Promise<SshConnectionGeneration> {
-    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
+  // `host` is the ssh alias (drives `ssh -G` + the ControlMaster path); `endpointId` is the
+  // stable identity/binding key. They were the same value when the catalog key WAS the alias;
+  // they are now distinct (endpoints.json carries `host` separately from the endpoint id).
+  async createGeneration(endpointId: string, host: string, signal?: AbortSignal): Promise<SshConnectionGeneration> {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u.test(host)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH host alias");
     const run = this.options.run ?? runBoundedProcess;
-    const result = await run(this.options.sshBinary, ["-G", endpointId], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024, ...(signal ? { signal } : {}) });
+    const result = await run(this.options.sshBinary, ["-G", host], { timeoutMs: 15_000, maxOutputBytes: 1024 * 1024, ...(signal ? { signal } : {}) });
     const effective = parseSshConfig(result.stdout.toString("utf8"));
-    let plan = planSshConnection(endpointId, effective, this.options.runtimeDir);
+    let plan = planSshConnection(host, effective, this.options.runtimeDir);
     const references = await this.options.hasReferences(endpointId);
     this.options.checkExisting(endpointId, plan.destination, references);
     if (!plan.ownsControlMaster) {
@@ -179,7 +182,7 @@ export class SshGenerationPlanner {
         });
       } catch (error) {
         if (signal?.aborted) throw error;
-        plan = planSshConnection(endpointId, {
+        plan = planSshConnection(host, {
           hostname: effective.hostname,
           user: effective.user,
           port: effective.port,

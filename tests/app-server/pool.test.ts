@@ -481,7 +481,7 @@ test("real ready-lease admission cannot activate after loss between predicate an
     localEndpoint: local,
     catalog: {
       reload: async () => undefined,
-      require: (id) => ({ id, type: "ssh" as const, projectsRoot: "~/projects" }),
+      require: (id) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/projects" }),
     },
     createRemote: async () => ({ endpoint: remote }),
     hasIdentityReferences: () => true,

@@ -79,7 +79,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /automatically maintained `auto_session_info`/iu);
   assert.match(policy, /automatic values may be `null`.*do not invent/isu);
   assert.match(policy, /Endpoints have a \*\*provider\*\*, `codex` or `claude`/iu);
-  assert.match(policy, /each entry `type` is `ssh` \(Codex\) or `claude-code` \(Claude\)/iu);
+  assert.match(policy, /each entry has a `provider` \(`codex`\|`claude`\) and `transport` \(`local`\|`ssh`\)/iu);
   assert.match(policy, /thread context usage.*not.*(?:billing|account usage|credits|rate limits)/isu);
   assert.match(policy, /no `?watch_session`? tool/iu);
   assert.match(policy, /preserve attachment IDs deliberately.*never invent backend paths.*never expose tokens, hidden bodies/isu);

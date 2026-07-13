@@ -201,4 +201,7 @@ test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the r
   }
   assert.equal(claudeLaunchPolicy().model, undefined);
   assert.equal(claudeLaunchPolicy("haiku").model, "haiku");
+  assert.equal(claudeLaunchPolicy().effort, undefined);
+  assert.equal(claudeLaunchPolicy("haiku", "high").effort, "high");
+  assert.equal(claudeLaunchPolicy(undefined, "low").effort, "low");
 });
