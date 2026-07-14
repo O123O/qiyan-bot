@@ -27,6 +27,8 @@ import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
+import { parseDirective } from "./directives/parser.ts";
+import { deliverDirectTo } from "./assistant/direct-to.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -1958,6 +1960,20 @@ export async function buildProductionApp(
   const closeStateDatabase = options.storage?.closeDatabase ?? ((database: Database) => { database.close(); });
 
   const acceptChat = async (source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void> => {
+    const directive = parseDirective(source.rawText, source.attachmentIds, config.maxCollectCount);
+    if (directive.kind === "to") {
+      // `/to <worker> <text>` is delivered directly to the worker + copied to the assistant as an
+      // internal awareness source; it does NOT run a normal assistant reply turn.
+      await deliverDirectTo({
+        alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
+        send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
+        recordAwareness: (input) => { conversations.createInternalSource(input); },
+        pump: () => { void dispatcher.enqueueInternal("direct_to"); },
+        commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
+        report,
+      }, source, directive.target, directive.payload);
+      return;
+    }
     await dispatcher.accept(source, effects);
     report({ level: "info", code: "chat_input_accepted", adapter: source.binding.adapterId });
   };

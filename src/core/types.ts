@@ -12,7 +12,7 @@ export type DeliveryState = "prepared" | "dispatched" | "confirmed" | "failed" |
 
 export interface SourceContext {
   id: string;
-  kind: "telegram" | "slack" | "event_batch" | "recovery";
+  kind: "telegram" | "slack" | "event_batch" | "recovery" | "direct_to";
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];

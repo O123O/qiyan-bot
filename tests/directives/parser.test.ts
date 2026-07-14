@@ -38,3 +38,33 @@ test("uses ASCII whitespace boundaries only", () => {
 test("a malformed first marker is not rescued later", () => {
   assert.equal(parseDirective("/pass\tbad /pass good", [], 20).kind, "malformed");
 });
+
+test("parses /to with a target nickname and verbatim payload", () => {
+  assert.deepEqual(parseDirective("/to payments  héllo\nworld", [], 20), {
+    kind: "to", prefix: "", target: "payments", payload: " héllo\nworld",
+  });
+  // A prefix before the marker is preserved; the first token after the required space is the target.
+  assert.deepEqual(parseDirective("hey /to build-1 run the build", [], 20), {
+    kind: "to", prefix: "hey ", target: "build-1", payload: "run the build",
+  });
+});
+
+test("/to requires a space, a valid nickname, and a separator space", () => {
+  assert.equal(parseDirective("/to\tpayments hi", [], 20).kind, "malformed"); // no leading ASCII space
+  assert.equal(parseDirective("/to payments", [], 20).kind, "malformed");     // no separator space
+  assert.equal(parseDirective("/to  hi", [], 20).kind, "malformed");          // empty nickname
+  assert.equal(parseDirective("/to UPPER hi", [], 20).kind, "malformed");     // nickname must be lowercase
+  assert.equal(parseDirective("/to bad/name hi", [], 20).kind, "malformed");  // invalid nickname char
+});
+
+test("/to requires a non-empty payload (text-only for now, even with an attachment)", () => {
+  assert.equal(parseDirective("/to payments ", [], 20).kind, "malformed");
+  assert.equal(parseDirective("/to payments ", ["att_1"], 20).kind, "malformed");
+});
+
+test("/to does not false-match a longer word and yields to an earlier directive", () => {
+  assert.equal(parseDirective("/tomorrow we ship", [], 20).kind, "none"); // /to must be followed by whitespace
+  // The first directive marker in the string wins.
+  assert.equal(parseDirective("/pass x /to payments y", [], 20).kind, "pass");
+  assert.equal(parseDirective("/to payments do /pass x", [], 20).kind, "to");
+});

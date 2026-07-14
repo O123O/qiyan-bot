@@ -176,6 +176,9 @@ export class AttemptScope {
       const consumed = this.db.prepare("SELECT operation_id FROM directive_consumptions WHERE context_id = ?").get(member.contextId);
       if (consumed) continue;
       if (parsed.kind === "malformed") return { kind: "malformed", reason: parsed.reason };
+      // `/to` is delivered directly at the ingress and never constrains an assistant tool call,
+      // so it must never appear in an admitted source here; reject defensively if it does.
+      if (parsed.kind === "to") return { kind: "malformed", reason: "to_is_an_ingress_directive" };
       if (parsed.kind !== expected) return { kind: "mismatch", directive: parsed.kind };
       return { kind: "directive", contextId: member.contextId, parsed };
     }

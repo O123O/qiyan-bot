@@ -10,7 +10,7 @@ import type { DeliveryStore } from "./delivery-store.ts";
 
 export interface InternalSource {
   id: string;
-  kind: "event_batch" | "recovery";
+  kind: "event_batch" | "recovery" | "direct_to";
   sourceId: string;
   rawText: string;
   attachmentIds: readonly string[];
@@ -105,6 +105,10 @@ export class ConversationStore {
 
   hasChatSource(adapterId: string, nativeSourceId: string): boolean {
     return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id = ? AND source_id = ?").get(adapterId, nativeSourceId) !== undefined;
+  }
+
+  hasInternalSource(kind: InternalSource["kind"], sourceId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?").get(kind, sourceId) !== undefined;
   }
 
   createInternalSource(input: InternalSource): string {

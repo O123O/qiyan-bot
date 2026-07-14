@@ -1,6 +1,8 @@
 export type OperationalEventCode =
   | "chat_ingress_started"
   | "chat_input_accepted"
+  | "direct_to_delivered"
+  | "direct_to_failed"
   | "chat_input_ignored"
   | "chat_ingress_failed"
   | "chat_ingress_recovered"

@@ -90,6 +90,8 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.match(policy, /one required ASCII space/iu);
   assert.match(policy, /\/pass.*choose the target and `start` or `steer`/isu);
   assert.match(policy, /\/collect.*exact count.*backend delivers.*directly/isu);
+  assert.match(policy, /`\/to <worker>` is delivered directly to that worker by the backend/iu);
+  assert.match(policy, /do NOT reply to it, re-send it, or act on it unless separately asked/iu);
   assert.match(policy, /do not repeat, summarize, or acknowledge directly collected bodies/iu);
   assert.match(policy, /User: tell payments \/pass  preserve this leading space/u);
   assert.match(policy, /"content":" preserve this leading space"/u);
