@@ -1,9 +1,11 @@
 // All client styling in one string, injected via <style>. Themes switch on <html data-theme>.
 export const STYLES = `
 :root, :root[data-theme="dark"] { color-scheme: dark;
-  --bg:#0f1720; --panel:#17212b; --panel2:#1e2b36; --line:#26333f; --muted:#8aa0b0; --accent:#16b8a6; --accent-fg:#04110f; --text:#e6eef2; --code:#0b1219; --you:#193040; }
+  --bg:#0f1720; --panel:#17212b; --panel2:#1e2b36; --line:#26333f; --muted:#8aa0b0; --accent:#16b8a6; --accent-fg:#04110f; --text:#e6eef2; --code:#0b1219; --you:#193040;
+  --hl-bg:#0d1117; --hl-fg:#c9d1d9; --hl-comment:#8b949e; --hl-kw:#ff7b72; --hl-str:#a5d6ff; --hl-num:#79c0ff; --hl-title:#d2a8ff; --hl-attr:#7ee787; --hl-type:#ffa657; }
 :root[data-theme="light"] { color-scheme: light;
-  --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f5; --line:#d6dee6; --muted:#5b6b78; --accent:#0f8f83; --accent-fg:#ffffff; --text:#111b22; --code:#f0f3f6; --you:#e3f0ee; }
+  --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f5; --line:#d6dee6; --muted:#5b6b78; --accent:#0f8f83; --accent-fg:#ffffff; --text:#111b22; --code:#f0f3f6; --you:#e3f0ee;
+  --hl-bg:#f6f8fa; --hl-fg:#24292e; --hl-comment:#6a737d; --hl-kw:#d73a49; --hl-str:#032f62; --hl-num:#005cc5; --hl-title:#6f42c1; --hl-attr:#22863a; --hl-type:#e36209; }
 * { box-sizing:border-box; }
 body { margin:0; }
 .app { font:14px/1.55 system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
@@ -43,6 +45,15 @@ body { margin:0; }
 .md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */
 .code-view, .md pre .hljs { margin:0; border-radius:8px; font:12.5px/1.5 monospace; }
 .code-view { border:1px solid var(--line); overflow:auto; }
+/* highlight.js palette follows the app theme (github light/dark) */
+.hljs { display:block; overflow-x:auto; padding:12px; background:var(--hl-bg); color:var(--hl-fg); }
+.hljs-comment,.hljs-quote { color:var(--hl-comment); font-style:italic; }
+.hljs-keyword,.hljs-selector-tag,.hljs-built_in,.hljs-name,.hljs-tag,.hljs-literal,.hljs-deletion { color:var(--hl-kw); }
+.hljs-string,.hljs-attr,.hljs-regexp,.hljs-addition,.hljs-meta .hljs-string { color:var(--hl-str); }
+.hljs-number,.hljs-variable,.hljs-template-variable,.hljs-selector-attr,.hljs-selector-pseudo { color:var(--hl-num); }
+.hljs-title,.hljs-section,.hljs-symbol,.hljs-bullet { color:var(--hl-title); }
+.hljs-attribute,.hljs-meta,.hljs-selector-id,.hljs-selector-class,.hljs-type,.hljs-params { color:var(--hl-type); }
+.hljs-emphasis { font-style:italic; } .hljs-strong { font-weight:700; }
 .md a { color:var(--accent); } .md table { border-collapse:collapse; } .md td, .md th { border:1px solid var(--line); padding:4px 8px; }
 .md blockquote { margin:.4em 0; padding-left:10px; border-left:3px solid var(--line); color:var(--muted); }
 
