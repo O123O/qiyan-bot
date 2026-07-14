@@ -2,7 +2,8 @@
 // QiYan stores nothing for workers. Prompts come from `userMessage.content` (codex populates it; the
 // Claude adapter currently does not, so Claude shows agent replies only), replies from the agent's
 // final-answer messages. Codex session setup (<environment_context>) is stripped. This is the pure map;
-// the pool read lives in SessionService so this stays trivially testable with a plain turns array.
+// the pool `thread/read` lives in the web wiring (production-app) so this stays trivially testable with
+// a plain turns array.
 
 export interface WorkerConvoRow {
   id: string;

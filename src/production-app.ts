@@ -3015,7 +3015,9 @@ export async function buildProductionApp(
         readWorkerConversation: async (endpointId, threadId, count, before) => {
           // Read the worker's two-sided transcript straight from its NATIVE codex/claude session
           // (thread/read) — QiYan stores nothing for workers. Web-UI only; chat apps are unaffected.
-          // Best-effort: an unreachable or not-yet-materialized thread yields an empty page.
+          // Only touch an ALREADY-READY endpoint: a passive tab-open must NOT activate/dial a down
+          // endpoint (e.g. a remote ssh worker). Not ready, unreachable, or not-yet-materialized → empty.
+          if (!pool.isReady(endpointId)) return [];
           let turns: unknown[] = [];
           try { const h = await pool.request<{ thread?: { turns?: unknown[] } }>(endpointId, "thread/read", { threadId, includeTurns: true }); turns = h.thread?.turns ?? []; }
           catch { /* unreachable / not materialized → empty */ }
