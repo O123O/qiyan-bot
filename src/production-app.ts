@@ -1987,6 +1987,9 @@ export async function buildProductionApp(
   // off, both are undefined and nothing is wired.
   const webBus = config.webUi ? new WebBus() : undefined;
   const webToken = config.webUi ? randomBytes(32).toString("base64url") : undefined;
+  // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
+  // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
+  const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
   const phases: AppPhase[] = [
     {
       name: "assistant-workspace",
@@ -2226,7 +2229,7 @@ export async function buildProductionApp(
         // `chats` for outbound routing AND admitted into the boot guard's expected set. Added
         // whenever WEB_UI is on (independent of the test adapter-injection path).
         const webEnabled = Boolean(config.webUi) && Boolean(webBus);
-        if (webEnabled && webBus) configured.push(createWebAdapter(webBus));
+        if (webEnabled && webBus) configured.push(createWebAdapter(webBus, webUploads()));
         const expectedAdapters = [
           telegramConfig ? "telegram" : undefined,
           config.chat.slack ? "slack" : undefined,
@@ -3003,7 +3006,7 @@ export async function buildProductionApp(
       },
       // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is
       // appended to the message so a LOCAL assistant/worker can read it (remote hosts can't — deferred).
-      uploads: { dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 },
+      uploads: webUploads(),
       acceptChat, report,
       onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
     })] : []),

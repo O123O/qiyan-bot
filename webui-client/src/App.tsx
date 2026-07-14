@@ -34,14 +34,17 @@ function normalizeMath(src: string): string {
 
 // Linkify file-path-like tokens in message text so they open a preview. Paths need a slash or a known
 // extension; code/links are skipped. Href scheme "qy-file:<encoded>" is intercepted by the <a> renderer.
-const PATH_RE = /((?:\.{0,2}\/)?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|[A-Za-z0-9._-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt|py|rs|go|c|h|cc|cpp|hpp|css|scss|html|yaml|yml|toml|ini|cfg|sh|sql|log|env|pdf|png|jpg|jpeg|gif|csv|zip|docx|xlsx))(:\d+(?::\d+)?)?/g;
+// Bounded quantifiers ({1,64} segments, {1,16} depth) keep this linear — an unbounded `+` here
+// backtracks O(n²) on long unbroken tokens (base64/hashes) and can freeze the tab.
+const PATH_RE = /((?:\.{0,2}\/)?(?:[A-Za-z0-9._-]{1,64}\/){1,16}[A-Za-z0-9._-]{1,64}(?:\.[A-Za-z0-9]{1,8})?|[A-Za-z0-9._-]{1,64}\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt|py|rs|go|c|h|cc|cpp|hpp|css|scss|html|yaml|yml|toml|ini|cfg|sh|sql|log|env|pdf|png|jpg|jpeg|gif|csv|zip|docx|xlsx))(:\d+(?::\d+)?)?/g;
 const SKIP = new Set(["code", "inlineCode", "link", "linkReference", "image"]);
+const MAX_LINKIFY = 20_000; // don't scan very long text nodes for paths (belt-and-suspenders vs ReDoS)
 function remarkFilePaths() {
   const walk = (node: any) => {
     if (!node.children) return;
     const out: any[] = [];
     for (const child of node.children) {
-      if (child.type === "text" && !SKIP.has(node.type)) {
+      if (child.type === "text" && !SKIP.has(node.type) && child.value.length <= MAX_LINKIFY) {
         let last = 0; let m: RegExpExecArray | null; PATH_RE.lastIndex = 0;
         while ((m = PATH_RE.exec(child.value))) {
           if (m.index > last) out.push({ type: "text", value: child.value.slice(last, m.index) });
