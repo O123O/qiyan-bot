@@ -203,7 +203,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     const messages = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/messages$/u.exec(url.pathname);
     if (request.method === "GET" && messages) {
       const { limit, before } = pageParams(url);
-      const result = transcript(options.reads, messages[1]!, limit, before);
+      const result = await transcript(options.reads, messages[1]!, limit, before);
       if (!result) { json(response, 404, { error: "unknown session" }); return; }
       json(response, 200, result);
       return;

@@ -64,6 +64,7 @@ import { SessionRegistry, type RegistrySession } from "./registry/session-regist
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
+import { mapWorkerConversation } from "./sessions/worker-conversation.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
 import {
   ExternalOwnershipMonitor,
@@ -3011,7 +3012,15 @@ export async function buildProductionApp(
       reads: {
         registrySnapshot: () => registry.snapshot(),
         dashboardSnapshot: () => dashboard.snapshot(),
-        listFinals: (endpointId, threadId, count, before) => finals.list(endpointId, threadId, count, before),
+        readWorkerConversation: async (endpointId, threadId, count, before) => {
+          // Read the worker's two-sided transcript straight from its NATIVE codex/claude session
+          // (thread/read) — QiYan stores nothing for workers. Web-UI only; chat apps are unaffected.
+          // Best-effort: an unreachable or not-yet-materialized thread yields an empty page.
+          let turns: unknown[] = [];
+          try { const h = await pool.request<{ thread?: { turns?: unknown[] } }>(endpointId, "thread/read", { threadId, includeTurns: true }); turns = h.thread?.turns ?? []; }
+          catch { /* unreachable / not materialized → empty */ }
+          return mapWorkerConversation(turns, count, before);
+        },
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
       },

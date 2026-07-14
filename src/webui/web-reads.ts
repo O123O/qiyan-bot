@@ -1,11 +1,13 @@
 import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { SessionDashboardDocument } from "../assistant/dashboard-schema.ts";
-import type { LogicalFinalMessage } from "../sessions/final-messages.ts";
+import type { WorkerConvoRow } from "../sessions/worker-conversation.ts";
 
 export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
-  listFinals(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[];
+  // A worker's two-sided transcript (your prompts + its replies), read from its native codex/claude
+  // session — QiYan stores nothing for workers.
+  readWorkerConversation(endpointId: string, threadId: string, count: number, before?: number): Promise<WorkerConvoRow[]>;
   // The owner↔QiYan conversation (your chat + everything the owner was sent — replies, [worker]
   // relays, notices), oldest → newest.
   listOwnerConversation(before: number | undefined, limit: number): WebConvoMessage[];
@@ -44,6 +46,7 @@ export interface WebMessage {
   body: string;
   completedAt: number;
   terminalStatus: string;
+  role?: "you"; // a prompt sent to the worker; absent ⇒ the worker's own reply
 }
 
 // Lease-free: reads only the registry + dashboard snapshots (never the pool / thread-read).
@@ -67,14 +70,15 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
   }).sort((a, b) => a.nickname.localeCompare(b.nickname));
 }
 
-// A worker's final messages (lease-free), oldest → newest, one page. `before` (a completedAt cursor)
-// pages older for scroll-up. `hasOlder` is true when the page came back full.
-export function transcript(deps: WebReadsDeps, nickname: string, limit: number, before?: number): WebPage<WebMessage> | undefined {
+// A worker's two-sided transcript from its native session (your prompts + its replies), oldest →
+// newest, one page. `before` (a completedAt cursor) pages older for scroll-up; `hasOlder` is true when
+// the page came back full. Returns undefined for an unknown session (→ 404).
+export async function transcript(deps: WebReadsDeps, nickname: string, limit: number, before?: number): Promise<WebPage<WebMessage> | undefined> {
   const session = deps.registrySnapshot().sessions[nickname];
   if (!session) return undefined;
   const clamped = Math.max(1, Math.min(50, limit));
-  const messages = deps.listFinals(session.endpoint, session.thread_id, clamped, before)
-    .map((m): WebMessage => ({ id: m.id, turnId: m.turnId, body: m.body, completedAt: m.completedAt, terminalStatus: m.terminalStatus }));
+  const messages = (await deps.readWorkerConversation(session.endpoint, session.thread_id, clamped, before))
+    .map((r): WebMessage => ({ id: r.id, turnId: r.turnId, body: r.body, completedAt: r.completedAt, terminalStatus: r.terminalStatus, ...(r.role === "you" ? { role: "you" as const } : {}) }));
   return { messages, hasOlder: messages.length === clamped };
 }
 

@@ -17,8 +17,13 @@ const reads: WebReadsDeps = {
   dashboardSnapshot: () => ({ version: 2, sessions: {
     payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: null, pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
-  listFinals: (_e, _t, count, before) => {
-    const all = Array.from({ length: 2 }, (_, i) => ({ id: `f${i}`, endpointId: "local", threadId: "t1", turnId: `turn-${i}`, itemId: `it${i}`, completedAt: 1000 + i, itemOrder: 0, body: `final ${i}`, terminalStatus: "completed" }));
+  readWorkerConversation: async (_e, _t, count, before) => {
+    // Two-sided native transcript: a prompt ("you") + the worker's replies ("worker"), merged by time.
+    const all = [
+      { id: "u:turn-0", turnId: "turn-0", role: "you" as const, body: "do the thing", completedAt: 999, terminalStatus: "" },
+      { id: "a:turn-0", turnId: "turn-0", role: "worker" as const, body: "final 0", completedAt: 1000, terminalStatus: "completed" },
+      { id: "a:turn-1", turnId: "turn-1", role: "worker" as const, body: "final 1", completedAt: 1001, terminalStatus: "completed" },
+    ];
     const older = all.filter((m) => before === undefined || m.completedAt <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - count));
   },
@@ -64,8 +69,10 @@ test("serves the session list and a worker transcript", async () => {
     assert.deepEqual(list.sessions[0].goal, { objective: "ship it", status: "active" });
 
     const t = await (await fetch(`${base}/api/sessions/payments/messages?count=5&token=${TOKEN}`)).json();
-    assert.equal(t.messages.length, 2);
-    assert.equal(t.messages[0].body, "final 0");
+    // Two-sided: the prompt ("you") precedes the worker's replies (no role ⇒ worker output).
+    assert.deepEqual(t.messages.map((m: { body: string }) => m.body), ["do the thing", "final 0", "final 1"]);
+    assert.equal(t.messages[0].role, "you");
+    assert.equal(t.messages[1].role, undefined);
     assert.equal((await fetch(`${base}/api/sessions/nope/messages?token=${TOKEN}`)).status, 404);
   });
 });
