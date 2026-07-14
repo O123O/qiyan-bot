@@ -45,7 +45,7 @@ body { margin:0; }
 .composer textarea { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; font:inherit; }
 .composer button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }
 .suggest { position:absolute; bottom:calc(100% + 4px); left:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 6px 20px rgba(0,0,0,.3); }
-.srow { padding:6px 14px; cursor:pointer; } .srow:hover { background:var(--panel2); }
+.srow { padding:6px 14px; cursor:pointer; } .srow:hover, .srow.on { background:var(--panel2); }
 
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:5vh 5vw; }
 .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(900px,100%); max-height:100%; display:flex; flex-direction:column; }
