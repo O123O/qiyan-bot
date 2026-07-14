@@ -30,7 +30,8 @@ export async function gitStatus(dir: string): Promise<GitStatus | { error: strin
     if (!line) continue;
     if (line.startsWith("## ")) {
       const head = line.slice(3);
-      branch = head.split("...")[0]!.split(" ")[0]!;
+      const noCommits = /^No commits yet on (.+)$/.exec(head); // fresh repo header
+      branch = noCommits ? noCommits[1]!.trim() : head.split("...")[0]!.split(" ")[0]!;
       ahead = Number(/ahead (\d+)/.exec(head)?.[1] ?? 0);
       behind = Number(/behind (\d+)/.exec(head)?.[1] ?? 0);
       continue;
