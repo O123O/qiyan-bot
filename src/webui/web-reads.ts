@@ -53,7 +53,18 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
 export function transcript(deps: WebReadsDeps, nickname: string, count: number): WebMessage[] | undefined {
   const session = deps.registrySnapshot().sessions[nickname];
   if (!session) return undefined;
+  return finals(deps, session.endpoint, session.thread_id, count);
+}
+
+// The assistant's own final messages (its replies), lease-free, oldest → newest — a persisted
+// history for the QiYan tab that survives page reloads and restarts.
+export function assistantTranscript(deps: WebReadsDeps, count: number): WebMessage[] {
+  const assistant = deps.registrySnapshot().assistant;
+  return finals(deps, assistant.endpoint, assistant.thread_id, count);
+}
+
+function finals(deps: WebReadsDeps, endpoint: string, threadId: string, count: number): WebMessage[] {
   const clamped = Math.max(1, Math.min(20, count));
-  return deps.listFinals(session.endpoint, session.thread_id, clamped)
+  return deps.listFinals(endpoint, threadId, clamped)
     .map((message) => ({ turnId: message.turnId, body: message.body, completedAt: message.completedAt, terminalStatus: message.terminalStatus }));
 }

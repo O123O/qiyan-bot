@@ -59,6 +59,14 @@ test("serves the session list and a worker transcript", async () => {
   });
 });
 
+test("serves the assistant's persisted history", async () => {
+  await withServer(async (base) => {
+    const h = await (await fetch(`${base}/api/assistant/messages?count=5&token=${TOKEN}`)).json();
+    assert.equal(h.messages.length, 2);
+    assert.equal(h.messages[0].body, "final 0");
+  });
+});
+
 test("POST /api/input forwards text and target to submitInput", async () => {
   await withServer(async (base, calls) => {
     await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hello", target: "payments" }) });

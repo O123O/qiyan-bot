@@ -5,7 +5,7 @@ import { extname, join, normalize } from "node:path";
 import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
-import { listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
+import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
 import { browse, type WebFilesDeps } from "./web-files.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
@@ -97,6 +97,11 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
 
     if (request.method === "GET" && url.pathname === "/api/sessions") { json(response, 200, { sessions: listSessions(options.reads) }); return; }
+    if (request.method === "GET" && url.pathname === "/api/assistant/messages") {
+      const count = Number(url.searchParams.get("count") ?? "20");
+      json(response, 200, { messages: assistantTranscript(options.reads, Number.isFinite(count) ? count : 20) });
+      return;
+    }
     const messages = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/messages$/u.exec(url.pathname);
     if (request.method === "GET" && messages) {
       const count = Number(url.searchParams.get("count") ?? "20");
