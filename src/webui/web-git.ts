@@ -42,14 +42,11 @@ export interface GitStatus {
   untracked: string[];
 }
 
-export async function gitStatus(dir: string): Promise<GitStatus | { error: string }> {
-  const inside = await git(dir, ["rev-parse", "--is-inside-work-tree"]);
-  if (inside.stdout.trim() !== "true") return { error: "not a git repository" };
-  const r = await git(dir, ["-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"]); // don't octal-escape non-ASCII names
-  if (r.code !== 0 && !r.stdout) return { error: r.stderr.trim() || "git status failed" };
+// Parse `git status --porcelain=v1 --branch` output (shared by the local and ssh paths).
+export function parseGitStatus(stdout: string): GitStatus {
   let branch = "", ahead = 0, behind = 0;
   const staged: string[] = [], changes: string[] = [], untracked: string[] = [];
-  for (const line of r.stdout.split("\n")) {
+  for (const line of stdout.split("\n")) {
     if (!line) continue;
     if (line.startsWith("## ")) {
       const head = line.slice(3);
@@ -66,6 +63,14 @@ export async function gitStatus(dir: string): Promise<GitStatus | { error: strin
     if (xy[1] !== " " && xy[1] !== "?") changes.push(path);
   }
   return { branch, ahead, behind, staged, changes, untracked };
+}
+
+export async function gitStatus(dir: string): Promise<GitStatus | { error: string }> {
+  const inside = await git(dir, ["rev-parse", "--is-inside-work-tree"]);
+  if (inside.stdout.trim() !== "true") return { error: "not a git repository" };
+  const r = await git(dir, ["-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"]); // don't octal-escape non-ASCII names
+  if (r.code !== 0 && !r.stdout) return { error: r.stderr.trim() || "git status failed" };
+  return parseGitStatus(r.stdout);
 }
 
 // Unified diff for a path. `staged` → index diff; otherwise the worktree diff, falling back to a

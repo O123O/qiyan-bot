@@ -1831,6 +1831,7 @@ export async function buildProductionApp(
   let dashboardStore!: SessionDashboardStore;
   let dashboard!: SessionDashboard;
   let localClaudeEndpointId: string | undefined; // the local Claude endpoint id, if configured (for web file-browse locality)
+  let webSshRuntimeRoot: string | undefined; // the ssh ControlMaster runtime root (for the web UI's remote file reads)
   let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
   let attachmentCleanup!: AttachmentCleanup;
@@ -2434,6 +2435,7 @@ export async function buildProductionApp(
         // The local worker's `monitor` check runs on this host.
         if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
+        webSshRuntimeRoot = sshRuntimeRoot;
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
           sshBinary: "ssh",
@@ -3016,7 +3018,8 @@ export async function buildProductionApp(
           return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;
         },
         // Every root a mentioned absolute path may resolve against: each LOCAL project dir, QiYan's own
-        // workdir, and the upload store. Remote (ssh) project dirs are on another host — not reachable.
+        // workdir, and the upload store. Remote (ssh) project dirs are on another host — resolved on the
+        // remote instead (see fileTarget + web-remote).
         allRoots: () => {
           const snapshot = registry.snapshot();
           const roots = Object.values(snapshot.sessions)
@@ -3025,8 +3028,18 @@ export async function buildProductionApp(
           roots.push(snapshot.assistant.project_dir, webUploads().dir);
           return roots;
         },
+        // Transport for a session: local (fs) or remote (ssh host from the endpoint catalog).
+        fileTarget: (nickname) => {
+          const session = registry.snapshot().sessions[nickname];
+          if (!session) return undefined;
+          if (isLocalEndpointId(session.endpoint, localClaudeEndpointId)) return { transport: "local", projectDir: session.project_dir };
+          const definition = endpointCatalog.definitions().find((d) => d.id === session.endpoint);
+          return definition?.transport === "ssh" && definition.host ? { transport: "remote", projectDir: session.project_dir, host: definition.host } : undefined;
+        },
         maxFileBytes: config.attachmentMaxBytes,
       },
+      // Remote-worker file access over ssh reuses the user's ControlMaster (never creates one).
+      ...(webSshRuntimeRoot ? { remote: { sshBinary: "ssh", sshRuntimeRoot: webSshRuntimeRoot } } : {}),
       // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is
       // appended to the message so a LOCAL assistant/worker can read it (remote hosts can't — deferred).
       uploads: webUploads(),

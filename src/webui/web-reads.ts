@@ -17,6 +17,7 @@ export interface WebConvoMessage {
   role: "you" | "assistant";
   body: string;
   at: number;
+  origin?: string; // the worker a relayed "[worker] …" message came from (routes its file paths to that host)
 }
 
 // One page of messages plus whether an older page exists (a full page came back ⇒ maybe more).
@@ -82,6 +83,14 @@ export function transcript(deps: WebReadsDeps, nickname: string, limit: number, 
 // so `hasOlder` and the client's `before` cursor stay consistent; the client hides blank bodies.
 export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
   const clamped = Math.max(1, Math.min(50, limit));
-  const messages = deps.listOwnerConversation(before, clamped);
-  return { messages, hasOlder: messages.length === clamped };
+  const raw = deps.listOwnerConversation(before, clamped);
+  // Tag each relayed "[worker …] …" message with a validated origin worker (only the LEADING prefix is
+  // trusted; the relay always prepends it) so the client routes its file paths to that worker's host.
+  const sessions = deps.registrySnapshot().sessions;
+  const messages = raw.map((m) => {
+    if (m.role !== "assistant") return m;
+    const match = /^\[([a-z0-9][a-z0-9_-]{0,63})(?:[^\]]*)\]/u.exec(m.body);
+    return match && sessions[match[1]!] ? { ...m, origin: match[1]! } : m;
+  });
+  return { messages, hasOlder: raw.length === clamped };
 }

@@ -7,6 +7,7 @@ import type { WebBus } from "./web-bus.ts";
 import type { WebReadsDeps } from "./web-reads.ts";
 import type { WebFilesDeps } from "./web-files.ts";
 import type { WebUploadsConfig } from "./web-uploads.ts";
+import type { RemoteDeps } from "./web-remote.ts";
 import { WEB_BINDING } from "./web-adapter.ts";
 import { createWebServer } from "./web-server.ts";
 
@@ -28,6 +29,7 @@ export interface WebUiPhaseDeps extends WebUiConfig {
   reads: WebReadsDeps;
   files: WebFilesDeps;
   uploads?: WebUploadsConfig;
+  remote?: RemoteDeps;
   acceptChat(source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void>;
   report(event: OperationalEvent): void;
   onStarted(url: string): void;
@@ -51,7 +53,7 @@ export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
 
   const server = createWebServer({
     host: deps.host, port: deps.port, allowLan: deps.allowLan, token: deps.token, staticDir: deps.staticDir,
-    bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), submitInput, report: deps.report,
+    bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}), submitInput, report: deps.report,
   });
 
   return {

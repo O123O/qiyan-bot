@@ -23,7 +23,7 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 const TOP_PX = 120, BOTTOM_PX = 80;
 
 interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: { objective: string; status: string } | null; }
-interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; }
+interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; origin?: string; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
 type Preview =
@@ -319,7 +319,7 @@ export function App() {
   const renderDir = (path: string, depth: number): React.ReactNode => {
     const node = dirs[path];
     if (!node) return null;
-    if ("error" in node) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>{node.error === "unknown session" ? "Not browsable — a remote worker's files live on another host (deferred)." : node.error}</div>;
+    if ("error" in node) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>{node.error}</div>;
     if (!node.length) return <div className="hint" style={{ paddingLeft: 8 + depth * 14 }}>empty</div>;
     return node.map((e) => {
       const full = path ? `${path}/${e.name}` : e.name;
@@ -439,17 +439,19 @@ export function App() {
     void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, text, truncated }))
       .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string })?.error ?? "unavailable" }));
   };
-  const openMentioned = (mention: string) =>
-    openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), selected);
+  // `session` decides which host a path resolves against: the current worker tab, or (in the QiYan tab)
+  // the relayed message's origin worker — so a REMOTE worker's path streams from its host.
+  const openMentioned = (mention: string, session: string | null) =>
+    openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), session);
 
   const remark = [remarkGfm, remarkMath, remarkFilePaths];
-  const mdComponents = { a: (props: any) => {
+  const mdComponentsFor = (session: string | null) => ({ a: (props: any) => {
     const href = typeof props.href === "string" ? props.href : "";
-    if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href)}>{props.children}</button>;
+    if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href, session)}>{props.children}</button>;
     // A plain markdown link to a local file → open the preview, not navigate to the SPA fallback.
-    if (isLocalHref(href)) return <button className="file-link" onClick={() => openMentioned(MENTION + encodeURIComponent(href))}>{props.children}</button>;
+    if (isLocalHref(href)) return <button className="file-link" onClick={() => openMentioned(MENTION + encodeURIComponent(href), session)}>{props.children}</button>;
     return <a {...props} target="_blank" rel="noreferrer" />;
-  } };
+  } });
 
   return (
     <div className="app">
@@ -494,7 +496,7 @@ export function App() {
             {rendered.map((m, i) => (
               <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : ""}`}>
                 <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(m.body)}</Markdown></div>
+                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected ?? m.origin ?? null)}>{normalizeMath(m.body)}</Markdown></div>
               </div>
             ))}
           </div>

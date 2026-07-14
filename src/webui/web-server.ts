@@ -7,10 +7,11 @@ import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, confine, createEntry, resolvePath, type WebFilesDeps } from "./web-files.ts";
+import { browse, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
+import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, type RemoteDeps } from "./web-remote.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -40,6 +41,35 @@ async function serveRaw(response: ServerResponse, target: string | undefined, do
   response.writeHead(200, headers);
   createReadStream(target).pipe(response);
 }
+
+const MAX_REMOTE_STREAM = 64 * 1024 * 1024;
+// Stream a remote file (ssh) to the HTTP response with backpressure; kill the ssh child on client
+// disconnect (which SIGPIPEs the remote `cat`), cap the bytes, and 404 if the confinement guard fails.
+async function serveRemoteRaw(response: ServerResponse, remote: RemoteDeps, host: string, root: string, path: string, download: boolean): Promise<void> {
+  const child = await remoteReadStream(remote, host, root, path);
+  const contentType = RAW_CONTENT_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream";
+  let started = false, size = 0;
+  const killChild = (): void => { try { child.kill("SIGKILL"); } catch { /* gone */ } };
+  response.on("close", killChild);
+  child.stdout.on("data", (chunk: Buffer) => {
+    if (!started) {
+      started = true;
+      const disposition = download ? `attachment; filename="${(path.split("/").pop() || "download").replace(/["\\]/g, "_")}"` : "inline";
+      const headers: Record<string, string> = { "content-type": contentType, "content-disposition": disposition, "x-content-type-options": "nosniff" };
+      if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
+      response.writeHead(200, headers);
+    }
+    size += chunk.length;
+    if (size > MAX_REMOTE_STREAM) { killChild(); response.end(); return; }
+    if (!response.write(chunk)) { child.stdout.pause(); response.once("drain", () => child.stdout.resume()); }
+  });
+  child.on("close", (code) => {
+    if (started) { response.end(); return; }
+    if (code === 0) { response.writeHead(200, { "content-type": contentType }); response.end(); } // empty file
+    else { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); }
+  });
+  child.on("error", () => { if (!started) { response.writeHead(502, { "content-type": "text/plain" }); response.end("remote error"); } else response.end(); });
+}
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png",
@@ -55,6 +85,7 @@ export interface WebServerOptions {
   reads: WebReadsDeps;
   files: WebFilesDeps;
   uploads?: WebUploadsConfig;
+  remote?: RemoteDeps; // ssh access for remote-worker files (reuses the user's ControlMaster)
   submitInput(text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }>;
   report(event: OperationalEvent): void;
 }
@@ -162,10 +193,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, 200, result);
       return;
     }
-    // Local file browsing, confined to the named session's project directory (web-files.ts).
+    // File tree, confined to the session's project — local via fs, remote via ssh.
     const files = /^\/api\/files\/([a-z0-9][a-z0-9_-]{0,63})$/u.exec(url.pathname);
     if (request.method === "GET" && files) {
-      const result = await browse(options.files, files[1]!, url.searchParams.get("path") ?? "");
+      const target = options.files.fileTarget(files[1]!);
+      const path = url.searchParams.get("path") ?? "";
+      if (!target) { json(response, 404, { error: "unknown session" }); return; }
+      const result = target.transport === "remote" && target.host && options.remote
+        ? await remoteBrowse(options.remote, target.host, target.projectDir, path)
+        : await browse(options.files, files[1]!, path);
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
@@ -185,8 +221,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
     // client streams text into the panel, uses it as an <img> src, or opens pdf/html in a new tab.
     if (request.method === "GET" && url.pathname === "/api/raw") {
       const session = url.searchParams.get("session") || undefined;
-      const target = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, url.searchParams.get("path") ?? "");
-      await serveRaw(response, target, url.searchParams.get("download") === "1");
+      const path = url.searchParams.get("path") ?? "";
+      const download = url.searchParams.get("download") === "1";
+      const target = session ? options.files.fileTarget(session) : undefined;
+      if (target?.transport === "remote" && target.host && options.remote) {
+        await serveRemoteRaw(response, options.remote, target.host, target.projectDir, path, download);
+        return;
+      }
+      const local = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, path);
+      await serveRaw(response, local, download);
       return;
     }
     // Create a file/folder in a session's project (tree write ops).
@@ -211,20 +254,30 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     // Git source control. Repos are tracked MANUALLY by the client (a worker's cwd may not be a repo,
     // or may hold several in subdirs), so ops take a `repo` sub-path confined to the session's project.
-    const gitRepoDir = async (session: unknown, repo: unknown): Promise<string | undefined> => {
-      const proj = typeof session === "string" ? options.files.projectDir(session) : undefined;
-      return proj ? confine(proj, typeof repo === "string" && repo ? repo : ".") : undefined;
+    // Local: git in a `confine()`d dir. Remote: git over ssh, confined on the remote (web-remote.ts).
+    const gitTarget = (session: unknown): FileTarget | undefined => (typeof session === "string" ? options.files.fileTarget(session) : undefined);
+    const withLocalRepo = async <T>(t: FileTarget, repo: string, fn: (dir: string) => Promise<T>): Promise<T | { error: string }> => {
+      const dir = await confine(t.projectDir, repo || ".");
+      return dir ? fn(dir) : { error: "repo not found" };
     };
     if (request.method === "GET" && url.pathname === "/api/git/discover") {
-      const proj = options.files.projectDir(url.searchParams.get("session") ?? "");
-      json(response, 200, { repos: proj ? await discoverRepos(proj) : [] });
+      const t = gitTarget(url.searchParams.get("session"));
+      const repos = !t ? [] : t.transport === "remote" && t.host && options.remote ? await remoteDiscover(options.remote, t.host, t.projectDir) : await discoverRepos(t.projectDir);
+      json(response, 200, { repos });
       return;
     }
     if (request.method === "GET" && (url.pathname === "/api/git/status" || url.pathname === "/api/git/diff")) {
-      const dir = await gitRepoDir(url.searchParams.get("session"), url.searchParams.get("repo"));
-      if (!dir) { json(response, 400, { error: "repo not found" }); return; }
-      if (url.pathname === "/api/git/status") { json(response, 200, await gitStatus(dir)); return; }
-      const result = await gitDiff(dir, url.searchParams.get("path") ?? "", url.searchParams.get("staged") === "1");
+      const t = gitTarget(url.searchParams.get("session"));
+      if (!t) { json(response, 400, { error: "repo not found" }); return; }
+      const repo = url.searchParams.get("repo") ?? "";
+      const remote = t.transport === "remote" && t.host && options.remote ? options.remote : undefined;
+      if (url.pathname === "/api/git/status") {
+        const result = remote ? await remoteGitStatus(remote, t.host!, t.projectDir, repo) : await withLocalRepo(t, repo, (dir) => gitStatus(dir));
+        json(response, "error" in result ? 400 : 200, result);
+        return;
+      }
+      const path = url.searchParams.get("path") ?? "", staged = url.searchParams.get("staged") === "1";
+      const result = remote ? await remoteGitDiff(remote, t.host!, t.projectDir, repo, path, staged) : await withLocalRepo(t, repo, (dir) => gitDiff(dir, path, staged));
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
@@ -232,14 +285,18 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (request.method === "POST" && gitOp) {
       const body = await readJson(request);
       if (!body) { json(response, 400, { error: "invalid json" }); return; }
-      const dir = await gitRepoDir(body.session, body.repo);
-      if (!dir) { json(response, 400, { error: "repo not found" }); return; }
+      const t = gitTarget(body.session);
+      if (!t) { json(response, 400, { error: "repo not found" }); return; }
+      const repo = typeof body.repo === "string" ? body.repo : "";
+      const remote = t.transport === "remote" && t.host && options.remote ? options.remote : undefined;
       const op = gitOp[1];
+      const path = typeof body.path === "string" ? body.path : "";
+      const message = typeof body.message === "string" ? body.message : "";
       const result = op === "commit"
-        ? await gitCommit(dir, typeof body.message === "string" ? body.message : "")
-        : typeof body.path === "string" && body.path
-          ? await (op === "stage" ? gitStage : gitUnstage)(dir, body.path)
-          : { error: "path required" };
+        ? (remote ? await remoteGitCommit(remote, t.host!, t.projectDir, repo, message) : await withLocalRepo(t, repo, (dir) => gitCommit(dir, message)))
+        : !path ? { error: "path required" }
+          : remote ? await (op === "stage" ? remoteGitStage : remoteGitUnstage)(remote, t.host!, t.projectDir, repo, path)
+            : await withLocalRepo(t, repo, (dir) => (op === "stage" ? gitStage : gitUnstage)(dir, path));
       json(response, "error" in result ? 400 : 200, result);
       return;
     }

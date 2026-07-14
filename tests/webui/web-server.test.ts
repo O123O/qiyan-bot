@@ -38,7 +38,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
-    files: { projectDir: () => undefined, allRoots: () => [uploadsDir], maxFileBytes: 1024 },
+    files: { projectDir: () => undefined, allRoots: () => [uploadsDir], fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
     report: () => {},
@@ -126,6 +126,35 @@ test("streams a raw file with a browser Content-Type and blocks paths outside ev
     assert.equal((await fetch(`${base}/api/raw?path=${encodeURIComponent("/etc/passwd")}&token=${TOKEN}`)).status, 404);
     assert.equal((await fetch(`${base}/api/raw?path=${abs}`)).status, 401); // still token-gated
   });
+});
+
+test("dispatches a remote session's files over ssh (browse + raw stream)", async () => {
+  const { mkdtemp, chmod } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-rsrv-"));
+  const ssh = join(dir, "ssh");
+  await writeFile(ssh, `#!/bin/bash\nif [ "$1" = "-G" ]; then printf 'hostname localhost\\nuser u\\nport 22\\ncontrolmaster no\\n'; exit 0; fi\ncmd="\${@: -1}"\nexec bash -c "$cmd"\n`);
+  await chmod(ssh, 0o755);
+  const remoteRoot = await mkdtemp(join(tmpdir(), "qiyan-rroot-"));
+  await writeFile(join(remoteRoot, "r.txt"), "remote-bytes\n");
+
+  const bus = new WebBus();
+  const staticDir = await mkdtemp(join(tmpdir(), "qiyan-rstatic-"));
+  await writeFile(join(staticDir, "index.html"), "ok");
+  const server = createWebServer({
+    host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    files: { projectDir: () => undefined, allRoots: () => [], maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
+    remote: { sshBinary: ssh, sshRuntimeRoot: await mkdtemp(join(tmpdir(), "qiyan-rrt-")) },
+    submitInput: async () => ({ ok: true }), report: () => {},
+  });
+  const { url } = await server.start();
+  const base = url.slice(0, url.indexOf("/?"));
+  try {
+    const listing = await (await fetch(`${base}/api/files/rworker?token=${TOKEN}`)).json();
+    assert.deepEqual(listing.entries?.map((e: { name: string }) => e.name), ["r.txt"]);
+    assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
+    assert.equal((await fetch(`${base}/api/raw?session=rworker&path=${encodeURIComponent("/etc/hostname")}&token=${TOKEN}`)).status, 404); // remote confinement
+  } finally { await server.stop(); }
 });
 
 test("WS upgrade requires the token and receives broadcasts", async () => {

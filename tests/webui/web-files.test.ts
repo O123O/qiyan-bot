@@ -16,7 +16,7 @@ async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: s
   await writeFile(join(root, "logo.bin"), Buffer.from([1, 2, 0, 3, 255]));
   await writeFile(outside, "TOP SECRET\n");
   await symlink(outside, join(root, "escape")); // symlink pointing OUTSIDE the project
-  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), allRoots: () => [root], maxFileBytes: 1024 }, root, outside };
+  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), allRoots: () => [root], fileTarget: (n) => (n === "proj" ? { transport: "local", projectDir: root } : undefined), maxFileBytes: 1024 }, root, outside };
 }
 
 test("lists a directory (dirs first) and reads a text file confined to the project", async () => {

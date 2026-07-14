@@ -5,11 +5,16 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 // when a legitimate child name merely starts with ".." (e.g. "..env", "...").
 const escapes = (rel: string): boolean => rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
 
+// Where a session's files live: local (fs) or remote (ssh host). Drives the transport dispatch.
+export interface FileTarget { transport: "local" | "remote"; projectDir: string; host?: string }
+
 export interface WebFilesDeps {
-  // The managed project directory for a session nickname (a root the browser may reach).
+  // The managed LOCAL project directory for a session nickname (a root the browser may reach via fs).
   projectDir(nickname: string): string | undefined;
-  // Every root a mentioned path may resolve against (all local project dirs + the upload store).
+  // Every LOCAL root a mentioned path may resolve against (all local project dirs + the upload store).
   allRoots(): string[];
+  // Transport + project dir + ssh host for a session (local or remote), or undefined if not browsable.
+  fileTarget(nickname: string): FileTarget | undefined;
   maxFileBytes: number;
 }
 
