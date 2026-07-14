@@ -94,6 +94,16 @@ test("collection sorts by completion, turn id, and item order", () => {
   assert.deepEqual(store.list("local", "thread", 3).map((message) => `${message.turnId}:${message.itemOrder}`), ["a:2", "b:1", "b:2"]);
 });
 
+test("normalizes second- and millisecond-scale completion times to millis for ordering", () => {
+  const store = new FinalMessageStore(createTestDatabase());
+  const one = (id: string) => [{ type: "agentMessage", id, text: id, phase: "final_answer" }];
+  store.persistTerminalTurn("local", "thread", turn({ id: "sec", completedAt: 1_700_000_000, items: one("s") }), 0);    // seconds
+  store.persistTerminalTurn("local", "thread", turn({ id: "ms", completedAt: 1_700_000_001_000, items: one("m") }), 0); // millis, 1s later
+  const list = store.list("local", "thread", 20);
+  assert.deepEqual(list.map((m) => m.completedAt), [1_700_000_000_000, 1_700_000_001_000]); // seconds scaled to millis
+  assert.deepEqual(list.map((m) => m.turnId), ["sec", "ms"]); // correct chronological order despite mixed units
+});
+
 test("reads a logical message by its opaque persisted id", () => {
   const store = new FinalMessageStore(createTestDatabase());
   const [message] = store.persistTerminalTurn("local", "thread", turn(), 0);

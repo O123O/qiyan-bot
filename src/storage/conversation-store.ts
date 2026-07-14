@@ -122,12 +122,16 @@ export class ConversationStore {
     // `at` (completed_at / created_at) is not unique, so the cursor is INCLUSIVE (`<=`) and a stable id
     // tie-breaks the ORDER BY; the caller dedups by id. Otherwise same-millisecond rows straddling a
     // page boundary would be skipped forever.
+    // Timestamps may be seconds or millis across rows; normalize both legs to millis so the merge
+    // orders correctly (older assistant replies were persisted in seconds). Matches toMillis.
+    const A = "(CASE WHEN completed_at < 1000000000000 THEN completed_at * 1000 ELSE completed_at END)";
+    const U = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
     const rows = this.db.prepare(`SELECT id, role, body, at FROM (
-        SELECT id AS id, 'assistant' AS role, body AS body, completed_at AS at FROM logical_final_messages
-          WHERE endpoint_id = ? AND thread_id = ?${cursor ? " AND completed_at <= ?" : ""}
+        SELECT id AS id, 'assistant' AS role, body AS body, ${A} AS at FROM logical_final_messages
+          WHERE endpoint_id = ? AND thread_id = ?${cursor ? ` AND ${A} <= ?` : ""}
         UNION ALL
-        SELECT id AS id, 'you' AS role, raw_text AS body, created_at AS at FROM source_contexts
-          WHERE source_class = 'chat'${cursor ? " AND created_at <= ?" : ""}
+        SELECT id AS id, 'you' AS role, raw_text AS body, ${U} AS at FROM source_contexts
+          WHERE source_class = 'chat'${cursor ? ` AND ${U} <= ?` : ""}
       ) ORDER BY at DESC, id DESC LIMIT ?`)
       .all(...(cursor ? [endpointId, threadId, before, before, clamped] : [endpointId, threadId, clamped])) as Array<{ id: string; role: string; body: string; at: number }>;
     return rows.reverse().map((row) => ({ id: String(row.id), role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at) }));

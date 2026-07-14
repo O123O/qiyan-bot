@@ -1,5 +1,12 @@
 import type { Database } from "../storage/database.ts";
 
+// Provider turn timestamps arrive in seconds OR milliseconds (Codex vs Claude vs the Date.now()
+// fallback), which corrupts ordering/merging when mixed. `list` normalizes everything to millis at
+// read time — same rule as normalizeProtocolTime — so callers see one consistent unit. `NORM` is the
+// SQL equivalent, used for ORDER BY and the `before` cursor comparison.
+const toMillis = (v: number): number => (Math.abs(v) < 1_000_000_000_000 ? v * 1000 : v);
+const NORM = "(CASE WHEN completed_at < 1000000000000 THEN completed_at * 1000 ELSE completed_at END)";
+
 export interface LogicalFinalMessage {
   id: string;
   endpointId: string;
@@ -44,13 +51,13 @@ export class FinalMessageStore {
   list(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[] {
     if (!Number.isSafeInteger(count) || count < 1 || count > 50) throw new RangeError("count must be between 1 and 50");
     const cursor = before !== undefined && Number.isFinite(before);
-    const clause = cursor ? " AND completed_at <= ?" : "";
+    const clause = cursor ? ` AND ${NORM} <= ?` : "";
     const params = cursor ? [endpointId, threadId, before as number, count] : [endpointId, threadId, count];
     const rows = this.db.prepare(`SELECT * FROM (
       SELECT * FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?${clause}
-      ORDER BY completed_at DESC, turn_id DESC, item_order DESC LIMIT ?
-    ) ORDER BY completed_at ASC, turn_id ASC, item_order ASC`).all(...params) as Array<Record<string, unknown>>;
-    return rows.map((row) => this.fromRow(row));
+      ORDER BY ${NORM} DESC, turn_id DESC, item_order DESC LIMIT ?
+    ) ORDER BY ${NORM} ASC, turn_id ASC, item_order ASC`).all(...params) as Array<Record<string, unknown>>;
+    return rows.map((row) => { const m = this.fromRow(row); return { ...m, completedAt: toMillis(m.completedAt) }; });
   }
 
   get(endpointId: string, threadId: string, turnId: string, itemId: string): LogicalFinalMessage | undefined {
