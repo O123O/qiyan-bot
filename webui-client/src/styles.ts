@@ -52,7 +52,8 @@ body { margin:0; }
 
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:4vh 4vw; }
 .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(900px,100%); max-height:100%; display:flex; flex-direction:column; box-shadow:0 12px 44px rgba(0,0,0,.45); }
-.sheet-head { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); font-family:monospace; word-break:break-all; }
+.sheet-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); font-family:monospace; word-break:break-all; }
+.head-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
 .sheet-body { overflow:auto; padding:14px; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
 .preview-img { max-width:100%; max-height:78vh; object-fit:contain; display:block; margin:0 auto; }
 `;

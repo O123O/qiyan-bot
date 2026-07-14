@@ -113,6 +113,7 @@ export function App() {
   const [text, setText] = useState("");
   const [filePath, setFilePath] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [srcMode, setSrcMode] = useState(false); // for markdown previews: rendered (false) vs raw source
   const [tree, setTree] = useState<FileResult | null>(null);
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
@@ -260,6 +261,7 @@ export function App() {
   // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
   // project for relative), so the client never guesses which root a path lives in.
   const openPreview = (path: string, session: string | null) => {
+    setSrcMode(false); // default markdown to the rendered view
     const url = rawUrl(path, session);
     if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, url }); return; }
     if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
@@ -341,19 +343,28 @@ export function App() {
         </main>
       </div>
 
-      {preview && (
-        <div className="modal" onClick={() => setPreview(null)}>
-          <div className="sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-head"><span>{preview.title}</span><button className="ghost" onClick={() => setPreview(null)}>✕</button></div>
-            <div className="sheet-body">
-              {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
-                : preview.kind === "loading" ? <div className="hint">loading…</div>
-                : preview.kind === "error" ? <div className="hint">{preview.error}</div>
-                : <pre>{preview.text}{preview.truncated ? "\n… [truncated]" : ""}</pre>}
+      {preview && (() => {
+        const isMd = preview.kind === "text" && /\.(md|markdown|mdx)$/i.test(preview.title);
+        return (
+          <div className="modal" onClick={() => setPreview(null)}>
+            <div className="sheet" onClick={(e) => e.stopPropagation()}>
+              <div className="sheet-head"><span>{preview.title}</span>
+                <div className="head-actions">
+                  {isMd && <button className="ghost sm" onClick={() => setSrcMode((s) => !s)}>{srcMode ? "Preview" : "Source"}</button>}
+                  <button className="ghost" onClick={() => setPreview(null)}>✕</button>
+                </div>
+              </div>
+              <div className="sheet-body">
+                {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
+                  : preview.kind === "loading" ? <div className="hint">loading…</div>
+                  : preview.kind === "error" ? <div className="hint">{preview.error}</div>
+                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
+                  : <pre>{preview.text}{preview.truncated ? "\n… [truncated]" : ""}</pre>}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
