@@ -38,7 +38,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
-    files: { projectDir: () => undefined, maxFileBytes: 1024 },
+    files: { projectDir: () => undefined, allRoots: () => [uploadsDir], maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
     report: () => {},
@@ -113,17 +113,18 @@ test("SPA fallback serves routes but 404s file-extension paths", async () => {
   });
 });
 
-test("streams a raw upload with a browser Content-Type and blocks traversal", async () => {
+test("streams a raw file with a browser Content-Type and blocks paths outside every root", async () => {
   await withServer(async (base, _calls, _bus, uploadsDir) => {
     await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");
-    const r = await fetch(`${base}/api/upload/raw?path=page.html&token=${TOKEN}`);
+    const abs = encodeURIComponent(join(uploadsDir, "page.html")); // absolute path inside a known root
+    const r = await fetch(`${base}/api/raw?path=${abs}&token=${TOKEN}`);
     assert.equal(r.status, 200);
     assert.match(r.headers.get("content-type") ?? "", /text\/html/);
     assert.equal(r.headers.get("content-security-policy"), "sandbox"); // scripts neutered
     assert.equal(await r.text(), "<h1>hi</h1>");
-    // basename() collapses traversal → not found in the store
-    assert.equal((await fetch(`${base}/api/upload/raw?path=../../etc/passwd&token=${TOKEN}`)).status, 404);
-    assert.equal((await fetch(`${base}/api/upload/raw?path=page.html`)).status, 401); // still token-gated
+    // a path outside every accessible root → 404
+    assert.equal((await fetch(`${base}/api/raw?path=${encodeURIComponent("/etc/passwd")}&token=${TOKEN}`)).status, 404);
+    assert.equal((await fetch(`${base}/api/raw?path=${abs}`)).status, 401); // still token-gated
   });
 });
 

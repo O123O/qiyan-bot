@@ -3015,6 +3015,16 @@ export async function buildProductionApp(
           const session = registry.snapshot().sessions[nickname];
           return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;
         },
+        // Every root a mentioned absolute path may resolve against: each LOCAL project dir, QiYan's own
+        // workdir, and the upload store. Remote (ssh) project dirs are on another host — not reachable.
+        allRoots: () => {
+          const snapshot = registry.snapshot();
+          const roots = Object.values(snapshot.sessions)
+            .filter((session) => isLocalEndpointId(session.endpoint, localClaudeEndpointId))
+            .map((session) => session.project_dir);
+          roots.push(snapshot.assistant.project_dir, webUploads().dir);
+          return roots;
+        },
         maxFileBytes: config.attachmentMaxBytes,
       },
       // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is

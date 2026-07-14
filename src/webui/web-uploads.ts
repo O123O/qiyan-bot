@@ -1,6 +1,5 @@
 import { mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { browse, type WebFilesResult } from "./web-files.ts";
 
 // A backend-owned store for files sent from the web UI. The UI uploads a file, the backend writes it
 // here and returns its path, and the UI appends that path to the message — so the assistant/worker
@@ -24,12 +23,6 @@ export async function storeUpload(config: WebUploadsConfig, filename: string, by
   const handle = await open(path, "wx");
   try { await handle.write(bytes); } finally { await handle.close(); }
   return { path };
-}
-
-// Preview an uploaded file by name, confined to the storage dir (reuses the file browser's realpath
-// confinement). Uploads are flat files, so the basename is the only reachable key.
-export async function previewUpload(config: WebUploadsConfig, requestedPath: string): Promise<WebFilesResult> {
-  return browse({ projectDir: () => config.dir, maxFileBytes: config.maxBytes }, "uploads", basename(requestedPath));
 }
 
 // Delete uploads older than the TTL. Returns how many were removed. Best-effort per file.

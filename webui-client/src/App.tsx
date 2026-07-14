@@ -24,6 +24,31 @@ const TOP_PX = 120, BOTTOM_PX = 80;
 interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: { objective: string; status: string } | null; }
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
+type Preview =
+  | { kind: "loading"; title: string }
+  | { kind: "text"; title: string; text: string; truncated: boolean }
+  | { kind: "image"; title: string; url: string }
+  | { kind: "error"; title: string; error: string };
+
+// One streaming endpoint resolves any path (absolute → any root; relative → the session's project).
+const rawUrl = (path: string, session: string | null) => `/api/raw?path=${encodeURIComponent(path)}&session=${encodeURIComponent(session ?? "")}${TOKEN_Q}`;
+
+// Stream a text file into the panel (capped), instead of preloading it — matches Codex-Web-UI.
+async function readTextStream(url: string, cap = 5_000_000): Promise<{ text: string; truncated: boolean }> {
+  const r = await fetch(url, { credentials: "same-origin" });
+  if (!r.ok) throw { error: (await r.text().catch(() => "")) || `HTTP ${r.status}` };
+  const reader = r.body?.getReader();
+  if (!reader) return { text: await r.text(), truncated: false };
+  const decoder = new TextDecoder();
+  let text = "", size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (size + value.length > cap) { text += decoder.decode(value.subarray(0, cap - size)); void reader.cancel(); return { text, truncated: true }; }
+    size += value.length; text += decoder.decode(value, { stream: true });
+  }
+  return { text, truncated: false };
+}
 
 async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   // Always carry the token (don't rely on the cookie, which can be stale) and tolerate non-JSON error
@@ -87,8 +112,7 @@ export function App() {
   const [live, setLive] = useState(false);
   const [text, setText] = useState("");
   const [filePath, setFilePath] = useState("");
-  const [file, setFile] = useState<FileResult | null>(null);
-  const [image, setImage] = useState<{ url: string; name: string } | null>(null);
+  const [preview, setPreview] = useState<Preview | null>(null);
   const [tree, setTree] = useState<FileResult | null>(null);
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
@@ -231,31 +255,20 @@ export function App() {
 
   const selSession = useMemo(() => sessions.find((s) => s.nickname === selected) ?? null, [sessions, selected]);
   const crumbs = filePath ? filePath.split("/") : [];
-  const openFileAt = (nickname: string, relPath: string) =>
-    void api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(relPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
 
-  const openUpload = (absPath: string) =>
-    void api<FileResult>(`/api/upload/preview?path=${encodeURIComponent(absPath)}`).then(setFile).catch(() => setFile({ error: "unavailable" }));
-
-  const closePreview = () => { setFile(null); setImage(null); };
-
-  // Open a mentioned path (like Codex-Web-UI): images show inline in the popup panel, pdf/html stream
-  // in a new tab, and text opens in the panel. Absolute paths under the worker's project resolve
-  // there; other absolute paths from the upload store; relative paths from the selected worker.
-  const openMentioned = (mention: string) => {
-    const decoded = decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
-    const proj = selSession?.projectDir;
-    const inProject = Boolean(selected && proj && decoded.startsWith(proj + "/"));
-    const isUpload = decoded.startsWith("/") && !inProject;
-    const rel = inProject ? decoded.slice(proj!.length + 1) : decoded;
-    if (!isUpload && !selected) return; // a relative/project path needs a worker
-    const rawUrl = isUpload
-      ? `/api/upload/raw?path=${encodeURIComponent(decoded)}${TOKEN_Q}`
-      : `/api/files/${selected}/raw?path=${encodeURIComponent(rel)}${TOKEN_Q}`;
-    if (IMG_EXT.test(decoded)) { setImage({ url: rawUrl, name: decoded.split("/").pop() || decoded }); return; }
-    if (TAB_EXT.test(decoded)) { window.open(rawUrl, "_blank", "noopener"); return; }
-    if (isUpload) openUpload(decoded); else openFileAt(selected!, rel);
+  // Open a file in the popup. Text is STREAMED into the panel (not preloaded); images render inline;
+  // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
+  // project for relative), so the client never guesses which root a path lives in.
+  const openPreview = (path: string, session: string | null) => {
+    const url = rawUrl(path, session);
+    if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, url }); return; }
+    if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
+    setPreview({ kind: "loading", title: path });
+    void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, text, truncated }))
+      .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string })?.error ?? "unavailable" }));
   };
+  const openMentioned = (mention: string) =>
+    openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), selected);
 
   const remark = [remarkGfm, remarkMath, remarkFilePaths];
   const mdComponents = { a: (props: any) => {
@@ -298,7 +311,7 @@ export function App() {
               </div>
               {tree && "error" in tree && <div className="hint">{tree.error === "unknown session" ? "Not browsable — a remote worker's files live on another host (deferred)." : tree.error}</div>}
               {tree && "kind" in tree && tree.kind === "dir" && (tree.entries.length ? tree.entries.map((e) => (
-                <div key={e.name} className={`frow ${e.type}`} onClick={() => e.type === "dir" ? setFilePath((filePath ? filePath + "/" : "") + e.name) : e.type === "file" ? openFileAt(selected, (filePath ? filePath + "/" : "") + e.name) : undefined}>
+                <div key={e.name} className={`frow ${e.type}`} onClick={() => e.type === "dir" ? setFilePath((filePath ? filePath + "/" : "") + e.name) : e.type === "file" ? openPreview((filePath ? filePath + "/" : "") + e.name, selected) : undefined}>
                   {e.type === "dir" ? "📁" : e.type === "file" ? "📄" : "🔗"} {e.name}
                 </div>
               )) : <div className="hint">empty</div>)}
@@ -328,15 +341,15 @@ export function App() {
         </main>
       </div>
 
-      {(file || image) && (
-        <div className="modal" onClick={closePreview}>
+      {preview && (
+        <div className="modal" onClick={() => setPreview(null)}>
           <div className="sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-head"><span>{image?.name ?? (file && "kind" in file && file.kind === "file" ? file.path : "file")}</span><button className="ghost" onClick={closePreview}>✕</button></div>
+            <div className="sheet-head"><span>{preview.title}</span><button className="ghost" onClick={() => setPreview(null)}>✕</button></div>
             <div className="sheet-body">
-              {image ? <img className="preview-img" src={image.url} alt={image.name} />
-                : file && "error" in file ? <div className="hint">{file.error}</div>
-                : file && file.encoding === "base64" ? <div className="hint">[binary file{file.truncated ? ", truncated" : ""} — not shown]</div>
-                : file ? <pre>{file.content}{file.truncated ? "\n… [truncated]" : ""}</pre> : null}
+              {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
+                : preview.kind === "loading" ? <div className="hint">loading…</div>
+                : preview.kind === "error" ? <div className="hint">{preview.error}</div>
+                : <pre>{preview.text}{preview.truncated ? "\n… [truncated]" : ""}</pre>}
             </div>
           </div>
         </div>

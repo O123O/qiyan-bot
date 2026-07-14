@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browse, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { browse, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
 
 async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: string }> {
   const base = await mkdtemp(join(tmpdir(), "qiyan-webfiles-"));
@@ -15,7 +15,7 @@ async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: s
   await writeFile(join(root, "logo.bin"), Buffer.from([1, 2, 0, 3, 255]));
   await writeFile(outside, "TOP SECRET\n");
   await symlink(outside, join(root, "escape")); // symlink pointing OUTSIDE the project
-  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), maxFileBytes: 1024 }, root, outside };
+  return { deps: { projectDir: (n) => (n === "proj" ? root : undefined), allRoots: () => [root], maxFileBytes: 1024 }, root, outside };
 }
 
 test("lists a directory (dirs first) and reads a text file confined to the project", async () => {
@@ -48,4 +48,16 @@ test("REJECTS every escape from the project root", async () => {
   assert.deepEqual(await browse(deps, "proj", "escape"), { error: "path not allowed" });          // symlink → outside
   assert.deepEqual(await browse(deps, "proj", "nope"), { error: "path not allowed" });            // non-existent
   assert.deepEqual(await browse(deps, "other", ""), { error: "unknown session" });                // unknown root
+});
+
+test("resolvePath confines absolute paths to a known root and relative paths to the session root", async () => {
+  const { root, outside } = await fixture();
+  // absolute path inside a root resolves; outside every root does not
+  assert.equal(await resolvePath([root], undefined, join(root, "src/app.ts")), join(root, "src/app.ts"));
+  assert.equal(await resolvePath([root], undefined, outside), undefined);
+  assert.equal(await resolvePath([root], undefined, "/etc/passwd"), undefined);
+  // relative paths need a session root and stay inside it
+  assert.equal(await resolvePath([root], root, "src/app.ts"), join(root, "src/app.ts"));
+  assert.equal(await resolvePath([root], root, "../secret"), undefined);
+  assert.equal(await resolvePath([root], undefined, "src/app.ts"), undefined); // relative with no session → unresolved
 });

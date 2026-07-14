@@ -2,13 +2,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createReadStream } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import { basename, extname, join, normalize } from "node:path";
+import { extname, join, normalize } from "node:path";
 import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, confine, type WebFilesDeps } from "./web-files.ts";
-import { cleanupUploads, previewUpload, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
+import { browse, resolvePath, type WebFilesDeps } from "./web-files.ts";
+import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -22,9 +22,8 @@ const RAW_CONTENT_TYPES: Record<string, string> = {
   ".json": "application/json; charset=utf-8", ".csv": "text/csv; charset=utf-8",
 };
 
-// Stream a file confined to `root` with a best-effort Content-Type so the browser can render it inline.
-async function serveRaw(response: ServerResponse, root: string, relPath: string): Promise<void> {
-  const target = await confine(root, relPath === "" ? "." : relPath);
+// Stream a resolved file with a best-effort Content-Type so the browser can render/read it inline.
+async function serveRaw(response: ServerResponse, target: string | undefined): Promise<void> {
   const info = target ? await stat(target).catch(() => undefined) : undefined;
   if (!target || !info?.isFile()) { response.writeHead(404, { "content-type": "text/plain" }); response.end("not found"); return; }
   const contentType = RAW_CONTENT_TYPES[extname(target).toLowerCase()] ?? "application/octet-stream";
@@ -169,23 +168,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
-    if (request.method === "GET" && url.pathname === "/api/upload/preview") {
-      if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
-      const result = await previewUpload(options.uploads, url.searchParams.get("path") ?? "");
-      json(response, "error" in result ? 400 : 200, result);
-      return;
-    }
-    // Raw streaming for browser-native types (pdf/html/image → open in a new tab).
-    if (request.method === "GET" && url.pathname === "/api/upload/raw") {
-      if (!options.uploads) { json(response, 501, { error: "uploads are disabled" }); return; }
-      await serveRaw(response, options.uploads.dir, basename(url.searchParams.get("path") ?? ""));
-      return;
-    }
-    const rawFile = /^\/api\/files\/([a-z0-9][a-z0-9_-]{0,63})\/raw$/u.exec(url.pathname);
-    if (request.method === "GET" && rawFile) {
-      const root = options.files.projectDir(rawFile[1]!);
-      if (!root) { json(response, 404, { error: "unknown session" }); return; }
-      await serveRaw(response, root, url.searchParams.get("path") ?? "");
+    // Unified streaming for any mentioned/browsed file: the server resolves the path against every
+    // accessible root (all project dirs + the upload store) for absolute paths, or under ?session=’s
+    // project for relative paths — so the client never guesses which root a path belongs to. The
+    // client streams text into the panel, uses it as an <img> src, or opens pdf/html in a new tab.
+    if (request.method === "GET" && url.pathname === "/api/raw") {
+      const session = url.searchParams.get("session") || undefined;
+      const target = await resolvePath(options.files.allRoots(), session ? options.files.projectDir(session) : undefined, url.searchParams.get("path") ?? "");
+      await serveRaw(response, target);
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/input") {
