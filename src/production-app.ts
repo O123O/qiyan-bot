@@ -2987,8 +2987,8 @@ export async function buildProductionApp(
       reads: {
         registrySnapshot: () => registry.snapshot(),
         dashboardSnapshot: () => dashboard.snapshot(),
-        listFinals: (endpointId, threadId, count) => finals.list(endpointId, threadId, count),
-        listUserMessages: (count) => conversations.listRecentUserMessages(count),
+        listFinals: (endpointId, threadId, count, before) => finals.list(endpointId, threadId, count, before),
+        listOwnerConversation: (endpointId, threadId, before, limit) => conversations.listOwnerConversation(endpointId, threadId, before, limit),
         provider: (id) => sessionProvider(id),
       },
       // Local file browsing is confined to each session's managed project directory. Only LOCAL

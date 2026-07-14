@@ -33,6 +33,15 @@ export interface WebServer {
   stop(): Promise<void>;
 }
 
+// Parse ?limit= (1..50, default 20) and an optional ?before= millis cursor for scroll-up paging.
+function pageParams(url: URL): { limit: number; before: number | undefined } {
+  const rawLimit = Number(url.searchParams.get("limit") ?? "20");
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(50, Math.trunc(rawLimit))) : 20;
+  const rawBefore = url.searchParams.get("before");
+  const before = rawBefore !== null && Number.isFinite(Number(rawBefore)) ? Number(rawBefore) : undefined;
+  return { limit, before };
+}
+
 function tokenValid(expected: string, actual: string | undefined): boolean {
   if (!actual) return false;
   const a = Buffer.from(expected);
@@ -98,16 +107,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
     if (request.method === "GET" && url.pathname === "/api/sessions") { json(response, 200, { sessions: listSessions(options.reads) }); return; }
     if (request.method === "GET" && url.pathname === "/api/assistant/messages") {
-      const count = Number(url.searchParams.get("count") ?? "20");
-      json(response, 200, { messages: assistantTranscript(options.reads, Number.isFinite(count) ? count : 20) });
+      const { limit, before } = pageParams(url);
+      json(response, 200, assistantTranscript(options.reads, limit, before));
       return;
     }
     const messages = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/messages$/u.exec(url.pathname);
     if (request.method === "GET" && messages) {
-      const count = Number(url.searchParams.get("count") ?? "20");
-      const result = transcript(options.reads, messages[1]!, Number.isFinite(count) ? count : 20);
+      const { limit, before } = pageParams(url);
+      const result = transcript(options.reads, messages[1]!, limit, before);
       if (!result) { json(response, 404, { error: "unknown session" }); return; }
-      json(response, 200, { messages: result });
+      json(response, 200, result);
       return;
     }
     // Local file browsing, confined to the named session's project directory (web-files.ts).

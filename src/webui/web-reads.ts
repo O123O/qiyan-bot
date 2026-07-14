@@ -5,9 +5,9 @@ import type { LogicalFinalMessage } from "../sessions/final-messages.ts";
 export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
-  listFinals(endpointId: string, threadId: string, count: number): LogicalFinalMessage[];
-  // Recent real user chat messages (source_class='chat'), oldest → newest — excludes internal plumbing.
-  listUserMessages(count: number): Array<{ body: string; at: number }>;
+  listFinals(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[];
+  // The owner↔assistant conversation (your chat + the assistant's replies), oldest → newest.
+  listOwnerConversation(endpointId: string, threadId: string, before: number | undefined, limit: number): WebConvoMessage[];
   provider(endpointId: string): "codex" | "claude";
 }
 
@@ -15,6 +15,12 @@ export interface WebConvoMessage {
   role: "you" | "assistant";
   body: string;
   at: number;
+}
+
+// One page of messages plus whether an older page exists (a full page came back ⇒ maybe more).
+export interface WebPage<T> {
+  messages: T[];
+  hasOlder: boolean;
 }
 
 export interface WebSessionSummary {
@@ -57,28 +63,22 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
   }).sort((a, b) => a.nickname.localeCompare(b.nickname));
 }
 
-// A worker's final messages (lease-free), oldest → newest. `count` is clamped to the store's 1..20.
-export function transcript(deps: WebReadsDeps, nickname: string, count: number): WebMessage[] | undefined {
+// A worker's final messages (lease-free), oldest → newest, one page. `before` (a completedAt cursor)
+// pages older for scroll-up. `hasOlder` is true when the page came back full.
+export function transcript(deps: WebReadsDeps, nickname: string, limit: number, before?: number): WebPage<WebMessage> | undefined {
   const session = deps.registrySnapshot().sessions[nickname];
   if (!session) return undefined;
-  return finals(deps, session.endpoint, session.thread_id, count);
+  const clamped = Math.max(1, Math.min(50, limit));
+  const messages = deps.listFinals(session.endpoint, session.thread_id, clamped, before)
+    .map((m): WebMessage => ({ turnId: m.turnId, body: m.body, completedAt: m.completedAt, terminalStatus: m.terminalStatus }));
+  return { messages, hasOlder: messages.length === clamped };
 }
 
-// The QiYan conversation, lease-free, oldest → newest: the assistant's replies (final-message store)
-// merged with your real chat messages (source_class='chat') by time. Survives reloads/restarts.
-// The final-message store keeps only agent output, so the user side comes from the conversation store.
-export function assistantTranscript(deps: WebReadsDeps, count: number): WebConvoMessage[] {
+// The QiYan conversation (your chat + the assistant's replies), lease-free, oldest → newest, one
+// page. `before` pages older. Survives reloads/restarts. Whitespace-only finals are dropped.
+export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
   const assistant = deps.registrySnapshot().assistant;
-  const clamped = Math.max(1, Math.min(20, count));
-  const replies = deps.listFinals(assistant.endpoint, assistant.thread_id, clamped)
-    .map((m): WebConvoMessage => ({ role: "assistant", body: m.body, at: m.completedAt }));
-  const prompts = deps.listUserMessages(clamped)
-    .map((m): WebConvoMessage => ({ role: "you", body: m.body, at: m.at }));
-  return [...replies, ...prompts].filter((m) => m.body.trim()).sort((a, b) => a.at - b.at);
-}
-
-function finals(deps: WebReadsDeps, endpoint: string, threadId: string, count: number): WebMessage[] {
-  const clamped = Math.max(1, Math.min(20, count));
-  return deps.listFinals(endpoint, threadId, clamped)
-    .map((message) => ({ turnId: message.turnId, body: message.body, completedAt: message.completedAt, terminalStatus: message.terminalStatus }));
+  const clamped = Math.max(1, Math.min(50, limit));
+  const raw = deps.listOwnerConversation(assistant.endpoint, assistant.thread_id, before, clamped);
+  return { messages: raw.filter((m) => m.body.trim()), hasOlder: raw.length === clamped };
 }

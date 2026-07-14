@@ -22,7 +22,10 @@ body { margin:0; }
 
 .body { flex:1; display:flex; min-height:0; }
 .files { width:290px; flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
-.files-head { padding:11px 14px; border-bottom:1px solid var(--line); font-weight:600; }
+.files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
+.ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
+.older { text-align:center; color:var(--muted); font-size:12px; padding:6px 0 10px; }
+.file-link { background:transparent; border:0; padding:0; color:var(--accent); cursor:pointer; font:inherit; text-decoration:underline; }
 .tree { overflow-y:auto; padding:8px; }
 .crumbs { color:var(--muted); font-size:12px; margin-bottom:8px; word-break:break-all; } .crumbs a { color:var(--accent); cursor:pointer; }
 .frow { padding:5px 8px; border-radius:6px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }

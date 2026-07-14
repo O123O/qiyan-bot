@@ -38,12 +38,17 @@ export class FinalMessageStore {
     return eligible.map(({ item }) => this.get(endpointId, threadId, turn.id, item.id) as LogicalFinalMessage);
   }
 
-  list(endpointId: string, threadId: string, count: number): LogicalFinalMessage[] {
-    if (!Number.isSafeInteger(count) || count < 1 || count > 20) throw new RangeError("count must be between 1 and 20");
+  // Newest `count` messages, oldest → newest. With `before` (a completed_at cursor) returns the page
+  // strictly older than that instant — for scroll-up pagination.
+  list(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[] {
+    if (!Number.isSafeInteger(count) || count < 1 || count > 50) throw new RangeError("count must be between 1 and 50");
+    const cursor = before !== undefined && Number.isFinite(before);
+    const clause = cursor ? " AND completed_at < ?" : "";
+    const params = cursor ? [endpointId, threadId, before as number, count] : [endpointId, threadId, count];
     const rows = this.db.prepare(`SELECT * FROM (
-      SELECT * FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?
+      SELECT * FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?${clause}
       ORDER BY completed_at DESC, turn_id DESC, item_order DESC LIMIT ?
-    ) ORDER BY completed_at ASC, turn_id ASC, item_order ASC`).all(endpointId, threadId, count) as Array<Record<string, unknown>>;
+    ) ORDER BY completed_at ASC, turn_id ASC, item_order ASC`).all(...params) as Array<Record<string, unknown>>;
     return rows.map((row) => this.fromRow(row));
   }
 

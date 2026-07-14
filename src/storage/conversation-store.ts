@@ -111,15 +111,23 @@ export class ConversationStore {
     return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?").get(kind, sourceId) !== undefined;
   }
 
-  // The most recent real user chat messages (source_class='chat'), oldest → newest. Excludes internal
-  // submissions (delivery batches, /to awareness copies, etc.). Lease-free — for the web UI's
-  // two-sided QiYan history.
-  listRecentUserMessages(count: number): Array<{ body: string; at: number }> {
-    const clamped = Math.max(1, Math.min(20, count));
-    const rows = this.db.prepare(
-      "SELECT raw_text, created_at FROM source_contexts WHERE source_class = 'chat' ORDER BY created_at DESC, arrival_sequence DESC LIMIT ?",
-    ).all(clamped) as Array<{ raw_text: string; created_at: number }>;
-    return rows.reverse().map((row) => ({ body: String(row.raw_text), at: Number(row.created_at) }));
+  // The owner↔assistant conversation for the web UI's QiYan tab, oldest → newest: your real chat
+  // messages (source_class='chat', excluding internal plumbing) merged with the assistant's replies
+  // (logical_final_messages for its thread) in one time-ordered page. `before` (a millis cursor)
+  // pages strictly older, for scroll-up. Lease-free; reads the final-message table by design so the
+  // merge + pagination happen in a single correct query.
+  listOwnerConversation(endpointId: string, threadId: string, before: number | undefined, limit: number): Array<{ role: "you" | "assistant"; body: string; at: number }> {
+    const clamped = Math.max(1, Math.min(50, limit));
+    const cursor = before !== undefined && Number.isFinite(before);
+    const rows = this.db.prepare(`SELECT role, body, at FROM (
+        SELECT 'assistant' AS role, body AS body, completed_at AS at FROM logical_final_messages
+          WHERE endpoint_id = ? AND thread_id = ?${cursor ? " AND completed_at < ?" : ""}
+        UNION ALL
+        SELECT 'you' AS role, raw_text AS body, created_at AS at FROM source_contexts
+          WHERE source_class = 'chat'${cursor ? " AND created_at < ?" : ""}
+      ) ORDER BY at DESC LIMIT ?`)
+      .all(...(cursor ? [endpointId, threadId, before, before, clamped] : [endpointId, threadId, clamped])) as Array<{ role: string; body: string; at: number }>;
+    return rows.reverse().map((row) => ({ role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at) }));
   }
 
   createInternalSource(input: InternalSource): string {

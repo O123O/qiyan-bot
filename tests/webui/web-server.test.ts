@@ -17,8 +17,16 @@ const reads: WebReadsDeps = {
   dashboardSnapshot: () => ({ version: 2, sessions: {
     payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: null, pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
-  listFinals: (_e, _t, count) => Array.from({ length: Math.min(count, 2) }, (_, i) => ({ id: `f${i}`, endpointId: "local", threadId: "t1", turnId: `turn-${i}`, itemId: `it${i}`, completedAt: 1000 + i, itemOrder: 0, body: `final ${i}`, terminalStatus: "completed" })),
-  listUserMessages: () => [{ body: "hi there", at: 500 }],
+  listFinals: (_e, _t, count, before) => {
+    const all = Array.from({ length: 2 }, (_, i) => ({ id: `f${i}`, endpointId: "local", threadId: "t1", turnId: `turn-${i}`, itemId: `it${i}`, completedAt: 1000 + i, itemOrder: 0, body: `final ${i}`, terminalStatus: "completed" }));
+    const older = all.filter((m) => before === undefined || m.completedAt < before);
+    return older.slice(Math.max(0, older.length - count));
+  },
+  listOwnerConversation: (_e, _t, before, limit) => {
+    const convo = [{ role: "you" as const, body: "hi there", at: 500 }, { role: "assistant" as const, body: "final 0", at: 1000 }, { role: "assistant" as const, body: "final 1", at: 1001 }];
+    const older = convo.filter((m) => before === undefined || m.at < before);
+    return older.slice(Math.max(0, older.length - limit));
+  },
   provider: () => "codex",
 };
 
@@ -62,13 +70,26 @@ test("serves the session list and a worker transcript", async () => {
 
 test("serves the assistant's persisted two-sided history, merged by time", async () => {
   await withServer(async (base) => {
-    const h = await (await fetch(`${base}/api/assistant/messages?count=5&token=${TOKEN}`)).json();
+    const h = await (await fetch(`${base}/api/assistant/messages?limit=5&token=${TOKEN}`)).json();
     // user prompt @500 sorts before the agent finals @1000/@1001
     assert.deepEqual(h.messages, [
       { role: "you", body: "hi there", at: 500 },
       { role: "assistant", body: "final 0", at: 1000 },
       { role: "assistant", body: "final 1", at: 1001 },
     ]);
+    assert.equal(h.hasOlder, false);
+  });
+});
+
+test("paginates older messages with the before cursor", async () => {
+  await withServer(async (base) => {
+    const page1 = await (await fetch(`${base}/api/assistant/messages?limit=2&token=${TOKEN}`)).json();
+    assert.deepEqual(page1.messages.map((m: { body: string }) => m.body), ["final 0", "final 1"]);
+    assert.equal(page1.hasOlder, true); // a full page came back ⇒ maybe older
+    const oldest = page1.messages[0].at; // 1000
+    const page2 = await (await fetch(`${base}/api/assistant/messages?limit=2&before=${oldest}&token=${TOKEN}`)).json();
+    assert.deepEqual(page2.messages.map((m: { body: string }) => m.body), ["hi there"]);
+    assert.equal(page2.hasOlder, false);
   });
 });
 
