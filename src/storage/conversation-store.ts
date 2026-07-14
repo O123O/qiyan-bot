@@ -111,29 +111,23 @@ export class ConversationStore {
     return this.db.prepare("SELECT 1 FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?").get(kind, sourceId) !== undefined;
   }
 
-  // The owner↔assistant conversation for the web UI's QiYan tab, oldest → newest: your real chat
-  // messages (source_class='chat', excluding internal plumbing) merged with the assistant's replies
-  // (logical_final_messages for its thread) in one time-ordered page. `before` (a millis cursor)
-  // pages strictly older, for scroll-up. Lease-free; reads the final-message table by design so the
-  // merge + pagination happen in a single correct query.
-  listOwnerConversation(endpointId: string, threadId: string, before: number | undefined, limit: number): Array<{ id: string; role: "you" | "assistant"; body: string; at: number }> {
+  // The owner↔QiYan conversation for the web UI's QiYan tab, oldest → newest. QiYan's side is the
+  // `deliveries` outbox — everything the owner was actually sent: assistant replies, the backend's
+  // "[worker] …" relays (delivered directly, so NOT in the assistant thread), and system notices —
+  // merged with your inbound chat messages (source_class='chat'). The cursor is INCLUSIVE (`<=`) with a
+  // stable-id tie-break (the caller dedups) so same-millisecond rows are never skipped; `created_at` is
+  // millis but normalized defensively. Lease-free; the merge + pagination are one correct query.
+  listOwnerConversation(before: number | undefined, limit: number): Array<{ id: string; role: "you" | "assistant"; body: string; at: number }> {
     const clamped = Math.max(1, Math.min(50, limit));
     const cursor = before !== undefined && Number.isFinite(before);
-    // `at` (completed_at / created_at) is not unique, so the cursor is INCLUSIVE (`<=`) and a stable id
-    // tie-breaks the ORDER BY; the caller dedups by id. Otherwise same-millisecond rows straddling a
-    // page boundary would be skipped forever.
-    // Timestamps may be seconds or millis across rows; normalize both legs to millis so the merge
-    // orders correctly (older assistant replies were persisted in seconds). Matches toMillis.
-    const A = "(CASE WHEN completed_at < 1000000000000 THEN completed_at * 1000 ELSE completed_at END)";
-    const U = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
+    const NORM = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
     const rows = this.db.prepare(`SELECT id, role, body, at FROM (
-        SELECT id AS id, 'assistant' AS role, body AS body, ${A} AS at FROM logical_final_messages
-          WHERE endpoint_id = ? AND thread_id = ?${cursor ? ` AND ${A} <= ?` : ""}
+        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at FROM deliveries${cursor ? ` WHERE ${NORM} <= ?` : ""}
         UNION ALL
-        SELECT id AS id, 'you' AS role, raw_text AS body, ${U} AS at FROM source_contexts
-          WHERE source_class = 'chat'${cursor ? ` AND ${U} <= ?` : ""}
+        SELECT id AS id, 'you' AS role, raw_text AS body, ${NORM} AS at FROM source_contexts
+          WHERE source_class = 'chat'${cursor ? ` AND ${NORM} <= ?` : ""}
       ) ORDER BY at DESC, id DESC LIMIT ?`)
-      .all(...(cursor ? [endpointId, threadId, before, before, clamped] : [endpointId, threadId, clamped])) as Array<{ id: string; role: string; body: string; at: number }>;
+      .all(...(cursor ? [before, before, clamped] : [clamped])) as Array<{ id: string; role: string; body: string; at: number }>;
     return rows.reverse().map((row) => ({ id: String(row.id), role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at) }));
   }
 

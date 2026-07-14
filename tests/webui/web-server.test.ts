@@ -22,7 +22,7 @@ const reads: WebReadsDeps = {
     const older = all.filter((m) => before === undefined || m.completedAt <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - count));
   },
-  listOwnerConversation: (_e, _t, before, limit) => {
+  listOwnerConversation: (before, limit) => {
     const convo = [{ id: "s1", role: "you" as const, body: "hi there", at: 500 }, { id: "f0", role: "assistant" as const, body: "final 0", at: 1000 }, { id: "f1", role: "assistant" as const, body: "final 1", at: 1001 }];
     const older = convo.filter((m) => before === undefined || m.at <= before); // inclusive cursor
     return older.slice(Math.max(0, older.length - limit));

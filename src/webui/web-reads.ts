@@ -6,8 +6,9 @@ export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
   listFinals(endpointId: string, threadId: string, count: number, before?: number): LogicalFinalMessage[];
-  // The owner↔assistant conversation (your chat + the assistant's replies), oldest → newest.
-  listOwnerConversation(endpointId: string, threadId: string, before: number | undefined, limit: number): WebConvoMessage[];
+  // The owner↔QiYan conversation (your chat + everything the owner was sent — replies, [worker]
+  // relays, notices), oldest → newest.
+  listOwnerConversation(before: number | undefined, limit: number): WebConvoMessage[];
   provider(endpointId: string): "codex" | "claude";
 }
 
@@ -80,8 +81,7 @@ export function transcript(deps: WebReadsDeps, nickname: string, limit: number, 
 // page. `before` pages older. Survives reloads/restarts. Rows are returned raw (whitespace included)
 // so `hasOlder` and the client's `before` cursor stay consistent; the client hides blank bodies.
 export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
-  const assistant = deps.registrySnapshot().assistant;
   const clamped = Math.max(1, Math.min(50, limit));
-  const messages = deps.listOwnerConversation(assistant.endpoint, assistant.thread_id, before, clamped);
+  const messages = deps.listOwnerConversation(before, clamped);
   return { messages, hasOlder: messages.length === clamped };
 }
