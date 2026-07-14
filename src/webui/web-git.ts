@@ -1,6 +1,27 @@
 import { execFile } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { readdir, realpath } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import { confine } from "./web-files.ts";
+
+// Find git repos (dirs containing a `.git`) under `root`, depth-limited, returning paths relative to
+// root ("" = root itself is a repo). Does not descend into a found repo. For the "add repo" picker.
+export async function discoverRepos(root: string, limit = 50, maxDepth = 4): Promise<string[]> {
+  const realRoot = await realpath(root).catch(() => undefined);
+  if (realRoot === undefined) return [];
+  const found: string[] = [];
+  const skip = new Set(["node_modules", ".venv", "__pycache__", "dist", "build"]);
+  const walk = async (dir: string, rel: string, depth: number): Promise<void> => {
+    if (found.length >= limit || depth > maxDepth) return;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    if (entries.some((e) => e.name === ".git")) { found.push(rel); return; } // a repo — don't recurse in
+    for (const e of entries) {
+      if (found.length >= limit) return;
+      if (e.isDirectory() && !skip.has(e.name) && !e.name.startsWith(".")) await walk(join(dir, e.name), rel ? `${rel}/${e.name}` : e.name, depth + 1);
+    }
+  };
+  await walk(realRoot, "", 0);
+  return found;
+}
 
 // Run `git` in `dir` with argument vectors (no shell — paths/messages are args, so no injection).
 function git(dir: string, args: string[], timeoutMs = 15_000): Promise<{ code: number; stdout: string; stderr: string }> {

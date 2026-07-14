@@ -27,7 +27,11 @@ body { margin:0; }
 .resizer { flex:0 0 5px; cursor:col-resize; background:transparent; } .resizer:hover { background:var(--accent); }
 .tw { display:inline-block; width:1.1em; color:var(--muted); }
 .tabs2 { display:flex; gap:4px; } .tabs2 button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 8px; border-radius:6px; font-weight:600; } .tabs2 button.on { color:var(--text); background:var(--panel2); }
-.gbranch { padding:6px 10px; color:var(--muted); font-size:12px; border-bottom:1px solid var(--line); margin-bottom:6px; }
+.git-toolbar { display:flex; gap:6px; padding:6px 8px; }
+.discover { border:1px solid var(--line); border-radius:8px; margin:0 8px 8px; padding:4px; }
+.grepo { border:1px solid var(--line); border-radius:8px; margin:0 8px 8px; overflow:hidden; }
+.grepo-h { display:flex; align-items:center; gap:4px; padding:6px 8px; background:var(--panel2); font-size:12px; font-weight:600; }
+.grepo-h .actions { display:flex; } /* repo header actions always visible */
 .gsec-h { padding:4px 10px; font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; }
 .commit { border-top:1px solid var(--line); margin-top:8px; padding:10px; display:flex; flex-direction:column; gap:6px; }
 .commit textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 8px; resize:none; font:inherit; }

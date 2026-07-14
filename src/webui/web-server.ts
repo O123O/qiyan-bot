@@ -7,10 +7,10 @@ import { WebSocketServer } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
-import { browse, createEntry, resolvePath, type WebFilesDeps } from "./web-files.ts";
+import { browse, confine, createEntry, resolvePath, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
-import { gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
+import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
@@ -209,12 +209,22 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, 200, await runCommand(cwd, command, { maxBytes: 256 * 1024, timeoutMs: 30_000 }));
       return;
     }
-    // Git source control for a LOCAL session's project dir.
+    // Git source control. Repos are tracked MANUALLY by the client (a worker's cwd may not be a repo,
+    // or may hold several in subdirs), so ops take a `repo` sub-path confined to the session's project.
+    const gitRepoDir = async (session: unknown, repo: unknown): Promise<string | undefined> => {
+      const proj = typeof session === "string" ? options.files.projectDir(session) : undefined;
+      return proj ? confine(proj, typeof repo === "string" && repo ? repo : ".") : undefined;
+    };
+    if (request.method === "GET" && url.pathname === "/api/git/discover") {
+      const proj = options.files.projectDir(url.searchParams.get("session") ?? "");
+      json(response, 200, { repos: proj ? await discoverRepos(proj) : [] });
+      return;
+    }
     if (request.method === "GET" && (url.pathname === "/api/git/status" || url.pathname === "/api/git/diff")) {
-      const repo = options.files.projectDir(url.searchParams.get("session") ?? "");
-      if (!repo) { json(response, 400, { error: "not a local session" }); return; }
-      if (url.pathname === "/api/git/status") { json(response, 200, await gitStatus(repo)); return; }
-      const result = await gitDiff(repo, url.searchParams.get("path") ?? "", url.searchParams.get("staged") === "1");
+      const dir = await gitRepoDir(url.searchParams.get("session"), url.searchParams.get("repo"));
+      if (!dir) { json(response, 400, { error: "repo not found" }); return; }
+      if (url.pathname === "/api/git/status") { json(response, 200, await gitStatus(dir)); return; }
+      const result = await gitDiff(dir, url.searchParams.get("path") ?? "", url.searchParams.get("staged") === "1");
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
@@ -222,13 +232,13 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (request.method === "POST" && gitOp) {
       const body = await readJson(request);
       if (!body) { json(response, 400, { error: "invalid json" }); return; }
-      const repo = options.files.projectDir(typeof body.session === "string" ? body.session : "");
-      if (!repo) { json(response, 400, { error: "not a local session" }); return; }
+      const dir = await gitRepoDir(body.session, body.repo);
+      if (!dir) { json(response, 400, { error: "repo not found" }); return; }
       const op = gitOp[1];
       const result = op === "commit"
-        ? await gitCommit(repo, typeof body.message === "string" ? body.message : "")
+        ? await gitCommit(dir, typeof body.message === "string" ? body.message : "")
         : typeof body.path === "string" && body.path
-          ? await (op === "stage" ? gitStage : gitUnstage)(repo, body.path)
+          ? await (op === "stage" ? gitStage : gitUnstage)(dir, body.path)
           : { error: "path required" };
       json(response, "error" in result ? 400 : 200, result);
       return;

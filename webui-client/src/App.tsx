@@ -134,8 +134,10 @@ export function App() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
   const [sidebarTab, setSidebarTab] = useState<"files" | "git">("files");
-  const [git, setGit] = useState<GitStatus | { error: string } | null>(null);
-  const [commitMsg, setCommitMsg] = useState("");
+  const [trackedRepos, setTrackedRepos] = useState<string[]>([]);            // repos tracked for this worker (localStorage)
+  const [repoStatus, setRepoStatus] = useState<Record<string, GitStatus | { error: string } | "loading">>({});
+  const [discovered, setDiscovered] = useState<string[] | null>(null);       // add-repo picker (null = closed)
+  const [commitMsg, setCommitMsg] = useState<Record<string, string>>({});    // per-repo commit message
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
@@ -185,7 +187,13 @@ export function App() {
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); } }, [selected, loadFinals, loadDir]);
-  useEffect(() => { if (selected && sidebarTab === "git") loadGit(selected); else if (!selected) setGit(null); }, [selected, sidebarTab]); // eslint-disable-line  // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
+  useEffect(() => {
+    if (selected && sidebarTab === "git") {
+      const saved = JSON.parse(localStorage.getItem(`qiyan-git:${selected}`) || "[]") as string[];
+      setTrackedRepos(saved); setDiscovered(null);
+      saved.forEach((r) => loadRepoStatus(selected, r));
+    }
+  }, [selected, sidebarTab]); // eslint-disable-line  // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
   useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
 
   // The visible conversation: QiYan = loaded history + session activity; worker = its finals + your
@@ -348,46 +356,76 @@ export function App() {
     window.addEventListener("mouseup", onUp);
   };
 
-  // Git source control (per the selected worker's project).
-  const loadGit = (nickname: string) => void api<GitStatus | { error: string }>(`/api/git/status?session=${nickname}`).then(setGit).catch((e) => setGit({ error: (e as { error?: string })?.error ?? "unavailable" }));
-  const gitAct = async (op: "stage" | "unstage", path: string) => {
+  // Git: repos are tracked MANUALLY (added from discovery / persisted per worker), refreshed manually.
+  const loadRepoStatus = (session: string, repo: string) => {
+    setRepoStatus((s) => ({ ...s, [repo]: "loading" }));
+    void api<GitStatus | { error: string }>(`/api/git/status?session=${session}&repo=${encodeURIComponent(repo)}`)
+      .then((r) => setRepoStatus((s) => ({ ...s, [repo]: r })))
+      .catch((e) => setRepoStatus((s) => ({ ...s, [repo]: { error: (e as { error?: string })?.error ?? "unavailable" } })));
+  };
+  const saveRepos = (session: string, list: string[]) => { setTrackedRepos(list); localStorage.setItem(`qiyan-git:${session}`, JSON.stringify(list)); };
+  const addRepo = (repo: string) => { if (!selected || trackedRepos.includes(repo)) return; saveRepos(selected, [...trackedRepos, repo]); loadRepoStatus(selected, repo); setDiscovered(null); };
+  const removeRepo = (repo: string) => { if (!selected) return; saveRepos(selected, trackedRepos.filter((r) => r !== repo)); setRepoStatus((s) => { const n = { ...s }; delete n[repo]; return n; }); };
+  const openDiscover = () => { if (!selected) return; void api<{ repos: string[] }>(`/api/git/discover?session=${selected}`).then((r) => setDiscovered(r.repos)).catch(() => setDiscovered([])); };
+  const gitAct = async (op: "stage" | "unstage", repo: string, path: string) => {
     if (!selected) return;
-    try { await api(`/api/git/${op}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, path }) }); loadGit(selected); }
+    try { await api(`/api/git/${op}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, repo, path }) }); loadRepoStatus(selected, repo); }
     catch (e) { alert((e as { error?: string })?.error ?? "failed"); }
   };
-  const commit = async () => {
-    if (!selected || !commitMsg.trim()) return;
-    try { await api("/api/git/commit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, message: commitMsg }) }); setCommitMsg(""); loadGit(selected); }
+  const commitRepo = async (repo: string) => {
+    const msg = commitMsg[repo];
+    if (!selected || !msg?.trim()) return;
+    try { await api("/api/git/commit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: selected, repo, message: msg }) }); setCommitMsg((m) => ({ ...m, [repo]: "" })); loadRepoStatus(selected, repo); }
     catch (e) { alert((e as { error?: string })?.error ?? "commit failed"); }
   };
-  const openDiff = (path: string, staged: boolean) => {
+  const openDiff = (repo: string, path: string, staged: boolean) => {
     if (!selected) return;
     setPreview({ kind: "loading", title: `diff · ${path}` });
-    void api<{ diff: string }>(`/api/git/diff?session=${selected}&path=${encodeURIComponent(path)}&staged=${staged ? "1" : "0"}`)
+    void api<{ diff: string }>(`/api/git/diff?session=${selected}&repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}&staged=${staged ? "1" : "0"}`)
       .then((r) => setPreview({ kind: "text", title: `${staged ? "staged " : ""}diff · ${path}`, text: r.diff, truncated: false, lang: "diff" }))
       .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string })?.error ?? "diff failed" }));
   };
-  const renderGit = (): React.ReactNode => {
-    if (!git) return <div className="hint">loading…</div>;
-    if ("error" in git) return <div className="hint">{git.error === "not a local session" ? "Not a local session." : git.error}</div>;
-    const section = (label: string, files: string[], staged: boolean) => files.length ? (
-      <div className="gsec" key={label}><div className="gsec-h">{label} · {files.length}</div>
-        {files.map((f) => <div key={label + f} className="frow"><span className="fname" title="View diff" onClick={() => openDiff(f, staged)}>{f}</span>
-          <span className="actions">{staged ? <button title="Unstage" onClick={() => void gitAct("unstage", f)}>−</button> : <button title="Stage" onClick={() => void gitAct("stage", f)}>＋</button>}</span></div>)}
+  const renderRepo = (repo: string): React.ReactNode => {
+    const st = repoStatus[repo];
+    const label = repo === "" ? "(workspace root)" : repo;
+    const section = (title: string, files: string[], staged: boolean) => files.length ? (
+      <div className="gsec" key={title}><div className="gsec-h">{title} · {files.length}</div>
+        {files.map((f) => <div key={title + f} className="frow"><span className="fname" title="View diff" onClick={() => openDiff(repo, f, staged)}>{f}</span>
+          <span className="actions">{staged ? <button title="Unstage" onClick={() => void gitAct("unstage", repo, f)}>−</button> : <button title="Stage" onClick={() => void gitAct("stage", repo, f)}>＋</button>}</span></div>)}
       </div>) : null;
-    const clean = !git.staged.length && !git.changes.length && !git.untracked.length;
-    return <div className="tree">
-      <div className="gbranch">⎇ {git.branch || "—"}{git.ahead ? ` ↑${git.ahead}` : ""}{git.behind ? ` ↓${git.behind}` : ""}</div>
-      {section("Staged", git.staged, true)}
-      {section("Changes", git.changes, false)}
-      {section("Untracked", git.untracked, false)}
-      {clean && <div className="hint">clean working tree</div>}
-      <div className="commit">
-        <textarea value={commitMsg} onChange={(e) => setCommitMsg(e.target.value)} rows={2} placeholder="Commit message (staged files)" />
-        <button disabled={!git.staged.length || !commitMsg.trim()} onClick={() => void commit()}>Commit · {git.staged.length}</button>
+    const branch = st && typeof st === "object" && "branch" in st ? ` · ${st.branch}${st.ahead ? ` ↑${st.ahead}` : ""}${st.behind ? ` ↓${st.behind}` : ""}` : "";
+    return <div className="grepo" key={repo}>
+      <div className="grepo-h">
+        <span className="fname" title={label}>⎇ {label}{branch}</span>
+        <span className="actions"><button title="Refresh" onClick={() => loadRepoStatus(selected!, repo)}>⟳</button><button title="Untrack" onClick={() => removeRepo(repo)}>✕</button></span>
       </div>
+      {st === "loading" || st === undefined ? <div className="hint">loading…</div>
+        : "error" in st ? <div className="hint">{st.error}</div>
+        : <>
+          {section("Staged", st.staged, true)}{section("Changes", st.changes, false)}{section("Untracked", st.untracked, false)}
+          {!st.staged.length && !st.changes.length && !st.untracked.length && <div className="hint">clean</div>}
+          <div className="commit">
+            <textarea value={commitMsg[repo] ?? ""} onChange={(e) => setCommitMsg((m) => ({ ...m, [repo]: e.target.value }))} rows={2} placeholder="Commit message (staged)" />
+            <button disabled={!st.staged.length || !(commitMsg[repo] ?? "").trim()} onClick={() => void commitRepo(repo)}>Commit · {st.staged.length}</button>
+          </div>
+        </>}
     </div>;
   };
+  const renderGit = (): React.ReactNode => (
+    <div className="tree">
+      <div className="git-toolbar">
+        <button className="ghost sm" onClick={openDiscover}>＋ Add repo</button>
+        {trackedRepos.length > 0 && <button className="ghost sm" title="Refresh all" onClick={() => trackedRepos.forEach((r) => loadRepoStatus(selected!, r))}>⟳</button>}
+      </div>
+      {discovered !== null && <div className="discover">
+        {discovered.filter((r) => !trackedRepos.includes(r)).length === 0 ? <div className="hint">{discovered.length ? "all discovered repos are tracked" : "no git repos found under this project"}</div>
+          : discovered.filter((r) => !trackedRepos.includes(r)).map((r) => <div key={r} className="frow" onClick={() => addRepo(r)}>＋ {r === "" ? "(workspace root)" : r}</div>)}
+        <div className="frow" onClick={() => setDiscovered(null)}>✕ close</div>
+      </div>}
+      {trackedRepos.length === 0 && discovered === null && <div className="hint">No repos tracked. Use “＋ Add repo” to track a git repo under this worker's project.</div>}
+      {trackedRepos.map((r) => renderRepo(r))}
+    </div>
+  );
 
   // Open a file in the popup. Text is STREAMED into the panel (not preloaded); images render inline;
   // pdf/html open in a new tab. The server resolves the path (any root for absolute, ?session=’s
@@ -437,14 +475,12 @@ export function App() {
           <div className="files-head">
             <span className="tabs2">
               <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
-              <button className={sidebarTab === "git" ? "on" : ""} onClick={() => { setSidebarTab("git"); if (selected) loadGit(selected); }}>Git</button>
+              <button className={sidebarTab === "git" ? "on" : ""} onClick={() => setSidebarTab("git")}>Git</button>
             </span>
-            {selected && <span className="head-actions">
-              {sidebarTab === "files" && <>
-                <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
-                <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
-              </>}
-              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { if (sidebarTab === "git") loadGit(selected); else { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); } void loadSessions(); }}>⟳</button>
+            {selected && sidebarTab === "files" && <span className="head-actions">
+              <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
+              <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
+              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>
             </span>}
           </div>
           {selected === null ? <div className="hint">Select a worker to browse its files / git.</div> : sidebarTab === "files" ? <div className="tree">{renderDir("", 0)}</div> : renderGit()}
