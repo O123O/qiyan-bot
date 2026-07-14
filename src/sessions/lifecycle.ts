@@ -332,14 +332,33 @@ export class SessionLifecycle {
       assertCurrent();
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       let resumed: ThreadResponse | undefined;
+      // Fast path for the common bot-restart case (the app-server kept the thread loaded → status "idle",
+      // and the session already has a persisted epoch): a metadata-only read is enough — the epoch and
+      // the delivery cursor already hold what recovery needs, so re-materializing the whole rollout (and
+      // re-resuming an already-loaded thread) is pure waste. Fall back to the original full path when:
+      //   • the thread is non-idle ("notLoaded" must be resumed+materialized; "active"/other needs its
+      //     turns to recover the in-flight turn), or
+      //   • there is no epoch yet (first adoption) — beginEpoch below needs the last turn id as the
+      //     delivery baseline, so we must materialize.
+      const hasEpoch = this.runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id) !== undefined;
       let before: ThreadResponse;
-      try { before = await this.read(session.endpoint, session.thread_id, lease); }
-      catch (error) {
+      try {
+        if (hasEpoch) {
+          before = await this.readLight(session.endpoint, session.thread_id, lease);
+          // Idle → done (fast path). Non-idle ("active", …) still needs its turns to recover the in-flight turn.
+          if (before.thread.status.type !== "idle") before = await this.read(session.endpoint, session.thread_id, lease);
+        } else {
+          before = await this.read(session.endpoint, session.thread_id, lease);
+        }
+      } catch (error) {
         if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
         resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
-        before = await this.read(session.endpoint, session.thread_id, lease);
+        // After resuming, take the same fast path: with a persisted epoch a metadata read is enough
+        // unless the thread came back non-idle (needs its turns for the in-flight turn).
+        before = hasEpoch ? await this.readLight(session.endpoint, session.thread_id, lease) : await this.read(session.endpoint, session.thread_id, lease);
+        if (hasEpoch && before.thread.status.type !== "idle") before = await this.read(session.endpoint, session.thread_id, lease);
       }
       assertCurrent();
       this.requireThreadIdentity(before.thread, session.thread_id);
@@ -484,6 +503,16 @@ export class SessionLifecycle {
       const response = await this.pool.request<ThreadResponse>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
       return { ...response, thread: { ...response.thread, turns: [] } };
     }
+  }
+
+  // Metadata-only read (status, cwd, rollout path) — does NOT ask for turns, so codex/claude never
+  // re-materializes the whole rollout. Used by managed recovery to check a thread's status cheaply
+  // before deciding whether the (rare) full read is actually needed.
+  private async readLight(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
+    const response = await this.pool.request<ThreadResponse>(endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease);
+    // includeTurns:false does not return turns; normalize to [] (as the `read` fallback does) so callers
+    // treat it as an unmaterialized view and never mistake it for "has turns".
+    return { ...response, thread: { ...response.thread, turns: [] } };
   }
 
   private requireIdle(thread: ThreadView): void {
