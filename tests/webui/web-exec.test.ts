@@ -25,6 +25,13 @@ test("enforces the timeout (SIGTERM/SIGKILL)", async () => {
   assert.equal(r.timedOut, true);
 });
 
+test("a backgrounded grandchild cannot hang the response (group kill)", async () => {
+  const t0 = Date.now();
+  const r = await runCommand(tmpdir(), "echo hi; sleep 30 &", { maxBytes: 4096, timeoutMs: 500 });
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`); // bounded well under the 30s sleep
+  assert.match(r.stdout, /hi/);
+});
+
 test("caps output at maxBytes and marks it truncated", async () => {
   const r = await runCommand(tmpdir(), "yes abcdefgh | head -c 100000", { maxBytes: 1024, timeoutMs: 5000 });
   assert.equal(r.truncated, true);

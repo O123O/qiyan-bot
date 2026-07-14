@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { isAbsolute } from "node:path";
+import { confine } from "./web-files.ts";
 
 // Run `git` in `dir` with argument vectors (no shell — paths/messages are args, so no injection).
 function git(dir: string, args: string[], timeoutMs = 15_000): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -22,7 +24,7 @@ export interface GitStatus {
 export async function gitStatus(dir: string): Promise<GitStatus | { error: string }> {
   const inside = await git(dir, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.stdout.trim() !== "true") return { error: "not a git repository" };
-  const r = await git(dir, ["status", "--porcelain=v1", "--branch"]);
+  const r = await git(dir, ["-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"]); // don't octal-escape non-ASCII names
   if (r.code !== 0 && !r.stdout) return { error: r.stderr.trim() || "git status failed" };
   let branch = "", ahead = 0, behind = 0;
   const staged: string[] = [], changes: string[] = [], untracked: string[] = [];
@@ -48,11 +50,17 @@ export async function gitStatus(dir: string): Promise<GitStatus | { error: strin
 // Unified diff for a path. `staged` → index diff; otherwise the worktree diff, falling back to a
 // whole-file diff for an untracked file.
 export async function gitDiff(dir: string, path: string, staged: boolean): Promise<{ diff: string } | { error: string }> {
+  // `--no-index` treats its args as arbitrary FS paths, so a path must be confined to the repo first —
+  // otherwise `path=/etc/hostname` would leak any file. Reject escapes syntactically and via realpath.
+  if (isAbsolute(path) || path.split(/[\\/]+/u).includes("..")) return { error: "path not allowed" };
   const inside = await git(dir, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.stdout.trim() !== "true") return { error: "not a git repository" };
   const primary = await git(dir, staged ? ["diff", "--cached", "--", path] : ["diff", "--", path]);
   if (primary.stdout.trim()) return { diff: primary.stdout };
-  if (!staged) { const untracked = await git(dir, ["diff", "--no-index", "--", "/dev/null", path]); if (untracked.stdout.trim()) return { diff: untracked.stdout }; }
+  if (!staged) {
+    const confined = await confine(dir, path); // untracked file must resolve inside the repo (no symlink escape)
+    if (confined) { const untracked = await git(dir, ["diff", "--no-index", "--", "/dev/null", confined]); if (untracked.stdout.trim()) return { diff: untracked.stdout }; }
+  }
   return { diff: primary.stdout || "(no changes)" };
 }
 

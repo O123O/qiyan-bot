@@ -17,19 +17,26 @@ const BLOCKED = /^\s*(sudo\s+)?(vi|vim|nvim|nano|emacs|less|more|man|top|htop|wa
 export function runCommand(cwd: string, command: string, opts: { maxBytes: number; timeoutMs: number }): Promise<ExecResult> {
   if (BLOCKED.test(command)) return Promise.resolve({ stdout: "", stderr: "interactive commands aren't supported here", exitCode: null, timedOut: false, truncated: false, error: "blocked" });
   return new Promise((resolveResult) => {
-    const child = spawn("bash", ["-lc", command], { cwd, env: { ...process.env, TERM: "dumb", PAGER: "cat", GIT_PAGER: "cat" } });
-    let stdout = "", stderr = "", size = 0, truncated = false, timedOut = false;
+    // `detached` makes bash a process-group leader so we can kill the WHOLE group — a backgrounded
+    // grandchild (`sleep 300 &`) would otherwise orphan, hold the stdout pipe, and hang the response.
+    const child = spawn("bash", ["-lc", command], { cwd, detached: true, env: { ...process.env, TERM: "dumb", PAGER: "cat", GIT_PAGER: "cat" } });
+    let stdout = "", stderr = "", size = 0, truncated = false, timedOut = false, settled = false;
+    let exitCode: number | null = null, errorMsg: string | undefined;
+    const killGroup = (sig: NodeJS.Signals): void => { try { if (child.pid) process.kill(-child.pid, sig); } catch { /* already gone */ } };
     const append = (buf: Buffer, add: (s: string) => void): void => {
       if (size >= opts.maxBytes) return;
       const chunk = buf.subarray(0, opts.maxBytes - size);
       size += chunk.length; add(chunk.toString("utf-8"));
-      if (size >= opts.maxBytes) { truncated = true; child.kill("SIGKILL"); }
+      if (size >= opts.maxBytes) { truncated = true; killGroup("SIGKILL"); }
     };
     child.stdout.on("data", (b: Buffer) => append(b, (s) => { stdout += s; }));
     child.stderr.on("data", (b: Buffer) => append(b, (s) => { stderr += s; }));
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 2000).unref?.(); }, opts.timeoutMs);
-    child.on("close", (code) => { clearTimeout(timer); resolveResult({ stdout, stderr, exitCode: code, timedOut, truncated }); });
-    child.on("error", (e) => { clearTimeout(timer); resolveResult({ stdout, stderr, exitCode: null, timedOut, truncated, error: e.message }); });
+    const timer = setTimeout(() => { timedOut = true; killGroup("SIGTERM"); setTimeout(() => killGroup("SIGKILL"), 2000).unref?.(); }, opts.timeoutMs);
+    // Backstop: resolve even if `close` never fires (a detached grandchild holding the pipe).
+    const hard = setTimeout(() => { killGroup("SIGKILL"); finish(); }, opts.timeoutMs + 5000); hard.unref?.();
+    const finish = (): void => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(hard); resolveResult({ stdout, stderr, exitCode, timedOut, truncated, ...(errorMsg ? { error: errorMsg } : {}) }); };
+    child.on("close", (code) => { exitCode = code; finish(); });
+    child.on("error", (e) => { errorMsg = e.message; finish(); });
     child.stdin.end();
   });
 }

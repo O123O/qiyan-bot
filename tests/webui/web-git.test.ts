@@ -41,6 +41,12 @@ test("status/diff/stage/unstage/commit lifecycle", async () => {
   assert.ok(!("error" in s) && !s.staged.length && !s.changes.length && !s.untracked.length); // clean
 });
 
+test("gitDiff refuses paths outside the repo (no --no-index leak)", async () => {
+  const dir = await repo();
+  assert.ok("error" in (await gitDiff(dir, "/etc/hostname", false)));      // absolute
+  assert.ok("error" in (await gitDiff(dir, "../../etc/hostname", false))); // traversal
+});
+
 test("reports non-repos and empty commit messages", async () => {
   assert.ok("error" in (await gitStatus(await mkdtemp(join(tmpdir(), "qiyan-nogit-")))));
   assert.ok("error" in (await gitCommit(await repo(), "   ")));
