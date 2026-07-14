@@ -24,8 +24,13 @@ interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 
 async function api<T>(path: string, opts?: RequestInit): Promise<T> {
-  const r = await fetch(path, { credentials: "same-origin", ...opts });
-  const body = await r.json();
+  // Always carry the token (don't rely on the cookie, which can be stale) and tolerate non-JSON error
+  // bodies like "unauthorized" so a 401 surfaces a readable message instead of a JSON parse crash.
+  const url = TOKEN ? `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(TOKEN)}` : path;
+  const r = await fetch(url, { credentials: "same-origin", ...opts });
+  const text = await r.text();
+  let body: unknown = {};
+  try { if (text) body = JSON.parse(text); } catch { if (!r.ok) throw { error: text || r.statusText }; }
   if (!r.ok) throw body;
   return body as T;
 }
@@ -205,7 +210,7 @@ export function App() {
   const uploadFile = async (f: File) => {
     setUploading(true);
     try {
-      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/octet-stream" }, body: f });
+      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}${TOKEN_Q}`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/octet-stream" }, body: f });
       const b = await r.json();
       if (r.ok && b.path) setText((t) => (t ? t.replace(/\s*$/, " ") : "") + b.path + " ");
       else push(key, { role: "assistant", body: `[upload failed: ${b.error ?? r.status}]`, at: Date.now() });

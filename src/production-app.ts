@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -1986,7 +1987,19 @@ export async function buildProductionApp(
   // the `web` ChatAdapter (chat-adapters phase) and the web server (web-ui phase). When WEB_UI is
   // off, both are undefined and nothing is wired.
   const webBus = config.webUi ? new WebBus() : undefined;
-  const webToken = config.webUi ? randomBytes(32).toString("base64url") : undefined;
+  // The access token is PERSISTED under the data dir so it survives restarts — otherwise every restart
+  // rotates it and open browser tabs (and their auth cookie) 401 with a stale token. Read lazily so
+  // `dataDir` is the finalized root.
+  let webTokenCache: string | undefined;
+  const webToken = (): string | undefined => {
+    if (!config.webUi) return undefined;
+    if (webTokenCache) return webTokenCache;
+    const path = join(dataDir, "web-token");
+    try { const existing = readFileSync(path, "utf8").trim(); if (existing) return (webTokenCache = existing); } catch { /* create below */ }
+    const token = randomBytes(32).toString("base64url");
+    try { writeFileSync(path, token, { mode: 0o600 }); } catch { /* fall back to an ephemeral token */ }
+    return (webTokenCache = token);
+  };
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
@@ -2984,8 +2997,8 @@ export async function buildProductionApp(
     },
     // The web UI server is last so it starts after every backend it reads is live, and (reverse
     // order) stops first — before the delivery/chat teardown it depends on.
-    ...(config.webUi && webBus && webToken ? [createWebUiPhase({
-      host: config.webUi.host, port: config.webUi.port, allowLan: config.webUi.allowLan, token: webToken,
+    ...(config.webUi && webBus ? [createWebUiPhase({
+      host: config.webUi.host, port: config.webUi.port, allowLan: config.webUi.allowLan, token: webToken()!,
       staticDir: webuiStaticRoot, bus: webBus,
       reads: {
         registrySnapshot: () => registry.snapshot(),
