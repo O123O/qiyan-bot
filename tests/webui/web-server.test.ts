@@ -106,6 +106,13 @@ test("POST /api/input forwards text and target to submitInput", async () => {
   });
 });
 
+test("SPA fallback serves routes but 404s file-extension paths", async () => {
+  await withServer(async (base) => {
+    assert.equal((await fetch(`${base}/some-route?token=${TOKEN}`)).status, 200);   // route → SPA
+    assert.equal((await fetch(`${base}/home/x/notes.md?token=${TOKEN}`)).status, 404); // file path → not the SPA
+  });
+});
+
 test("streams a raw upload with a browser Content-Type and blocks traversal", async () => {
   await withServer(async (base, _calls, _bus, uploadsDir) => {
     await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");

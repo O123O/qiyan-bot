@@ -107,7 +107,11 @@ export function createWebServer(options: WebServerOptions): WebServer {
     // Confine to the static dir; a normalized path that escapes it falls back to index.html (SPA).
     const relative = normalize(pathname === "/" ? "index.html" : pathname.replace(/^\/+/, ""));
     const candidate = relative.startsWith("..") ? "index.html" : relative;
-    for (const file of [candidate, "index.html"]) {
+    // Only fall back to the SPA for route-like paths (no file extension). A path with an extension that
+    // isn't a real static asset 404s rather than returning index.html — otherwise a stray navigation to
+    // e.g. /home/…/notes.md would render the chat page in a new tab.
+    const candidates = extname(candidate) ? [candidate] : [candidate, "index.html"];
+    for (const file of candidates) {
       const full = join(options.staticDir, file);
       try {
         if (!(await stat(full)).isFile()) continue;

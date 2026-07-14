@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import Markdown, { defaultUrlTransform } from "react-markdown";
+import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
@@ -11,8 +11,10 @@ const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
 const IMG_EXT = /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i; // shown inline in the preview panel
 const TAB_EXT = /\.(pdf|html?)$/i;                     // opened in a new tab as a streaming file
-// Preserve our internal file-mention scheme (react-markdown strips unknown protocols by default).
-const urlTransform = (u: string) => (u.startsWith("qy-file:") ? u : defaultUrlTransform(u));
+const MENTION = "#qyfile:"; // a fragment scheme: react-markdown never strips it and it never navigates
+// A plain markdown-link href that points at a local file (relative or absolute, no URL scheme) — we
+// route these through the preview too, or a bare path would navigate to the SPA fallback (chat page).
+const isLocalHref = (h: string) => h.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(h) && !h.startsWith("//") && !h.startsWith("#") && /[./]/.test(h);
 const ASSIST = " assistant"; // log key for the QiYan tab (selected === null)
 const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
@@ -43,7 +45,7 @@ function normalizeMath(src: string): string {
 }
 
 // Linkify file-path-like tokens in message text so they open a preview. Paths need a slash or a known
-// extension; code/links are skipped. Href scheme "qy-file:<encoded>" is intercepted by the <a> renderer.
+// extension; code/links are skipped. The "#qyfile:<encoded>" href is intercepted by the <a> renderer.
 // Bounded quantifiers ({1,64} segments, {1,16} depth) keep this linear — an unbounded `+` here
 // backtracks O(n²) on long unbroken tokens (base64/hashes) and can freeze the tab.
 const PATH_RE = /((?:\.{0,2}\/)?(?:[A-Za-z0-9._-]{1,64}\/){1,16}[A-Za-z0-9._-]{1,64}(?:\.[A-Za-z0-9]{1,8})?|[A-Za-z0-9._-]{1,64}\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|txt|py|rs|go|c|h|cc|cpp|hpp|css|scss|html|yaml|yml|toml|ini|cfg|sh|sql|log|env|pdf|png|jpg|jpeg|gif|csv|zip|docx|xlsx))(:\d+(?::\d+)?)?/g;
@@ -58,7 +60,7 @@ function remarkFilePaths() {
         let last = 0; let m: RegExpExecArray | null; PATH_RE.lastIndex = 0;
         while ((m = PATH_RE.exec(child.value))) {
           if (m.index > last) out.push({ type: "text", value: child.value.slice(last, m.index) });
-          out.push({ type: "link", url: "qy-file:" + encodeURIComponent(m[0]), children: [{ type: "text", value: m[0] }] });
+          out.push({ type: "link", url: MENTION + encodeURIComponent(m[0]), children: [{ type: "text", value: m[0] }] });
           last = m.index + m[0].length;
         }
         if (last === 0) { out.push(child); } else { if (last < child.value.length) out.push({ type: "text", value: child.value.slice(last) }); }
@@ -241,7 +243,7 @@ export function App() {
   // in a new tab, and text opens in the panel. Absolute paths under the worker's project resolve
   // there; other absolute paths from the upload store; relative paths from the selected worker.
   const openMentioned = (mention: string) => {
-    const decoded = decodeURIComponent(mention.replace(/^qy-file:/, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
+    const decoded = decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, "");
     const proj = selSession?.projectDir;
     const inProject = Boolean(selected && proj && decoded.startsWith(proj + "/"));
     const isUpload = decoded.startsWith("/") && !inProject;
@@ -256,9 +258,13 @@ export function App() {
   };
 
   const remark = [remarkGfm, remarkMath, remarkFilePaths];
-  const mdComponents = { a: (props: any) => typeof props.href === "string" && props.href.startsWith("qy-file:")
-    ? <button className="file-link" onClick={() => openMentioned(props.href)}>{props.children}</button>
-    : <a {...props} target="_blank" rel="noreferrer" /> };
+  const mdComponents = { a: (props: any) => {
+    const href = typeof props.href === "string" ? props.href : "";
+    if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href)}>{props.children}</button>;
+    // A plain markdown link to a local file → open the preview, not navigate to the SPA fallback.
+    if (isLocalHref(href)) return <button className="file-link" onClick={() => openMentioned(MENTION + encodeURIComponent(href))}>{props.children}</button>;
+    return <a {...props} target="_blank" rel="noreferrer" />;
+  } };
 
   return (
     <div className="app">
@@ -307,7 +313,7 @@ export function App() {
             {rendered.map((m, i) => (
               <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : ""}`}>
                 <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents} urlTransform={urlTransform}>{normalizeMath(m.body)}</Markdown></div>
+                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponents}>{normalizeMath(m.body)}</Markdown></div>
               </div>
             ))}
           </div>
