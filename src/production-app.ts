@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -29,6 +30,8 @@ import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
 import { parseDirective } from "./directives/parser.ts";
 import { deliverDirectTo } from "./assistant/direct-to.ts";
+import { WebBus, createWebAdapter, createWebUiPhase } from "./webui/index.ts";
+import { webUiStatePath } from "./webui/webui-state.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -62,6 +65,7 @@ import { SessionRegistry, type RegistrySession } from "./registry/session-regist
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
+import { mapWorkerConversation } from "./sessions/worker-conversation.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
 import {
   ExternalOwnershipMonitor,
@@ -143,6 +147,7 @@ function runMonitorCheck(command: string, timeoutMs = 20_000): Promise<boolean> 
 
 const assistantAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/assistant");
 const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/remote");
+const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
 const scheduledFailureThreshold = 3;
@@ -1796,6 +1801,7 @@ export async function buildProductionApp(
         tools: Readonly<Record<AssistantToolName, ToolHandler>>,
         activity: { registerTool(attemptId: string): number; finishTool(attemptId: string): void },
       ): void;
+      onWebUiStarted?(url: string): void;
     };
     storage?: {
       acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
@@ -1826,6 +1832,8 @@ export async function buildProductionApp(
   let registry!: SessionRegistry;
   let dashboardStore!: SessionDashboardStore;
   let dashboard!: SessionDashboard;
+  let localClaudeEndpointId: string | undefined; // the local Claude endpoint id, if configured (for web file-browse locality)
+  let webSshRuntimeRoot: string | undefined; // the ssh ControlMaster runtime root (for the web UI's remote file reads)
   let observations!: SessionObservationProcessor;
   let attachments!: AttachmentStore;
   let attachmentCleanup!: AttachmentCleanup;
@@ -1966,7 +1974,13 @@ export async function buildProductionApp(
       // internal awareness source; it does NOT run a normal assistant reply turn.
       await deliverDirectTo({
         alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
-        send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
+        send: (nickname, text, sendOptions) => {
+          // Record the client id for this direct relay BEFORE dispatch. A direct send carries no MCP
+          // operation and no scheduler outbox marker, so without this the ownership guard misreads the
+          // turn it starts as an external Codex turn and releases the session (see ownsDrivenTurn).
+          if (sendOptions.clientUserMessageId) ownership.recordDirectSendTurn(sendOptions.clientUserMessageId);
+          return sessions.send(nickname, text, sendOptions);
+        },
         recordAwareness: (input) => { conversations.createInternalSource(input); },
         pump: () => { void dispatcher.enqueueInternal("direct_to"); },
         commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
@@ -1978,6 +1992,26 @@ export async function buildProductionApp(
     report({ level: "info", code: "chat_input_accepted", adapter: source.binding.adapterId });
   };
 
+  // Web UI (opt-in). The bus + token are dependency-free, so create them here and share between
+  // the `web` ChatAdapter (chat-adapters phase) and the web server (web-ui phase). The machinery is
+  // always built; the web server listens only when the persisted state says enabled (off by default,
+  // toggled by `qiyan-bot web-ui start|stop`).
+  const webBus = new WebBus();
+  // The access token is PERSISTED under the data dir so it survives restarts — otherwise every restart
+  // rotates it and open browser tabs (and their auth cookie) 401 with a stale token. Read lazily so
+  // `dataDir` is the finalized root.
+  let webTokenCache: string | undefined;
+  const webToken = (): string => {
+    if (webTokenCache) return webTokenCache;
+    const path = join(dataDir, "web-token");
+    try { const existing = readFileSync(path, "utf8").trim(); if (existing) return (webTokenCache = existing); } catch { /* create below */ }
+    const token = randomBytes(32).toString("base64url");
+    try { writeFileSync(path, token, { mode: 0o600 }); } catch { /* fall back to an ephemeral token */ }
+    return (webTokenCache = token);
+  };
+  // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
+  // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
+  const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
   const phases: AppPhase[] = [
     {
       name: "assistant-workspace",
@@ -2213,10 +2247,15 @@ export async function buildProductionApp(
         } else if (options.chatAdapters) {
           weixin = configured.find((adapter) => adapter.delivery.id === "weixin") as WeixinChatAdapter | undefined;
         }
+        // The web UI participates as a `web` ChatAdapter (browser ⇄ assistant), so it must be in
+        // `chats` for outbound routing AND admitted into the boot guard's expected set. Always
+        // registered (the machinery is always built); it only carries traffic when the server listens.
+        configured.push(createWebAdapter(webBus, webUploads(), (id, appended) => deliveries.appendToBody(id, appended)));
         const expectedAdapters = [
           telegramConfig ? "telegram" : undefined,
           config.chat.slack ? "slack" : undefined,
           config.chat.weixin ? "weixin" : undefined,
+          "web", // always registered — the web machinery is always built
         ].filter((id): id is string => Boolean(id)).sort();
         const actualAdapters = configured.map((adapter) => adapter.delivery.id).sort();
         if (!isDeepStrictEqual(actualAdapters, expectedAdapters)) throw new AppError("CONFIGURATION_ERROR", "configured chat adapters do not match chat credentials");
@@ -2304,6 +2343,7 @@ export async function buildProductionApp(
           throw new AppError("CONFIGURATION_ERROR", `at most one local Claude endpoint (provider:claude, transport:local) is allowed; found: ${localClaudeDefs.map((definition) => definition.id).join(", ")}`);
         }
         const localClaudeDef = localClaudeDefs[0];
+        localClaudeEndpointId = localClaudeDef?.id;
         // Goals + scheduling serve EVERY Claude endpoint (the local one and any remote
         // claude endpoint), keyed by (endpointId, threadId). Construct the stack
         // unconditionally: a remote Claude endpoint is added at runtime by writing
@@ -2402,6 +2442,7 @@ export async function buildProductionApp(
         // The local worker's `monitor` check runs on this host.
         if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
+        webSshRuntimeRoot = sshRuntimeRoot;
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
         const planner = new SshGenerationPlanner({
           sshBinary: "ssh",
@@ -2518,6 +2559,10 @@ export async function buildProductionApp(
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
           commitBinding: (binding, references) => endpointBindings.commitAfterActivation(binding.endpointId, binding.destination, references),
           managedThreadIds: (id) => Object.values(registry.snapshot().sessions).filter((session) => session.endpoint === id).map((session) => session.thread_id),
+          onReconnectGaveUp: (id, attempts) => reportOperationalSafely(report, {
+            level: "warn", code: "endpoint_reconnect_gave_up", component: "endpoint_manager", consecutiveFailures: attempts,
+            reason: `endpoint ${id} unreachable after sustained reconnect attempts (~48h); pausing automatic recovery until restart or next use`,
+          }),
         });
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,
@@ -2537,14 +2582,21 @@ export async function buildProductionApp(
         // Bind the shared locality predicate to this deployment's local Claude endpoint id,
         // then inject it into the workspace router, rollout-access, and worker file bridge.
         const isLocalEndpoint = (id: string): boolean => isLocalEndpointId(id, localClaudeDef?.id);
+        // Reuse the ProjectWorkspacePolicy (and its SshHost + resolved-constant cache) while the
+        // endpoint's remote context is unchanged. A new generation installs a fresh RemoteContext
+        // (bindProjectEndpoint), so the `=== context` check rebuilds — never handing back a policy
+        // bound to a torn-down transport. ensureReady() still gates every lookup onto a ready generation.
+        const remotePolicyCache = new Map<string, { context: RemoteContext; policy: ProjectWorkspacePolicy }>();
         workspaceRouter = new WorkspaceRouter(async (id) => {
           if (isLocalEndpoint(id)) return projectWorkspaces;
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);
+          const cached = remotePolicyCache.get(id);
+          if (cached && cached.context === context) return cached.policy;
           const home = context.host.remoteHome;
           const projectsRoot = context.projectsRoot.startsWith("~/") ? posix.resolve(home, context.projectsRoot.slice(2)) : posix.resolve(context.projectsRoot);
-          return new ProjectWorkspacePolicy({
+          const policy = new ProjectWorkspacePolicy({
             userHome: home,
             qiyanHome: context.host.remoteRuntimeDir,
             assistantWorkdir: context.host.remoteRuntimeDir,
@@ -2553,6 +2605,8 @@ export async function buildProductionApp(
             defaultProjectsRoot: projectsRoot,
             host: new SshHost(id, context.remote, context.host.remoteHelperPath),
           });
+          remotePolicyCache.set(id, { context, policy });
+          return policy;
         }, (id, lease) => endpointManager.validateWorkLease(lease, id));
         workerFiles = new WorkerFileBridge({
           attachments,
@@ -2866,9 +2920,13 @@ export async function buildProductionApp(
         await reconcileOperations();
         conversations.repairQueueNotices();
         await reconcileStartupLifecycleState();
-        await resumeStartupManagedSessions();
+        const backgroundedRecovery = await resumeStartupManagedSessions();
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
+          // Endpoints whose managed recovery was backgrounded own their per-endpoint reconcile
+          // (ownership + relay + claims) inside that background task — skip them here so this
+          // synchronous loop can't race/redo it or block on a still-recovering endpoint.
           if (endpointId === assistantEndpoint.id || activation.unavailable.includes(endpointId)
+            || backgroundedRecovery.has(endpointId)
             || lifecycleOwnedEndpointIds().has(endpointId) || endpointManager.desiredState(endpointId) !== "automatic") continue;
           await reconcileOwnershipBeforeRelayWithLease(endpointManager, ownershipWatcher, relay, endpointId, async (lease) => {
             await pool.reconcileEndpointClaims(
@@ -2963,6 +3021,56 @@ export async function buildProductionApp(
       },
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
+    // The web UI server is last so it starts after every backend it reads is live, and (reverse
+    // order) stops first — before the delivery/chat teardown it depends on.
+    createWebUiPhase({
+      defaultHost: config.webUi.host, defaultPort: config.webUi.port, token: webToken(),
+      staticDir: webuiStaticRoot, bus: webBus,
+      reads: {
+        registrySnapshot: () => registry.snapshot(),
+        dashboardSnapshot: () => dashboard.snapshot(),
+        readWorkerConversation: async (endpointId, threadId, count, before) => {
+          // Read the worker's two-sided transcript straight from its NATIVE codex/claude session
+          // (thread/read) — QiYan stores nothing for workers. Web-UI only; chat apps are unaffected.
+          // Only touch an ALREADY-READY endpoint: a passive tab-open must NOT activate/dial a down
+          // endpoint (e.g. a remote ssh worker). Not ready, unreachable, or not-yet-materialized → empty.
+          if (!pool.isReady(endpointId)) return [];
+          let turns: unknown[] = [];
+          try { const h = await pool.request<{ thread?: { turns?: unknown[] } }>(endpointId, "thread/read", { threadId, includeTurns: true }); turns = h.thread?.turns ?? []; }
+          catch { /* unreachable / not materialized → empty */ }
+          return mapWorkerConversation(turns, count, before);
+        },
+        listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
+        provider: (id) => sessionProvider(id),
+      },
+      // Local file browsing is confined to each session's managed project directory. Only LOCAL
+      // sessions expose files here; a remote (ssh) session's project dir is on another host, so it
+      // is intentionally not browsable yet (remote file browsing is a later phase).
+      files: {
+        projectDir: (nickname) => {
+          const session = registry.snapshot().sessions[nickname];
+          return session && isLocalEndpointId(session.endpoint, localClaudeEndpointId) ? session.project_dir : undefined;
+        },
+        // Transport for a session: local (fs) or remote (ssh host from the endpoint catalog).
+        fileTarget: (nickname) => {
+          const session = registry.snapshot().sessions[nickname];
+          if (!session) return undefined;
+          if (isLocalEndpointId(session.endpoint, localClaudeEndpointId)) return { transport: "local", projectDir: session.project_dir };
+          const definition = endpointCatalog.definitions().find((d) => d.id === session.endpoint);
+          return definition?.transport === "ssh" && definition.host ? { transport: "remote", projectDir: session.project_dir, host: definition.host } : undefined;
+        },
+        maxFileBytes: config.attachmentMaxBytes,
+      },
+      // Remote-worker file access over ssh reuses the user's ControlMaster (never creates one). A
+      // provider read per request: `webSshRuntimeRoot` is only assigned once endpoints start up.
+      remote: () => (webSshRuntimeRoot ? { sshBinary: "ssh", sshRuntimeRoot: webSshRuntimeRoot } : undefined),
+      // Send-file store: uploads land here on the bot host and auto-expire after 30 days. The path is
+      // appended to the message so a LOCAL assistant/worker can read it (remote hosts can't — deferred).
+      uploads: webUploads(),
+      acceptChat, report,
+      onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
+      statePath: webUiStatePath(config.qiyanHome),
+    }),
   ];
 
   function stopRecoveryOwners(): Promise<void> {
@@ -4034,11 +4142,43 @@ export async function buildProductionApp(
     for (const endpointId of endpointIds) await reconcileLifecycleState({ endpointId });
   }
 
-  async function resumeStartupManagedSessions(): Promise<void> {
+  async function resumeStartupManagedSessions(): Promise<Set<string>> {
     const excluded = lifecycleOwnedEndpointIds();
     const endpointIds = [...new Set(Object.values(registry.managedSnapshot().sessions).map((session) => session.endpoint))]
       .filter((endpointId) => !excluded.has(endpointId) && endpointManager.desiredState(endpointId) === "automatic");
-    for (const endpointId of endpointIds) await resumeManagedEndpoint(endpointId);
+    const managedEndpoints = new Set(endpointIds);
+    // SYNCHRONOUS gate-close (the linchpin): flip every managed session to "unavailable" (DB-only, no
+    // network) BEFORE returning. dispatch (SESSION_DETACHED), delivery (non-deliverable), the ownership
+    // watcher, and the scheduler all treat "unavailable" as hands-off, so nothing drives/delivers/
+    // releases a session before its recovery re-verifies native liveness + re-scans ownership for an
+    // external turn. Leaving sessions "managed" while recovery is backgrounded would reopen the
+    // duplicate-delivery window — so this flip MUST stay synchronous.
+    for (const session of Object.values(registry.managedSnapshot().sessions)) {
+      if (!managedEndpoints.has(session.endpoint)) continue;
+      const state = runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
+      if (state?.managementState === "managed") {
+        runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unavailable", state.nativeStatus);
+      }
+    }
+    // Recover each endpoint in the BACKGROUND — startup must not wait for session recovery, which
+    // re-verifies each session over the app-server (ssh for remote, minutes when the cluster is slow).
+    // Each session stays "unavailable" (hands-off) until its endpoint's background recovery re-opens
+    // it; failures are surfaced (background_task_failed) and the endpoint's managedRecoveryOwner keeps
+    // retrying. On-demand callers (a send to an unrecovered session) get SESSION_DETACHED and, for
+    // scheduled drives, a proven-not-dispatched retry — never a lost or duplicated delivery.
+    for (const endpointId of endpointIds) {
+      runBackground(() => resumeManagedEndpoint(endpointId), (error) => reportOperationalSafely(report, {
+        level: "warn", code: "background_task_failed", component: "managed_recovery",
+        reason: `background managed recovery of ${endpointId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      }));
+      // Claim this endpoint's recovery for the background task: remove it from the ready buffer's
+      // pending set so the synchronous acceptAndDrain() below doesn't kick a second, concurrent
+      // recoverProjectEndpoint for it. Failures are still retried by managedRecoveryOwner, and a later
+      // endpoint-ready event re-arms the buffer normally. (resumeManagedEndpoint also acknowledges at
+      // the end — idempotent.)
+      endpointReadyBuffer?.acknowledge(endpointId);
+    }
+    return managedEndpoints;
   }
 
   async function resumeManagedEndpoint(endpointId: string, requireAcknowledged = false): Promise<void> {

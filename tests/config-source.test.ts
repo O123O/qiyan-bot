@@ -87,6 +87,8 @@ test("rejects bootstrap and unsupported keys in dotenv without exposing their va
     ["QIYAN_HOME=/secret/redirect", "QIYAN_HOME"],
     ["OPENAI_API_KEY=provider-secret", "OPENAI_API_KEY"],
     ["BROKEN_LINE", "dotenv"],
+    ["WEB_UI=1", "WEB_UI"], // removed in the command-driven web-UI model
+    ["WEB_ALLOW_LAN=1", "WEB_ALLOW_LAN"],
   ] as const) {
     const value = await fixture();
     await writeDotenv(value.qiyanHome, `${line}\n`);

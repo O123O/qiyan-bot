@@ -12,6 +12,7 @@ export const RECOVERY_TABLES = [
   "conversation_cutover",
   "deliveries",
   "delivery_attachment_releases",
+  "direct_send_turns",
   "directive_consumptions",
   "discovery_snapshots",
   "endpoint_bindings",

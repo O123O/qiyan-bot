@@ -125,44 +125,69 @@ test("dispatch revalidation rejects directory replacement and symlink insertion"
   await assert.rejects(value.policy.assertDispatchable(second), /real directory|protected|changed unexpectedly/);
 });
 
-test("dispatch revalidation detects replacement after its canonical safety check", async () => {
+test("dispatch revalidation rejects an ancestor-symlink swap via the identity check", async () => {
   const value = await fixture();
-  const prepared = await value.policy.prepareCreate("raced", "~/Documents/raced");
-  const policy = value.policy as any;
-  const originalAssertSafe = policy.assertSafe.bind(policy);
-  let swapped = false;
-  policy.assertSafe = async (candidate: string) => {
-    await originalAssertSafe(candidate);
-    if (swapped || candidate !== prepared.path) return;
-    swapped = true;
-    await rename(prepared.path, `${prepared.path}-original`);
-    await mkdir(prepared.path, { mode: 0o700 });
-  };
-
+  const prepared = await value.policy.prepareCreate("proj", "~/Documents/proj");
+  await value.policy.assertDispatchable(prepared); // ok initially
+  // Turn the parent dir into a symlink to a decoy: lstat(prepared.path) now resolves a DIFFERENT inode.
+  const parent = dirname(prepared.path);
+  await mkdir(join(value.userHome, "decoy", "proj"), { recursive: true, mode: 0o700 });
+  await rename(parent, `${parent}-orig`);
+  await symlink(join(value.userHome, "decoy"), parent, "dir");
   await assert.rejects(value.policy.assertDispatchable(prepared), /changed unexpectedly/);
 });
 
-test("deduplicates identical protected paths during remote safety checks", async () => {
+test("dispatch revalidation still rejects a path overlapping protected QiYan state (assertSafe retained)", async () => {
   const value = await fixture();
-  const project = join(value.userHome, "Documents", "deduplicated");
+  const st = await lstat(value.qiyanHome);
+  // A workspace whose identity matches the real qiyanHome dir but overlaps protected state: the
+  // identity lstat passes, so only the retained assertSafe can catch it.
+  const forged = preparedProjectWorkspaceFromCheckpoint({
+    projectDir: value.qiyanHome, projectDirCreated: false, projectDirFallback: false,
+    projectDirDevice: st.dev.toString(10), projectDirInode: st.ino.toString(10),
+  });
+  await assert.rejects(value.policy.assertDispatchable(forged), /protected|broad parent|changed/u);
+});
+
+test("dispatch revalidation maps a transient host failure to a typed error, not a raw throw", async () => {
+  const value = await fixture();
+  const prepared = await value.policy.prepareCreate("proj", "~/Documents/proj");
+  const raw = new Error("ssh transport died mid-lstat");
+  const policy = policyFor(value, failingHost(value.userHome, (m, p) => (m === "lstat" && p === prepared.path ? raw : undefined)));
+  await assert.rejects(policy.assertDispatchable(prepared), (error: unknown) => error instanceof AppError && error !== raw);
+});
+
+test("resolves the constant protected/home paths once and reuses them across calls", async () => {
+  const value = await fixture();
+  const project = join(value.userHome, "Documents", "cached");
   await mkdir(project, { recursive: true, mode: 0o700 });
-  let protectedRealpaths = 0;
+  let qiyanHomeRealpaths = 0;
+  let userHomeRealpaths = 0;
   const host = failingHost(value.userHome, (method, path) => {
-    if (method === "realpath" && path === value.qiyanHome) protectedRealpaths += 1;
+    if (method === "realpath" && path === value.qiyanHome) qiyanHomeRealpaths += 1;
+    if (method === "realpath" && path === value.userHome) userHomeRealpaths += 1;
     return undefined;
   });
   const policy = new ProjectWorkspacePolicy({
-    userHome: value.userHome,
-    qiyanHome: value.qiyanHome,
-    assistantWorkdir: value.qiyanHome,
-    dataDir: value.qiyanHome,
-    registryPath: join(value.qiyanHome, "sessions.json"),
-    host,
+    userHome: value.userHome, qiyanHome: value.qiyanHome, assistantWorkdir: value.qiyanHome,
+    dataDir: value.qiyanHome, registryPath: join(value.qiyanHome, "sessions.json"), host,
   });
 
-  await policy.prepareExisting(project);
+  const prepared = await policy.prepareExisting(project); // two safety passes + resolveUserPath
+  await policy.assertDispatchable(prepared);              // retained assertSafe
+  await policy.prepareExisting(project);                  // second time — constants stay cached
 
-  assert.equal(protectedRealpaths, 2, "each safety pass should inspect one unique protected path");
+  assert.equal(qiyanHomeRealpaths, 1, "the protected dir is resolved once and cached (was ~4×)");
+  assert.equal(userHomeRealpaths, 1, "the user home is resolved once and cached");
+});
+
+test("a moved project directory is still detected with the constant cache on", async () => {
+  const value = await fixture();
+  const prepared = await value.policy.prepareCreate("proj", "~/Documents/proj");
+  await value.policy.assertDispatchable(prepared);
+  await rename(prepared.path, `${prepared.path}-moved`);
+  await mkdir(prepared.path, { mode: 0o700 }); // fresh dir, different inode
+  await assert.rejects(value.policy.assertDispatchable(prepared), /changed unexpectedly/u);
 });
 
 test("workspace policy preserves typed endpoint failures from finalize and dispatch revalidation", async () => {

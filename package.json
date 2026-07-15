@@ -7,6 +7,7 @@
   },
   "files": [
     "dist/qiyan-bot",
+    "assets/webui/index.html",
     "assets/brand/qiyan-logo.png",
     "assets/brand/qiyan-overview.svg",
     "assets/assistant/AGENTS.md",

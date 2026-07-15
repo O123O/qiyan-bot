@@ -57,6 +57,7 @@ jobs:
           package/assets/remote/qiyan-app-server-launcher.sh
           package/assets/remote/qiyan-ssh-helper.mjs
           package/assets/slack/manifest.yaml
+          package/assets/webui/index.html
           package/dist/qiyan-bot
           package/docs/chat-apps/wechat.md
           package/docs/sqlite.md

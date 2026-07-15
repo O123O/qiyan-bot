@@ -6,3 +6,8 @@ node_modules/
 data/
 coordinator/session-status.json
 coordinator/session-status.json.invalid-*
+
+# webui client build deps
+webui-client/node_modules/
+webui-client/dist/
+*.tgz

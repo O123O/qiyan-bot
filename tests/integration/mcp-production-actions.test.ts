@@ -125,6 +125,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     attachmentMaxBytes: 1024 * 1024,
     attachmentStoreMaxBytes: 8 * 1024 * 1024,
     assistantSandboxMode: "read-only",
+    webUi: { host: "127.0.0.1", port: 0 },
     // The local Claude endpoint (`claude-local`) is declared in endpoints.json above, so the
     // Claude lifecycle runs through the same real manager/service/ownership stack as Codex.
   };

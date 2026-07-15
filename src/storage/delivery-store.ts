@@ -52,6 +52,13 @@ export class DeliveryStore {
     return this.get(id) as DeliveryRecord;
   }
 
+  // Append text to a delivery's stored body. The web surface uses this to persist an outbound file's
+  // store path into the durable outbox, so it survives a browser reload (the path is generated at
+  // send time, after the delivery row was prepared).
+  appendToBody(id: string, suffix: string): void {
+    this.db.prepare("UPDATE deliveries SET body = body || ?, updated_at = ? WHERE id = ?").run(suffix, Date.now(), id);
+  }
+
   get(id: string): DeliveryRecord | undefined {
     const row = this.db.prepare("SELECT * FROM deliveries WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     if (!row) return undefined;

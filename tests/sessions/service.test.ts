@@ -461,7 +461,7 @@ test("collect returns assistant bodies or creates chronological direct deliverie
   const secondRequest = await service.collect("payments", 2, { direct: true, binding, deliveryKey: "request-2" });
   assert.notDeepEqual(secondRequest, receipt);
   assert.equal(deliveries.listReady().length, 4);
-  await assert.rejects(service.collect("payments", 21), RangeError);
+  await assert.rejects(service.collect("payments", 51), RangeError);
 });
 
 test("direct collection recovery fills a frozen partial selection and accepts an empty window", async () => {

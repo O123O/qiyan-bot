@@ -90,6 +90,13 @@ export class AppServerPool {
 
   setWorkLeaseProvider(provider: WorkLeaseProvider): void { this.workLeaseProvider = provider; }
 
+  // Non-activating readiness check: true iff the endpoint is already ready. Triggers NO start/activation
+  // — lets a passive reader (e.g. the web UI transcript) skip an endpoint that would otherwise be spun
+  // up on demand (a down remote ssh worker must not be dialed just because a tab was opened).
+  isReady(endpointId: string): boolean {
+    return this.endpoints.get(endpointId)?.state === "ready";
+  }
+
   private async ensureEndpoint(id: string): Promise<AppServerEndpoint> {
     const existing = this.endpoints.get(id);
     if (existing?.state === "ready") return existing;

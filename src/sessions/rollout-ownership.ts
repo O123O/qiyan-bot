@@ -317,6 +317,21 @@ export class SessionOwnershipGuard {
     return true;
   }
 
+  // Record the client id QiYan issued for a direct `/to` relay so ownsDrivenTurn recognizes the turn
+  // that send drives. Must be called BEFORE the send dispatches (so the marker exists before the turn
+  // it labels can be inspected). Global by client id — like an operation marker or an outbox key — not
+  // scoped to an identity, and idempotent.
+  //
+  // Threat model: this guards against a BENIGN second Codex client accidentally driving the session —
+  // which never stamps QiYan's `to:<sourceId>` client id, so it is never misread as owned. A hostile
+  // client could in principle replay a recorded `to:<sourceId>` to look owned, but that needs direct
+  // app-server write access to the managed thread (the boundary the whole ownership model rests on),
+  // so it is out of scope here — as with the send_to_session marker documented in claude-transcript.ts.
+  recordDirectSendTurn(clientId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO direct_send_turns (client_id, created_at) VALUES (?, ?)")
+      .run(clientId, Date.now());
+  }
+
   private ownsObservedTurn(identity: MappingIdentity, turn: RolloutTurnStart): boolean {
     return this.ownsDrivenTurn(turn) || this.isAuthorizedTurn(identity, turn.turnId);
   }
@@ -328,6 +343,11 @@ export class SessionOwnershipGuard {
   // every turn, so without this the scheduler-driven turn is misread as external and detached.
   private ownsDrivenTurn(turn: { turnId: string; clientId?: string }): boolean {
     if (this.operations.ownsWorkerTurn(turn)) return true;
+    // A direct `/to` relay records the client id it issued (it has no operation and no outbox key);
+    // recognize it here so the driven turn beats the "every turn has a user message ⇒ external"
+    // heuristic in classifyObservedTurn.
+    if (turn.clientId !== undefined && this.db.prepare("SELECT 1 FROM direct_send_turns WHERE client_id = ? LIMIT 1")
+      .get(turn.clientId) !== undefined) return true;
     return this.db.prepare("SELECT 1 FROM scheduled_sends WHERE single_fire_key IN (?, ?) LIMIT 1")
       .get(turn.clientId ?? turn.turnId, turn.turnId) !== undefined;
   }

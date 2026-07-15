@@ -25,6 +25,12 @@ const configValueSchema = z.object({
   ATTACHMENT_MAX_BYTES: positiveInt.default(20 * 1024 * 1024),
   ATTACHMENT_STORE_MAX_BYTES: positiveInt.default(1024 * 1024 * 1024),
   ASSISTANT_SANDBOX_MODE: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("danger-full-access"),
+  // Default host/port for the web UI. The web UI is off by default and turned on with
+  // `qiyan-bot web-ui start` (persisted state, not a config flag); `start --host/--port` overrides
+  // these. A non-loopback WEB_HOST binds to the LAN — a danger-full-access surface over plain HTTP
+  // (token still required), which prints a loud warning.
+  WEB_HOST: z.string().default("127.0.0.1"),
+  WEB_PORT: z.coerce.number().int().min(0).max(65_535).default(9_520),
 });
 
 // Every env key the config schema reads. `HOME` is a system value, not a QiYan dotenv
@@ -106,6 +112,7 @@ export interface BotConfig {
   attachmentMaxBytes: number;
   attachmentStoreMaxBytes: number;
   assistantSandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  webUi: { host: string; port: number }; // default host/port; the web UI is toggled via `web-ui` + state
 }
 
 export interface ConfigOverrides { qiyanHome: string; assistantWorkdir?: string; weixinConfigured?: boolean }
@@ -161,6 +168,7 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     maxCollectCount: parsed.MAX_COLLECT_COUNT,
     mcpHost: parsed.MCP_HOST,
     mcpPort: parsed.MCP_PORT,
+    webUi: { host: parsed.WEB_HOST, port: parsed.WEB_PORT },
     attachmentMaxBytes: parsed.ATTACHMENT_MAX_BYTES,
     attachmentStoreMaxBytes: parsed.ATTACHMENT_STORE_MAX_BYTES,
     assistantSandboxMode: parsed.ASSISTANT_SANDBOX_MODE,

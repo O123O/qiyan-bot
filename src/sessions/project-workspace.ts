@@ -38,6 +38,11 @@ export class ProjectWorkspacePolicy {
   private readonly requestedRegistryDir: string;
   private readonly requestedDefaultProjectsRoot: string;
   private readonly host: WorkspaceHost;
+  // projectedCanonical() of the CONSTANT paths (user home + protected QiYan dirs) memoized for the
+  // life of this policy instance — one endpoint generation, where those paths are stable. This turns
+  // assertSafe()/resolveUserPath() from per-call ssh round-trips into cached string comparisons on a
+  // remote host. Only successful resolutions are cached (projectedCanonical can walk-up/throw).
+  private readonly resolvedConstants = new Map<string, string>();
 
   constructor(options: {
     userHome: string;
@@ -77,19 +82,20 @@ export class ProjectWorkspacePolicy {
     if (!validIdentity(prepared.identity.device) || !validIdentity(prepared.identity.inode)) {
       throw managedError("project workspace identity is invalid");
     }
+    // `prepared.path` is already canonical and was validated safe when it was prepared. The only
+    // pre-dispatch risk is the directory being swapped/removed/symlinked — a single lstat + device/
+    // inode compare detects all of those: a swap or symlink changes `kind` or `inode`, and an
+    // ancestor-symlink swap makes `lstat(path)` resolve a different inode. Re-`realpath` and the
+    // paranoid double-read are redundant given the identity check (the residual race vs. the actual
+    // dispatch is unchanged by read count), so drop them. One ssh round-trip.
     const value = await optionalWorkspaceEvidence(() => this.host.lstat(prepared.path));
-    if (!value) throw managedError("project workspace changed unexpectedly");
-    if (value.kind !== "directory") throw managedError("project workspace must remain a real directory");
-    const canonical = await optionalWorkspaceEvidence(() => this.host.realpath(prepared.path));
-    if (canonical !== prepared.path) throw managedError("project workspace changed unexpectedly");
-    await this.assertSafe(canonical);
-    const current = await optionalWorkspaceEvidence(() => this.host.lstat(prepared.path));
-    const currentCanonical = await optionalWorkspaceEvidence(() => this.host.realpath(prepared.path));
-    if (current?.kind !== "directory" || currentCanonical !== prepared.path
-      || current.device !== value.device || current.inode !== value.inode
-      || current.device !== prepared.identity.device || current.inode !== prepared.identity.inode) {
+    if (value?.kind !== "directory" || value.device !== prepared.identity.device || value.inode !== prepared.identity.inode) {
       throw managedError("project workspace changed unexpectedly");
     }
+    // Retained (ssh-free after the constant-path cache): re-check the canonical path doesn't overlap
+    // protected QiYan state. This is the SOLE safety re-validation on the recovery dispatch path
+    // (a checkpoint-reconstructed workspace never goes through prepareExisting).
+    await this.assertSafe(prepared.path);
   }
 
   private async prepareFallback(nickname: string): Promise<PreparedProjectWorkspace> {
@@ -108,8 +114,18 @@ export class ProjectWorkspacePolicy {
     return this.finalize(leaf, true, true);
   }
 
+  // projectedCanonical() of a CONSTANT path (user home / protected dir), memoized per policy instance.
+  // Only successful resolutions are cached — projectedCanonical can walk-up/throw for a missing path.
+  private async projectedConstant(path: string): Promise<string> {
+    const cached = this.resolvedConstants.get(path);
+    if (cached !== undefined) return cached;
+    const resolved = await projectedCanonical(this.host, path);
+    this.resolvedConstants.set(path, resolved);
+    return resolved;
+  }
+
   private async resolveUserPath(requested: string): Promise<string> {
-    const userHome = await this.host.realpath(this.requestedUserHome);
+    const userHome = await this.projectedConstant(this.requestedUserHome);
     if (requested.startsWith("~/")) return resolve(userHome, requested.slice(2));
     if (!isAbsolute(requested)) throw managedError("project directory must be absolute or begin with ~/");
     return resolve(requested);
@@ -141,14 +157,14 @@ export class ProjectWorkspacePolicy {
   }
 
   private async assertSafe(candidate: string): Promise<void> {
-    const userHome = await projectedCanonical(this.host, this.requestedUserHome);
+    const userHome = await this.projectedConstant(this.requestedUserHome);
     if (contains(candidate, userHome)) throw managedError("project workspace cannot be a broad parent of the user home");
     const protectedPaths = await Promise.all([...new Set([
       this.requestedQiYanHome,
       this.requestedAssistantWorkdir,
       this.requestedDataDir,
       this.requestedRegistryDir,
-    ])].map((path) => projectedCanonical(this.host, path)));
+    ])].map((path) => this.projectedConstant(path)));
     for (const path of protectedPaths) {
       if (overlaps(candidate, path)) throw managedError("project workspace overlaps protected QiYan state");
     }

@@ -228,6 +228,36 @@ test("goal control leaves an unproven open turn unclassified until user evidence
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "pending-goal-turn" });
 });
 
+test("a direct /to relay turn is owned via its recorded client id, not misread as external", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const path = join(root, "rollout-thread-directto.jsonl");
+  await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
+  const db = createTestDatabase();
+  const runtime = new RuntimeStore(db);
+  const identity = { endpoint: "local", thread_id: "thread-directto", mapping_id: "mapping-directto" };
+  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
+  });
+  await guard.initialize(identity, path);
+  // A `/to` relay drives a turn directly: no MCP send_to_session operation, no scheduler outbox key,
+  // and (Claude/Codex) every turn reports a user message stamped with QiYan's chosen client id. The
+  // turn id and the client id differ (unlike a scheduler fire), so ownership must match by client id.
+  // Recording the client id QiYan issued proves QiYan drove the turn; without it the user-message
+  // evidence would misclassify the turn as external (the pre-fix bug) — as the external-turn tests
+  // above show for an unrecorded client id.
+  const clientId = "to:native-123";
+  guard.recordDirectSendTurn(clientId);
+  await appendFile(path, [
+    line("event_msg", { type: "task_started", turn_id: "directto-turn" }),
+    line("event_msg", { type: "user_message", client_id: clientId }),
+    line("event_msg", { type: "task_complete", turn_id: "directto-turn" }),
+  ].join(""));
+
+  assert.deepEqual(await guard.inspect(identity), { state: "owned" });
+  assert.equal(guard.ownsTurn(identity, "directto-turn"), true);
+});
+
 test("a scheduler-driven turn is owned via its send-outbox key, not misread as external", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-scheduled.jsonl");

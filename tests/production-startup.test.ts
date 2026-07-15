@@ -276,6 +276,7 @@ test("production prepares the configured assistant workdir before endpoint start
     attachmentMaxBytes: 1024,
     attachmentStoreMaxBytes: 4096,
     assistantSandboxMode: "danger-full-access",
+    webUi: { host: "127.0.0.1", port: 0 },
   };
   await mkdir(config.qiyanHome, { mode: 0o700 });
   const app = await buildProductionApp(config, { chdir: (path) => { changedDirectories.push(path); } });
@@ -352,6 +353,7 @@ test("production initializes exactly the configured Telegram, Slack, and WeChat 
       attachmentMaxBytes: 1024,
       attachmentStoreMaxBytes: 4096,
       assistantSandboxMode: "read-only",
+      webUi: { host: "127.0.0.1", port: 0 },
     };
     await mkdir(config.qiyanHome, { mode: 0o700 });
     const app = await buildProductionApp(config, { chdir: () => undefined, chatAdapters: adapters });
@@ -398,6 +400,7 @@ async function productionFixture(t: TestContext): Promise<{ root: string; config
     attachmentMaxBytes: 1024,
     attachmentStoreMaxBytes: 4096,
     assistantSandboxMode: "read-only",
+    webUi: { host: "127.0.0.1", port: 0 },
   };
   await mkdir(config.qiyanHome, { mode: 0o700 });
   return { root, config };

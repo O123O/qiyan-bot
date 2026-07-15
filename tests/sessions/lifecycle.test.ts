@@ -676,6 +676,26 @@ test("managed recovery restores a loaded empty thread without rollout resume", a
   ]);
 });
 
+test("managed recovery of an already-managed idle thread reads metadata only (no full read, no resume)", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-idle",
+  });
+  endpoint.status = "idle";
+  endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "completed" }]; // has rollout history
+  endpoint.failResume = true; // resume would throw — proves an already-loaded thread is never resumed
+  // A persisted epoch (as after a bot restart) means the delivery baseline is already known.
+  runtime.beginEpoch("local", "thread-1", "mapping-idle", "t2", 0);
+
+  const recovered = await lifecycle.reconcileManaged("payments", required(registry));
+
+  assert.equal(recovered.thread.id, "thread-1");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-idle")?.managementState, "managed");
+  // The whole point: an idle, already-managed thread is recovered from a single metadata-only read —
+  // codex is NOT asked to re-materialize the full rollout, and the thread is not resumed.
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [["thread/read", false]]);
+});
+
 test("create-completion recovery drops a managed mapping whose rollout never materialized", async () => {
   const requireFlags: Array<boolean | undefined> = [];
   const released: string[] = [];

@@ -671,4 +671,14 @@ export const migrations: readonly Migration[] = [
     archived_at INTEGER NOT NULL,
     PRIMARY KEY (endpoint_id, thread_id)
   );`,
+  // Ownership marker for direct `/to` relays. A direct send carries neither an MCP send_to_session
+  // operation nor a scheduler outbox key, and every Claude/Codex turn reports a user message — so
+  // without a marker its turn is misread as an external client's and the session is wrongly released.
+  // Recording the client id QiYan issued for the send lets the ownership guard recognize the turn it
+  // drove (see SessionOwnershipGuard.ownsDrivenTurn).
+  `
+  CREATE TABLE IF NOT EXISTS direct_send_turns (
+    client_id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+  );`,
 ];

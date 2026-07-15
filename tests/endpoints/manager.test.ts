@@ -152,6 +152,133 @@ test("an unavailable referenced endpoint keeps retrying without blocking startup
   assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
 });
 
+test("reconnect backoff escalates then gives up after ~48h of failures instead of hammering forever", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("offline");
+  remote.failStart = true;
+  const scheduled: Array<{ delay: number; run: () => void }> = [];
+  const gaveUp: Array<{ id: string; attempts: number }> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "offline", provider: "codex" as const, transport: "ssh" as const, host: "offline", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
+    onReconnectGaveUp: (id, attempts) => { gaveUp.push({ id, attempts }); },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await assert.rejects(manager.ensureReady("offline"), /offline/u);
+  await settle();
+
+  const delays: number[] = [];
+  let guard = 0;
+  while (scheduled.length > 0 && guard++ < 500) {
+    const item = scheduled.shift()!;
+    delays.push(item.delay);
+    item.run();
+    await settle();
+  }
+
+  assert.ok(guard < 500, "the reconnect loop terminated via give-up, not the test safety cap");
+  // 5 fast ramp attempts (5s,10s,30s,1m,2m) then hourly until ~48h total → give up.
+  assert.equal(delays.length, 53);
+  assert.deepEqual(delays.slice(0, 5), [5_000, 10_000, 30_000, 60_000, 120_000]);
+  assert.equal(delays[5], 3_600_000);
+  assert.equal(delays[52], 3_600_000);
+  assert.deepEqual(gaveUp, [{ id: "offline", attempts: 53 }]);
+  assert.equal(scheduled.length, 0, "no further retries are scheduled once the circuit gives up");
+
+  // In production ensureReady runs per turn/RPC (AppServerPool.resolveEndpoint); a downed endpoint
+  // under continued use must NOT re-emit the give-up signal or re-arm the background retry loop.
+  await assert.rejects(manager.ensureReady("offline"), /offline/u);
+  await settle();
+  await assert.rejects(manager.ensureReady("offline"), /offline/u);
+  await settle();
+  assert.deepEqual(gaveUp, [{ id: "offline", attempts: 53 }], "give-up is latched: fired exactly once");
+  assert.equal(scheduled.length, 0, "post-give-up on-demand use stays bounded (one direct attempt, no ramp)");
+});
+
+test("a successful reconnect resets the backoff so a later outage restarts at the fast ramp", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("offline");
+  remote.failStart = true;
+  const scheduled: Array<{ delay: number; run: () => void }> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "offline", provider: "codex" as const, transport: "ssh" as const, host: "offline", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await assert.rejects(manager.ensureReady("offline"), /offline/u);
+  await settle();
+  assert.deepEqual(scheduled.map((item) => item.delay), [5_000]); // first attempt
+
+  scheduled.shift()!.run(); // still failing → escalates
+  await settle();
+  assert.deepEqual(scheduled.map((item) => item.delay), [10_000]); // second attempt
+
+  remote.failStart = false;
+  scheduled.shift()!.run(); // succeeds → publishes and resets reconnectAttempt
+  await settle();
+  assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+  assert.equal(scheduled.length, 0);
+
+  remote.failStart = true;
+  remote.fail("connection-lost"); // a fresh outage after recovery
+  await settle();
+  assert.deepEqual(scheduled.map((item) => item.delay), [5_000], "the backoff restarts at the fast ramp, not the previous escalation");
+});
+
+test("the give-up latch re-arms after a recovery so a second sustained outage warns again", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("offline");
+  remote.failStart = true;
+  const scheduled: Array<{ delay: number; run: () => void }> = [];
+  const gaveUp: Array<{ id: string; attempts: number }> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "offline", provider: "codex" as const, transport: "ssh" as const, host: "offline", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
+    onReconnectGaveUp: (id, attempts) => { gaveUp.push({ id, attempts }); },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  const driveToGiveUp = async () => {
+    let guard = 0;
+    while (scheduled.length > 0 && guard++ < 500) { scheduled.shift()!.run(); await settle(); }
+    assert.ok(guard < 500, "the reconnect loop terminated via give-up, not the test safety cap");
+  };
+
+  // First sustained outage, via on-demand activation retries → gives up once.
+  await assert.rejects(manager.ensureReady("offline"), /offline/u);
+  await settle();
+  await driveToGiveUp();
+  assert.deepEqual(gaveUp, [{ id: "offline", attempts: 53 }]);
+
+  // Cluster comes back: a successful activation publishes and clears the latch.
+  remote.failStart = false;
+  await manager.ensureReady("offline");
+  await settle();
+  assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+  assert.equal(scheduled.length, 0);
+
+  // A second sustained outage — this time via the loss path (onUnavailable → scheduleReconnect,
+  // the real cluster-maintenance trigger): the latch has re-armed, so it ramps up and warns again.
+  remote.failStart = true;
+  remote.fail("connection-lost");
+  await settle();
+  await driveToGiveUp();
+  assert.deepEqual(gaveUp, [{ id: "offline", attempts: 53 }, { id: "offline", attempts: 53 }]);
+});
+
 test("a failed referenced local activation retries and publishes its first generation", async () => {
   const local = new FakeEndpoint("local");
   local.failStart = true;

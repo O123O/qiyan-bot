@@ -205,3 +205,10 @@ test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the r
   assert.equal(claudeLaunchPolicy("haiku", "high").effort, "high");
   assert.equal(claudeLaunchPolicy(undefined, "low").effort, "low");
 });
+
+test("web UI default host/port comes from WEB_HOST/WEB_PORT (default 127.0.0.1:9520)", () => {
+  // The web UI is always available (toggled by `web-ui start|stop` + state, not a config flag);
+  // WEB_HOST/WEB_PORT only set the default bind address.
+  assert.deepEqual(loadConfig(baseEnv(), { qiyanHome }).webUi, { host: "127.0.0.1", port: 9520 });
+  assert.deepEqual(loadConfig(baseEnv({ WEB_HOST: "0.0.0.0", WEB_PORT: "8080" }), { qiyanHome }).webUi, { host: "0.0.0.0", port: 8080 });
+});
