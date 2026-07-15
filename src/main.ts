@@ -1,5 +1,5 @@
 import { createApp, type BotApp } from "./app.ts";
-import { formatCliHelp, parseCliArgs } from "./cli.ts";
+import { formatCliHelp, parseCliArgs, type WebUiAction } from "./cli.ts";
 import { loadConfig, loadAssistantLoginConfig } from "./config.ts";
 import { loadConfigSource } from "./config-source.ts";
 import { runAssistantLogin } from "./assistant/login.ts";
@@ -10,16 +10,23 @@ import { WeixinAuthClient } from "./chat-apps/weixin/auth-client.ts";
 import { WeixinCredentialStore } from "./chat-apps/weixin/credential-store.ts";
 import { createNodeWeixinLoginTerminal, runWeixinLogin } from "./chat-apps/weixin/login.ts";
 import { bootstrapWeixin } from "./chat-apps/weixin/bootstrap.ts";
-import { buildServiceEffectiveEnvironment, SystemdUserService } from "./service/systemd-user.ts";
+import { buildServiceEffectiveEnvironment, readServiceMainPid, SystemdUserService } from "./service/systemd-user.ts";
+import { installWebUiSignalHandler } from "./webui/webui-signal.ts";
+import { readWebUiEnabled, webUiStatePath, writeWebUiEnabled } from "./webui/webui-state.ts";
 import { AppError } from "./core/errors.ts";
 import { createOperationalLogSink } from "./core/operational-log.ts";
-import { isAbsolute, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 
 export async function main(
   env = process.env,
   argv: readonly string[] = process.argv.slice(2),
 ): Promise<void> {
   const command = parseCliArgs(argv);
+  // Own SIGUSR2 before any startup await so a `web-ui` toggle signal can never terminate the
+  // long-lived bot (SIGUSR2's default disposition). Placement is load-bearing: it MUST precede
+  // loadConfigSource/bootstrapWeixin/createApp below.
+  if (command.command === "run") installWebUiSignalHandler();
   if (command.command === "help") {
     process.stdout.write(formatCliHelp(command.topic));
     return;
@@ -90,6 +97,19 @@ export async function main(
     process.stdout.write("Configuration OK.\n");
     return;
   }
+  if (command.command === "web-ui") {
+    const config = loadConfig(loaded.values, { qiyanHome: loaded.qiyanHome, weixinConfigured: weixin.configured });
+    await runWebUiCommand(command.action, {
+      qiyanHome: loaded.qiyanHome,
+      ...(config.webUi ? { webUi: { host: config.webUi.host, port: config.webUi.port } } : {}),
+      dataDir: config.dataDir,
+      mainPid: () => readServiceMainPid(env),
+      signal: (pid) => { try { process.kill(pid, "SIGUSR2"); return true; } catch { return false; } },
+      readToken: (dataDir) => { try { return readFileSync(join(dataDir, "web-token"), "utf8").trim() || undefined; } catch { return undefined; } },
+      write: (text) => process.stdout.write(text),
+    });
+    return;
+  }
   const config = loadConfig(loaded.values, {
     qiyanHome: loaded.qiyanHome,
     weixinConfigured: weixin.configured,
@@ -101,6 +121,52 @@ export async function main(
     requestRestart: () => { requestServiceRestart(); },
   });
   await runForegroundApp(app);
+}
+
+export interface WebUiCommandDeps {
+  qiyanHome: string;
+  webUi?: { host: string; port: number }; // undefined ⇒ WEB_UI not configured
+  dataDir: string;
+  mainPid(): Promise<number | undefined>; // the running bot's main PID, or undefined
+  signal(pid: number): boolean; // deliver SIGUSR2; false on ESRCH (PID died)
+  readToken(dataDir: string): string | undefined; // best-effort persisted web token
+  write(text: string): void;
+}
+
+// `qiyan-bot web-ui start|stop|status`. start/stop persist the desired state atomically and, when
+// the bot is running, signal it to reconcile live (no restart). Signalling is safe regardless of
+// config because the running bot always installs a SIGUSR2 handler (see installWebUiSignalHandler);
+// the config guard here is UX only.
+export async function runWebUiCommand(action: WebUiAction, deps: WebUiCommandDeps): Promise<void> {
+  const statePath = webUiStatePath(deps.qiyanHome);
+  if (action === "status") {
+    let desired: string;
+    try { desired = readWebUiEnabled(statePath) ? "enabled" : "disabled"; }
+    catch { desired = "unreadable (kept as-is)"; }
+    const pid = await deps.mainPid();
+    const lines = [
+      `Web UI: ${deps.webUi ? "configured" : "not configured (set WEB_UI=1 and restart)"}`,
+      `Desired: ${desired}`,
+      `Bot service: ${pid === undefined ? "not running" : `running (pid ${pid})`}`,
+    ];
+    if (deps.webUi) {
+      const base = `http://${deps.webUi.host}:${deps.webUi.port}`;
+      const token = deps.readToken(deps.dataDir);
+      lines.push(`URL: ${token ? `${base}/?token=${token}` : `${base} (token shown by: qiyan-bot service logs)`}`);
+    }
+    deps.write(`${lines.join("\n")}\n`);
+    return;
+  }
+  if (!deps.webUi) {
+    deps.write("Web UI is not configured; set WEB_UI=1 (and WEB_HOST/WEB_PORT) in <qiyanHome>/.env and restart.\n");
+    return;
+  }
+  writeWebUiEnabled(statePath, action === "start");
+  const pid = await deps.mainPid();
+  const signalled = pid !== undefined && deps.signal(pid);
+  deps.write(signalled
+    ? `Web UI ${action === "start" ? "started" : "stopped"}.\n`
+    : "Saved; the bot is not running — it will apply on next start.\n");
 }
 
 interface ServiceProcessControl {

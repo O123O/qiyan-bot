@@ -31,6 +31,7 @@ import type { BotConfig } from "./config.ts";
 import { parseDirective } from "./directives/parser.ts";
 import { deliverDirectTo } from "./assistant/direct-to.ts";
 import { WebBus, createWebAdapter, createWebUiPhase } from "./webui/index.ts";
+import { webUiStatePath } from "./webui/webui-state.ts";
 import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
@@ -3056,6 +3057,7 @@ export async function buildProductionApp(
       uploads: webUploads(),
       acceptChat, report,
       onStarted: (url) => { process.stdout.write(`QiYan web UI listening — open ${url}\n`); options.testing?.onWebUiStarted?.(url); },
+      statePath: webUiStatePath(config.qiyanHome),
     })] : []),
   ];
 

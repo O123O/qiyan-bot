@@ -146,7 +146,9 @@ function tokenFromRequest(request: IncomingMessage, url: URL): string | undefine
 
 export function createWebServer(options: WebServerOptions): WebServer {
   const host = options.allowLan ? options.host : "127.0.0.1";
-  const wss = new WebSocketServer({ noServer: true });
+  // Recreated on each start() (and closed+cleared on stop()) so the handle is re-startable for the
+  // manual web-UI toggle — a closed ws.Server rejects later handleUpgrade calls.
+  let wss: WebSocketServer | undefined;
   let server: Server | undefined;
   let poll: ReturnType<typeof setInterval> | undefined;
   let uploadSweep: ReturnType<typeof setInterval> | undefined;
@@ -334,10 +336,12 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   return {
     async start() {
+      wss = new WebSocketServer({ noServer: true });
+      lastSessions = ""; // re-broadcast the first poll after a restart
       server = createServer((request, response) => { void handle(request, response).catch(() => { try { response.writeHead(500); response.end("error"); } catch { /* already sent */ } }); });
       server.on("upgrade", (request, socket, head) => {
         const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-        if (url.pathname !== "/ws" || !tokenValid(options.token, tokenFromRequest(request, url))) { socket.destroy(); return; }
+        if (url.pathname !== "/ws" || !wss || !tokenValid(options.token, tokenFromRequest(request, url))) { socket.destroy(); return; }
         wss.handleUpgrade(request, socket, head, (ws) => {
           options.bus.add(ws);
           ws.on("close", () => options.bus.remove(ws));
@@ -376,8 +380,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     async stop() {
       if (poll) clearInterval(poll);
       if (uploadSweep) clearInterval(uploadSweep);
-      for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } }
-      wss.close();
+      if (wss) { for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } } wss.close(); wss = undefined; }
       await new Promise<void>((resolve) => { if (!server) { resolve(); return; } server.close(() => resolve()); });
     },
   };

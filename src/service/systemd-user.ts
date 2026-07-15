@@ -445,6 +445,22 @@ async function runSystemctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv)
   return runBoundedCommand("systemctl", ["--user", ...args], hostEnv, MAX_SYSTEMCTL_OUTPUT_BYTES);
 }
 
+// The unit's main process PID, or undefined when the service is not running / not present /
+// systemd is unavailable. `qiyan-bot web-ui` uses it to deliver SIGUSR2 to exactly the bot's main
+// process (never the whole cgroup, which would signal ssh/vendored children with no handler).
+// Never throws — spawn failure and every non-running state map to undefined.
+export async function readServiceMainPid(
+  env: NodeJS.ProcessEnv = process.env,
+  runner: SystemdRunner = (args) => runSystemctl(args, env),
+): Promise<number | undefined> {
+  let outcome: SystemdOutcome;
+  try { outcome = await runner(["show", SYSTEMD_UNIT_NAME, "-p", "MainPID", "--value"]); }
+  catch { return undefined; }
+  if (outcome.code !== 0 || outcome.signal !== null) return undefined;
+  const pid = Number(outcome.stdout.trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 async function runJournalctl(args: readonly string[], hostEnv: NodeJS.ProcessEnv): Promise<SystemdOutcome> {
   return runBoundedCommand("journalctl", args, hostEnv, MAX_JOURNAL_OUTPUT_BYTES);
 }

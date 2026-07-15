@@ -53,6 +53,31 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
   try { await run(base, calls, bus, uploadsDir); } finally { await server.stop(); }
 }
 
+test("the server handle is restartable: start → stop → start re-listens and re-serves WS", async () => {
+  const bus = new WebBus();
+  const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
+  await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
+  const server = createWebServer({
+    host: "127.0.0.1", port: 0, allowLan: false, token: TOKEN, staticDir, bus, reads,
+    files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
+    submitInput: async () => ({ ok: true }), report: () => {},
+  });
+  const httpBase = (u: string) => u.slice(0, u.indexOf("/?"));
+
+  const first = await server.start();
+  assert.equal((await fetch(`${httpBase(first.url)}/api/sessions?token=${TOKEN}`)).status, 200);
+  await server.stop();
+
+  const second = await server.start();
+  const base2 = httpBase(second.url);
+  assert.equal((await fetch(`${base2}/api/sessions?token=${TOKEN}`)).status, 200, "re-listens after a stop");
+  // A closed ws.Server can't handleUpgrade — this proves stop()/start() recreated it.
+  const ws = new WebSocket(`${base2.replace("http", "ws")}/ws?token=${TOKEN}`);
+  await new Promise<void>((resolve, reject) => { ws.once("open", () => resolve()); ws.once("error", reject); });
+  ws.close();
+  await server.stop();
+});
+
 test("requires the token on every route", async () => {
   await withServer(async (base) => {
     assert.equal((await fetch(`${base}/api/sessions`)).status, 401);

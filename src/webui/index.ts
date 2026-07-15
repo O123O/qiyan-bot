@@ -10,6 +10,8 @@ import type { WebUploadsConfig } from "./web-uploads.ts";
 import type { RemoteDeps } from "./web-remote.ts";
 import { WEB_BINDING } from "./web-adapter.ts";
 import { createWebServer } from "./web-server.ts";
+import { readWebUiEnabled } from "./webui-state.ts";
+import { setWebUiSignalHandler } from "./webui-signal.ts";
 
 export { WebBus } from "./web-bus.ts";
 export { createWebAdapter, WEB_ADAPTER_ID } from "./web-adapter.ts";
@@ -33,6 +35,57 @@ export interface WebUiPhaseDeps extends WebUiConfig {
   acceptChat(source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void>;
   report(event: OperationalEvent): void;
   onStarted(url: string): void;
+  statePath: string; // <qiyanHome>/webui.json — persisted listening state for the manual toggle
+}
+
+// A restartable web server handle (the shape createWebServer returns); injectable for tests.
+export interface WebServerHandle {
+  start(): Promise<{ url: string }>;
+  stop(): Promise<void>;
+}
+
+export interface WebUiToggle {
+  reconcile(): Promise<void>;
+  dispose(): Promise<void>;
+  isRunning(): boolean;
+}
+
+// Single-flight controller reconciling the (restartable) web server against the persisted
+// desired-enabled state. dispose() enqueues its stop on the SAME chain, so it runs after any
+// in-flight start() — no orphaned listener can outlive shutdown. A corrupt state file is treated
+// as "keep the current state" (fail-safe), never fail-open.
+export function createWebUiToggle(deps: {
+  server: WebServerHandle;
+  readEnabled(): boolean;
+  onStarted(url: string): void;
+  report(event: OperationalEvent): void;
+}): WebUiToggle {
+  let running = false;
+  let disposed = false;
+  // `chain = next.catch(() => {})` is BOTH the single-flight tail AND the rejection sink for a
+  // signal-triggered `void reconcile()` whose promise is discarded — do NOT collapse to `chain = next`.
+  let chain: Promise<void> = Promise.resolve();
+  const run = (op: () => Promise<void>): Promise<void> => {
+    const next = chain.then(op, op);
+    chain = next.catch(() => {});
+    return next;
+  };
+  const reconcile = (): Promise<void> => run(async () => {
+    if (disposed) return; // dispose() performs the final stop
+    let want: boolean;
+    try { want = deps.readEnabled(); }
+    catch (error) {
+      deps.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: `web-ui state unreadable; keeping current state (${error instanceof Error ? error.message : String(error)})` });
+      return;
+    }
+    if (want && !running) { const { url } = await deps.server.start(); running = true; deps.onStarted(url); }
+    else if (!want && running) { await deps.server.stop(); running = false; }
+  });
+  const dispose = (): Promise<void> => {
+    disposed = true;
+    return run(async () => { if (running) { await deps.server.stop(); running = false; } });
+  };
+  return { reconcile, dispose, isRunning: () => running };
 }
 
 // The web UI HTTP/WS server as an AppPhase. Input to a specific worker is expressed as the `/to`
@@ -56,9 +109,24 @@ export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
     bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}), submitInput, report: deps.report,
   });
 
+  const toggle = createWebUiToggle({
+    server,
+    readEnabled: () => readWebUiEnabled(deps.statePath),
+    onStarted: deps.onStarted,
+    report: deps.report,
+  });
+
   return {
     name: "web-ui",
-    start: async () => { const { url } = await server.start(); deps.onStarted(url); },
-    stop: async () => { await server.stop(); },
+    // Reconcile FIRST (apply persisted state), THEN own SIGUSR2 — so if the initial start() fails
+    // the error propagates with no callback registered and a stray signal can't orphan a listener.
+    start: async () => {
+      await toggle.reconcile();
+      setWebUiSignalHandler(() => { void toggle.reconcile(); });
+    },
+    stop: async () => {
+      setWebUiSignalHandler(undefined);
+      await toggle.dispose();
+    },
   };
 }

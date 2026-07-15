@@ -118,3 +118,18 @@ test("formats startup phases and only sanitized typed causes", () => {
     "STARTUP_ERROR: application startup failed",
   );
 });
+
+test("parses web-ui subcommands with --home for every action", () => {
+  assert.deepEqual(parseCliArgs(["web-ui", "start"]), { command: "web-ui", action: "start" });
+  assert.deepEqual(parseCliArgs(["web-ui", "stop"]), { command: "web-ui", action: "stop" });
+  assert.deepEqual(parseCliArgs(["web-ui", "status"]), { command: "web-ui", action: "status" });
+  assert.deepEqual(parseCliArgs(["web-ui", "status", "--home", "/srv/qiyan"]), { command: "web-ui", action: "status", qiyanHome: "/srv/qiyan" });
+  assert.deepEqual(parseCliArgs(["web-ui", "start", "--home", "/srv/qiyan"]), { command: "web-ui", action: "start", qiyanHome: "/srv/qiyan" });
+  assert.deepEqual(parseCliArgs(["web-ui", "--help"]), { command: "help", topic: "web-ui" });
+  assert.deepEqual(parseCliArgs(["web-ui", "stop", "--help"]), { command: "help", topic: "web-ui" });
+  assert.throws(() => parseCliArgs(["web-ui"]), /web-ui action is required/u);
+  assert.throws(() => parseCliArgs(["web-ui", "bogus"]), /unknown web-ui action/u);
+  assert.throws(() => parseCliArgs(["web-ui", "start", "extra"]), /unknown argument/u);
+  assert.throws(() => parseCliArgs(["web-ui", "start", "--workdir", "/x"]), /unknown argument/u);
+  assert.match(formatCliHelp("web-ui"), /web-ui <start\|stop\|status>/u);
+});

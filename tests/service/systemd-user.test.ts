@@ -8,10 +8,20 @@ import {
   buildServiceEffectiveEnvironment,
   MANAGED_UNIT_MARKER,
   NodeSystemdUnitStore,
+  readServiceMainPid,
   SystemdUserService,
   renderSystemdUserUnit,
   type SystemdRunner,
 } from "../../src/service/systemd-user.ts";
+
+test("readServiceMainPid parses --value; non-running and spawn failure ⇒ undefined (never throws)", async () => {
+  assert.equal(await readServiceMainPid(process.env, async () => ({ code: 0, signal: null, stdout: "12345\n" })), 12345);
+  assert.equal(await readServiceMainPid(process.env, async () => ({ code: 0, signal: null, stdout: "0\n" })), undefined, "MainPID=0 ⇒ not running");
+  assert.equal(await readServiceMainPid(process.env, async () => ({ code: 0, signal: null, stdout: "\n" })), undefined, "empty ⇒ undefined");
+  assert.equal(await readServiceMainPid(process.env, async () => ({ code: 4, signal: null, stdout: "" })), undefined, "non-zero ⇒ undefined");
+  assert.equal(await readServiceMainPid(process.env, async () => ({ code: null, signal: "SIGTERM", stdout: "" })), undefined, "killed ⇒ undefined");
+  assert.equal(await readServiceMainPid(process.env, async () => { throw new Error("systemctl not found"); }), undefined, "spawn failure ⇒ undefined");
+});
 
 test("renders a secret-free foreground user unit with safely quoted paths", () => {
   const base = {
