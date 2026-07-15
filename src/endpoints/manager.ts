@@ -32,8 +32,23 @@ interface EndpointRecord {
   subscriptions: Array<() => void>;
   reconnect?: ScheduledWork;
   reconnectAttempt: number;
+  gaveUp?: boolean;
   lifecycle?: Promise<void>;
 }
+
+// Reconnect backoff for a lost/unreachable endpoint (e.g. a remote worker whose cluster is in
+// maintenance): retry fast at first for transient blips, then escalate and cap at hourly. If the
+// endpoint stays unreachable for ~48h — a long maintenance window — give up the automatic background
+// retries entirely instead of hammering it forever. Once given up, the background loop stays stopped;
+// it resumes only after a successful reconnect (which resets reconnectAttempt) or a bot restart. An
+// explicit ensureReady still makes a single direct attempt, so a recovered endpoint reconnects on next
+// use — it just doesn't restart the background ramp. Indexed by the record's reconnectAttempt, which
+// resets to 0 on a successful publish.
+const RECONNECT_BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 120_000]; // ramp: 5s, 10s, 30s, 1m, 2m
+const RECONNECT_STEADY_MS = 3_600_000; // then every 1h once the ramp is exhausted
+const RECONNECT_MAX_ATTEMPTS = RECONNECT_BACKOFF_MS.length + 48; // 5 ramp + 48 hourly ≈ 48h, then give up
+const reconnectDelayMs = (attempt: number): number =>
+  attempt < RECONNECT_BACKOFF_MS.length ? RECONNECT_BACKOFF_MS[attempt]! : RECONNECT_STEADY_MS;
 
 export class EndpointManager {
   private readonly records = new Map<string, EndpointRecord>();
@@ -54,6 +69,11 @@ export class EndpointManager {
     commitBinding?(binding: PendingDestinationBinding, hasReferences: boolean): void | Promise<void>;
     managedThreadIds(endpointId: string): readonly string[] | Promise<readonly string[]>;
     schedule?(delayMs: number, run: () => void): ScheduledWork;
+    // Called once (latched until the next successful reconnect) when the automatic reconnect loop
+    // gives up on a persistently-unreachable endpoint (~48h of failed retries, e.g. a cluster in
+    // extended maintenance). The background loop then stays stopped until a successful reconnect or a
+    // bot restart; an explicit ensureReady still makes one direct attempt.
+    onReconnectGaveUp?(endpointId: string, attempts: number): void;
   }) {
     this.builtins.set("local", options.localEndpoint);
     for (const endpoint of options.builtinEndpoints ?? []) this.builtins.set(endpoint.id, endpoint);
@@ -488,6 +508,7 @@ export class EndpointManager {
     record.endpoint = endpoint;
     record.generation += 1;
     record.reconnectAttempt = 0;
+    record.gaveUp = false;
     const generation = record.generation;
     record.subscriptions.push(endpoint.onUnavailable((kind) => {
       if (record.endpoint !== endpoint || record.generation !== generation) return;
@@ -509,11 +530,24 @@ export class EndpointManager {
     }
   }
 
+  // Circuit breaker for the automatic reconnect loop: once ~48h of continuous failures is reached,
+  // stop scheduling retries and surface the give-up exactly once (latched until the next successful
+  // publish clears record.gaveUp). Shared by both the loss-triggered and activation-retry schedulers.
+  private reachedReconnectLimit(endpointId: string, record: EndpointRecord): boolean {
+    if (record.reconnectAttempt < RECONNECT_MAX_ATTEMPTS) return false;
+    if (!record.gaveUp) {
+      record.gaveUp = true;
+      this.options.onReconnectGaveUp?.(endpointId, record.reconnectAttempt);
+    }
+    return true;
+  }
+
   private scheduleReconnect(endpointId: string, record: EndpointRecord, generation: number, _kind: EndpointLossKind): void {
     if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation || record.gate.desiredState !== "automatic" || record.reconnect) return;
-      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(record.reconnectAttempt, 5));
+      if (this.reachedReconnectLimit(endpointId, record)) return;
+      const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
       const schedule = this.options.schedule ?? ((delayMs: number, run: () => void) => {
         const timer = setTimeout(run, delayMs);
@@ -535,7 +569,8 @@ export class EndpointManager {
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.generation !== generation
         || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic" || record.reconnect) return;
-      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(record.reconnectAttempt, 5));
+      if (this.reachedReconnectLimit(endpointId, record)) return;
+      const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
       const schedule = this.options.schedule ?? ((delayMs: number, run: () => void) => {
         const timer = setTimeout(run, delayMs);

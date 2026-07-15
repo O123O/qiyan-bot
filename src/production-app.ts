@@ -2559,6 +2559,10 @@ export async function buildProductionApp(
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
           commitBinding: (binding, references) => endpointBindings.commitAfterActivation(binding.endpointId, binding.destination, references),
           managedThreadIds: (id) => Object.values(registry.snapshot().sessions).filter((session) => session.endpoint === id).map((session) => session.thread_id),
+          onReconnectGaveUp: (id, attempts) => reportOperationalSafely(report, {
+            level: "warn", code: "endpoint_reconnect_gave_up", component: "endpoint_manager", consecutiveFailures: attempts,
+            reason: `endpoint ${id} unreachable after sustained reconnect attempts (~48h); pausing automatic recovery until restart or next use`,
+          }),
         });
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,
