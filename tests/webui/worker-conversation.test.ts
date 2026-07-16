@@ -30,7 +30,7 @@ test("strips setup, ignores non-text inputs, and preserves all unknown-phase age
   assert.deepEqual(pageWorkerConversation(turns, 20).messages.map((row) => row.body), ["ok", "real prompt", "one", "two"]);
 });
 
-test("paginates only terminal rows with an exclusive compound cursor", () => {
+test("paginates terminal and open rows with a bounded exclusive compound cursor", () => {
   const terminalItems = Array.from({ length: 25 }, (_, index) => agentMsg(`a${index}`, `done-${index}`, "commentary"));
   const openItems = Array.from({ length: 25 }, (_, index) => agentMsg(`o${index}`, `open-${index}`, "commentary"));
   const turns = [
@@ -40,13 +40,20 @@ test("paginates only terminal rows with an exclusive compound cursor", () => {
   assert.deepEqual(openWorkerTurnIds(turns), ["open"]);
   assert.deepEqual(terminalWorkerTurnIds(turns), ["done"]);
   const newest = pageWorkerConversation(turns, 20);
-  assert.deepEqual(newest.messages.map((row) => row.body), Array.from({ length: 20 }, (_, index) => `done-${index + 5}`));
+  assert.deepEqual(newest.messages.map((row) => row.body), Array.from({ length: 20 }, (_, index) => `open-${index + 5}`));
   assert.equal(newest.hasOlder, true);
   assert.ok(newest.nextCursor);
   const older = pageWorkerConversation(turns, 20, newest.nextCursor);
-  assert.deepEqual(older.messages.map((row) => row.body), Array.from({ length: 5 }, (_, index) => `done-${index}`));
-  assert.equal(older.hasOlder, false);
-  assert.equal(older.nextCursor, undefined);
+  assert.deepEqual(older.messages.map((row) => row.body), [
+    ...Array.from({ length: 15 }, (_, index) => `done-${index + 10}`),
+    ...Array.from({ length: 5 }, (_, index) => `open-${index}`),
+  ]);
+  assert.equal(older.hasOlder, true);
+  assert.ok(older.nextCursor);
+  const oldest = pageWorkerConversation(turns, 20, older.nextCursor);
+  assert.deepEqual(oldest.messages.map((row) => row.body), Array.from({ length: 10 }, (_, index) => `done-${index}`));
+  assert.equal(oldest.hasOlder, false);
+  assert.equal(oldest.nextCursor, undefined);
 });
 
 test("Claude-style userMessage without content yields agent rows only", () => {

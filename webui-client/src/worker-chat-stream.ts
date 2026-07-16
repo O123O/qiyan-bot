@@ -68,6 +68,7 @@ export interface WorkerStreamState {
   pendingRecoveryTurnIds: string[];
   recoveredTurnIds: string[];
   observedTurnIds: string[];
+  terminalTurns: Array<{ turnId: string; status: string }>;
   historyInFlight: boolean;
   historyLoaded: boolean;
   hasOlder: boolean;
@@ -80,6 +81,7 @@ const MAX_RETAINED_DRAFT_MESSAGES = 30;
 const MAX_RETAINED_DRAFT_BYTES = 512 * 1024;
 const MAX_RETAINED_WORKERS = 4;
 const MAX_RETAINED_TOTAL_BYTES = 1024 * 1024;
+const MAX_TERMINAL_TURNS = 50;
 const utf8Bytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 export type WorkerDraftCache = Map<string, WorkerChatMessage[]>;
@@ -95,7 +97,8 @@ export function beginWorkerSubscription(
     nickname, mappingId, provider, requestId, messages: [...retainedMessages], retainedMessageIds: retainedMessages.map((message) => message.id),
     bufferedEvents: [], bufferedBytes: 0,
     snapshotPending: false, overflow: false, recoveryTurnIds: [], pendingRecoveryTurnIds: [],
-    recoveredTurnIds: [], observedTurnIds: [], historyInFlight: false, historyLoaded: false, hasOlder: false, olderCursor: undefined,
+    recoveredTurnIds: [], observedTurnIds: [], terminalTurns: [],
+    historyInFlight: false, historyLoaded: false, hasOlder: false, olderCursor: undefined,
   };
 }
 
@@ -172,6 +175,14 @@ function queueRecovery(state: WorkerStreamState, turnId: string): WorkerStreamSt
   return { ...state, pendingRecoveryTurnIds: [...state.pendingRecoveryTurnIds, turnId] };
 }
 
+function rememberTerminalTurn(state: WorkerStreamState, turnId: string, status: string): WorkerStreamState {
+  const terminalTurns = [
+    ...state.terminalTurns.filter((turn) => turn.turnId !== turnId),
+    { turnId, status },
+  ].slice(-MAX_TERMINAL_TURNS);
+  return { ...state, terminalTurns };
+}
+
 export function requeueWorkerRecovery(state: WorkerStreamState, turnId: string): WorkerStreamState {
   return queueRecovery(state, turnId);
 }
@@ -184,6 +195,14 @@ function compareMessages(left: WorkerChatMessage, right: WorkerChatMessage): num
     || (left.itemOrder ?? Number.MAX_SAFE_INTEGER) - (right.itemOrder ?? Number.MAX_SAFE_INTEGER);
 }
 
+function eventMessageId(event: WorkerChatEvent): string | undefined {
+  if (event.kind === "agent-message-delta") return `a:${event.turnId}:${event.itemId}`;
+  if (event.kind === "item-started" || event.kind === "item-completed") {
+    return `${event.item.type === "user-message" ? "u" : "a"}:${event.turnId}:${event.item.id}`;
+  }
+  return undefined;
+}
+
 function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): WorkerStreamState {
   const event = envelope.event;
   if (event.kind === "turn-started") return state.observedTurnIds.includes(event.turnId)
@@ -191,7 +210,10 @@ function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): Wo
     : { ...state, observedTurnIds: [...state.observedTurnIds, event.turnId] };
   if (event.kind === "turn-completed") {
     const terminalStatus = event.status ?? "completed";
-    let next = { ...state, messages: state.messages.map((message) => message.turnId === event.turnId ? { ...message, terminalStatus, streaming: false } : message) };
+    let next = rememberTerminalTurn({
+      ...state,
+      messages: state.messages.map((message) => message.turnId === event.turnId ? { ...message, terminalStatus, streaming: false } : message),
+    }, event.turnId, terminalStatus);
     if (state.provider === "claude" || state.recoveryTurnIds.includes(event.turnId)) next = queueRecovery(next, event.turnId);
     return next;
   }
@@ -239,8 +261,18 @@ export function receiveWorkerEvent(state: WorkerStreamState, envelope: WorkerEve
 
 export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSnapshot, recoveredTurnId?: string): WorkerStreamState {
   const open = new Set(snapshot.openTurnIds);
-  const terminalMessages = snapshot.messages.filter((message) => !open.has(message.turnId)).map((message): WorkerChatMessage => ({
-    ...message, role: message.role === "you" ? "you" : "worker", streaming: false, optimistic: false,
+  const liveTerminalStatus = new Map(state.terminalTurns.map((turn) => [turn.turnId, turn.status]));
+  const initialSnapshot = state.snapshotPending;
+  const fullyObserved = new Set([
+    ...state.observedTurnIds,
+    ...state.bufferedEvents.flatMap((envelope) => envelope.event.kind === "turn-started" ? [envelope.event.turnId] : []),
+  ]);
+  const snapshotMessages = snapshot.messages.map((message): WorkerChatMessage => ({
+    ...message,
+    role: message.role === "you" ? "you" : "worker",
+    terminalStatus: open.has(message.turnId) ? liveTerminalStatus.get(message.turnId) ?? "" : message.terminalStatus,
+    streaming: false,
+    optimistic: false,
   }));
   const currentOpenTurnIds = new Set([
     ...snapshot.openTurnIds,
@@ -252,16 +284,14 @@ export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSn
     || message.optimistic
     || currentOpenTurnIds.has(message.turnId)
     || snapshotMessageIds.has(message.id));
-  for (const message of terminalMessages) {
+  for (const message of snapshotMessages) {
     if (message.clientId) messages = messages.filter((candidate) => !(candidate.optimistic && candidate.clientId === message.clientId));
     messages = upsert(messages, message);
   }
-  const fullyObserved = new Set([
-    ...state.observedTurnIds,
-    ...state.bufferedEvents.flatMap((envelope) => envelope.event.kind === "turn-started" ? [envelope.event.turnId] : []),
-  ]);
   const recovery = new Set(state.recoveryTurnIds);
-  for (const turnId of snapshot.openTurnIds) if (!fullyObserved.has(turnId)) recovery.add(turnId);
+  if (initialSnapshot) {
+    for (const turnId of snapshot.openTurnIds) if (!fullyObserved.has(turnId)) recovery.add(turnId);
+  }
   const recoveryConfirmed = recoveredTurnId !== undefined && snapshot.terminalTurnIds.includes(recoveredTurnId);
   if (recoveryConfirmed) recovery.delete(recoveredTurnId);
   let pendingRecoveryTurnIds = state.pendingRecoveryTurnIds;
@@ -279,7 +309,12 @@ export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSn
     historyInFlight: false, recoveryTurnIds: [...recovery], pendingRecoveryTurnIds, recoveredTurnIds,
     historyLoaded: true, hasOlder: snapshot.hasOlder, olderCursor: snapshot.nextCursor,
   };
-  for (const envelope of state.bufferedEvents) next = applyEvent(next, envelope);
+  for (const envelope of state.bufferedEvents) {
+    const id = eventMessageId(envelope.event);
+    if (id && snapshotMessageIds.has(id)
+      && (envelope.event.kind === "agent-message-delta" || envelope.event.kind === "item-started")) continue;
+    next = applyEvent(next, envelope);
+  }
   return { ...next, messages: [...next.messages].sort(compareMessages) };
 }
 

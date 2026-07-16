@@ -144,19 +144,25 @@ test("snapshot merge trusts terminal items and recovers only a true mid-turn joi
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, true).state;
   state = receiveWorkerEvent(state, envelope({ kind: "turn-started", turnId: "observed" }));
-  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "observed", itemId: "a2", delta: "new" }));
-  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "joined", itemId: "a3", delta: "suffix" }));
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "observed", itemId: "a4", delta: "new" }));
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "joined", itemId: "a5", delta: "suffix" }));
   state = applyWorkerSnapshot(state, {
     messages: [
       { id: "a:done:a1", turnId: "done", body: "old", completedAt: 1, terminalStatus: "completed", phase: "commentary" },
-      { id: "a:observed:a2", turnId: "observed", body: "possibly overlapping", completedAt: 2, terminalStatus: "inProgress" },
-      { id: "a:joined:a3", turnId: "joined", body: "prefix", completedAt: 2, terminalStatus: "inProgress" },
+      { id: "a:observed:a2", turnId: "observed", body: "completed while loading", completedAt: 2, terminalStatus: "inProgress" },
+      { id: "a:joined:a3", turnId: "joined", body: "earlier", completedAt: 2, terminalStatus: "inProgress" },
     ],
     hasOlder: false,
     terminalTurnIds: ["done"],
     openTurnIds: ["observed", "joined"],
   });
-  assert.deepEqual(state.messages.map((message) => [message.id, message.body]), [["a:done:a1", "old"], ["a:observed:a2", "new"], ["a:joined:a3", "suffix"]]);
+  assert.deepEqual(state.messages.map((message) => [message.id, message.body]), [
+    ["a:done:a1", "old"],
+    ["a:observed:a2", "completed while loading"],
+    ["a:joined:a3", "earlier"],
+    ["a:observed:a4", "new"],
+    ["a:joined:a5", "suffix"],
+  ]);
   assert.deepEqual(state.recoveryTurnIds, ["joined"]);
 
   state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "observed" }));
@@ -165,12 +171,68 @@ test("snapshot merge trusts terminal items and recovers only a true mid-turn joi
   assert.deepEqual(state.pendingRecoveryTurnIds, ["joined"]);
 });
 
-test("paging does not reclassify an already observed live turn as a mid-turn join", () => {
+test("initial snapshot shows items from a turn that started before the panel subscribed", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
-  state = receiveWorkerEvent(state, envelope({ kind: "turn-started", turnId: "live" }));
+  state = beginWorkerHistory(state, true).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [
+      { id: "u:joined:u1", turnId: "joined", body: "latest question", completedAt: 1, terminalStatus: "inProgress", role: "you", turnOrder: 0, itemOrder: 0 },
+      { id: "a:joined:a1", turnId: "joined", body: "latest update", completedAt: 1, terminalStatus: "inProgress", phase: "commentary", turnOrder: 0, itemOrder: 1 },
+    ],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["joined"],
+  });
+
+  assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.terminalStatus, message.streaming]), [
+    ["u:joined:u1", "latest question", "", false],
+    ["a:joined:a1", "latest update", "", false],
+  ]);
+  assert.deepEqual(state.recoveryTurnIds, ["joined"]);
+});
+
+test("open snapshot reconciles by item identity instead of message text", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = beginWorkerHistory(state, true).state;
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "joined", itemId: "a1", delta: "ha" }));
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "joined", itemId: "a2", delta: "ha" }));
+  state = receiveWorkerEvent(state, envelope({ kind: "item-completed", turnId: "joined", item: { type: "agent-message", id: "a3", text: "authoritative", phase: "commentary" } }));
+  state = applyWorkerSnapshot(state, {
+    messages: [
+      { id: "a:joined:a1", turnId: "joined", body: "alpha", completedAt: 1, terminalStatus: "inProgress", phase: "commentary", turnOrder: 0, itemOrder: 0 },
+    ],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["joined"],
+  });
+
+  assert.deepEqual(state.messages.map((message) => [message.id, message.body]), [
+    ["a:joined:a1", "alpha"],
+    ["a:joined:a2", "ha"],
+    ["a:joined:a3", "authoritative"],
+  ]);
+});
+
+test("paging does not classify an open turn as a mid-turn join", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = beginWorkerHistory(state, false).state;
   state = applyWorkerSnapshot(state, { messages: [], hasOlder: true, terminalTurnIds: [], openTurnIds: ["live"] });
   assert.deepEqual(state.recoveryTurnIds, []);
+});
+
+test("a stale older page cannot downgrade a live terminal turn", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({ kind: "item-completed", turnId: "turn", item: { type: "agent-message", id: "a1", text: "already visible" } }));
+  state = beginWorkerHistory(state, false).state;
+  state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "turn", status: "completed" }));
+  state = applyWorkerSnapshot(state, {
+    messages: [
+      { id: "a:turn:a1", turnId: "turn", body: "already visible", completedAt: 1, terminalStatus: "inProgress" },
+      { id: "a:turn:a2", turnId: "turn", body: "older row", completedAt: 1, terminalStatus: "inProgress" },
+    ],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["turn"],
+  });
+
+  assert.deepEqual(state.messages.map((message) => [message.body, message.terminalStatus]), [
+    ["already visible", "completed"],
+    ["older row", "completed"],
+  ]);
 });
 
 test("a failed initial snapshot releases buffered live events instead of stranding them", () => {
@@ -228,6 +290,18 @@ test("recovery is complete only after the native snapshot proves the turn termin
 
   state = requeueWorkerRecovery({ ...state, recoveredTurnIds: [] }, "retry");
   assert.deepEqual(state.pendingRecoveryTurnIds, ["retry"]);
+});
+
+test("terminal recovery overrides a provisional status-less Claude completion", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({ kind: "turn-completed", turnId: "turn" }));
+  state = beginWorkerHistory(state, true).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:turn:a", turnId: "turn", body: "failed", completedAt: 2, terminalStatus: "failed", turnOrder: 0, itemOrder: 0 }],
+    hasOlder: false, terminalTurnIds: ["turn"], openTurnIds: [],
+  }, "turn");
+
+  assert.deepEqual(state.messages.map((message) => [message.body, message.terminalStatus]), [["failed", "failed"]]);
 });
 
 test("a long recovered turn advances paging so omitted target rows remain reachable", () => {

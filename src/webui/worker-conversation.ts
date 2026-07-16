@@ -92,7 +92,6 @@ export function pageWorkerConversation(turns: readonly unknown[], count: number,
     const turn = (raw ?? {}) as NativeTurn;
     const turnId = String(turn.id ?? "");
     const status = String(turn.status ?? "");
-    if (!TERMINAL.has(status)) return;
     const startedMs = toMillis(turn.startedAt ?? turn.completedAt);
     const completedMs = toMillis(turn.completedAt ?? turn.startedAt);
     const items = Array.isArray(turn.items) ? turn.items : [];
