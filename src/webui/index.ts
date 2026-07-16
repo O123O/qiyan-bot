@@ -17,6 +17,7 @@ export { WebBus } from "./web-bus.ts";
 export { createWebAdapter, WEB_ADAPTER_ID } from "./web-adapter.ts";
 
 const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export interface WebUiPhaseDeps {
   defaultHost: string; // WEB_HOST — used when the saved state has no host override
@@ -104,13 +105,14 @@ export function createWebUiToggle(deps: {
 // is an ordinary message to the assistant. The machinery is always built; it listens only when the
 // saved state says enabled (off by default), toggled live by `qiyan-bot web-ui start|stop`.
 export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
-  const submitInput = async (text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }> => {
+  const submitInput = async (text: string, target: string | undefined, clientInputId?: string): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }> => {
     if (target !== undefined && !NICKNAME.test(target)) return { ok: false, error: "invalid worker nickname" };
+    if (target !== undefined && (!clientInputId || !UUID.test(clientInputId))) return { ok: false, error: "valid clientInputId is required for worker input" };
     const rawText = target ? `/to ${target} ${text}` : text;
-    const id = `web:${randomUUID()}`;
+    const id = `web:${target ? clientInputId! : randomUUID()}`;
     try {
       await deps.acceptChat({ id, nativeSourceId: id, binding: WEB_BINDING, rawText, attachmentIds: [], receivedAt: Date.now() }, {});
-      return { ok: true };
+      return { ok: true, ...(target ? { clientUserMessageId: `to:${id}` } : {}) };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }

@@ -9,6 +9,22 @@ import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { STYLES } from "./styles";
 import { workerStatus } from "./worker-status";
+import {
+  acknowledgeWorkerSubscription,
+  addOptimisticWorkerMessage,
+  applyWorkerSnapshot,
+  beginWorkerHistory,
+  beginWorkerSubscription,
+  dequeueWorkerRecovery,
+  drainWorkerRecoveryAfterAttempt,
+  failWorkerHistory,
+  finishWorkerHistory,
+  receiveWorkerEvent,
+  requeueWorkerRecovery,
+  type WorkerEventEnvelope,
+  type WorkerSnapshot,
+  type WorkerStreamState,
+} from "./worker-chat-stream";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
@@ -23,9 +39,10 @@ const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
 const TOP_PX = 120, BOTTOM_PX = 80;
+const RECOVERY_RETRY_MS = [500, 1_500, 4_000] as const;
 
 interface Session { nickname: string; endpoint: string; provider: string; projectDir: string; lifecycleState: string; nativeStatus: string | null; activeTurnId: string | null; model: string | null; goal: WorkerGoal | null; }
-interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant"; at?: number; origin?: string; }
+interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
 type Preview =
@@ -123,7 +140,7 @@ export function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("qiyan-theme") as "dark" | "light") || "dark");
   const [log, setLog] = useState<Record<string, Msg[]>>({}); // your sent echoes + live replies, keyed by tab
   const [history, setHistory] = useState<Msg[]>([]); // QiYan's loaded conversation page(s), oldest→newest
-  const [finals, setFinals] = useState<Msg[]>([]);   // the selected worker's loaded page(s)
+  const [workerChat, setWorkerChat] = useState<WorkerStreamState | null>(null); // foreground worker only
   const [hasOlder, setHasOlder] = useState<Record<string, boolean>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [visible, setVisible] = useState(RENDER_CAP);
@@ -147,7 +164,36 @@ export function App() {
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
+  const sessionsRef = useRef(sessions); sessionsRef.current = sessions;
+  const workerRef = useRef<WorkerStreamState | null>(workerChat); workerRef.current = workerChat;
+  const wsRef = useRef<WebSocket | null>(null);
+  const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<void>) | null>(null);
+  const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
+  const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
+  const clearRecoveryRetries = useCallback(() => {
+    for (const retry of recoveryRetriesRef.current.values()) window.clearTimeout(retry.timer);
+    recoveryRetriesRef.current.clear();
+  }, []);
+  const scheduleRecoveryRetry = useCallback((nickname: string, subscriptionId: string, turnId: string): boolean => {
+    const key = `${subscriptionId}:${turnId}`;
+    const previous = recoveryRetriesRef.current.get(key);
+    const attempt = previous?.attempt ?? 0;
+    if (attempt >= RECOVERY_RETRY_MS.length) {
+      recoveryRetriesRef.current.delete(key);
+      return false;
+    }
+    if (previous) window.clearTimeout(previous.timer);
+    const timer = window.setTimeout(() => {
+      const current = workerRef.current;
+      if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId
+        || current.historyInFlight || !current.pendingRecoveryTurnIds.includes(turnId)) return;
+      replaceWorker({ ...current, pendingRecoveryTurnIds: current.pendingRecoveryTurnIds.filter((id) => id !== turnId) });
+      void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, turnId);
+    }, RECOVERY_RETRY_MS[attempt]);
+    recoveryRetriesRef.current.set(key, { attempt: attempt + 1, timer });
+    return true;
+  }, [replaceWorker]);
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("qiyan-theme", theme); }, [theme]);
 
@@ -156,10 +202,48 @@ export function App() {
     try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`); setHistory(p.messages); setHasOlder((h) => ({ ...h, [ASSIST]: p.hasOlder })); }
     catch { /* transient */ }
   }, []);
-  const loadFinals = useCallback(async (nickname: string) => {
-    try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/sessions/${nickname}/messages?limit=${PAGE}`); setFinals(p.messages); setHasOlder((h) => ({ ...h, [nickname]: p.hasOlder })); }
-    catch (e) { setFinals([{ body: `Error: ${(e as { error?: string }).error ?? e}`, completedAt: 0 }]); }
-  }, []);
+  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => {
+    const current = workerRef.current;
+    if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return;
+    const started = beginWorkerHistory(current, snapshotPending);
+    if (!started.started) return;
+    replaceWorker(started.state);
+    try {
+      const cursor = before === undefined ? "" : `&before=${encodeURIComponent(before)}`;
+      const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`);
+      const latest = workerRef.current;
+      if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return;
+      const merged = applyWorkerSnapshot(latest, page, recoveredTurnId);
+      replaceWorker(merged);
+      setHasOlder((value) => ({ ...value, [nickname]: merged.hasOlder }));
+      if (recoveredTurnId && merged.recoveredTurnIds.includes(recoveredTurnId)) {
+        const key = `${subscriptionId}:${recoveredTurnId}`;
+        const retry = recoveryRetriesRef.current.get(key);
+        if (retry) window.clearTimeout(retry.timer);
+        recoveryRetriesRef.current.delete(key);
+      }
+    } catch (error) {
+      const latest = workerRef.current;
+      if (latest?.nickname === nickname && latest.subscriptionId === subscriptionId) {
+        let failed = latest.snapshotPending ? failWorkerHistory(latest) : finishWorkerHistory(latest);
+        if (recoveredTurnId) failed = requeueWorkerRecovery(failed, recoveredTurnId);
+        replaceWorker(failed);
+        push(nickname, { role: "assistant", body: `Error: ${(error as { error?: string }).error ?? error}`, at: Date.now() });
+      }
+    } finally {
+      const latest = workerRef.current;
+      if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return;
+      const retryScheduled = recoveredTurnId !== undefined && latest.pendingRecoveryTurnIds.includes(recoveredTurnId)
+        ? scheduleRecoveryRetry(nickname, subscriptionId, recoveredTurnId)
+        : false;
+      const queued = drainWorkerRecoveryAfterAttempt(latest, recoveredTurnId, retryScheduled);
+      if (queued.state !== latest) replaceWorker(queued.state);
+      if (queued.turnId) {
+        queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, queued.turnId); });
+      }
+    }
+  }, [replaceWorker, scheduleRecoveryRetry]);
+  workerPageLoaderRef.current = loadWorkerPage;
   const loadDir = useCallback(async (nickname: string, path: string) => {
     try { const r = await api<FileResult>(`/api/files/${nickname}?path=${encodeURIComponent(path)}`);
       setDirs((d) => ({ ...d, [path]: "kind" in r && r.kind === "dir" ? r.entries : { error: "not a directory" } })); }
@@ -171,39 +255,86 @@ export function App() {
     return next;
   });
 
+  const subscribeWorker = useCallback((socket: WebSocket | null, nickname: string | null) => {
+    clearRecoveryRetries();
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!nickname) {
+      replaceWorker(null);
+      socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: crypto.randomUUID() }));
+      return;
+    }
+    const session = sessionsRef.current.find((candidate) => candidate.nickname === nickname);
+    const requestId = crypto.randomUUID();
+    const previous = workerRef.current;
+    const next = beginWorkerSubscription(nickname, session?.provider ?? "codex", requestId);
+    replaceWorker(previous?.nickname === nickname ? { ...next, messages: previous.messages.filter((message) => message.optimistic) } : next);
+    socket.send(JSON.stringify({ type: "worker/subscribe", nickname, requestId }));
+  }, [clearRecoveryRetries, replaceWorker]);
+
+  useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
   useEffect(() => { // WebSocket live updates
     let ws: WebSocket, stop = false;
     const connect = () => {
       ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
-      ws.onopen = () => setLive(true);
-      ws.onclose = () => { setLive(false); if (!stop) setTimeout(connect, 2000); };
+      wsRef.current = ws;
+      ws.onopen = () => { setLive(true); subscribeWorker(ws, selectedRef.current); };
+      ws.onclose = () => { if (wsRef.current === ws) wsRef.current = null; setLive(false); if (!stop) setTimeout(connect, 2000); };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "sessions") setSessions(m.sessions);
-        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); } }; // grow the window (only while viewing QiYan) so a live append while scrolled up doesn't slide/jump
+        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
+        else if (m.type === "worker/subscribed") {
+          const current = workerRef.current;
+          if (!current || current.nickname !== m.nickname || current.requestId !== m.requestId || typeof m.subscriptionId !== "string") return;
+          const acknowledged = acknowledgeWorkerSubscription(current, m.subscriptionId);
+          replaceWorker(acknowledged);
+          void workerPageLoaderRef.current?.(m.nickname, m.subscriptionId, true);
+        } else if (m.type === "worker/event") {
+          const current = workerRef.current;
+          if (!current) return;
+          const next = receiveWorkerEvent(current, m as WorkerEventEnvelope);
+          if (next === current) return;
+          replaceWorker(next);
+          if (next.overflow) { try { ws.close(1013, "worker stream buffer exceeded"); } catch { /* reconnect repairs */ } return; }
+          if (!stickRef.current) setVisible((value) => value + 1);
+          const queued = dequeueWorkerRecovery(next);
+          if (queued.turnId && queued.state.subscriptionId) {
+            replaceWorker(queued.state);
+            void workerPageLoaderRef.current?.(queued.state.nickname, queued.state.subscriptionId, true, undefined, queued.turnId);
+          }
+        } else if (m.type === "worker/subscription-error") {
+          const current = workerRef.current;
+          if (current && current.requestId === m.requestId) push(current.nickname, { role: "assistant", body: `[worker stream unavailable: ${m.code ?? "error"}]`, at: Date.now() });
+        } }; // grow the window while scrolled up so a live append doesn't slide/jump
     };
     connect();
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
-  }, []);
+  }, [replaceWorker, subscribeWorker]);
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
-  useEffect(() => { setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null; if (selected) { setFinals([]); void loadFinals(selected); setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); } }, [selected, loadFinals, loadDir]);
+  useEffect(() => {
+    setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null;
+    subscribeWorker(wsRef.current, selected);
+    if (selected) { setDirs({}); setExpanded(new Set()); void loadDir(selected, ""); }
+  }, [selected, subscribeWorker, loadDir]);
   useEffect(() => {
     if (selected && sidebarTab === "git") {
       const saved = JSON.parse(localStorage.getItem(`qiyan-git:${selected}`) || "[]") as string[];
       setTrackedRepos(saved); setDiscovered(null);
       saved.forEach((r) => loadRepoStatus(selected, r));
     }
-  }, [selected, sidebarTab]); // eslint-disable-line  // When a worker turn completes and you're pinned to the bottom, refresh to the latest page.
-  useEffect(() => { const s = sessions.find((x) => x.nickname === selected); if (s && !s.activeTurnId && selected && stickRef.current) void loadFinals(selected); }, [sessions]); // eslint-disable-line
+  }, [selected, sidebarTab]); // eslint-disable-line
 
-  // The visible conversation: QiYan = loaded history + session activity; worker = its finals + your
-  // echoes. Blank bodies are hidden here (kept in the loaded pages so the `before` cursor stays valid).
+  // The visible conversation: QiYan uses its durable owner history; the worker uses only the
+  // foreground subscription's Codex snapshot/live reducer plus ephemeral exec/error cards.
   const shown: Msg[] = useMemo(() => {
-    const base = selected === null ? [...history, ...(log[ASSIST] ?? [])] : [...finals, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b));
+    const workerMessages: Msg[] = workerChat?.nickname === selected ? workerChat.messages : [];
+    const base = selected === null ? [...history, ...(log[ASSIST] ?? [])] : [...workerMessages, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b)
+      || (a.turnOrder ?? Number.MAX_SAFE_INTEGER) - (b.turnOrder ?? Number.MAX_SAFE_INTEGER)
+      || (a.itemOrder ?? Number.MAX_SAFE_INTEGER) - (b.itemOrder ?? Number.MAX_SAFE_INTEGER));
     return base.filter((m) => m.body.trim());
-  }, [selected, finals, log, history]);
+  }, [selected, workerChat, log, history]);
   const rendered = shown.slice(Math.max(0, shown.length - visible));
 
   // Keep scroll position when prepending older messages; otherwise stay pinned to the bottom.
@@ -216,25 +347,34 @@ export function App() {
   const loadOlder = useCallback(async () => {
     if (loadingOlder) return;
     const el = logRef.current;
-    const cursor = selected === null ? history[0]?.at : finals[0]?.completedAt;
-    if (cursor === undefined) return;
+    const assistantCursor = selected === null ? history[0]?.at : undefined;
+    const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
+    if (assistantCursor === undefined && workerCursor === undefined) return;
     setLoadingOlder(true);
     if (el) preserveRef.current = el.scrollHeight;
     try {
-      const path = selected === null ? `/api/assistant/messages?limit=${PAGE}&before=${cursor}` : `/api/sessions/${selected}/messages?limit=${PAGE}&before=${cursor}`;
+      if (selected !== null) {
+        const active = workerRef.current;
+        if (active?.nickname === selected && active.subscriptionId && workerCursor !== undefined) {
+          await loadWorkerPage(selected, active.subscriptionId, false, workerCursor);
+          setVisible((value) => value + PAGE);
+        }
+        return;
+      }
+      const path = `/api/assistant/messages?limit=${PAGE}&before=${assistantCursor}`;
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path);
       // The `before` cursor is INCLUSIVE, so dedup the boundary rows we already have (by id).
-      const existing = new Set((selected === null ? history : finals).map((m) => m.id).filter(Boolean));
+      const existing = new Set(history.map((m) => m.id).filter(Boolean));
       const fresh = p.messages.filter((m) => !m.id || !existing.has(m.id));
       if (fresh.length) {
-        if (selected === null) setHistory((cur) => [...fresh, ...cur]); else setFinals((cur) => [...fresh, ...cur]);
+        setHistory((cur) => [...fresh, ...cur]);
         setVisible((v) => v + fresh.length);
       } else preserveRef.current = null;
       // Stop paging if the server has no more OR this fetch made no progress (avoids re-fetching the
       // same boundary page forever when >limit rows share one millisecond).
       setHasOlder((h) => ({ ...h, [key]: p.hasOlder && fresh.length > 0 }));
     } catch { preserveRef.current = null; } finally { setLoadingOlder(false); }
-  }, [loadingOlder, selected, history, finals, key]);
+  }, [loadingOlder, selected, history, workerChat, key, loadWorkerPage]);
 
   const onScroll = () => {
     const el = logRef.current; if (!el) return;
@@ -274,11 +414,18 @@ export function App() {
     const target = redirect ?? selected ?? undefined;
     const body = redirect ? m![2] : t;
     setText(""); setSuggest([]); stickRef.current = true;
-    push(key, { role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now() });
-    try { const r = await api<{ ok: boolean; error?: string }>("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body, target }) });
+    const clientInputId = target ? crypto.randomUUID() : undefined;
+    const active = workerRef.current;
+    if (target && target === selected && clientInputId) {
+      const session = sessions.find((candidate) => candidate.nickname === target);
+      const timeline = active?.nickname === target ? active : beginWorkerSubscription(target, session?.provider ?? "codex", crypto.randomUUID());
+      replaceWorker(addOptimisticWorkerMessage(timeline, `to:web:${clientInputId}`, body, Date.now()));
+    } else {
+      push(key, { role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now() });
+    }
+    try { const r = await api<{ ok: boolean; error?: string; clientUserMessageId?: string }>("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body, target, ...(clientInputId ? { clientInputId } : {}) }) });
       if (!r.ok) push(key, { role: "assistant", body: `[send failed: ${r.error ?? ""}]`, at: Date.now() }); }
     catch (e) { push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e}]`, at: Date.now() }); }
-    if (target) setTimeout(() => { if (selected === target) void loadFinals(target); }, 900);
   };
 
   const fileInput = useRef<HTMLInputElement>(null);

@@ -17,16 +17,15 @@ const reads: WebReadsDeps = {
   dashboardSnapshot: () => ({ version: 2, sessions: {
     payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: null, pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
-  readWorkerConversation: async (_e, _t, count, before) => {
-    // Two-sided native transcript: a prompt ("you") + the worker's replies ("worker"), merged by time.
-    const all = [
-      { id: "u:turn-0", turnId: "turn-0", role: "you" as const, body: "do the thing", completedAt: 999, terminalStatus: "" },
-      { id: "a:turn-0", turnId: "turn-0", role: "worker" as const, body: "final 0", completedAt: 1000, terminalStatus: "completed" },
-      { id: "a:turn-1", turnId: "turn-1", role: "worker" as const, body: "final 1", completedAt: 1001, terminalStatus: "completed" },
-    ];
-    const older = all.filter((m) => before === undefined || m.completedAt <= before); // inclusive cursor
-    return older.slice(Math.max(0, older.length - count));
-  },
+  readWorkerTurns: async () => [
+    { id: "turn-0", status: "completed", startedAt: 0.999, completedAt: 1, items: [
+      { type: "userMessage", id: "u0", clientId: "client-u0", content: [{ type: "text", text: "do the thing" }] },
+      { type: "agentMessage", id: "a0", text: "final 0", phase: "final_answer" },
+    ] },
+    { id: "turn-1", status: "completed", startedAt: 1.0005, completedAt: 1.001, items: [
+      { type: "agentMessage", id: "a1", text: "final 1", phase: "final_answer" },
+    ] },
+  ],
   listOwnerConversation: (before, limit) => {
     const convo = [{ id: "s1", role: "you" as const, body: "hi there", at: 500 }, { id: "f0", role: "assistant" as const, body: "final 0", at: 1000 }, { id: "f1", role: "assistant" as const, body: "final 1", at: 1001 }];
     const older = convo.filter((m) => before === undefined || m.at <= before); // inclusive cursor
@@ -35,9 +34,9 @@ const reads: WebReadsDeps = {
   provider: () => "codex",
 };
 
-async function withServer(run: (base: string, calls: { inputs: Array<{ text: string; target?: string }> }, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
+async function withServer(run: (base: string, calls: { inputs: Array<{ text: string; target?: string; clientInputId?: string }> }, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
   const bus = new WebBus();
-  const calls = { inputs: [] as Array<{ text: string; target?: string }> };
+  const calls = { inputs: [] as Array<{ text: string; target?: string; clientInputId?: string }> };
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
@@ -45,7 +44,7 @@ async function withServer(run: (base: string, calls: { inputs: Array<{ text: str
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
-    submitInput: async (text, target) => { calls.inputs.push({ text, ...(target ? { target } : {}) }); return { ok: true }; },
+    submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
     report: () => {},
   });
   const { url } = await server.start();
@@ -86,19 +85,15 @@ test("requires the token on every route", async () => {
   });
 });
 
-test("serves the session list and a worker transcript", async () => {
+test("serves the session list but never reads worker history without an active subscription", async () => {
   await withServer(async (base) => {
     const list = await (await fetch(`${base}/api/sessions?token=${TOKEN}`)).json();
     assert.deepEqual(list.sessions.map((s: { nickname: string }) => s.nickname), ["payments"]);
     assert.equal(list.sessions[0].provider, "codex");
     assert.deepEqual(list.sessions[0].goal, { objective: "ship it", status: "active" });
 
-    const t = await (await fetch(`${base}/api/sessions/payments/messages?count=5&token=${TOKEN}`)).json();
-    // Two-sided: the prompt ("you") precedes the worker's replies (no role ⇒ worker output).
-    assert.deepEqual(t.messages.map((m: { body: string }) => m.body), ["do the thing", "final 0", "final 1"]);
-    assert.equal(t.messages[0].role, "you");
-    assert.equal(t.messages[1].role, undefined);
-    assert.equal((await fetch(`${base}/api/sessions/nope/messages?token=${TOKEN}`)).status, 404);
+    assert.equal((await fetch(`${base}/api/sessions/payments/messages?count=5&token=${TOKEN}`)).status, 409);
+    assert.equal((await fetch(`${base}/api/sessions/nope/messages?token=${TOKEN}`)).status, 409);
   });
 });
 
@@ -131,9 +126,13 @@ test("paginates older messages with an inclusive before cursor (no same-ms skip)
 
 test("POST /api/input forwards text and target to submitInput", async () => {
   await withServer(async (base, calls) => {
-    await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hello", target: "payments" }) });
+    const clientInputId = crypto.randomUUID();
+    const sent = await (await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hello", target: "payments", clientInputId }) })).json();
     await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hi assistant" }) });
-    assert.deepEqual(calls.inputs, [{ text: "hello", target: "payments" }, { text: "hi assistant" }]);
+    assert.deepEqual(sent, { ok: true, clientUserMessageId: `to:web:${clientInputId}` });
+    assert.deepEqual(calls.inputs, [{ text: "hello", target: "payments", clientInputId }, { text: "hi assistant" }]);
+    assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "missing id", target: "payments" }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "bad id", target: "payments", clientInputId: "not-a-uuid" }) })).status, 400);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 400);
   });
 });
@@ -222,5 +221,39 @@ test("WS upgrade requires the token and receives broadcasts", async () => {
       s.on("error", reject);
     });
     assert.deepEqual(JSON.parse(got), { type: "message", body: "live!", at: 1 });
+  });
+});
+
+test("worker history requires the exact active WS subscription and tab switching invalidates it", async () => {
+  await withServer(async (base) => {
+    const ws = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    const requestId = crypto.randomUUID();
+    const ack = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("subscription acknowledgement timed out")), 1_000);
+      ws.on("message", (raw) => { const event = JSON.parse(String(raw)); if (event.type === "worker/subscribed") { clearTimeout(timer); resolve(event); } });
+    });
+    ws.send(JSON.stringify({ type: "worker/subscribe", nickname: "payments", requestId }));
+    const subscribed = await ack;
+    assert.equal(subscribed.requestId, requestId);
+    assert.match(subscribed.subscriptionId, /^[0-9a-f-]{36}$/u);
+
+    assert.equal((await fetch(`${base}/api/sessions/payments/messages?token=${TOKEN}`)).status, 409);
+    const page = await (await fetch(`${base}/api/sessions/payments/messages?subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).json();
+    assert.deepEqual(page.messages.map((message: { body: string }) => message.body), ["do the thing", "final 0", "final 1"]);
+    assert.deepEqual(page.openTurnIds, []);
+    assert.deepEqual(page.terminalTurnIds, ["turn-0", "turn-1"]);
+
+    const newest = await (await fetch(`${base}/api/sessions/payments/messages?limit=2&subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).json();
+    assert.deepEqual(newest.messages.map((message: { body: string }) => message.body), ["final 0", "final 1"]);
+    assert.equal(newest.hasOlder, true);
+    const older = await (await fetch(`${base}/api/sessions/payments/messages?limit=2&before=${encodeURIComponent(newest.nextCursor)}&subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).json();
+    assert.deepEqual(older.messages.map((message: { body: string }) => message.body), ["do the thing"]);
+    assert.equal(older.hasOlder, false);
+
+    ws.send(JSON.stringify({ type: "worker/unsubscribe", requestId: crypto.randomUUID() }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal((await fetch(`${base}/api/sessions/payments/messages?subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).status, 409);
+    ws.close();
   });
 });

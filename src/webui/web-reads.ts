@@ -1,13 +1,12 @@
 import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { SessionDashboardDocument } from "../assistant/dashboard-schema.ts";
-import type { WorkerConvoRow } from "../sessions/worker-conversation.ts";
 
 export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
-  // A worker's two-sided transcript (your prompts + its replies), read from its native codex/claude
-  // session — QiYan stores nothing for workers.
-  readWorkerConversation(endpointId: string, threadId: string, count: number, before?: number): Promise<WorkerConvoRow[]>;
+  // Raw native turns for the active Web UI subscription. Production must acquire an already-ready
+  // endpoint lease and pass the AbortSignal through; mapping happens only after identity revalidation.
+  readWorkerTurns(endpointId: string, threadId: string, signal: AbortSignal): Promise<unknown[]>;
   // The owner↔QiYan conversation (your chat + everything the owner was sent — replies, [worker]
   // relays, notices), oldest → newest.
   listOwnerConversation(before: number | undefined, limit: number): WebConvoMessage[];
@@ -46,7 +45,11 @@ export interface WebMessage {
   body: string;
   completedAt: number;
   terminalStatus: string;
+  turnOrder?: number;
+  itemOrder?: number;
   role?: "you"; // a prompt sent to the worker; absent ⇒ the worker's own reply
+  clientId?: string;
+  phase?: string;
 }
 
 // Lease-free: reads only the registry + dashboard snapshots (never the pool / thread-read).
@@ -68,18 +71,6 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       goal: goal ? { objective: goal.objective, status: goal.status } : null,
     };
   }).sort((a, b) => a.nickname.localeCompare(b.nickname));
-}
-
-// A worker's two-sided transcript from its native session (your prompts + its replies), oldest →
-// newest, one page. `before` (a completedAt cursor) pages older for scroll-up; `hasOlder` is true when
-// the page came back full. Returns undefined for an unknown session (→ 404).
-export async function transcript(deps: WebReadsDeps, nickname: string, limit: number, before?: number): Promise<WebPage<WebMessage> | undefined> {
-  const session = deps.registrySnapshot().sessions[nickname];
-  if (!session) return undefined;
-  const clamped = Math.max(1, Math.min(50, limit));
-  const messages = (await deps.readWorkerConversation(session.endpoint, session.thread_id, clamped, before))
-    .map((r): WebMessage => ({ id: r.id, turnId: r.turnId, body: r.body, completedAt: r.completedAt, terminalStatus: r.terminalStatus, ...(r.role === "you" ? { role: "you" as const } : {}) }));
-  return { messages, hasOlder: messages.length === clamped };
 }
 
 // The QiYan conversation (your chat + the assistant's replies), lease-free, oldest → newest, one

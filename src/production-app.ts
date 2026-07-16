@@ -65,7 +65,8 @@ import { SessionRegistry, type RegistrySession } from "./registry/session-regist
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
-import { mapWorkerConversation } from "./sessions/worker-conversation.ts";
+import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
+import { createWorkerStream, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { OwnershipEventStore } from "./sessions/ownership-event-store.ts";
 import {
   ExternalOwnershipMonitor,
@@ -2046,6 +2047,7 @@ export async function buildProductionApp(
   // always built; the web server listens only when the persisted state says enabled (off by default,
   // toggled by `qiyan-bot web-ui start|stop`).
   const webBus = new WebBus();
+  const webWorkerStream = createWorkerStream({ bus: webBus, registrySnapshot: () => registry.snapshot() });
   // The access token is PERSISTED under the data dir so it survives restarts — otherwise every restart
   // rotates it and open browser tabs (and their auth cookie) 401 with a stale token. Read lazily so
   // `dataDir` is the finalized root.
@@ -3075,17 +3077,10 @@ export async function buildProductionApp(
       reads: {
         registrySnapshot: () => registry.snapshot(),
         dashboardSnapshot: () => dashboard.snapshot(),
-        readWorkerConversation: async (endpointId, threadId, count, before) => {
-          // Read the worker's two-sided transcript straight from its NATIVE codex/claude session
-          // (thread/read) — QiYan stores nothing for workers. Web-UI only; chat apps are unaffected.
-          // Only touch an ALREADY-READY endpoint: a passive tab-open must NOT activate/dial a down
-          // endpoint (e.g. a remote ssh worker). Not ready, unreachable, or not-yet-materialized → empty.
-          if (!pool.isReady(endpointId)) return [];
-          let turns: unknown[] = [];
-          try { const h = await pool.request<{ thread?: { turns?: unknown[] } }>(endpointId, "thread/read", { threadId, includeTurns: true }); turns = h.thread?.turns ?? []; }
-          catch { /* unreachable / not materialized → empty */ }
-          return mapWorkerConversation(turns, count, before);
-        },
+        readWorkerTurns: (endpointId, threadId, signal) => readReadyWorkerTurns({
+          withReadyWorkLease: (id, run) => endpointManager.withReadyWorkLease(id, run),
+          request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
+        }, endpointId, threadId, signal),
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
       },
@@ -3693,6 +3688,7 @@ export async function buildProductionApp(
     const subscriptions = [
       target.onNotification((method, params) => {
         if (!current()) return;
+        offerWorkerNotification(webWorkerStream, target.id, method, params);
         if (!observations.accept(target.id, method, params)) runBackground(() => onNotification(target.id, method, params), () => recordBackgroundFailure("project notification"));
       }),
       target.onPermissionBlocked((event) => {

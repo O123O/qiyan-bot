@@ -3,10 +3,11 @@ import { createReadStream } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
-import { assistantTranscript, listSessions, transcript, type WebReadsDeps } from "./web-reads.ts";
+import { assistantTranscript, listSessions, type WebReadsDeps } from "./web-reads.ts";
+import { WorkerHistoryError, createWorkerHistoryReader, type WorkerHistoryReader } from "./worker-history-reader.ts";
 import { browse, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
@@ -15,6 +16,9 @@ import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGit
 
 const AUTH_COOKIE = "qiyan_web_token";
 const POLL_MS = 1_000;
+const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MAX_WS_INPUT_BYTES = 4 * 1024;
 // Browser-native types are streamed raw (Content-Type set) so a new tab renders them; everything
 // else is served as JSON text via the preview endpoints. Unknown types download as octet-stream.
 const RAW_CONTENT_TYPES: Record<string, string> = {
@@ -99,7 +103,7 @@ export interface WebServerOptions {
   // ssh access for remote-worker files (reuses the user's ControlMaster). A PROVIDER, not a value: the
   // ssh runtime root is only known after startup, so it must be resolved per request, not at wiring time.
   remote?: () => RemoteDeps | undefined;
-  submitInput(text: string, target: string | undefined): Promise<{ ok: boolean; error?: string }>;
+  submitInput(text: string, target: string | undefined, clientInputId?: string): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }>;
   report(event: OperationalEvent): void;
 }
 
@@ -152,6 +156,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   let poll: ReturnType<typeof setInterval> | undefined;
   let uploadSweep: ReturnType<typeof setInterval> | undefined;
   let lastSessions = "";
+  let historyReader: WorkerHistoryReader | undefined;
 
   const json = (response: ServerResponse, status: number, body: unknown): void => {
     const payload = JSON.stringify(body);
@@ -203,10 +208,27 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     const messages = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/messages$/u.exec(url.pathname);
     if (request.method === "GET" && messages) {
-      const { limit, before } = pageParams(url);
-      const result = await transcript(options.reads, messages[1]!, limit, before);
-      if (!result) { json(response, 404, { error: "unknown session" }); return; }
-      json(response, 200, result);
+      const { limit } = pageParams(url);
+      const before = url.searchParams.get("before") || undefined;
+      const nickname = messages[1]!;
+      const subscriptionId = url.searchParams.get("subscriptionId") ?? "";
+      if (!UUID.test(subscriptionId) || !historyReader) { json(response, 409, { error: "active worker subscription required" }); return; }
+      const abort = new AbortController();
+      const cancel = () => { if (!response.writableEnded) abort.abort(); };
+      request.once("aborted", cancel);
+      response.once("close", cancel);
+      try {
+        const result = await historyReader.read(subscriptionId, nickname, limit, before, abort.signal);
+        if (!response.writableEnded) json(response, 200, result);
+      } catch (error) {
+        if (!response.writableEnded && !abort.signal.aborted) {
+          const status = error instanceof WorkerHistoryError && (error.code === "busy" || error.code === "stale") ? 409 : 503;
+          json(response, status, { error: error instanceof Error ? error.message : "worker history unavailable" });
+        }
+      } finally {
+        request.off("aborted", cancel);
+        response.off("close", cancel);
+      }
       return;
     }
     // File tree, confined to the session's project — local via fs, remote via ssh.
@@ -319,12 +341,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (request.method === "POST" && url.pathname === "/api/input") {
       let raw = "";
       for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) { json(response, 413, { error: "too large" }); return; } }
-      let parsed: { text?: unknown; target?: unknown };
+      let parsed: { text?: unknown; target?: unknown; clientInputId?: unknown };
       try { parsed = JSON.parse(raw || "{}"); } catch { json(response, 400, { error: "invalid json" }); return; }
       const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
       const target = typeof parsed.target === "string" && parsed.target ? parsed.target : undefined;
+      const clientInputId = typeof parsed.clientInputId === "string" ? parsed.clientInputId : undefined;
       if (!text) { json(response, 400, { error: "text is required" }); return; }
-      const result = await options.submitInput(text, target);
+      if (target && (!clientInputId || !UUID.test(clientInputId))) { json(response, 400, { error: "valid clientInputId is required for worker input" }); return; }
+      const result = await options.submitInput(text, target, clientInputId);
       json(response, result.ok ? 200 : 400, result);
       return;
     }
@@ -335,7 +359,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   return {
     async start() {
-      wss = new WebSocketServer({ noServer: true });
+      wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_INPUT_BYTES });
+      historyReader = createWorkerHistoryReader({ bus: options.bus, registrySnapshot: options.reads.registrySnapshot, readTurns: options.reads.readWorkerTurns });
       lastSessions = ""; // re-broadcast the first poll after a restart
       server = createServer((request, response) => { void handle(request, response).catch(() => { try { response.writeHead(500); response.end("error"); } catch { /* already sent */ } }); });
       server.on("upgrade", (request, socket, head) => {
@@ -343,6 +368,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
         if (url.pathname !== "/ws" || !wss || !tokenValid(options.token, tokenFromRequest(request, url))) { socket.destroy(); return; }
         wss.handleUpgrade(request, socket, head, (ws) => {
           options.bus.add(ws);
+          ws.on("message", (raw) => handleWorkerCommand(ws, raw));
           ws.on("close", () => options.bus.remove(ws));
           ws.on("error", () => options.bus.remove(ws));
         });
@@ -379,6 +405,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     async stop() {
       if (poll) clearInterval(poll);
       if (uploadSweep) clearInterval(uploadSweep);
+      historyReader?.dispose(); historyReader = undefined;
       if (wss) { for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } } wss.close(); wss = undefined; }
       await new Promise<void>((resolve) => {
         if (!server) { resolve(); return; }
@@ -389,4 +416,33 @@ export function createWebServer(options: WebServerOptions): WebServer {
       });
     },
   };
+
+  function subscriptionError(socket: WebSocket, requestId: string, code: string): void {
+    options.bus.send(socket, { type: "worker/subscription-error", requestId, code });
+  }
+
+  function handleWorkerCommand(socket: WebSocket, raw: unknown): void {
+    let command: Record<string, unknown> | undefined;
+    try {
+      const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+      if (Buffer.byteLength(text) > MAX_WS_INPUT_BYTES) { socket.close(1009, "worker command too large"); return; }
+      const parsed = JSON.parse(text) as unknown;
+      command = parsed !== null && typeof parsed === "object" ? parsed as Record<string, unknown> : undefined;
+    } catch { /* invalid command below */ }
+    const requestId = typeof command?.requestId === "string" ? command.requestId : "";
+    if (!command || !UUID.test(requestId)) { subscriptionError(socket, requestId, "invalid-request"); return; }
+    if (command.type === "worker/unsubscribe") {
+      options.bus.unsubscribe(socket);
+      options.bus.send(socket, { type: "worker/unsubscribed", requestId });
+      return;
+    }
+    const nickname = typeof command.nickname === "string" ? command.nickname : "";
+    if (command.type !== "worker/subscribe" || !NICKNAME.test(nickname)) { subscriptionError(socket, requestId, "invalid-request"); return; }
+    const session = options.reads.registrySnapshot().sessions[nickname];
+    if (!session) { options.bus.unsubscribe(socket); subscriptionError(socket, requestId, "unknown-worker"); return; }
+    const subscription = options.bus.subscribe(socket, {
+      nickname, endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id, requestId,
+    });
+    options.bus.send(socket, { type: "worker/subscribed", nickname, requestId, subscriptionId: subscription.subscriptionId });
+  }
 }
