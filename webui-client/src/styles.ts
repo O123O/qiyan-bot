@@ -17,8 +17,10 @@ body { margin:0; }
 .tab { flex:0 0 auto; display:flex; align-items:center; gap:6px; background:transparent; color:var(--muted); border:1px solid transparent; border-radius:999px; padding:5px 12px; cursor:pointer; white-space:nowrap; font-size:13px; }
 .tab:hover { background:var(--panel2); }
 .tab.on { color:var(--text); background:var(--panel2); border-color:var(--line); }
+.tab-copy { display:flex; flex-direction:column; align-items:flex-start; line-height:1.1; }
+.tab-status { color:var(--muted); font-size:10px; }
 .dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
-.dot.idle { background:#3fd68a; } .dot.busy { background:#f5b13d; } .dot.other { background:#7d93a3; }
+.dot.idle { background:#3fd68a; } .dot.working { background:#f5b13d; } .dot.error { background:#ef6b73; } .dot.unavailable, .dot.other { background:#7d93a3; }
 .right { display:flex; align-items:center; gap:10px; }
 .live { font-size:12px; color:var(--muted); } .live.on { color:#3fd68a; }
 .ghost { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:5px 9px; cursor:pointer; }

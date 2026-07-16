@@ -8,6 +8,7 @@ import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { STYLES } from "./styles";
+import { workerStatus } from "./worker-status";
 
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
@@ -115,7 +116,6 @@ function CodeView({ text, title, lang: forced }: { text: string; title: string; 
 }
 
 const when = (m: Msg) => m.completedAt ?? m.at ?? 0;
-const STATUS_CLASS = (s: Session | null) => (!s ? "other" : s.nativeStatus === "idle" ? "idle" : s.nativeStatus ? "busy" : "other");
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -462,11 +462,13 @@ export function App() {
         <div className="brand">QiYan</div>
         <nav className="tabs" onWheel={(e) => { if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY; }}>
           <button className={`tab ${selected === null ? "on" : ""}`} onClick={() => setSelected(null)}><span className="dot other" />QiYan</button>
-          {sessions.map((s) => (
-            <button key={s.nickname} className={`tab ${selected === s.nickname ? "on" : ""}`} onClick={() => setSelected(s.nickname)} title={`${s.provider} · ${s.nativeStatus ?? "?"}${s.goal ? " · goal:" + s.goal.status : ""}`}>
-              <span className={`dot ${STATUS_CLASS(s)}`} />{s.nickname}
-            </button>
-          ))}
+          {sessions.map((s) => {
+            const status = workerStatus(s);
+            return <button key={s.nickname} className={`tab ${selected === s.nickname ? "on" : ""}`} onClick={() => setSelected(s.nickname)} title={`${s.provider} · ${status.label}${s.goal ? " · goal:" + s.goal.status : ""}`}>
+              <span className={`dot ${status.tone}`} />
+              <span className="tab-copy"><span className="tab-name">{s.nickname}</span><span className="tab-status">{status.label}</span></span>
+            </button>;
+          })}
         </nav>
         <div className="right">
           <span className={`live ${live ? "on" : ""}`}>{live ? "live" : "offline"}</span>
