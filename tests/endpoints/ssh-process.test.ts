@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
 const readyMarker = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
@@ -63,6 +64,19 @@ test("times out without returning child output in the error", async () => {
     (error: unknown) => error instanceof Error && /timed out/u.test(error.message) && !error.message.includes("SECRET"),
   );
   assert.ok(Date.now() - started >= 200, "the timeout waits for bounded child termination");
+});
+
+test("reports a nonzero process exit structurally without returning diagnostic output", async () => {
+  const secret = "REMOTE_CREDENTIAL_OUTPUT";
+  await assert.rejects(
+    runBoundedProcess(process.execPath, ["-e", `process.stderr.write(${JSON.stringify(secret)}); process.exit(23)`], {
+      timeoutMs: 1_000, maxOutputBytes: 1024,
+    }),
+    (error: unknown) => error instanceof AppError
+      && error.code === "ENDPOINT_UNAVAILABLE"
+      && error.details?.exitCode === 23
+      && !error.message.includes(secret),
+  );
 });
 
 test("rejects pre-aborted work without spawning and handles an early stdin close", async (t) => {
@@ -154,8 +168,9 @@ test("a ready process stream fails generically before its marker and cleans up",
     openReadyProcessStream(process.execPath, ["-e", program], {
       readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
     }),
-    (error: unknown) => error instanceof Error
+    (error: unknown) => error instanceof AppError
       && /stream failed before readiness/u.test(error.message)
+      && error.details?.exitCode === 23
       && !error.message.includes(secret),
   );
 });

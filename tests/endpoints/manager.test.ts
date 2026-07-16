@@ -22,11 +22,18 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   localPid = 10;
   threadStatus: "notLoaded" | "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
+  startGate: Promise<void> | undefined;
   readonly requests: Array<{ method: string; params: unknown }> = [];
   onRuntimeIdentity: (() => void) | undefined;
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
-  async start() { this.starts += 1; if (this.failStart) throw this.startError ?? new Error("offline"); this.state = "ready"; this.events.emit("ready"); }
+  async start() {
+    this.starts += 1;
+    await this.startGate;
+    if (this.failStart) throw this.startError ?? new Error("offline");
+    this.state = "ready";
+    this.events.emit("ready");
+  }
   async closeConnection() { this.connectionCloses += 1; this.state = "stopped"; }
   async shutdownRuntime() {
     this.runtimeStops += 1;
@@ -76,7 +83,7 @@ function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly st
   return { manager, local, candidateCount: () => index };
 }
 
-function fixture() {
+function fixture(options: { onRecoveryPaused?(id: string, recovery: { reason: "ssh_fresh_channel_unavailable"; sshHost: string }): boolean } = {}) {
   const local = new FakeEndpoint("local");
   const remotes = new Map<string, FakeEndpoint>();
   const commits: string[] = [];
@@ -95,8 +102,16 @@ function fixture() {
     hasIdentityReferences: () => true,
     commitBinding: (binding) => { commits.push(binding.endpointId); },
     managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    ...(options.onRecoveryPaused ? { onRecoveryPaused: options.onRecoveryPaused } : {}),
   });
   return { manager, local, remotes, commits, reloads: () => reloads };
+}
+
+function freshSshChannelUnavailable(sshHost = "prenyx"): AppError {
+  return new AppError("ENDPOINT_UNAVAILABLE", "SSH cannot open a fresh remote session", {
+    recovery: "ssh_fresh_channel_unavailable",
+    sshHost,
+  });
 }
 
 test("local is the default and SSH endpoints are created lazily", async () => {
@@ -150,6 +165,185 @@ test("an unavailable referenced endpoint keeps retrying without blocking startup
   scheduled.shift()!();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(manager.endpointGeneration("offline").endpoint.state, "ready");
+});
+
+test("a fresh-channel activation failure pauses retries, notifies once, and re-arms after recovery", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  remote.failStart = true;
+  remote.startError = freshSshChannelUnavailable();
+  const scheduled: Array<{ delay: number; run: () => void }> = [];
+  const notifications: Array<{ id: string; reason: string; sshHost: string }> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
+    onRecoveryPaused: (id, recovery) => { notifications.push({ id, ...recovery }); return true; },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
+  await settle();
+  assert.equal(scheduled.length, 0, "classified activation failures do not start the retry ramp");
+  assert.deepEqual(notifications, [{ id: remote.id, reason: "ssh_fresh_channel_unavailable", sshHost: "prenyx" }]);
+
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
+  await settle();
+  assert.equal(remote.starts, 2, "direct use still makes one recovery attempt");
+  assert.equal(scheduled.length, 0);
+  assert.equal(notifications.length, 1, "a prepared notice is latched for the incident");
+
+  remote.failStart = false;
+  await manager.ensureReady(remote.id);
+  remote.failStart = true;
+  remote.fail("connection-lost");
+  await settle();
+  assert.equal(scheduled.length, 1, "successful publication clears the pause and restores normal retries");
+  scheduled.shift()!.run();
+  await settle();
+  assert.equal(scheduled.length, 0, "the later classified loss pauses before another timer is installed");
+  assert.equal(notifications.length, 2, "a fresh incident after recovery notifies again");
+});
+
+test("a loss-triggered retry pauses immediately when activation reports a fresh-channel failure", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  const scheduled: Array<() => void> = [];
+  let notifications = 0;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+    onRecoveryPaused: () => { notifications += 1; return true; },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await manager.ensureReady(remote.id);
+  remote.failStart = true;
+  remote.startError = freshSshChannelUnavailable();
+  remote.fail("runtime-lost");
+  await settle();
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()!();
+  await settle();
+  assert.equal(notifications, 1);
+  assert.equal(scheduled.length, 0, "the classified retry failure does not recursively reschedule");
+});
+
+test("a pending reference check cannot install a reconnect timer after operator action is latched", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  let resolveReferences!: (value: boolean) => void;
+  const pendingReferences = new Promise<boolean>((resolve) => { resolveReferences = resolve; });
+  let referenceCalls = 0;
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => ++referenceCalls === 2 ? pendingReferences : true,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+    onRecoveryPaused: () => true,
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await manager.ensureReady(remote.id);
+  remote.fail("connection-lost");
+  await settle();
+  assert.equal(referenceCalls, 2, "loss-triggered scheduling is waiting on its durable-reference check");
+
+  remote.failStart = true;
+  remote.startError = freshSshChannelUnavailable();
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
+  resolveReferences(true);
+  await settle();
+  assert.equal(scheduled.length, 0, "the stale async continuation observes the recovery pause");
+});
+
+test("notification preparation failure cannot alter the endpoint error and is retried only on direct use", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  const failure = freshSshChannelUnavailable();
+  remote.failStart = true;
+  remote.startError = failure;
+  const attempts: string[] = [];
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+    onRecoveryPaused: () => {
+      attempts.push("prepare");
+      if (attempts.length === 1) throw new Error("delivery database unavailable");
+      return true;
+    },
+  });
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === failure);
+  await settle();
+  assert.deepEqual(attempts, ["prepare"]);
+  assert.equal(scheduled.length, 0);
+
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === failure);
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === failure);
+  await settle();
+  assert.deepEqual(attempts, ["prepare", "prepare"], "a successful second preparation is latched");
+  assert.equal(scheduled.length, 0);
+});
+
+test("a newer lifecycle publication wins over an older classified activation failure", async () => {
+  const local = new FakeEndpoint("local");
+  const current = new FakeEndpoint("devbox");
+  const stale = new FakeEndpoint("devbox");
+  stale.failStart = true;
+  stale.startError = freshSshChannelUnavailable();
+  let releaseStale!: () => void;
+  stale.startGate = new Promise<void>((resolve) => { releaseStale = resolve; });
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  const candidates = [current, stale, replacement];
+  const notifications: string[] = [];
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: "devbox", provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => {
+      const endpoint = candidates.shift();
+      assert.ok(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => false,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+    onRecoveryPaused: (id) => { notifications.push(id); return true; },
+  });
+
+  await manager.ensureReady("devbox");
+  current.fail("connection-lost");
+  const staleAttempt = manager.ensureReady("devbox");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stale.starts, 1);
+
+  await manager.restart("devbox");
+  assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+  releaseStale();
+  await assert.rejects(staleAttempt, (error) => error === stale.startError);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(notifications, [], "the stale error cannot re-latch after the replacement publication");
+  assert.equal(scheduled.length, 0);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
 });
 
 test("reconnect backoff escalates then gives up after ~48h of failures instead of hammering forever", async () => {
@@ -507,6 +701,58 @@ test("lifecycle cold activation retries on its capped timer without a ready even
   await new Promise<void>((resolve) => { setImmediate(resolve); });
   assert.equal(attempts, 2);
   assert.equal(replacement.starts, 2);
+  assert.equal(replacement.state, "ready");
+  await loop.stop();
+});
+
+test("fresh-channel lifecycle recovery pauses and waits for an explicit endpoint-ready wake", async () => {
+  const notifications: Array<{ id: string; sshHost: string }> = [];
+  const value = fixture({
+    onRecoveryPaused: (id, recovery) => { notifications.push({ id, sshHost: recovery.sshHost }); return true; },
+  });
+  const replacement = new FakeEndpoint("devbox");
+  replacement.identityToken = "b".repeat(32);
+  replacement.failStart = true;
+  replacement.startError = freshSshChannelUnavailable();
+  value.remotes.set("devbox", replacement);
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  let attempts = 0;
+  const target = { policy: "endpoint_lifecycle", endpointId: "devbox" } as const;
+  const loop = createOperationReconciliationLoop({
+    isEndpointReady: () => replacement.state === "ready",
+    timers: {
+      setTimeout: (callback, delay) => { const timer = { callback, delay }; scheduled.push(timer); return timer; },
+      clearTimeout: () => undefined,
+    },
+    reconcileOnce: async () => {
+      attempts += 1;
+      try {
+        await value.manager.recoverRestart("devbox", "runtime_stopped", {
+          kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10,
+        });
+        return { outcome: { attempted: true, transientRetry: false, waitingForEndpoint: false }, transientTargets: new Map() };
+      } catch (error) {
+        const disposition = operationRecoveryFailureDisposition(error, target);
+        return {
+          outcome: {
+            attempted: true,
+            transientRetry: disposition === "retry",
+            waitingForEndpoint: disposition === "wait_for_endpoint",
+          },
+          transientTargets: disposition === "retry" ? new Map([["restart", target]]) : new Map(),
+        };
+      }
+    },
+  });
+
+  await loop.request();
+  assert.equal(attempts, 1);
+  assert.deepEqual(notifications, [{ id: "devbox", sshHost: "prenyx" }]);
+  assert.equal(scheduled.length, 0, "operator-action failures never arm the lifecycle retry timer");
+
+  replacement.failStart = false;
+  await loop.endpointReady("devbox");
+  assert.equal(attempts, 2, "an explicit ready edge retries the retained durable operation");
   assert.equal(replacement.state, "ready");
   await loop.stop();
 });

@@ -131,9 +131,11 @@ export function openReadyProcessStream(
       processExited = true;
       if (escalation) clearTimeout(escalation);
       exitResolve();
-      const error = code === 0 && !signal ? undefined : new AppError("ENDPOINT_UNAVAILABLE", ready
-        ? "SSH process stream failed"
-        : "SSH process stream failed before readiness");
+      const error = code === 0 && !signal ? undefined : new AppError(
+        "ENDPOINT_UNAVAILABLE",
+        ready ? "SSH process stream failed" : "SSH process stream failed before readiness",
+        code === null ? undefined : { exitCode: code },
+      );
       if (!startupSettled) failStartup(error ?? new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream closed before readiness"));
       else if (!intentional) notifyClose(error);
     });
@@ -183,7 +185,11 @@ export function runBoundedProcess(
       if (!exitOutcome || !inputSettled || !stdoutClosed || !stderrClosed) return;
       if (terminalError) { finish(terminalError); return; }
       if (exitOutcome.code === 0) finish();
-      else finish(new AppError("ENDPOINT_UNAVAILABLE", `SSH process failed (${exitOutcome.signal ? "signal" : `exit ${exitOutcome.code ?? "unknown"}`})`));
+      else finish(new AppError(
+        "ENDPOINT_UNAVAILABLE",
+        `SSH process failed (${exitOutcome.signal ? "signal" : `exit ${exitOutcome.code ?? "unknown"}`})`,
+        exitOutcome.code === null ? undefined : { exitCode: exitOutcome.code },
+      ));
     };
     const stop = (error: Error) => {
       if (settled || terminalError) return;

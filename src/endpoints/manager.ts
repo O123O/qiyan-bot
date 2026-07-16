@@ -33,7 +33,13 @@ interface EndpointRecord {
   reconnect?: ScheduledWork;
   reconnectAttempt: number;
   gaveUp?: boolean;
+  recoveryPause?: EndpointRecoveryPause & { notificationPrepared: boolean };
   lifecycle?: Promise<void>;
+}
+
+export interface EndpointRecoveryPause {
+  reason: "ssh_fresh_channel_unavailable";
+  sshHost: string;
 }
 
 // Reconnect backoff for a lost/unreachable endpoint (e.g. a remote worker whose cluster is in
@@ -74,6 +80,10 @@ export class EndpointManager {
     // extended maintenance). The background loop then stays stopped until a successful reconnect or a
     // bot restart; an explicit ensureReady still makes one direct attempt.
     onReconnectGaveUp?(endpointId: string, attempts: number): void;
+    // Called after automatic retries are paused for an operator-actionable recovery state. Return
+    // true only after the durable owner notice is prepared. A throw/false result is isolated from
+    // the endpoint error and retried on the next directly-triggered classified failure.
+    onRecoveryPaused?(endpointId: string, recovery: EndpointRecoveryPause): boolean;
   }) {
     this.builtins.set("local", options.localEndpoint);
     for (const endpoint of options.builtinEndpoints ?? []) this.builtins.set(endpoint.id, endpoint);
@@ -88,9 +98,10 @@ export class EndpointManager {
     const record = this.record(endpointId);
     if (record.gate.desiredState === "draining") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is draining: ${endpointId}`);
     record.gate.requestAutomatic();
+    const attemptedGeneration = record.generation;
     try { return await this.activate(endpointId, false); }
     catch (error) {
-      this.scheduleActivationRetry(endpointId, record);
+      if (!this.pauseForRecovery(endpointId, record, attemptedGeneration, error)) this.scheduleActivationRetry(endpointId, record);
       throw error;
     }
   }
@@ -195,7 +206,7 @@ export class EndpointManager {
   async disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
-    return this.enqueueLifecycle(record, () => this.disconnectInternal(endpointId, record, checkpoint));
+    return this.enqueueLifecycle(endpointId, record, () => this.disconnectInternal(endpointId, record, checkpoint));
   }
 
   private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
@@ -222,7 +233,7 @@ export class EndpointManager {
   async restart(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
-    return this.enqueueLifecycle(record, () => this.restartInternal(endpointId, record, checkpoint));
+    return this.enqueueLifecycle(endpointId, record, () => this.restartInternal(endpointId, record, checkpoint));
   }
 
   async recoverDisconnect(
@@ -232,7 +243,7 @@ export class EndpointManager {
     checkpoint?: (value: unknown) => void,
   ): Promise<void> {
     const record = this.record(id);
-    return this.enqueueLifecycle(record, async () => {
+    return this.enqueueLifecycle(id, record, async () => {
       if (record.gate.desiredState === "disconnected") return;
       this.cancelReconnect(record);
       const drain = await record.gate.beginDrain();
@@ -281,7 +292,7 @@ export class EndpointManager {
     checkpoint?: (value: unknown) => void,
   ): Promise<void> {
     const record = this.record(id);
-    return this.enqueueLifecycle(record, async () => {
+    return this.enqueueLifecycle(id, record, async () => {
       this.cancelReconnect(record);
       if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
       const replacement = phase === "runtime_started" || phase === "runtime_stopped"
@@ -509,6 +520,7 @@ export class EndpointManager {
     record.generation += 1;
     record.reconnectAttempt = 0;
     record.gaveUp = false;
+    delete record.recoveryPause;
     const generation = record.generation;
     record.subscriptions.push(endpoint.onUnavailable((kind) => {
       if (record.endpoint !== endpoint || record.generation !== generation) return;
@@ -545,9 +557,10 @@ export class EndpointManager {
   }
 
   private scheduleReconnect(endpointId: string, record: EndpointRecord, generation: number, _kind: EndpointLossKind): void {
-    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
-      if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation || record.gate.desiredState !== "automatic" || record.reconnect) return;
+      if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation
+        || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -558,8 +571,13 @@ export class EndpointManager {
       });
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
-        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic") return;
-        void this.activate(endpointId, false).catch(() => this.scheduleReconnect(endpointId, record, generation, "connection-lost"));
+        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic"
+          || record.recoveryPause) return;
+        void this.activate(endpointId, false).catch((error) => {
+          if (!this.pauseForRecovery(endpointId, record, generation, error)) {
+            this.scheduleReconnect(endpointId, record, generation, "connection-lost");
+          }
+        });
       });
     }).catch(() => undefined);
   }
@@ -567,10 +585,11 @@ export class EndpointManager {
   private scheduleActivationRetry(endpointId: string, record: EndpointRecord): void {
     const generation = record.generation;
     if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect
-      || record.endpoint?.state === "ready") return;
+      || record.endpoint?.state === "ready" || record.recoveryPause) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.generation !== generation
-        || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic" || record.reconnect) return;
+        || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic"
+        || record.reconnect || record.recoveryPause) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -582,10 +601,12 @@ export class EndpointManager {
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
         if (this.closing || record.generation !== generation
-          || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic") return;
+          || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic"
+          || record.recoveryPause) return;
         void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((stillReferenced) => {
           if (this.closing || !stillReferenced || record.generation !== generation || record.reconnect
-            || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic") return;
+            || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic"
+            || record.recoveryPause) return;
           void this.ensureReady(endpointId).catch(() => undefined);
         }).catch(() => undefined);
       });
@@ -595,6 +616,28 @@ export class EndpointManager {
   private cancelReconnect(record: EndpointRecord): void {
     record.reconnect?.cancel();
     delete record.reconnect;
+  }
+
+  private pauseForRecovery(
+    endpointId: string,
+    record: EndpointRecord,
+    attemptedGeneration: number,
+    error: unknown,
+  ): boolean {
+    const recovery = endpointRecoveryPause(error);
+    if (!recovery || record.generation !== attemptedGeneration) return false;
+    this.cancelReconnect(record);
+    if (record.recoveryPause?.reason !== recovery.reason || record.recoveryPause.sshHost !== recovery.sshHost) {
+      record.recoveryPause = { ...recovery, notificationPrepared: false };
+    }
+    if (!record.recoveryPause.notificationPrepared) {
+      try {
+        record.recoveryPause.notificationPrepared = this.options.onRecoveryPaused?.(endpointId, recovery) ?? true;
+      } catch {
+        record.recoveryPause.notificationPrepared = false;
+      }
+    }
+    return true;
   }
 
   private async requireRuntimeIdentity(endpoint: ManagedAppServerEndpoint): Promise<RuntimeIdentity> {
@@ -609,10 +652,17 @@ export class EndpointManager {
     return identity;
   }
 
-  private enqueueLifecycle<T>(record: EndpointRecord, run: () => Promise<T>): Promise<T> {
+  private enqueueLifecycle<T>(endpointId: string, record: EndpointRecord, run: () => Promise<T>): Promise<T> {
     if (this.closing) return Promise.reject(new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down"));
     const previous = record.lifecycle ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(run);
+    const result = previous.catch(() => undefined).then(async () => {
+      const attemptedGeneration = record.generation;
+      try { return await run(); }
+      catch (error) {
+        this.pauseForRecovery(endpointId, record, attemptedGeneration, error);
+        throw error;
+      }
+    });
     const settled = result.then(() => undefined, () => undefined);
     record.lifecycle = settled;
     void settled.finally(() => { if (record.lifecycle === settled) delete record.lifecycle; });
@@ -657,6 +707,13 @@ export class EndpointManager {
   private newRecord(id: string, endpoint?: ManagedAppServerEndpoint): EndpointRecord {
     return { gate: new EndpointAdmissionGate(id), ...(endpoint ? { endpoint } : {}), generation: 0, subscriptions: [], reconnectAttempt: 0 };
   }
+}
+
+function endpointRecoveryPause(error: unknown): EndpointRecoveryPause | undefined {
+  if (!(error instanceof AppError) || error.code !== "ENDPOINT_UNAVAILABLE"
+    || error.details?.recovery !== "ssh_fresh_channel_unavailable"
+    || typeof error.details.sshHost !== "string" || error.details.sshHost.length === 0) return undefined;
+  return { reason: "ssh_fresh_channel_unavailable", sshHost: error.details.sshHost };
 }
 
 function sameRuntimeIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {

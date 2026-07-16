@@ -6,8 +6,10 @@ import { gzipSync } from "node:zlib";
 import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
+  buildControlMasterCheckArgs,
   buildControlMasterExitArgs,
   buildSshRemoteNodeProgramArgs,
+  buildSshSessionProbeArgs,
   type SshConnectionPlan,
 } from "./ssh-config.ts";
 import {
@@ -349,11 +351,15 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       this.helperProgram,
       ["proxy-app-server", encodeRemoteArgument(JSON.stringify(request))],
     );
-    return (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
-      readyMarker: REMOTE_APP_SERVER_PROXY_READY,
-      timeoutMs: 10_000,
-      maxPreludeBytes: 64 * 1024,
-    });
+    try {
+      return await (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
+        readyMarker: REMOTE_APP_SERVER_PROXY_READY,
+        timeoutMs: 10_000,
+        maxPreludeBytes: 64 * 1024,
+      });
+    } catch (error) {
+      return this.throwFreshChannelFailure(error);
+    }
   }
 
   async closeControlMaster(): Promise<void> {
@@ -378,11 +384,45 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       this.helperProgram,
       [operation, ...encodedArgs],
     );
-    return run(this.options.sshBinary ?? "ssh", args, {
-      timeoutMs,
-      maxOutputBytes,
-      ...(input ? { input } : {}),
-    });
+    try {
+      return await run(this.options.sshBinary ?? "ssh", args, {
+        timeoutMs,
+        maxOutputBytes,
+        ...(input ? { input } : {}),
+      });
+    } catch (error) {
+      return this.throwFreshChannelFailure(error);
+    }
+  }
+
+  private async throwFreshChannelFailure(error: unknown): Promise<never> {
+    if (this.options.plan.ownsControlMaster || !isProcessExit(error, 255)) throw error;
+    const run = this.options.run ?? runBoundedProcess;
+    const command = this.options.sshBinary ?? "ssh";
+    try {
+      await attestUserControlMaster(this.options.plan);
+      await run(command, buildControlMasterCheckArgs(this.options.plan), {
+        timeoutMs: 5_000,
+        maxOutputBytes: 64 * 1024,
+      });
+    } catch {
+      throw error;
+    }
+    try {
+      await run(command, buildSshSessionProbeArgs(this.options.plan), {
+        timeoutMs: 10_000,
+        maxOutputBytes: 64 * 1024,
+      });
+    } catch (probeError) {
+      if (isProcessExit(probeError, 255)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", "SSH ControlMaster cannot open a fresh remote session", {
+          recovery: "ssh_fresh_channel_unavailable",
+          sshHost: this.options.plan.alias,
+          exitCode: 255,
+        });
+      }
+    }
+    throw error;
   }
 
   private async prepareConnection(): Promise<void> {
@@ -483,6 +523,12 @@ function requireDigest(bytes: Buffer, expected: string): void {
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+function isProcessExit(error: unknown, exitCode: number): boolean {
+  return error instanceof AppError
+    && error.code === "ENDPOINT_UNAVAILABLE"
+    && error.details?.exitCode === exitCode;
 }
 
 function invalidHelperResponse(operation: string): AppError {

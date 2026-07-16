@@ -18,6 +18,7 @@ export type OperationalEventCode =
   | "database_metadata_recovered"
   | "database_metadata_recovery_required"
   | "worker_scheduling_unavailable"
+  | "endpoint_recovery_paused"
   | "endpoint_reconnect_gave_up"
   | "background_task_failed";
 
@@ -25,6 +26,7 @@ export interface OperationalEvent {
   level: "info" | "warn";
   code: OperationalEventCode;
   adapter?: string;
+  endpoint?: string;
   reason?: string;
   component?: string;
   consecutiveFailures?: number;
@@ -38,6 +40,7 @@ export function createOperationalLogSink(
   return (event) => {
     const fields = [`event=${safeToken(event.code)}`];
     if (event.adapter !== undefined) fields.push(`adapter=${safeToken(event.adapter)}`);
+    if (event.endpoint !== undefined) fields.push(`endpoint=${safeToken(event.endpoint)}`);
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
     if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
     if (event.consecutiveFailures !== undefined) fields.push(`consecutive_failures=${safeCount(event.consecutiveFailures)}`);

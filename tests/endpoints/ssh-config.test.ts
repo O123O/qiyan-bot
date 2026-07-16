@@ -6,6 +6,7 @@ import {
   buildSshArgs,
   buildSshReverseForwardArgs,
   buildSshReverseForwardCancelArgs,
+  buildSshSessionProbeArgs,
   parseSshConfig,
   planSshConnection,
 } from "../../src/endpoints/ssh-config.ts";
@@ -38,6 +39,19 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   assert.ok(args.includes("ControlMaster=no"));
   assert.doesNotMatch(args.join(" "), /ControlPersist/u);
   assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
+});
+
+test("the fixed session probe can only reuse an existing user ControlMaster", () => {
+  const plan = planSshConnection("devbox", parseSshConfig(`${parsed}controlmaster auto\ncontrolpath /tmp/user-master\n`), "/private/runtime");
+  const args = buildSshSessionProbeArgs(plan);
+  assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
+  assert.ok(args.includes("ControlMaster=no"));
+  assert.doesNotMatch(args.join(" "), /ControlMaster=auto|ControlPersist/u);
+  assert.deepEqual(args.slice(-2), ["devbox", "true"]);
+  assert.throws(
+    () => buildSshSessionProbeArgs({ ...plan, ownsControlMaster: true }),
+    /user-owned/u,
+  );
 });
 
 test("reverse forwarding binds a REMOTE loopback port (bind-not-relax) on the ControlMaster", () => {

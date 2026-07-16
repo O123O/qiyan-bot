@@ -79,6 +79,16 @@ export function buildSshRemoteArgs(plan: SshConnectionPlan, command: readonly st
   return [...baseArgs(plan, true), plan.alias, ...command];
 }
 
+// Diagnoses whether an already-attested user-owned ControlMaster can open one new
+// session channel. It must never establish or operate the master and carries no
+// caller-controlled remote command.
+export function buildSshSessionProbeArgs(plan: SshConnectionPlan): string[] {
+  if (plan.ownsControlMaster) {
+    throw new AppError("OPERATION_CONFLICT", "fresh-channel probe requires a user-owned SSH ControlMaster");
+  }
+  return [...baseArgs(plan, false), plan.alias, "true"];
+}
+
 // Carries a locally pinned, gzip-compressed Node.js module in a shell-safe base64url
 // argument. Unlike `node -`, this leaves stdin available for bounded streaming uploads.
 // The only shell syntax is this fixed loader; the program and all caller arguments remain

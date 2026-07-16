@@ -104,6 +104,7 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
+import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
 import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
@@ -694,6 +695,12 @@ export function operationRecoveryFailureDisposition(
   if (error instanceof RpcRequestTimeoutError
     || (error instanceof AppError && error.details?.recovery === "ownership_unclassified")) {
     return target?.policy === "ready_endpoint" && !exactGenerationReady ? "wait_for_endpoint" : "retry";
+  }
+  if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
+    && error.details?.recovery === "ssh_fresh_channel_unavailable") {
+    return target?.policy === "endpoint_lifecycle" || target?.policy === "ready_endpoint"
+      ? "wait_for_endpoint"
+      : "sleep";
   }
   if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE") {
     return target?.policy === "endpoint_lifecycle" || (target?.policy === "ready_endpoint" && exactGenerationReady)
@@ -2615,6 +2622,30 @@ export async function buildProductionApp(
             level: "warn", code: "endpoint_reconnect_gave_up", component: "endpoint_manager", consecutiveFailures: attempts,
             reason: `endpoint ${id} unreachable after sustained reconnect attempts (~48h); pausing automatic recovery until restart or next use`,
           }),
+          onRecoveryPaused: (id, recovery) => {
+            reportOperationalSafely(report, {
+              level: "warn",
+              code: "endpoint_recovery_paused",
+              component: "endpoint_manager",
+              endpoint: id,
+              reason: recovery.reason,
+            });
+            try {
+              prepareSshFreshChannelUnavailableNotice(deliveries, currentOwnerBinding(), {
+                endpointId: id,
+                sshHost: recovery.sshHost,
+              });
+              return true;
+            } catch {
+              reportOperationalSafely(report, {
+                level: "warn",
+                code: "background_task_failed",
+                component: "endpoint_recovery_notice",
+                endpoint: id,
+              });
+              return false;
+            }
+          },
         });
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           maxConcurrentTurns: config.maxConcurrentTurns,

@@ -197,7 +197,7 @@ test("helper response framing ignores unrelated remote shell stdout", async (t) 
   assert.deepEqual(await remote.invoke("inspect", ["{}"], helperPath), { ok: true });
 });
 
-test("a failed user-owned helper operation preserves its direct SSH failure", async (t) => {
+test("a live user-owned master that rejects helper and no-op channels requires operator action", async (t) => {
   const { plan } = await privateUserMaster(t);
   const calls: string[][] = [];
   const remote = new SshRemoteClient({
@@ -205,13 +205,100 @@ test("a failed user-owned helper operation preserves its direct SSH failure", as
     helperSource,
     run: async (_command, args) => {
       calls.push([...args]);
-      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)");
+      if (args.includes("-O")) return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
     },
   });
 
-  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), /SSH process failed \(exit 255\)/u);
+  await assert.rejects(
+    remote.invoke("inspect", ["{}"], helperPath),
+    (error: unknown) => error instanceof AppError
+      && error.code === "ENDPOINT_UNAVAILABLE"
+      && error.details?.recovery === "ssh_fresh_channel_unavailable"
+      && error.details?.sshHost === "devbox",
+  );
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : args.at(-1) === "true" ? "probe" : "helper"), [
+    "helper", "check", "probe",
+  ]);
+});
+
+test("a working no-op channel preserves the original helper failure", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const original = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (calls.length === 1) throw original;
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+  });
+
+  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), (error) => error === original);
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : args.at(-1) === "true" ? "probe" : "helper"), [
+    "helper", "check", "probe",
+  ]);
+});
+
+test("a dead user-owned master preserves the original helper failure", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const original = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    run: async (_command, args) => {
+      calls.push([...args]);
+      throw original;
+    },
+  });
+
+  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), (error) => error === original);
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : "helper"), ["helper", "check"]);
+});
+
+test("a QiYan-owned master failure never runs the user-master diagnostic", async (t) => {
+  const calls: string[][] = [];
+  const original = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+  const root = await mkdtemp(join(tmpdir(), "qiyan-owned-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const remote = new SshRemoteClient({
+    plan: { ...userMasterPlan, controlPath: join(root, "master"), ownsControlMaster: true },
+    helperSource,
+    run: async (_command, args) => { calls.push([...args]); throw original; },
+  });
+
+  await assert.rejects(remote.invoke("inspect", ["{}"], helperPath), (error) => error === original);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.includes("-O"), false);
+});
+
+test("an App Server proxy startup failure uses the same fresh-channel diagnostic", async (t) => {
+  const { plan } = await privateUserMaster(t);
+  const calls: string[][] = [];
+  const remote = new SshRemoteClient({
+    plan,
+    helperSource,
+    openStream: async () => {
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream failed before readiness", { exitCode: 255 });
+    },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args.includes("-O")) return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      throw new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+    },
+  });
+
+  await assert.rejects(remote.openAppServerStream({
+    runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01",
+    session: "qiyan-abcdef0123456789abcdef01",
+    tmuxMode: "explicit",
+    expected: { kind: "ssh", token: "d".repeat(32), pid: 901, linuxStartTime: "902", processGroupId: 901 },
+  }, helperPath), (error: unknown) => error instanceof AppError
+    && error.details?.recovery === "ssh_fresh_channel_unavailable");
+  assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : "probe"), ["check", "probe"]);
 });
 
 test("a missing socket in a safe local parent reaches the authoritative helper operation", async (t) => {

@@ -923,6 +923,12 @@ test("operation recovery retries only source-classified transient proof failures
     new AppError("OPERATION_UNCERTAIN", "temporary", { recovery: "ownership_unclassified" }), ordinaryTarget, false,
   ), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), lifecycleTarget), "retry");
+  assert.equal(operationRecoveryFailureDisposition(
+    new AppError("ENDPOINT_UNAVAILABLE", "fresh channel blocked", {
+      recovery: "ssh_fresh_channel_unavailable", sshHost: "prenyx",
+    }),
+    lifecycleTarget,
+  ), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), ordinaryTarget), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "helper"), ordinaryTarget, true), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");
