@@ -29,6 +29,7 @@ import {
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
   prepareAssistantWebCommentary,
+  routeLifecycleNotification,
   processWorkerTerminalNotification,
   stopOperationRecoveryBeforeTools,
   reconcileLifecycleAndOwnership,
@@ -157,6 +158,32 @@ test("assistant commentary from an active web turn is durably queued while termi
     { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-3", text: "Stale update", phase: "commentary" } },
   ), false);
   assert.equal(prepared.length, 1);
+});
+
+test("lifecycle routing ignores assistant child threads without suppressing assistant or worker completions", async () => {
+  const assistant = { endpoint: "assistant-local", thread_id: "assistant-thread" };
+  const routed: string[] = [];
+  const handlers = {
+    assistant: async (notification: { params: { threadId: string } }) => { routed.push(`assistant:${notification.params.threadId}`); },
+    worker: async (endpointId: string, _method: string, params: unknown) => {
+      routed.push(`worker:${endpointId}:${(params as { threadId: string }).threadId}`);
+    },
+  };
+
+  assert.equal(await routeLifecycleNotification(handlers,
+    "assistant-local", assistant, "turn/completed",
+    { threadId: "child-thread", turn: { id: "child-turn" } }), true);
+  assert.deepEqual(routed, []);
+
+  assert.equal(await routeLifecycleNotification(handlers,
+    "assistant-local", assistant, "turn/completed",
+    { threadId: "assistant-thread", turn: { id: "assistant-turn" } }), true);
+  assert.deepEqual(routed, ["assistant:assistant-thread"]);
+
+  assert.equal(await routeLifecycleNotification(handlers,
+    "local", assistant, "turn/completed",
+    { threadId: "worker-thread", turn: { id: "worker-turn" } }), true);
+  assert.deepEqual(routed, ["assistant:assistant-thread", "worker:local:worker-thread"]);
 });
 
 test("every production durable event source forwards only successful inserts to one wake boundary", async () => {

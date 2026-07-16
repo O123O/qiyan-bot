@@ -174,6 +174,42 @@ export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: st
   return endpointId === "local" || (localClaudeEndpointId !== undefined && endpointId === localClaudeEndpointId);
 }
 
+function isForeignAssistantThreadNotification(
+  endpointId: string,
+  assistant: { endpoint: string; thread_id: string },
+  params: unknown,
+): boolean {
+  if (endpointId !== assistant.endpoint || !params || typeof params !== "object" || Array.isArray(params)) return false;
+  const threadId = (params as Record<string, unknown>).threadId;
+  return typeof threadId === "string" && threadId !== assistant.thread_id;
+}
+
+export async function routeLifecycleNotification(
+  handlers: {
+    assistant(notification: AssistantTurnLifecycleNotification): Promise<void>;
+    worker(endpointId: string, method: string, params: unknown): Promise<void>;
+  },
+  endpointId: string,
+  assistant: { endpoint: string; thread_id: string },
+  method: string,
+  params: unknown,
+): Promise<boolean> {
+  if (endpointId === assistant.endpoint) {
+    if (isForeignAssistantThreadNotification(endpointId, assistant, params)) return true;
+    const lifecycle = parseAssistantLifecycleNotification(method, params);
+    if (lifecycle?.params.threadId === assistant.thread_id) {
+      await handlers.assistant(lifecycle);
+      return true;
+    }
+    // The assistant-only endpoint can never own a managed worker. Consume malformed terminal
+    // notifications here rather than routing them through the project endpoint manager.
+    return method === "turn/completed";
+  }
+  if (method !== "turn/completed") return false;
+  await handlers.worker(endpointId, method, params);
+  return true;
+}
+
 export function reportAssistantTerminalFailure(
   dispatcher: Pick<ConversationDispatcher, "requestRecovery"> | undefined,
   report: () => void,
@@ -4067,22 +4103,16 @@ export async function buildProductionApp(
     }
     if (endpointId === identity.endpoint
       && prepareAssistantWebCommentary(conversations, deliveries, identity.thread_id, method, params)) return;
-    const assistantLifecycle = parseAssistantLifecycleNotification(method, params);
-    if (assistantLifecycle && endpointId === identity.endpoint && assistantLifecycle.params.threadId === identity.thread_id) {
-      await assistantLifecycleBuffer.accept(assistantLifecycle, handleAssistantLifecycleNotification);
-      return;
-    }
-    if (method === "turn/completed") {
-      await processWorkerTerminalNotification({
+    if (await routeLifecycleNotification({
+      assistant: (notification) => assistantLifecycleBuffer.accept(notification, handleAssistantLifecycleNotification),
+      worker: (targetEndpointId, targetMethod, targetParams) => processWorkerTerminalNotification({
         endpoints: endpointManager,
         ownership: ownershipWatcher,
         relay,
         reconcileOperations,
-      }, endpointId, method, params);
-      return;
-    } else {
-      await relay.handleNotification(endpointId, method, params);
-    }
+      }, targetEndpointId, targetMethod, targetParams),
+    }, endpointId, identity, method, params)) return;
+    await relay.handleNotification(endpointId, method, params);
   }
 
   async function handleAssistantLifecycleNotification(notification: AssistantTurnLifecycleNotification): Promise<void> {
