@@ -696,6 +696,55 @@ test("managed recovery of an already-managed idle thread reads metadata only (no
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [["thread/read", false]]);
 });
 
+test("managed recovery rebinds an idle thread to a replacement notification connection", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-rebound",
+  });
+  endpoint.status = "idle";
+  endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "completed" }];
+  runtime.beginEpoch("local", "thread-1", "mapping-rebound", "t2", 0);
+
+  const recovered = await lifecycle.reconcileManaged(
+    "payments",
+    required(registry),
+    undefined,
+    undefined,
+    { resumeForConnection: true },
+  );
+
+  assert.equal(recovered.thread.id, "thread-1");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-rebound")?.managementState, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", false],
+    ["thread/resume", undefined],
+  ]);
+});
+
+test("managed recovery rebinds a loaded empty thread without a persisted epoch", async () => {
+  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  await registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty-rebound",
+  });
+  endpoint.status = "idle";
+  endpoint.turns = [];
+
+  const recovered = await lifecycle.reconcileManaged(
+    "payments",
+    required(registry),
+    undefined,
+    undefined,
+    { resumeForConnection: true },
+  );
+
+  assert.equal(recovered.thread.id, "thread-1");
+  assert.equal(runtime.getSession("local", "thread-1", "mapping-empty-rebound")?.managementState, "managed");
+  assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
+    ["thread/read", true],
+    ["thread/resume", undefined],
+  ]);
+});
+
 test("create-completion recovery drops a managed mapping whose rollout never materialized", async () => {
   const requireFlags: Array<boolean | undefined> = [];
   const released: string[] = [];

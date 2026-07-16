@@ -1113,6 +1113,10 @@ export function managedSessionNeedsRecovery(
   return unavailableOnly ? state?.managementState === "unavailable" : true;
 }
 
+export function managedRecoveryRequiresConnectionResume(provider: string, remote: boolean): boolean {
+  return provider === "codex" && remote;
+}
+
 export type ManagedRecoveryDisposition = "retry" | "endpoint" | "external" | "permanent";
 
 export function managedRecoveryDisposition(error: unknown, currentReadyLease = false): ManagedRecoveryDisposition {
@@ -4271,7 +4275,20 @@ export async function buildProductionApp(
         continue;
       }
       try {
-        const response = await lifecycle.reconcileManaged(nickname, session, options.lease, options.isCurrent);
+        // SSH Codex keeps a detached App Server across QiYan connection generations. Rejoin each
+        // managed thread so this WebSocket receives lifecycle/item notifications; local Codex gets
+        // a fresh process and Claude's daemonless runtime has no connection subscription.
+        const resumeForConnection = managedRecoveryRequiresConnectionResume(
+          sessionProvider(session.endpoint),
+          remoteContexts.has(session.endpoint),
+        );
+        const response = await lifecycle.reconcileManaged(
+          nickname,
+          session,
+          options.lease,
+          options.isCurrent,
+          resumeForConnection ? { resumeForConnection: true } : undefined,
+        );
         if ((options.isCurrent && !options.isCurrent())
           || (options.lease && !isManagedRecoveryLeaseCurrent(session.endpoint, options.lease))) {
           throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery endpoint generation changed");

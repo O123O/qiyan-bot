@@ -17,6 +17,7 @@ import {
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRecoveryManagementState,
+  managedRecoveryRequiresConnectionResume,
   managedRetryKey,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
@@ -75,6 +76,12 @@ import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
+
+test("only remote Codex recovery rejoins threads on the replacement connection", () => {
+  assert.equal(managedRecoveryRequiresConnectionResume("codex", true), true);
+  assert.equal(managedRecoveryRequiresConnectionResume("codex", false), false);
+  assert.equal(managedRecoveryRequiresConnectionResume("claude", true), false);
+});
 
 test("assistant commentary from an active web turn is durably queued while terminal and final items stay excluded", () => {
   const prepared: unknown[] = [];

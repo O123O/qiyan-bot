@@ -318,7 +318,7 @@ export class SessionLifecycle {
     expected: RegistrySession,
     existingLease?: EndpointWorkLease,
     canPublish: () => boolean = () => true,
-    options?: { requireDurableRollout?: boolean },
+    options?: { requireDurableRollout?: boolean; resumeForConnection?: boolean },
   ): Promise<ThreadResponse> {
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const assertCurrent = (): void => {
@@ -335,7 +335,7 @@ export class SessionLifecycle {
       // Fast path for the common bot-restart case (the app-server kept the thread loaded → status "idle",
       // and the session already has a persisted epoch): a metadata-only read is enough — the epoch and
       // the delivery cursor already hold what recovery needs, so re-materializing the whole rollout (and
-      // re-resuming an already-loaded thread) is pure waste. Fall back to the original full path when:
+      // re-resuming on the same connection) is pure waste. Fall back to the original full path when:
       //   • the thread is non-idle ("notLoaded" must be resumed+materialized; "active"/other needs its
       //     turns to recover the in-flight turn), or
       //   • there is no epoch yet (first adoption) — beginEpoch below needs the last turn id as the
@@ -408,12 +408,16 @@ export class SessionLifecycle {
       assertCurrent();
       this.assertExact(nickname, expected, "managed");
       let authoritative = before;
-      if (!resumed && this.requiresResume(before.thread)) {
+      // A detached App Server may keep an idle thread loaded after its client disconnects. Loaded
+      // state does not subscribe the replacement connection, so its generation recovery must resume
+      // once even though the persisted epoch still permits the metadata-only read above.
+      const resumeLoadedIdleThread = options?.resumeForConnection === true && before.thread.status.type === "idle";
+      if (!resumed && (resumeLoadedIdleThread || this.requiresResume(before.thread))) {
         resumed = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", { threadId: session.thread_id }, undefined, lease);
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
         const afterResume = this.assertExact(nickname, expected, "managed");
-        authoritative = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+        authoritative = resumeLoadedIdleThread ? resumed : await this.read(afterResume.endpoint, afterResume.thread_id, lease);
       }
       assertCurrent();
       this.requireThreadIdentity(authoritative.thread, session.thread_id);
