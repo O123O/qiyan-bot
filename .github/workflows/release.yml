@@ -22,7 +22,9 @@ jobs:
           cache: npm
 
       - name: Install locked dependencies
-        run: npm ci
+        run: |
+          npm ci
+          npm --prefix webui-client ci
 
       - name: Match tag to package version
         shell: bash

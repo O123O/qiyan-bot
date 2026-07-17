@@ -9,7 +9,7 @@ test("release workflow validates, checks, packs, and uploads only a versioned ru
 
   for (const required of [
     "tags:", "- \"v*\"", "contents: write", "actions/checkout@v6", "actions/setup-node@v6", "node-version: 24",
-    "npm ci", "GITHUB_REF_NAME", "package.json", "package-lock.json", "npm run check", "npm pack --silent", "qiyan-bot.tgz",
+    "npm ci", "npm --prefix webui-client ci", "GITHUB_REF_NAME", "package.json", "package-lock.json", "npm run check", "npm pack --silent", "qiyan-bot.tgz",
     "expected-package-files.txt", "diff -u", "tar -xzf", "retired_role", "retired_product", "retired_compact", "retired_spaced",
     "package/assets/brand/qiyan-logo.png", "package/assets/brand/qiyan-overview.svg", "package/assets/slack/manifest.yaml",
     "package/docs/chat-apps/wechat.md", "package/docs/sqlite.md", "env -i", "./dist/qiyan-bot --version", "config-check --home",
