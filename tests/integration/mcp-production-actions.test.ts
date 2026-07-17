@@ -377,7 +377,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(read.threadId, session.thread_id);
     assert.equal(read.turnId, firstSend.turnId);
     assert.match(read.body, new RegExp(marker, "u"));
-    const history = await call("read_worker_messages", { nickname: fixture.nickname, count: 20 }, fixture.endpoint);
+    const history = await call("inspect_worker_conversation", { nickname: fixture.nickname, count: 20 }, fixture.endpoint);
     assert.ok(history.messages.some((message: any) => message.role === "worker" && new RegExp(marker, "u").test(message.body)));
     const ordinaryCollected = await call("collect_messages", { nickname: fixture.nickname, count: 1 }, fixture.endpoint);
     assert.equal(ordinaryCollected.length, 1);
@@ -523,7 +523,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
       .get(fixture.endpoint, session.thread_id, send.turnId) as { id: string } | undefined, workerTimeoutMs, `${fixture.nickname} first final delivered`);
     const read = await call("read_worker_message", { nickname: fixture.nickname, message_id: final.id }, fixture.endpoint);
     assert.match(read.body, new RegExp(marker, "u"), `${fixture.nickname} reply not delivered`);
-    const history = await call("read_worker_messages", { nickname: fixture.nickname }, fixture.endpoint);
+    const history = await call("inspect_worker_conversation", { nickname: fixture.nickname }, fixture.endpoint);
     assert.ok(history.messages.some((message: any) => message.role === "worker" && new RegExp(marker, "u").test(message.body)));
     const collected = await call("collect_messages", { nickname: fixture.nickname, count: 1 }, fixture.endpoint);
     assert.equal(collected.length, 1);
@@ -677,7 +677,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
 
   const endpointScoped: readonly AssistantToolName[] = [
     "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
-    "send_to_session", "read_worker_message", "read_worker_messages", "collect_messages", "interrupt_session", "compact_session", "list_models", "disconnect_endpoint", "restart_endpoint",
+    "send_to_session", "read_worker_message", "inspect_worker_conversation", "collect_messages", "interrupt_session", "compact_session", "list_models", "disconnect_endpoint", "restart_endpoint",
     "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes",
     "prepare_chat_attachment", "send_chat_attachment",
   ];
@@ -687,7 +687,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
   }
   // The Claude lifecycle must have exercised the create/send/deliver/adopt/unadopt/archive/restart
   // path on the local Claude endpoint (the coverage that was previously missing entirely).
-  for (const name of ["create_session", "send_to_session", "read_worker_message", "read_worker_messages", "collect_messages", "unadopt_session", "adopt_session", "archive_session", "restart_endpoint"] as const) {
+  for (const name of ["create_session", "send_to_session", "read_worker_message", "inspect_worker_conversation", "collect_messages", "unadopt_session", "adopt_session", "archive_session", "restart_endpoint"] as const) {
     assert.ok((endpointCoverage.get(name) ?? new Set()).has("claude-local"), `${name} lacks Claude evidence`);
   }
   if (includeCodex) assert.deepEqual([...coverage].sort(), [...TOOL_NAMES].sort());

@@ -21,9 +21,9 @@ export const ASSISTANT_TOOL_SCHEMAS = {
   unadopt_session: z.object({ nickname }).strict(), archive_session: z.object({ nickname }).strict(),
   send_to_session: z.object({ nickname, content: z.string().describe("the message text to send to the worker"), attachment_ids: z.array(z.string()).describe("attachment ids to include, in order").default([]), mode: z.enum(["start", "steer"]).describe("'start' = new turn (fails if one is running); 'steer' = queue onto the active turn") }).strict(),
   read_worker_message: z.object({ nickname, message_id: z.string().min(1).describe("worker message id (from a notification)") }).strict(),
-  read_worker_messages: z.object({
+  inspect_worker_conversation: z.object({
     nickname,
-    count: z.number().int().positive().max(50).describe("how many recent native conversation messages to read (1-50)").default(20),
+    count: z.number().int().positive().max(50).describe("how many recent user and worker messages to inspect (1-50)").default(20),
     before: z.string().min(1).max(16_384).describe("pagination cursor from a previous call").optional(),
   }).strict(),
   collect_messages: z.object({ nickname, count: z.number().int().positive().describe("how many of the most-recent final messages to deliver (max 20)") }).strict(),
@@ -73,7 +73,7 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   archive_session: "Release a session and mark its native thread archived (still returned by discover_sessions, flagged archived; unadopt leaves it unarchived).",
   send_to_session: "Send a message to a worker as a new turn (start) or onto the active turn (steer). Used by /pass.",
   read_worker_message: "Read one worker message's full body by id (notifications are metadata-only until read).",
-  read_worker_messages: "Read a bounded page of recent native worker conversation messages on demand, including commentary already recorded in an active turn. No message id is required. QiYan creates no operation/receipt record; the native assistant rollout still records the tool result.",
+  inspect_worker_conversation: "Inspect a bounded page of the latest native conversation on demand, including both user and worker messages and commentary already recorded in an active turn. No message id is required; use before to page backward. QiYan creates no operation/receipt record; the native assistant rollout still records the tool result.",
   collect_messages: "Deliver the worker's last N final message bodies into chat. Used by /collect.",
   interrupt_session: "Interrupt the worker's active turn.",
   compact_session: "Compact a managed Codex session.",
@@ -98,10 +98,10 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
 
 type Action = (args: any, context: ToolActionContext) => Promise<any>;
 
-export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["read_worker_messages", "search_slack", "get_slack_mentions"]);
+export const EPHEMERAL_READ_TOOLS = new Set<AssistantToolName>(["inspect_worker_conversation", "search_slack", "get_slack_mentions"]);
 
 export const READ_ONLY_TOOLS = new Set<AssistantToolName>([
-  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "read_worker_messages", "list_models", "get_goal", "get_chat_history", "search_slack", "get_slack_mentions",
+  "list_managed_sessions", "discover_sessions", "get_session_status", "read_worker_message", "inspect_worker_conversation", "list_models", "get_goal", "get_chat_history", "search_slack", "get_slack_mentions",
 ]);
 
 export function createAssistantTools(

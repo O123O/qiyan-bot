@@ -3730,7 +3730,7 @@ export async function buildProductionApp(
         if (!message || message.endpointId !== session.endpoint || message.threadId !== session.thread_id) throw new Error("worker message does not belong to that nickname");
         return message;
       },
-      read_worker_messages: async (args, context) => {
+      inspect_worker_conversation: async (args, context) => {
         const signal = context.signal ?? new AbortController().signal;
         return readWorkerMessages({
           resolveSession: (nickname) => registry.get(nickname),

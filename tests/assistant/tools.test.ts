@@ -11,7 +11,7 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 const expected = [
   "list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session",
   "disconnect_endpoint", "restart_endpoint",
-  "send_to_session", "read_worker_message", "read_worker_messages", "collect_messages", "interrupt_session", "compact_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
+  "send_to_session", "read_worker_message", "inspect_worker_conversation", "collect_messages", "interrupt_session", "compact_session", "list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal",
   "update_session_notes",
   "send_chat_message", "prepare_chat_attachment", "send_chat_attachment", "get_chat_history", "search_slack", "get_slack_mentions",
 ].sort();
@@ -46,14 +46,14 @@ test("chat history has one bounded platform-neutral read-only schema", () => {
 });
 
 test("transient history and Slack reads never create replay receipts", async () => {
-  assert.deepEqual([...EPHEMERAL_READ_TOOLS].sort(), ["get_slack_mentions", "read_worker_messages", "search_slack"]);
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.read_worker_messages.parse({ nickname: "payments" }), { nickname: "payments", count: 20 });
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.read_worker_messages.parse({ nickname: "payments", count: 50, before: "cursor" }), {
+  assert.deepEqual([...EPHEMERAL_READ_TOOLS].sort(), ["get_slack_mentions", "inspect_worker_conversation", "search_slack"]);
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments" }), { nickname: "payments", count: 20 });
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse({ nickname: "payments", count: 50, before: "cursor" }), {
     nickname: "payments", count: 50, before: "cursor",
   });
   for (const input of [
     { nickname: "payments", count: 0 }, { nickname: "payments", count: 51 }, { nickname: "payments", count: 1, message_id: "forbidden" },
-  ]) assert.throws(() => ASSISTANT_TOOL_SCHEMAS.read_worker_messages.parse(input));
+  ]) assert.throws(() => ASSISTANT_TOOL_SCHEMAS.inspect_worker_conversation.parse(input));
   assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.search_slack.parse({ query: "launch", date_from: "2026-01-01", date_to: "2026-02-01" }), {
     query: "launch", date_from: "2026-01-01", date_to: "2026-02-01",
   });
@@ -67,13 +67,13 @@ test("transient history and Slack reads never create replay receipts", async () 
   const sentinel = "TRANSIENT_SLACK_RESULT_DO_NOT_STORE_91f2";
   const tools = createAssistantTools(operations, {
     search_slack: async () => ({ results: [{ text: sentinel, call: ++calls }] }),
-    read_worker_messages: async () => ({ messages: [{ body: sentinel, call: ++calls }] }),
+    inspect_worker_conversation: async () => ({ messages: [{ body: sentinel, call: ++calls }] }),
   }, { maxCollectCount: 20 });
   const context = { sourceContextId: "ctx-search", attemptId: "a", turnId: "t", callId: "same-call" };
   assert.equal(((await tools.search_slack(context, { query: "launch" })) as any).results[0].call, 1);
   assert.equal(((await tools.search_slack(context, { query: "launch" })) as any).results[0].call, 2);
-  assert.equal(((await tools.read_worker_messages(context, { nickname: "payments" })) as any).messages[0].call, 3);
-  assert.equal(((await tools.read_worker_messages(context, { nickname: "payments" })) as any).messages[0].call, 4);
+  assert.equal(((await tools.inspect_worker_conversation(context, { nickname: "payments" })) as any).messages[0].call, 3);
+  assert.equal(((await tools.inspect_worker_conversation(context, { nickname: "payments" })) as any).messages[0].call, 4);
   assert.equal((db.prepare("SELECT COUNT(*) AS count FROM operations").get() as any).count, 0);
   for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>) {
     const rows = db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all();
