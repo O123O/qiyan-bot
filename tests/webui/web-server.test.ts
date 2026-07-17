@@ -46,14 +46,17 @@ interface ServerCalls {
   goals: WebGoalControlInput[];
 }
 
-async function withServer(run: (base: string, calls: ServerCalls, bus: WebBus, uploadsDir: string) => Promise<void>): Promise<void> {
+async function withServer(
+  run: (base: string, calls: ServerCalls, bus: WebBus, uploadsDir: string) => Promise<void>,
+  readsOverride: WebReadsDeps = reads,
+): Promise<void> {
   const bus = new WebBus();
   const calls: ServerCalls = { inputs: [], goals: [] };
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
-    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads: readsOverride,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
@@ -343,11 +346,61 @@ test("WS upgrade requires the token and receives broadcasts", async () => {
     const got = await new Promise<string>((resolve, reject) => {
       const s = new WebSocket(`${wsUrl}/ws?token=${TOKEN}`);
       s.on("open", () => setTimeout(() => bus.broadcast({ type: "message", body: "live!", at: 1 }), 20));
-      s.on("message", (data) => { resolve(String(data)); s.close(); });
+      s.on("message", (data) => {
+        const raw = String(data);
+        if (JSON.parse(raw).type === "message") { resolve(raw); s.close(); }
+      });
       s.on("error", reject);
     });
     assert.deepEqual(JSON.parse(got), { type: "message", body: "live!", at: 1 });
   });
+});
+
+test("session snapshots are polled only while a WebSocket client is connected", async () => {
+  let snapshotReads = 0;
+  const countedReads: WebReadsDeps = {
+    ...reads,
+    assistantSession: () => { snapshotReads += 1; return reads.assistantSession(); },
+  };
+  await withServer(async (base, _calls, bus) => {
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.equal(snapshotReads, 0, "an inactive Web UI must not poll session state");
+
+    const ws = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
+    const sessions = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("sessions snapshot timed out")), 1_500);
+      ws.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        if (event.type === "sessions") { clearTimeout(timer); resolve(); }
+      });
+      ws.on("error", reject);
+    });
+    await sessions;
+    assert.ok(snapshotReads > 0);
+
+    const second = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("second client sessions snapshot timed out")), 1_500);
+      second.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        if (event.type === "sessions") { clearTimeout(timer); resolve(); }
+      });
+      second.on("error", reject);
+    });
+    ws.close();
+    await new Promise<void>((resolve) => ws.once("close", resolve));
+    assert.equal(bus.size, 1);
+    const readsWithOneClient = snapshotReads;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.ok(snapshotReads > readsWithOneClient, "polling must continue while one client remains");
+
+    second.close();
+    await new Promise<void>((resolve) => second.once("close", resolve));
+    assert.equal(bus.size, 0);
+    const readsAfterClose = snapshotReads;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.equal(snapshotReads, readsAfterClose, "the last disconnect must stop session polling");
+  }, countedReads);
 });
 
 test("worker history requires the exact active WS subscription and tab switching invalidates it", async () => {

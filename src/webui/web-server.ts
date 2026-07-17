@@ -179,7 +179,39 @@ export function createWebServer(options: WebServerOptions): WebServer {
   let poll: ReturnType<typeof setInterval> | undefined;
   let uploadSweep: ReturnType<typeof setInterval> | undefined;
   let lastSessions = "";
+  let lastSessionSnapshot: ReturnType<typeof sessionSnapshot> | undefined;
   let historyReader: WorkerHistoryReader | undefined;
+
+  const pollSessions = (): void => {
+    try {
+      const snapshot = sessionSnapshot(options.reads);
+      const serialized = JSON.stringify(snapshot);
+      if (serialized !== lastSessions) {
+        lastSessions = serialized;
+        lastSessionSnapshot = snapshot;
+        options.bus.broadcast({ type: "sessions", ...snapshot, at: Date.now() });
+      }
+    } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
+  };
+
+  const sendCurrentSessions = (socket: WebSocket): void => {
+    if (!lastSessionSnapshot) { pollSessions(); return; }
+    options.bus.send(socket, { type: "sessions", ...lastSessionSnapshot, at: Date.now() });
+  };
+
+  const startSessionsPolling = (): void => {
+    if (poll) return;
+    pollSessions();
+    poll = setInterval(pollSessions, POLL_MS);
+    poll.unref?.();
+  };
+
+  const stopSessionsPolling = (): void => {
+    if (poll) clearInterval(poll);
+    poll = undefined;
+    lastSessions = "";
+    lastSessionSnapshot = undefined;
+  };
 
   const json = (response: ServerResponse, status: number, body: unknown): void => {
     const payload = JSON.stringify(body);
@@ -399,10 +431,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
         const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
         if (url.pathname !== "/ws" || !wss || !tokenValid(options.token, tokenFromRequest(request, url))) { socket.destroy(); return; }
         wss.handleUpgrade(request, socket, head, (ws) => {
+          const polling = poll !== undefined;
           options.bus.add(ws);
+          if (polling) sendCurrentSessions(ws); else startSessionsPolling();
           ws.on("message", (raw) => handleWorkerCommand(ws, raw));
-          ws.on("close", () => options.bus.remove(ws));
-          ws.on("error", () => options.bus.remove(ws));
+          const remove = () => {
+            options.bus.remove(ws);
+            if (options.bus.size === 0) stopSessionsPolling();
+          };
+          ws.on("close", remove);
+          ws.on("error", remove);
         });
       });
       await new Promise<void>((resolve, reject) => {
@@ -410,17 +448,6 @@ export function createWebServer(options: WebServerOptions): WebServer {
         server!.listen(options.port, host, () => { server!.off("error", reject); resolve(); });
       });
       options.openGoalAdmission();
-      // Poll the dashboard/registry and push a `sessions` event when the summary changes.
-      poll = setInterval(() => {
-        try {
-          const snapshot = JSON.stringify(sessionSnapshot(options.reads));
-          if (snapshot !== lastSessions) {
-            lastSessions = snapshot;
-            options.bus.broadcast({ type: "sessions", ...JSON.parse(snapshot), at: Date.now() });
-          }
-        } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
-      }, POLL_MS);
-      poll.unref?.();
       // Expire uploaded files past their TTL: once now, then periodically.
       if (options.uploads) {
         const sweep = () => void cleanupUploads(options.uploads!, Date.now()).catch(() => {});
@@ -440,7 +467,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     },
     async stop() {
       options.closeGoalAdmission();
-      if (poll) clearInterval(poll);
+      stopSessionsPolling();
       if (uploadSweep) clearInterval(uploadSweep);
       historyReader?.dispose(); historyReader = undefined;
       if (wss) { for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } } wss.close(); wss = undefined; }

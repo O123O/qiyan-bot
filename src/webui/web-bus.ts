@@ -5,7 +5,7 @@ import type { WorkerChatEvent } from "./worker-stream.ts";
 
 export type WebEvent =
   | { type: "message"; body: string; at: number }
-  | { type: "sessions"; sessions: unknown[]; at: number };
+  | { type: "sessions"; sessions: unknown[]; assistant: unknown; at: number };
 
 export interface WorkerSubscriptionTarget {
   nickname: string;
