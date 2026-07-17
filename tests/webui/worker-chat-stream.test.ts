@@ -39,7 +39,7 @@ test("agent deltas accumulate into one draft and item completion replaces it aut
   assert.equal(state.messages[0]!.body, "complete");
 });
 
-test("switching away and back retains only the running turn transcript", () => {
+test("switching away and back retains the bounded recent timeline", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   state = applyWorkerSnapshot(state, {
     messages: [{ id: "a:done:a1", turnId: "done", body: "old", completedAt: 1, terminalStatus: "completed", turnOrder: 0, itemOrder: 0 }],
@@ -52,18 +52,19 @@ test("switching away and back retains only the running turn transcript", () => {
   const restored = beginWorkerSubscription("worker", "codex", crypto.randomUUID(), retained);
 
   assert.deepEqual(restored.messages.map((message) => [message.body, message.streaming]), [
+    ["old", false],
     ["question", false],
     ["working", true],
   ]);
 });
 
-test("a fresh snapshot prunes retained rows that belong to a replaced worker", () => {
+test("a fresh same-mapping snapshot preserves retained rows omitted from its bounded page", () => {
   let old = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
   old = receiveWorkerEvent(old, envelope({ kind: "item-completed", turnId: "old-turn", item: { type: "user-message", id: "u1", text: "old question" } }));
   const retained = retainWorkerDraftMessages(old);
   let replacement = beginWorkerSubscription("worker", "codex", crypto.randomUUID(), retained);
   replacement = applyWorkerSnapshot(replacement, { messages: [], hasOlder: false, terminalTurnIds: [], openTurnIds: [] });
-  assert.deepEqual(replacement.messages, []);
+  assert.deepEqual(replacement.messages.map((message) => message.body), ["old question"]);
   assert.deepEqual(replacement.retainedMessageIds, []);
 });
 
@@ -89,14 +90,27 @@ test("the selected panel resubscribes when its mapping identity changes", async 
   assert.match(source, /active\?\.nickname === target && active\.mappingId === mappingId/u);
 });
 
-test("terminal proof drops a retained partial item omitted from the bounded page", () => {
+test("terminal proof preserves a retained live item omitted from the bounded page", () => {
   const retained = [{
     id: "a:turn:a", turnId: "turn", body: "partial", completedAt: 1,
     terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
   }];
   let state = beginWorkerSubscription("worker", "codex", ids.requestId, retained);
   state = applyWorkerSnapshot(state, { messages: [], hasOlder: true, terminalTurnIds: ["turn"], openTurnIds: [] });
-  assert.deepEqual(state.messages, []);
+  assert.deepEqual(state.messages.map((message) => message.body), ["partial"]);
+});
+
+test("a bounded snapshot authoritatively replaces a retained row with the same native item id", () => {
+  const retained = [{
+    id: "a:turn:a", turnId: "turn", body: "live value", completedAt: 1,
+    terminalStatus: "", role: "worker" as const, streaming: true, optimistic: false,
+  }];
+  let state = beginWorkerSubscription("worker", "codex", ids.requestId, retained, "mapping");
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:turn:a", turnId: "turn", body: "native value", completedAt: 2, terminalStatus: "completed", turnOrder: 0, itemOrder: 0 }],
+    hasOlder: false, terminalTurnIds: ["turn"], openTurnIds: [],
+  });
+  assert.deepEqual(state.messages.map((message) => [message.body, message.streaming]), [["native value", false]]);
 });
 
 test("inactive worker drafts use a byte-bounded four-worker LRU", () => {

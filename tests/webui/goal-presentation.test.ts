@@ -33,7 +33,7 @@ test("renders the selected worker goal above the composer and reflows pinned cha
   assert.ok(row < composer, "goal row precedes the composer");
   assert.match(source, /className="goal-status"[^>]*>\{formatGoalStatus\(goal\.status\)\}<\/span>/u);
   assert.match(source, /className="goal-objective">\{goal\.objective\}<\/div>/u);
-  assert.match(source, /\[rendered\.length, selected, goal\?\.objective, goal\?\.status\]/u);
+  assert.match(source, /\[rendered\.length, tailRevision, selected, loadingOlder, goal\?\.objective, goal\?\.status\]/u);
 
   const shipped = await readFile(new URL("../../assets/webui/index.html", import.meta.url), "utf8");
   assert.match(shipped, /goal-row/u, "the shipped client contains the goal row");

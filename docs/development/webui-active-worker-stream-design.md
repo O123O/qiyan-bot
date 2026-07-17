@@ -34,11 +34,12 @@ forwarding the payload when no Web UI is viewing that endpoint and thread.
 This follows Codex-Web-UI's important property—build the visible timeline from
 App Server notifications—but narrows its replay architecture to QiYan's lazy
 panel. QiYan will not maintain a browser replay stream for every worker when no
-browser is viewing it. A bounded `thread/read` is reserved for panel entry,
-browser reconnect, explicit history paging, and recovery after a gap. That read
-reconstructs the browser timeline from Codex's durable `userMessage` and
-`agentMessage` items, including commentary/intermediate agent messages; QiYan
-does not copy those items into its own persistence.
+browser is viewing it. Bounded native history pagination is reserved for panel
+entry, browser reconnect, explicit history paging, and recovery after a gap. It
+reconstructs the rows Codex exposes as durable `userMessage` and `agentMessage`
+items, but is not a replay log for every notification emitted during a turn. A
+bounded browser cache therefore preserves recently observed live rows across tab
+switches. QiYan does not copy those items into its own persistence.
 
 ## Fixed behavior
 
@@ -48,7 +49,7 @@ does not copy those items into its own persistence.
   events received while that snapshot is in flight are buffered by the client,
   then merged after the snapshot using stable turn/item IDs and terminal state.
 - Switching workers discards the old subscription and retains only a small,
-  globally byte-bounded LRU of nonterminal display rows in browser memory.
+  globally byte-bounded LRU of recent display rows in browser memory.
   Entries are bound to the immutable registry mapping ID. Returning later
   validates those rows against a fresh lazy snapshot; inactive workers receive
   no events or history reads.
@@ -60,7 +61,7 @@ does not copy those items into its own persistence.
   assistant-message broadcasts keep their current behavior.
 - The 900 ms post-send transcript reload and the idle-status transcript reload
   are removed for Codex workers. The Web UI initiates no additional Codex
-  `thread/read` on send or completion. This does not affect core terminal
+  native history read on send or completion. This does not affect core terminal
   reconciliation, which may perform its own authoritative history read.
 - Claude currently publishes only `turn/completed`, without item/delta events.
   While a Claude worker is selected, its targeted `turn/completed` event triggers
@@ -127,20 +128,21 @@ buffered until the snapshot resolves, then merged using the rule below.
 
 ### Snapshot/live merge without a transport-order assumption
 
-Wire ordering does not prove that App Server `thread/read` is a linearizable
+Wire ordering does not prove that App Server history pagination is a linearizable
 snapshot, so QiYan does not discard events based on an assumed time watermark.
 The snapshot response identifies terminal turn IDs and any open turn IDs:
 
-- Rows from terminal snapshot turns are authoritative and keyed by native turn
-  and item ID. They carry native turn/item order so recovered commentary is
+- Rows returned from terminal snapshot turns are authoritative for matching
+  native turn and item IDs. Absence from one bounded page does not invalidate a
+  retained browser-observed row. Returned rows carry native turn/item order so commentary is
   restored before later commentary and the final answer even when the turn's
   items share one completion timestamp. Replayed `item/started` is ignored,
   `item/completed` idempotently replaces the same item, and deltas for an
   already-finalized item are ignored.
-- Rows from an open snapshot turn are not installed. Buffered events for that
-  turn build the forward stream from subscription time; `item/completed`
-  eventually supplies the authoritative full item text. A tab switch retains
-  only the foreground reducer's bounded nonterminal display rows in browser
+- Completed rows from an open snapshot turn are installed by native item ID.
+  Buffered events build the forward stream from subscription time and
+  `item/completed` supplies the authoritative full item text. A tab switch retains
+  only the foreground reducer's bounded recent display rows in browser
   memory, so already-rendered user and agent text does not blink away when the
   user returns; the inactive worker still receives no events or history reads.
 - Opening midway through a turn can omit items that completed before the
@@ -271,7 +273,7 @@ even when Codex does not call QiYan's `send_message` tool.
   paths are unchanged. Web streaming is an additional ephemeral observer and
   must not consume, short-circuit, or redefine their notifications. It does not
   publish detailed flow to Telegram, Slack, WeChat, or other adapters.
-- `web-reads` retains a raw native `thread/read` for the lazy snapshot and future
+- Web reads use bounded native turn/item pagination for the lazy snapshot and future
   paging. The HTTP worker-history route requires the active subscription ID, so
   it cannot initiate reads for a background panel. It validates the stored full
   identity before the read and again after it, then maps text. It is not a live-
@@ -286,7 +288,7 @@ even when Codex does not call QiYan's `send_message` tool.
   commentary always makes progress without skipping or repeating rows.
 - `src/webui/worker-history-reader.ts` bounds native reads. It keys in-flight
   work by exact endpoint/thread identity, passes an `AbortSignal` through to
-  `pool.request`, and allows at most one native `thread/read` for that identity.
+  `pool.request`, and allows at most one native history read for that identity.
   Compatible active subscriptions may share the same raw-turn promise and map
   their own page only after their individual post-read identity validation. A
   second overlapping GET from the same subscription is rejected as already in
@@ -298,11 +300,10 @@ even when Codex does not call QiYan's `send_message` tool.
 - Each HTTP request is itself a consumer. Request abort or response close detaches
   it immediately even if its WebSocket remains subscribed, so a cancelled GET
   cannot keep an otherwise-unused native read alive.
-- Codex `thread/read` currently has no native cursor/limit: the HTTP response is
-  bounded to the requested 1–50 mapped messages, but App Server may return the
-  full native turn history before local mapping. The design does not claim that
-  RPC cost is bounded. Reducing calls to panel entry/reconnect is the available
-  improvement until Codex exposes paged thread reads.
+- Each native history request has fixed turn, item, and request-count limits and
+  returns an exclusive opaque continuation when those limits are reached. The
+  foreground browser follows sparse continuations only until its viewport can
+  scroll, then resumes lazy paging when the user scrolls upward.
 - All detailed timeline accumulation, snapshot/event buffering, optimistic-item
   correlation, and delta reduction lives in `webui-client`, not the bot core.
 
@@ -387,12 +388,13 @@ even when Codex does not call QiYan's `send_message` tool.
 
 ## Acceptance criteria
 
-- On the normal fully-observed Codex path, opening a worker performs exactly one
-  transcript read and then renders intermediate and completed API events without
-  further automatic reads. The only defined exceptions are a selected Claude
-  completion and recovery of a Codex turn already open before subscription.
-- Reloading or reconnecting reconstructs previously persisted commentary and
-  final messages from Codex's native session rather than a QiYan timeline copy.
+- On the normal fully-observed Codex path, opening a worker performs a bounded
+  history read, fills an otherwise unscrollable sparse viewport within a fixed
+  continuation budget, and then renders intermediate and completed API events.
+- Reloading or reconnecting reconstructs the durable rows exposed by Codex and
+  resumes the foreground notification stream rather than reading a QiYan
+  timeline copy. It does not claim to replay intermediate notifications that
+  Codex does not expose through native history.
 - Switching workers stops all old-worker chat delivery to that browser.
 - A background worker item/delta event is neither normalized, retained, nor sent
   when no Web UI browser subscribes to its endpoint and thread.

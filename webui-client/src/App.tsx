@@ -11,6 +11,18 @@ import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
+import {
+  advanceWorkerScrollPreservation,
+  nextWorkerHistoryAutoFill,
+  releaseWorkerHistoryAutoFill,
+  sameWorkerSubscriptionTarget,
+  settleWorkerScrollPreservation,
+  shouldFollowWorkerTail,
+  workerViewportRevision,
+  type WorkerHistoryAutoFillState,
+  type WorkerScrollPreservation,
+  type WorkerSubscriptionTarget,
+} from "./worker-chat-policy";
 import { workerStatus } from "./worker-status";
 import {
   acknowledgeWorkerSubscription,
@@ -167,7 +179,7 @@ export function App() {
   const [suggest, setSuggest] = useState<string[]>([]);
   const [sugIdx, setSugIdx] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
-  const preserveRef = useRef<number | null>(null); // scrollHeight snapshot to keep position on prepend
+  const preserveRef = useRef<WorkerScrollPreservation | null>(null); // scroll-height baseline across a prepend read
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
@@ -178,9 +190,12 @@ export function App() {
   const workerRef = useRef<WorkerStreamState | null>(workerChat); workerRef.current = workerChat;
   const workerDraftsRef = useRef<WorkerDraftCache>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
-  const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<void>) | null>(null);
+  const workerSubscriptionTargetRef = useRef<WorkerSubscriptionTarget | null>(null);
+  const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => Promise<boolean>) | null>(null);
   const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
-  const emptyHistoryContinuationsRef = useRef(new Map<string, number>());
+  const workerHistoryAutoFillsRef = useRef(new Map<string, WorkerHistoryAutoFillState>());
+  const workerTailRevisionRef = useRef("");
+  const workerTailScrollFrameRef = useRef<number | null>(null);
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
   const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
   const clearRecoveryRetries = useCallback(() => {
@@ -219,31 +234,20 @@ export function App() {
     try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`); setHistory(p.messages); setHasOlder((h) => ({ ...h, [ASSIST]: p.hasOlder })); }
     catch { /* transient */ }
   }, []);
-  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string) => {
+  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string): Promise<boolean> => {
     const current = workerRef.current;
-    if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return;
+    if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return false;
     const started = beginWorkerHistory(current, snapshotPending);
-    if (!started.started) return;
+    if (!started.started) return false;
     replaceWorker(started.state);
-    let emptyContinuation: string | undefined;
     try {
       const cursor = before === undefined ? "" : `&before=${encodeURIComponent(before)}`;
       const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`);
       const latest = workerRef.current;
-      if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return;
+      if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return true;
       const merged = applyWorkerSnapshot(latest, page, recoveredTurnId);
       replaceWorker(merged);
       setHasOlder((value) => ({ ...value, [nickname]: merged.hasOlder }));
-      const emptyKey = `${nickname}:${subscriptionId}`;
-      if (page.messages.length === 0 && page.nextCursor) {
-        const count = emptyHistoryContinuationsRef.current.get(emptyKey) ?? 0;
-        if (count < 8) {
-          emptyHistoryContinuationsRef.current.set(emptyKey, count + 1);
-          emptyContinuation = page.nextCursor;
-        }
-      } else {
-        emptyHistoryContinuationsRef.current.delete(emptyKey);
-      }
       if (recoveredTurnId && merged.recoveredTurnIds.includes(recoveredTurnId)) {
         const key = `${subscriptionId}:${recoveredTurnId}`;
         const retry = recoveryRetriesRef.current.get(key);
@@ -260,18 +264,18 @@ export function App() {
       }
     } finally {
       const latest = workerRef.current;
-      if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return;
-      const retryScheduled = recoveredTurnId !== undefined && latest.pendingRecoveryTurnIds.includes(recoveredTurnId)
-        ? scheduleRecoveryRetry(nickname, subscriptionId, recoveredTurnId)
-        : false;
-      const queued = drainWorkerRecoveryAfterAttempt(latest, recoveredTurnId, retryScheduled);
-      if (queued.state !== latest) replaceWorker(queued.state);
-      if (queued.turnId) {
-        queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, queued.turnId); });
-      } else if (emptyContinuation) {
-        queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, emptyContinuation); });
+      if (latest && latest.nickname === nickname && latest.subscriptionId === subscriptionId) {
+        const retryScheduled = recoveredTurnId !== undefined && latest.pendingRecoveryTurnIds.includes(recoveredTurnId)
+          ? scheduleRecoveryRetry(nickname, subscriptionId, recoveredTurnId)
+          : false;
+        const queued = drainWorkerRecoveryAfterAttempt(latest, recoveredTurnId, retryScheduled);
+        if (queued.state !== latest) replaceWorker(queued.state);
+        if (queued.turnId) {
+          queueMicrotask(() => { void workerPageLoaderRef.current?.(nickname, subscriptionId, true, undefined, queued.turnId); });
+        }
       }
     }
+    return true;
   }, [replaceWorker, scheduleRecoveryRetry]);
   workerPageLoaderRef.current = loadWorkerPage;
   const loadDir = useCallback(async (nickname: string, path: string) => {
@@ -286,21 +290,26 @@ export function App() {
   });
 
   const subscribeWorker = useCallback((socket: WebSocket | null, nickname: string | null) => {
-    clearRecoveryRetries();
-    emptyHistoryContinuationsRef.current.clear();
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const previous = workerRef.current;
     const session = nickname ? sessionsRef.current.find((candidate) => candidate.nickname === nickname) : undefined;
     const mappingId = session?.mappingId ?? "";
+    const target = nickname ? { socket, nickname, mappingId } : null;
+    if (target && sameWorkerSubscriptionTarget(workerSubscriptionTargetRef.current, target)
+      && previous?.nickname === nickname && previous.mappingId === mappingId) return;
+    clearRecoveryRetries();
+    workerHistoryAutoFillsRef.current.clear();
     const sameWorker = previous?.nickname === nickname && previous.mappingId === mappingId;
     if (previous && !sameWorker) {
       storeWorkerDraftMessages(workerDraftsRef.current, previous);
     }
     if (!nickname) {
+      workerSubscriptionTargetRef.current = null;
       replaceWorker(null);
       socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: createBrowserUuid() }));
       return;
     }
+    workerSubscriptionTargetRef.current = target;
     const requestId = createBrowserUuid();
     const retained = sameWorker && previous
       ? retainWorkerDraftMessages(previous)
@@ -311,6 +320,9 @@ export function App() {
   }, [clearRecoveryRetries, replaceWorker]);
 
   useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
+  useEffect(() => () => {
+    if (workerTailScrollFrameRef.current !== null) window.cancelAnimationFrame(workerTailScrollFrameRef.current);
+  }, []);
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
   useEffect(() => { // WebSocket live updates
@@ -319,7 +331,11 @@ export function App() {
       ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
       wsRef.current = ws;
       ws.onopen = () => { setLive(true); subscribeWorker(ws, selectedRef.current); };
-      ws.onclose = () => { if (wsRef.current === ws) wsRef.current = null; setLive(false); if (!stop) setTimeout(connect, 2000); };
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (workerSubscriptionTargetRef.current?.socket === ws) workerSubscriptionTargetRef.current = null;
+        setLive(false); if (!stop) setTimeout(connect, 2000);
+      };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
         if (m.type === "sessions") { setSessions(m.sessions); setAssistantSession(m.assistant); }
         else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at, ...(typeof m.worker === "string" ? { worker: m.worker } : {}), ...(typeof m.origin === "string" ? { origin: m.origin } : {}) }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
@@ -344,7 +360,10 @@ export function App() {
           }
         } else if (m.type === "worker/subscription-error") {
           const current = workerRef.current;
-          if (current && current.requestId === m.requestId) push(current.nickname, { role: "assistant", body: `[worker stream unavailable: ${m.code ?? "error"}]`, at: Date.now() });
+          if (current && current.requestId === m.requestId) {
+            workerSubscriptionTargetRef.current = null;
+            push(current.nickname, { role: "assistant", body: `[worker stream unavailable: ${m.code ?? "error"}]`, at: Date.now() });
+          }
         } }; // grow the window while scrolled up so a live append doesn't slide/jump
     };
     connect();
@@ -375,13 +394,32 @@ export function App() {
     return base.filter((m) => m.body.trim());
   }, [selected, workerChat, log, history]);
   const rendered = shown.slice(Math.max(0, shown.length - visible));
+  const tailRevision = workerViewportRevision(key, rendered, goal ? `${goal.status}\0${goal.objective}` : "");
 
   // Keep scroll position when prepending older messages; otherwise stay pinned to the bottom.
   useLayoutEffect(() => {
     const el = logRef.current; if (!el) return;
-    if (preserveRef.current !== null) { el.scrollTop += el.scrollHeight - preserveRef.current; preserveRef.current = null; }
-    else if (stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [rendered.length, selected, goal?.objective, goal?.status]);
+    const previousRevision = workerTailRevisionRef.current;
+    const preservation = preserveRef.current;
+    const preservePending = preservation !== null;
+    if (preservePending) {
+      if (workerTailScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(workerTailScrollFrameRef.current);
+        workerTailScrollFrameRef.current = null;
+      }
+      const advanced = advanceWorkerScrollPreservation(preservation, el.scrollHeight);
+      el.scrollTop += advanced.scrollDelta;
+      preserveRef.current = advanced.state;
+    }
+    else if (shouldFollowWorkerTail({ pinned: stickRef.current, preservePending, previousRevision, nextRevision: tailRevision })
+      && workerTailScrollFrameRef.current === null) {
+      workerTailScrollFrameRef.current = window.requestAnimationFrame(() => {
+        workerTailScrollFrameRef.current = null;
+        if (stickRef.current) el.scrollTop = el.scrollHeight;
+      });
+    }
+    workerTailRevisionRef.current = tailRevision;
+  }, [rendered.length, tailRevision, selected, loadingOlder, goal?.objective, goal?.status]);
 
   const loadOlder = useCallback(async () => {
     if (loadingOlder) return;
@@ -390,7 +428,7 @@ export function App() {
     const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
     if (assistantCursor === undefined && workerCursor === undefined) return;
     setLoadingOlder(true);
-    if (el) preserveRef.current = el.scrollHeight;
+    if (el) preserveRef.current = { height: el.scrollHeight, pending: true };
     try {
       if (selected !== null) {
         const active = workerRef.current;
@@ -412,14 +450,55 @@ export function App() {
       // Stop paging if the server has no more OR this fetch made no progress (avoids re-fetching the
       // same boundary page forever when >limit rows share one millisecond).
       setHasOlder((h) => ({ ...h, [key]: p.hasOlder && fresh.length > 0 }));
-    } catch { preserveRef.current = null; } finally { setLoadingOlder(false); }
+    } catch { preserveRef.current = null; } finally {
+      preserveRef.current = settleWorkerScrollPreservation(preserveRef.current);
+      setLoadingOlder(false);
+    }
   }, [loadingOlder, selected, history, workerChat, key, loadWorkerPage]);
+
+  // Tool-heavy turns can yield a non-empty native page with only a few visible messages. Continue
+  // only until the foreground viewport can scroll; subsequent history remains lazy on scroll-up.
+  useLayoutEffect(() => {
+    if (selected === null || !workerChat || workerChat.nickname !== selected || !workerChat.subscriptionId
+      || workerChat.pendingRecoveryTurnIds.length > 0) return;
+    const key = `${selected}:${workerChat.subscriptionId}`;
+    const previous = workerHistoryAutoFillsRef.current.get(key);
+    if (!workerChat.olderCursor || workerChat.historyInFlight || loadingOlder || previous?.cursor === workerChat.olderCursor) return;
+    const el = logRef.current;
+    if (!el) return;
+    const cursor = nextWorkerHistoryAutoFill({
+      hasOlder: workerChat.hasOlder,
+      historyInFlight: workerChat.historyInFlight,
+      loadingOlder,
+      cursor: workerChat.olderCursor,
+      attempts: previous?.attempts ?? 0,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    });
+    if (!cursor) {
+      workerHistoryAutoFillsRef.current.set(key, { attempts: previous?.attempts ?? 0, cursor: workerChat.olderCursor });
+      return;
+    }
+    workerHistoryAutoFillsRef.current.set(key, { attempts: (previous?.attempts ?? 0) + 1, cursor });
+    queueMicrotask(() => {
+      const current = workerRef.current;
+      if (current?.nickname === selected && current.subscriptionId === workerChat.subscriptionId) {
+        const load = workerPageLoaderRef.current?.(selected, workerChat.subscriptionId!, false, cursor);
+        void load?.then((started) => {
+          if (started) return;
+          const consumed = workerHistoryAutoFillsRef.current.get(key);
+          const released = releaseWorkerHistoryAutoFill(consumed, cursor);
+          if (released) workerHistoryAutoFillsRef.current.set(key, released);
+        });
+      }
+    });
+  }, [selected, workerChat, loadingOlder]);
 
   const onScroll = () => {
     const el = logRef.current; if (!el) return;
     stickRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - BOTTOM_PX;
     if (el.scrollTop <= TOP_PX) {
-      if (visible < shown.length) { preserveRef.current = el.scrollHeight; setVisible((v) => Math.min(v + REVEAL_STEP, shown.length)); }
+      if (visible < shown.length) { preserveRef.current = { height: el.scrollHeight, pending: false }; setVisible((v) => Math.min(v + REVEAL_STEP, shown.length)); }
       else if (hasOlder[key] && !loadingOlder) void loadOlder();
     }
   };
@@ -427,7 +506,7 @@ export function App() {
   const requestOlder = () => {
     const el = logRef.current;
     if (visible < shown.length) {
-      if (el) preserveRef.current = el.scrollHeight;
+      if (el) preserveRef.current = { height: el.scrollHeight, pending: false };
       setVisible((value) => Math.min(value + REVEAL_STEP, shown.length));
       return;
     }

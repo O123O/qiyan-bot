@@ -2,8 +2,8 @@
 
 ## Problem
 
-The foreground worker panel subscribes to native app-server notifications and then reads
-`thread/read`. QiYan currently omits every item from an in-progress turn. A panel that joins a
+The foreground worker panel subscribes to native app-server notifications and then reads bounded
+native turn/item history. QiYan currently omits every item from an in-progress turn. A panel that joins a
 remote worker mid-turn therefore loses the current user message and any completed intermediate
 agent messages until the turn finishes.
 
@@ -14,12 +14,13 @@ repeated text may be either an already-snapshotted delta or legitimate new outpu
 
 Codex identifies every streamed item by `threadId`, `turnId`, and `itemId`. Its per-item lifecycle
 is `item/started`, zero or more ordered item-specific deltas, and `item/completed`; the completed
-item is authoritative. Persisted thread history is materialized from item lifecycle records, and
-agent-message history contains complete messages rather than an actively streaming partial message.
+item is authoritative. Rows returned by native history contain complete messages rather than an
+actively streaming partial message. A bounded page is not proof that every previously emitted
+intermediate notification is present.
 
 An in-progress turn can therefore contain two different kinds of state at once:
 
-- completed user and agent-message items available from `thread/read`;
+- completed user and agent-message items available from bounded native history;
 - a newer active item available only through live notifications until `item/completed`.
 
 ## Design
@@ -37,6 +38,8 @@ The foreground-only Web UI flow reconciles by native item identity:
 - always accept `item/completed` as the authoritative replacement;
 - keep the last 50 live `turn/completed` statuses so a stale older-page response cannot reclassify
   a completed turn as open, while still trusting a later terminal history status during recovery;
+- preserve the byte/count-bounded recent browser timeline across tab switches when the immutable
+  worker mapping is unchanged; stable item IDs let returned history replace matching retained rows;
 - keep the existing one-shot completion recovery for a turn joined after `turn/started`, so a
   partial live item is repaired if the panel missed its prefix;
 - retain Claude's existing completion recovery path; Claude does not use Codex delta semantics.

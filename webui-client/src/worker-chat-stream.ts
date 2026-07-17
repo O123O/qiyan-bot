@@ -103,7 +103,10 @@ export function beginWorkerSubscription(
 }
 
 export function retainWorkerDraftMessages(state: WorkerStreamState): WorkerChatMessage[] {
-  const candidates = state.messages.filter((message) => message.optimistic || message.terminalStatus === "");
+  // A bounded native page is not proof that a previously observed live item does not exist. Keep the
+  // recent foreground timeline across tab switches; mapping validation and stable item IDs make the
+  // subsequent snapshot merge safe and deterministic.
+  const candidates = state.messages;
   const retained: WorkerChatMessage[] = [];
   let bytes = 0;
   for (let index = candidates.length - 1; index >= 0 && retained.length < MAX_RETAINED_DRAFT_MESSAGES; index -= 1) {
@@ -274,16 +277,8 @@ export function applyWorkerSnapshot(state: WorkerStreamState, snapshot: WorkerSn
     streaming: false,
     optimistic: false,
   }));
-  const currentOpenTurnIds = new Set([
-    ...snapshot.openTurnIds,
-    ...state.bufferedEvents.map((envelope) => envelope.event.turnId),
-  ]);
   const snapshotMessageIds = new Set(snapshot.messages.map((message) => message.id));
-  const retainedIds = new Set(state.retainedMessageIds);
-  let messages = state.messages.filter((message) => !retainedIds.has(message.id)
-    || message.optimistic
-    || currentOpenTurnIds.has(message.turnId)
-    || snapshotMessageIds.has(message.id));
+  let messages = state.messages;
   for (const message of snapshotMessages) {
     if (message.clientId) messages = messages.filter((candidate) => !(candidate.optimistic && candidate.clientId === message.clientId));
     messages = upsert(messages, message);
