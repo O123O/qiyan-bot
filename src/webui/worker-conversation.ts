@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
-// Web-UI-only mapping of provider-native turn rows. The provider transcript remains the durable
-// owner of this history; QiYan maps one requested page and does not persist the timeline.
+// Foreground-only mapping of provider-native turn rows. The provider transcript remains the
+// durable owner of this history; consumers map one requested page and do not cache the timeline.
 
 export interface WorkerConvoRow {
   id: string;

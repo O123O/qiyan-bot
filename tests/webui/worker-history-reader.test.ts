@@ -73,10 +73,15 @@ test("revalidates the complete mapping after the raw read before extracting text
 test("ready native reads request complete turns through the existing lease and never activate", async () => {
   const lease = { endpointId: "local", endpointGeneration: 3, leaseId: "lease" } as never;
   const requests: unknown[][] = [];
-  const page = await readReadyWorkerTurns({
+  const read = (cursor?: string) => readReadyWorkerTurns({
     withReadyWorkLease: async (endpointId, run) => { assert.equal(endpointId, "local"); return run(lease); },
     request: async (...args) => {
       requests.push(args);
+      if (args[1] === "thread/turns/list" && (args[2] as any).cursor === "older-page") return {
+        data: [{ ...turn("older"), id: "older-turn", itemsView: "full" }],
+        nextCursor: null,
+        backwardsCursor: null,
+      };
       if (args[1] === "thread/turns/list") return {
         data: [{
           ...turn(), itemsView: "full",
@@ -89,11 +94,22 @@ test("ready native reads request complete turns through the existing lease and n
       };
       throw new Error(`unexpected method: ${String(args[1])}`);
     },
-  }, "local", "thread", 1, undefined, new AbortController().signal);
-  assert.deepEqual(page.messages.map((message) => message.body), ["checking", "done"]);
-  assert.equal(page.nextCursor, "older-page");
-  assert.deepEqual(requests.map((request) => request[1]), ["thread/turns/list"]);
+  }, "local", "thread", 1, cursor, new AbortController().signal);
+  const page = await read();
+  assert.deepEqual(page.messages.map((message) => message.body), ["done"]);
+  assert.equal(page.hasOlder, true);
+  assert.ok(page.nextCursor);
+  const withinTurn = await read(page.nextCursor);
+  assert.deepEqual(withinTurn.messages.map((message) => message.body), ["checking"]);
+  assert.equal(withinTurn.hasOlder, true);
+  assert.ok(withinTurn.nextCursor);
+  const older = await read(withinTurn.nextCursor);
+  assert.deepEqual(older.messages.map((message) => message.body), ["older"]);
+  assert.equal(older.hasOlder, false);
+  assert.deepEqual(requests.map((request) => request[1]), ["thread/turns/list", "thread/turns/list", "thread/turns/list"]);
   assert.equal((requests[0]?.[2] as any).cursor, undefined);
+  assert.equal((requests[1]?.[2] as any).cursor, undefined);
+  assert.equal((requests[2]?.[2] as any).cursor, "older-page");
   assert.equal((requests[0]?.[2] as any).itemsView, "full");
   assert.ok(requests.every((request) => request[0] === "local" && request[4] === lease));
   assert.equal(requests.some((request) => request[1] === "thread/read"), false);
@@ -106,25 +122,31 @@ test("ready native reads request complete turns through the existing lease and n
   assert.equal(touched, false);
 });
 
-test("native Web UI paging uses one stable turn cursor without head-relative message boundaries", async () => {
+test("native Web UI paging wraps one stable turn cursor without head-relative message boundaries", async () => {
   let requests = 0;
-  const page = await readReadyWorkerTurns({
+  const cursors: unknown[] = [];
+  const request = async (_endpoint: string, method: string, params: unknown) => {
+    requests += 1;
+    assert.equal(method, "thread/turns/list");
+    assert.equal((params as any).itemsView, "full");
+    cursors.push((params as any).cursor);
+    return {
+      data: [{ id: "turn", status: "completed", itemsView: "full", items: [{ type: "reasoning", id: "tool" }] }],
+      nextCursor: (params as any).cursor === undefined ? "older" : null,
+      backwardsCursor: null,
+    };
+  };
+  const deps = {
     withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
-    request: async (_endpoint, method, params) => {
-      requests += 1;
-      assert.equal(method, "thread/turns/list");
-      assert.equal((params as any).itemsView, "full");
-      return {
-        data: [{ id: "turn", status: "completed", itemsView: "full", items: [{ type: "reasoning", id: "tool" }] }],
-        nextCursor: "older",
-        backwardsCursor: null,
-      };
-    },
-  }, "local", "thread", 20, undefined, new AbortController().signal);
+    request,
+  } satisfies Parameters<typeof readReadyWorkerTurns>[0];
+  const page = await readReadyWorkerTurns(deps, "local", "thread", 20, undefined, new AbortController().signal);
 
   assert.deepEqual(page.messages, []);
-  assert.equal(page.nextCursor, "older");
-  assert.equal(requests, 1);
+  assert.ok(page.nextCursor);
+  await readReadyWorkerTurns(deps, "local", "thread", 20, page.nextCursor, new AbortController().signal);
+  assert.equal(requests, 2);
+  assert.deepEqual(cursors, [undefined, "older"]);
 });
 
 test("native Web UI paging never falls back to lossy summaries", async () => {

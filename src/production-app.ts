@@ -68,6 +68,7 @@ import {
 import { AttemptScope } from "./assistant/attempt-scope.ts";
 import { SessionObservationProcessor } from "./assistant/session-observer.ts";
 import { createAssistantTools, type AssistantToolName, type ToolHandler } from "./assistant/tools.ts";
+import { readWorkerMessages } from "./assistant/worker-message-history.ts";
 import { prepareAssistantWorkspace } from "./assistant/workspace.ts";
 import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
@@ -2320,6 +2321,40 @@ export async function buildProductionApp(
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
+  const readWorkerTurns = (
+    endpointId: string,
+    threadId: string,
+    mappingId: string,
+    limit: number,
+    cursor: string | undefined,
+    signal: AbortSignal,
+  ) => {
+    if (sessionProvider(endpointId) === "claude") {
+      return readReadyWorkerTurns({
+        withReadyWorkLease: (id, run) => endpointManager.withReadyWorkLease(id, run),
+        request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
+      }, endpointId, threadId, limit, cursor, signal);
+    }
+    const readCodexPage = async (lease?: EndpointWorkLease) => {
+      if (signal.aborted) throw signal.reason;
+      const path = ownership.managedRolloutPath({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId });
+      if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
+      const native = nativeSessions.view({ endpointId, threadId, mappingId });
+      const activeTurnId = native?.availability === "ready" && native.status === "active"
+        ? native.activeTurnId
+        : null;
+      const page = await codexHistoryAccess.read(endpointId, {
+        path, threadId, limit,
+        ...(activeTurnId ? { activeTurnId } : {}),
+        ...(cursor ? { cursor } : {}),
+      }, lease, signal);
+      if (signal.aborted) throw signal.reason;
+      return page;
+    };
+    return endpointId === assistantEndpoint.id
+      ? readCodexPage()
+      : endpointManager.withReadyWorkLease(endpointId, readCodexPage);
+  };
   const phases: AppPhase[] = [
     {
       name: "assistant-workspace",
@@ -3461,33 +3496,7 @@ export async function buildProductionApp(
             unsubscribeDashboard();
           };
         },
-        readWorkerTurns: (endpointId, threadId, mappingId, limit, cursor, signal) => {
-          if (sessionProvider(endpointId) === "claude") {
-            return readReadyWorkerTurns({
-              withReadyWorkLease: (id, run) => endpointManager.withReadyWorkLease(id, run),
-              request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
-            }, endpointId, threadId, limit, cursor, signal);
-          }
-          const readCodexPage = async (lease?: EndpointWorkLease) => {
-            if (signal.aborted) throw signal.reason;
-            const path = ownership.managedRolloutPath({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId });
-            if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
-            const native = nativeSessions.view({ endpointId, threadId, mappingId });
-            const activeTurnId = native?.availability === "ready" && native.status === "active"
-              ? native.activeTurnId
-              : null;
-            const page = await codexHistoryAccess.read(endpointId, {
-              path, threadId, limit,
-              ...(activeTurnId ? { activeTurnId } : {}),
-              ...(cursor ? { cursor } : {}),
-            }, lease, signal);
-            if (signal.aborted) throw signal.reason;
-            return page;
-          };
-          return endpointId === assistantEndpoint.id
-            ? readCodexPage()
-            : endpointManager.withReadyWorkLease(endpointId, readCodexPage);
-        },
+        readWorkerTurns,
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
         host: (id) => {
@@ -3720,6 +3729,13 @@ export async function buildProductionApp(
         const message = finals.getById(args.message_id);
         if (!message || message.endpointId !== session.endpoint || message.threadId !== session.thread_id) throw new Error("worker message does not belong to that nickname");
         return message;
+      },
+      read_worker_messages: async (args, context) => {
+        const signal = context.signal ?? new AbortController().signal;
+        return readWorkerMessages({
+          resolveSession: (nickname) => registry.get(nickname),
+          readTurns: readWorkerTurns,
+        }, args, signal);
       },
       collect_messages: async (args, context) => args.direct
         ? sessions.collect(args.nickname, args.count, {
