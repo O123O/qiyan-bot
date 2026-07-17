@@ -341,8 +341,8 @@ test("attempt-scoped safeguards feed the ordinary action path with the admitted 
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   const binding = { adapterId: "telegram", conversationKey: "telegram:chat", destination: { chatId: "chat" } } as const;
   for (const [id, rawText] of [["primary", "ordinary"], ["guard", "/pass exact"]] as const) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText, attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
-  conversations.reserveStart("primary");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "primary" });
+  conversations.reserveStart(lease.attemptId, "primary");
   conversations.markSubmitted(lease.attemptId, "primary", "turn");
   conversations.reserveNextSteer(lease.attemptId);
   conversations.markSubmitted(lease.attemptId, "guard", "turn");

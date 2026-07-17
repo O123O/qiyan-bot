@@ -9,6 +9,20 @@ import { OperationStore } from "../../src/storage/operation-store.ts";
 
 const binding = { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } } as const;
 
+function submittedAttempt(
+  db: ReturnType<typeof createTestDatabase>,
+  deliveries: DeliveryStore,
+  contextId: string,
+  kind: "chat" | "internal",
+  turnId: string,
+) {
+  const conversations = new ConversationStore(db, deliveries);
+  const attempt = conversations.createAttempt({ kind, contextId });
+  conversations.reserveStart(attempt.attemptId, contextId);
+  conversations.confirmStart(attempt.attemptId, contextId, turnId);
+  return attempt;
+}
+
 test("user assistant finals are durable deliveries while internal finals are suppressed", () => {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
@@ -18,10 +32,10 @@ test("user assistant finals are durable deliveries while internal finals are sup
   db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('batch-event', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
   db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES ('batch', '[\"batch-event\"]', 'pending', 1)").run();
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.beginUserAttempt("ctx", "attempt", "turn-user");
+  submittedAttempt(db, deliveries, "ctx", "chat", "turn-user");
   runtime.handleTerminal("turn-user", "answer");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx'").get() as any).state, "completed");
-  runtime.beginInternalAttempt("batch", "attempt-2", "turn-internal");
+  submittedAttempt(db, deliveries, "batch", "internal", "turn-internal");
   const restarted = new AssistantRuntime(db, operations, deliveries, { binding });
   restarted.handleTerminal("turn-internal", "do not send");
   assert.deepEqual(deliveries.listReady().map((item) => item.body), ["answer"]);
@@ -32,12 +46,13 @@ test("post-dispatch assistant failure creates one recovery context with receipts
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "go", attachmentIds: [], binding });
-  const operation = operations.prepare({ contextId: "ctx", attemptId: "a", callId: "c", kind: "send", args: { x: 1 } });
+  const deliveries = new DeliveryStore(db);
+  const attempt = submittedAttempt(db, deliveries, "ctx", "chat", "turn");
+  const operation = operations.prepare({ contextId: "ctx", attemptId: attempt.attemptId, callId: "c", kind: "send", args: { x: 1 } });
   operations.markDispatched(operation.id);
   db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('event-1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
   db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES ('ctx', '[\"event-1\"]', 'active', 1)").run();
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  runtime.beginUserAttempt("ctx", "a", "turn");
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
   const first = runtime.failAttempt("turn", new Error("lost"));
   const replay = runtime.failAttempt("turn", new Error("lost"));
   assert.equal(first?.id, replay?.id);
@@ -53,9 +68,9 @@ test("terminalization rolls back attempt and source state if final delivery prep
   operations.createSourceContext({ id: "ctx-atomic", kind: "telegram", sourceId: "atomic", rawText: "question", attachmentIds: [], binding });
   const failingDeliveries = { prepare() { throw new Error("outbox failed"); } } as unknown as DeliveryStore;
   const runtime = new AssistantRuntime(db, operations, failingDeliveries, { binding });
-  runtime.beginUserAttempt("ctx-atomic", "attempt-atomic", "turn-atomic");
+  const attempt = submittedAttempt(db, failingDeliveries, "ctx-atomic", "chat", "turn-atomic");
   assert.throws(() => runtime.handleTerminal("turn-atomic", "answer"), /outbox failed/);
-  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-atomic'").get() as any).state, "active");
+  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(attempt.attemptId) as any).state, "active");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-atomic'").get() as any).state, "active");
 });
 
@@ -65,27 +80,72 @@ test("a completed chat without final text is restored instead of silently droppe
   const deliveries = new DeliveryStore(db);
   operations.createSourceContext({ id: "ctx-empty", kind: "telegram", sourceId: "empty", rawText: "question", attachmentIds: [], binding });
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.beginUserAttempt("ctx-empty", "attempt-empty", "turn-empty");
+  const attempt = submittedAttempt(db, deliveries, "ctx-empty", "chat", "turn-empty");
 
   runtime.handleTerminal("turn-empty", "completed");
 
-  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-empty'").get() as any).state, "failed");
+  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(attempt.attemptId) as any).state, "failed");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-empty'").get() as any).state, "pending");
   assert.deepEqual(deliveries.listReady(), []);
+});
+
+test("effect-free assistant failures stop at a durable per-source attempt limit", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  operations.createSourceContext({ id: "ctx-limited", kind: "telegram", sourceId: "limited", rawText: "question", attachmentIds: [], binding });
+
+  const preDispatch = new ConversationStore(db, deliveries);
+  const unstarted = preDispatch.createAttempt({ kind: "chat", contextId: "ctx-limited" });
+  preDispatch.reserveStart(unstarted.attemptId, "ctx-limited");
+  preDispatch.restorePending(unstarted.attemptId, "ctx-limited");
+  preDispatch.failUnstartedAttempt(unstarted.attemptId);
+
+  const first = new AssistantRuntime(db, operations, deliveries, { binding, maxEffectFreeAttempts: 2 });
+  submittedAttempt(db, deliveries, "ctx-limited", "chat", "turn-limited-1");
+  first.failAttempt("turn-limited-1", new Error("failed"));
+  assert.equal(operations.getSourceContext("ctx-limited")?.state, "pending");
+  assert.equal(deliveries.get("assistant-attempts-exhausted:ctx-limited"), undefined);
+
+  submittedAttempt(db, deliveries, "ctx-limited", "chat", "turn-limited-2");
+  const restarted = new AssistantRuntime(db, operations, deliveries, { binding, maxEffectFreeAttempts: 2 });
+  restarted.failAttempt("turn-limited-2", new Error("failed again"));
+
+  assert.equal(operations.getSourceContext("ctx-limited")?.state, "completed");
+  assert.equal(deliveries.get("assistant-attempts-exhausted:ctx-limited")?.kind, "system_warning");
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM assistant_attempts WHERE context_id = 'ctx-limited' AND state = 'failed' AND turn_id IS NOT NULL").get()!.count, 2);
+});
+
+test("an exhausted internal source is terminalized and reported to the owner", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  operations.createSourceContext({ id: "batch-limited", kind: "event_batch", sourceId: "batch-limited", rawText: "", attachmentIds: [] });
+  db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('limited-event', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
+  db.prepare("INSERT INTO event_batches(id, event_ids_json, state, created_at) VALUES ('batch-limited', '[\"limited-event\"]', 'active', 1)").run();
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding, maxEffectFreeAttempts: 1 });
+  submittedAttempt(db, deliveries, "batch-limited", "internal", "turn-batch-limited");
+
+  runtime.failAttempt("turn-batch-limited", new Error("failed"));
+
+  assert.equal(operations.getSourceContext("batch-limited")?.state, "completed");
+  assert.equal(db.prepare("SELECT state FROM events WHERE id = 'limited-event'").get()!.state, "processed");
+  assert.equal(deliveries.get("assistant-attempts-exhausted:batch-limited")?.kind, "system_warning");
 });
 
 test("failed-attempt terminalization rolls back if recovery creation fails", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-fail-atomic", kind: "telegram", sourceId: "fail-atomic", rawText: "", attachmentIds: [], binding });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  runtime.beginUserAttempt("ctx-fail-atomic", "attempt-fail-atomic", "turn-fail-atomic");
-  const operation = operations.prepare({ contextId: "ctx-fail-atomic", attemptId: "attempt-fail-atomic", callId: "call", kind: "send", args: {} });
+  const deliveries = new DeliveryStore(db);
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  const attempt = submittedAttempt(db, deliveries, "ctx-fail-atomic", "chat", "turn-fail-atomic");
+  const operation = operations.prepare({ contextId: "ctx-fail-atomic", attemptId: attempt.attemptId, callId: "call", kind: "send", args: {} });
   operations.markDispatched(operation.id);
   db.exec(`CREATE TRIGGER fail_recovery_insert BEFORE INSERT ON source_contexts WHEN NEW.kind = 'recovery'
     BEGIN SELECT RAISE(ABORT, 'recovery insert failed'); END;`);
   assert.throws(() => runtime.failAttempt("turn-fail-atomic", "failed"), /recovery insert failed/);
-  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = 'attempt-fail-atomic'").get() as any).state, "active");
+  assert.equal((db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(attempt.attemptId) as any).state, "active");
   assert.equal((db.prepare("SELECT state FROM source_contexts WHERE id = 'ctx-fail-atomic'").get() as any).state, "active");
 });
 
@@ -95,8 +155,9 @@ test("source attachment retention is released exactly once at terminalization", 
     VALUES ('file-one', 'ctx-file', 'a', 'text/plain', '/tmp/a', 1, 'x', 1, 999, 1)`).run();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-file", kind: "telegram", sourceId: "file", rawText: "", attachmentIds: ["file-one"], binding });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  runtime.beginUserAttempt("ctx-file", "attempt-file", "turn-file");
+  const deliveries = new DeliveryStore(db);
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  submittedAttempt(db, deliveries, "ctx-file", "chat", "turn-file");
   runtime.handleTerminal("turn-file", "answer");
   runtime.handleTerminal("turn-file", "answer");
   assert.equal((db.prepare("SELECT ref_count FROM attachments WHERE id = 'file-one'").get() as any).ref_count, 0);
@@ -107,10 +168,10 @@ test("assistant context exists before turn/start dispatch and later binds the re
   const operations = new OperationStore(db);
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.acceptChatSource({ id: "ctx", nativeSourceId: "4", binding, rawText: "go", attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "ctx" }, "claim");
-  conversations.reserveStart("ctx");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "ctx" });
+  conversations.reserveStart(lease.attemptId, "ctx");
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  assert.deepEqual(runtime.hydrateActive(), {
+  assert.deepEqual(runtime.activateAttempt(lease.attemptId), {
     attemptId: lease.attemptId, contextId: "ctx", triggerKind: "chat", binding, toolFence: 0,
   });
   const startingFence = runtime.registerTool(lease.attemptId);
@@ -118,11 +179,29 @@ test("assistant context exists before turn/start dispatch and later binds the re
   assert.equal(startingFence, 0);
   assert.deepEqual(operations.listPendingSourceContexts(["telegram"]), []);
   conversations.confirmStart(lease.attemptId, "ctx", "real-turn");
-  runtime.hydrateActive();
+  runtime.activateAttempt(lease.attemptId);
   assert.equal(runtime.current()?.turnId, "real-turn");
   runtime.abandonActive("real-turn");
   assert.equal(runtime.current(), undefined);
   assert.equal(runtime.activeAttempts()[0]?.turnId, "real-turn", "transport loss keeps the durable attempt active for reconciliation");
+});
+
+test("durable attempt state cannot admit a tool without process-local activation", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.createInternalSource({ id: "owned", kind: "event_batch", sourceId: "owned", rawText: "", attachmentIds: [], receivedAt: 1 });
+  const attempt = conversations.createAttempt({ kind: "internal", contextId: "owned" });
+  conversations.reserveStart(attempt.attemptId, "owned");
+  conversations.confirmStart(attempt.attemptId, "owned", "turn-a");
+
+  const restarted = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
+  assert.equal(restarted.current(), undefined);
+  assert.throws(() => restarted.registerTool(attempt.attemptId), /not active in this process/iu);
+
+  restarted.activateAttempt(attempt.attemptId);
+  assert.equal(restarted.registerTool(attempt.attemptId), 0);
+  restarted.finishTool(attempt.attemptId);
 });
 
 test("orphan and identity-inconsistent attempts cannot become MCP context", () => {
@@ -130,40 +209,40 @@ test("orphan and identity-inconsistent attempts cannot become MCP context", () =
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "orphan", kind: "event_batch", sourceId: "orphan", rawText: "", attachmentIds: [] });
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  runtime.prepareAttempt("orphan", "orphan-attempt", "internal");
-  assert.equal(runtime.hydrateActive(), undefined);
+  db.prepare(`INSERT INTO assistant_attempts(id, context_id, trigger_kind, state, created_at)
+    VALUES ('orphan-attempt', 'orphan', 'internal', 'active', 1)`).run();
+  assert.equal(runtime.activateAttempt("orphan-attempt"), undefined);
   assert.equal(runtime.current(), undefined);
-  assert.throws(() => runtime.registerTool("orphan-attempt"), /active assistant lease/iu);
+  assert.throws(() => runtime.registerTool("orphan-attempt"), /not accepting tools/iu);
 
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.createInternalSource({ id: "owned", kind: "event_batch", sourceId: "owned", rawText: "", attachmentIds: [], receivedAt: 2 });
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "owned" }, "claim");
-  conversations.reserveStart("owned");
-  conversations.confirmStart(lease.attemptId, "owned", "turn-a");
-  db.prepare("UPDATE assistant_attempts SET turn_id = 'turn-b' WHERE id = ?").run(lease.attemptId);
-  assert.equal(runtime.hydrateActive(), undefined);
-  assert.throws(() => runtime.registerTool(lease.attemptId), /active assistant lease/iu);
+  const attempt = conversations.createAttempt({ kind: "internal", contextId: "owned" });
+  conversations.reserveStart(attempt.attemptId, "owned");
+  conversations.confirmStart(attempt.attemptId, "owned", "turn-a");
+  db.prepare("UPDATE assistant_attempts SET turn_id = 'turn-b' WHERE id = ?").run(attempt.attemptId);
+  assert.equal(runtime.activateAttempt(attempt.attemptId), undefined);
+  assert.throws(() => runtime.registerTool(attempt.attemptId), /not accepting tools/iu);
 });
 
-test("terminalizing lease immediately closes cached MCP context", () => {
+test("terminalizing an attempt immediately closes cached MCP context", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.createInternalSource({ id: "owned", kind: "event_batch", sourceId: "owned", rawText: "", attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "owned" }, "claim");
-  conversations.reserveStart("owned");
-  conversations.confirmStart(lease.attemptId, "owned", "turn-a");
+  const attempt = conversations.createAttempt({ kind: "internal", contextId: "owned" });
+  conversations.reserveStart(attempt.attemptId, "owned");
+  conversations.confirmStart(attempt.attemptId, "owned", "turn-a");
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  assert.equal(runtime.hydrateActive()?.turnId, "turn-a");
+  assert.equal(runtime.activateAttempt(attempt.attemptId)?.turnId, "turn-a");
 
-  conversations.beginTerminalizing("turn-a");
+  conversations.beginTerminalizing(attempt.attemptId, "turn-a");
   assert.equal(runtime.current(), undefined);
-  assert.throws(() => runtime.registerTool(lease.attemptId), /active assistant lease/iu);
-  assert.equal(runtime.contextForLease(lease.attemptId, "turn-a")?.attemptId, lease.attemptId);
-  assert.equal(runtime.contextForLease("other", "turn-a"), undefined);
+  assert.throws(() => runtime.registerTool(attempt.attemptId), /not accepting tools/iu);
+  assert.equal(runtime.contextForTurn("turn-a")?.attemptId, attempt.attemptId);
 });
 
-test("terminal handling prefers the active lease owner when historical attempts share a turn id", () => {
+test("terminal handling prefers the active attempt when historical attempts share a turn id", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   const deliveries = new DeliveryStore(db);
@@ -172,8 +251,8 @@ test("terminal handling prefers the active lease owner when historical attempts 
   conversations.createInternalSource({ id: "current", kind: "event_batch", sourceId: "current", rawText: "", attachmentIds: [], receivedAt: 2 });
   db.prepare(`INSERT INTO assistant_attempts(id, context_id, turn_id, trigger_kind, state, created_at)
     VALUES ('historical-attempt', 'historical', 'shared-turn', 'internal', 'failed', 1)`).run();
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "current" }, "claim-current");
-  conversations.reserveStart("current");
+  const lease = conversations.createAttempt({ kind: "internal", contextId: "current" });
+  conversations.reserveStart(lease.attemptId, "current");
   conversations.markSubmitted(lease.attemptId, "current", "shared-turn");
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
 
@@ -181,7 +260,7 @@ test("terminal handling prefers the active lease owner when historical attempts 
   runtime.handleTerminal("shared-turn", "interrupted", undefined, new Error("interrupted"));
 
   assert.equal(db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.state, "failed");
-  assert.equal(conversations.lease(), undefined);
+  assert.equal(conversations.attempt(lease.attemptId), undefined);
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'current'").get()!.state, "pending");
 });
 
@@ -189,9 +268,10 @@ test("successful read-only tools do not force a recovery context after a failed 
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   operations.createSourceContext({ id: "ctx-read", kind: "telegram", sourceId: "3", rawText: "status", attachmentIds: [], binding });
-  const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
-  runtime.beginUserAttempt("ctx-read", "a-read", "t-read");
-  const operation = operations.prepare({ contextId: "ctx-read", attemptId: "a-read", callId: "c", kind: "get_session_status", args: {} });
+  const deliveries = new DeliveryStore(db);
+  const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
+  const attempt = submittedAttempt(db, deliveries, "ctx-read", "chat", "t-read");
+  const operation = operations.prepare({ contextId: "ctx-read", attemptId: attempt.attemptId, callId: "c", kind: "get_session_status", args: {} });
   operations.succeed(operation.id, { status: "idle" });
   assert.equal(runtime.failAttempt("t-read", "model failed"), undefined);
 });
@@ -211,13 +291,13 @@ function multiSourceAttempt() {
       receivedAt: 1,
     });
   }
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  conversations.reserveStart("one");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "one" });
+  conversations.reserveStart(lease.attemptId, "one");
   conversations.markSubmitted(lease.attemptId, "one", "turn");
   conversations.reserveNextSteer(lease.attemptId);
   conversations.markSubmitted(lease.attemptId, "two", "turn");
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.hydrateActive();
+  runtime.activateAttempt(lease.attemptId);
   return { db, operations, deliveries, conversations, lease, runtime };
 }
 
@@ -246,11 +326,11 @@ test("effect-free multi-source failure restores every source without releasing a
 });
 
 test("a completed multi-source chat without final text restores every source", () => {
-  const { db, conversations, runtime } = multiSourceAttempt();
+  const { db, conversations, lease, runtime } = multiSourceAttempt();
   runtime.handleTerminal("turn", "completed");
   assert.deepEqual((db.prepare("SELECT state FROM source_contexts ORDER BY id").all() as any[]).map((row) => row.state), ["pending", "pending"]);
   assert.deepEqual((db.prepare("SELECT state FROM assistant_attempt_sources ORDER BY source_ordinal").all() as any[]).map((row) => row.state), ["failed", "failed"]);
-  assert.equal(conversations.lease(), undefined);
+  assert.equal(conversations.attempt(lease.attemptId), undefined);
 });
 
 test("effectful multi-source failure creates one inherited-route recovery and supersedes the group", () => {
@@ -281,8 +361,8 @@ test("a completed internal attempt does not require final text", () => {
   const deliveries = new DeliveryStore(db);
   const conversations = new ConversationStore(db, deliveries);
   conversations.createInternalSource({ id: "internal-empty", kind: "event_batch", sourceId: "internal-empty", rawText: "", attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "internal-empty" }, "claim-internal-empty");
-  conversations.reserveStart("internal-empty");
+  const lease = conversations.createAttempt({ kind: "internal", contextId: "internal-empty" });
+  conversations.reserveStart(lease.attemptId, "internal-empty");
   conversations.markSubmitted(lease.attemptId, "internal-empty", "internal-empty-turn");
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
   runtime.handleTerminal("internal-empty-turn", "completed");
@@ -329,18 +409,17 @@ test("tool settlement is observable and the global drain waits for every attempt
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), { binding });
   conversations.createInternalSource({ id: "ctx-one", kind: "event_batch", sourceId: "ctx-one", rawText: "", attachmentIds: [], receivedAt: 1 });
-  const first = conversations.acquireLease({ kind: "internal", contextId: "ctx-one" }, "claim-one");
-  conversations.reserveStart("ctx-one");
+  const first = conversations.createAttempt({ kind: "internal", contextId: "ctx-one" });
+  conversations.reserveStart(first.attemptId, "ctx-one");
   conversations.confirmStart(first.attemptId, "ctx-one", "turn-one");
-  runtime.hydrateActive();
+  runtime.activateAttempt(first.attemptId);
   runtime.registerTool(first.attemptId);
 
-  db.prepare("DELETE FROM assistant_turn_lease WHERE singleton = 1").run();
   conversations.createInternalSource({ id: "ctx-two", kind: "event_batch", sourceId: "ctx-two", rawText: "", attachmentIds: [], receivedAt: 2 });
-  const second = conversations.acquireLease({ kind: "internal", contextId: "ctx-two" }, "claim-two");
-  conversations.reserveStart("ctx-two");
+  const second = conversations.createAttempt({ kind: "internal", contextId: "ctx-two" });
+  conversations.reserveStart(second.attemptId, "ctx-two");
   conversations.confirmStart(second.attemptId, "ctx-two", "turn-two");
-  runtime.hydrateActive();
+  runtime.activateAttempt(second.attemptId);
   runtime.registerTool(second.attemptId);
 
   assert.equal(runtime.hasActiveTools(first.attemptId), true);
@@ -369,23 +448,27 @@ test("causal finals retain the attempt binding while destinationless internal re
   const conversations = new ConversationStore(db, deliveries);
   const causal = { adapterId: "slack", conversationKey: "slack:D1", destination: { channel: "D1" } } as const;
   conversations.acceptChatSource({ id: "chat", nativeSourceId: "chat", binding: causal, rawText: "hello", attachmentIds: [], receivedAt: 1 });
-  const chatLease = conversations.acquireLease({ kind: "chat", contextId: "chat" }, "claim-chat");
-  conversations.reserveStart("chat");
+  const chatLease = conversations.createAttempt({ kind: "chat", contextId: "chat" });
+  conversations.reserveStart(chatLease.attemptId, "chat");
   conversations.markSubmitted(chatLease.attemptId, "chat", "chat-turn");
   const outsider = { adapterId: "telegram", conversationKey: "telegram:outsider", destination: { chatId: "outsider" } } as const;
-  assert.equal(conversations.acceptChatSource({ id: "outsider", nativeSourceId: "outsider", binding: outsider, rawText: "later", attachmentIds: [], receivedAt: 2 }).disposition, "queued");
+  assert.equal(conversations.acceptChatSource(
+    { id: "outsider", nativeSourceId: "outsider", binding: outsider, rawText: "later", attachmentIds: [], receivedAt: 2 },
+    {},
+    chatLease,
+  ).disposition, "queued");
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.hydrateActive();
+  runtime.activateAttempt(chatLease.attemptId);
   runtime.handleTerminal("chat-turn", "completed", "answer");
   assert.deepEqual(deliveries.get("assistant:chat-turn")?.binding, causal);
 
   conversations.createInternalSource({ id: "internal", kind: "event_batch", sourceId: "batch", rawText: "event", attachmentIds: [], receivedAt: 2 });
-  const internal = conversations.acquireLease({ kind: "internal", contextId: "internal" }, "claim-internal");
-  conversations.reserveStart("internal");
+  const internal = conversations.createAttempt({ kind: "internal", contextId: "internal" });
+  conversations.reserveStart(internal.attemptId, "internal");
   conversations.markSubmitted(internal.attemptId, "internal", "internal-turn");
   const operation = operations.prepare({ contextId: "internal", attemptId: internal.attemptId, callId: "effect", kind: "create_session", args: {}, effectClass: "side_effecting", toolFence: 0 });
   operations.markDispatched(operation.id, 0);
-  runtime.hydrateActive();
+  runtime.activateAttempt(internal.attemptId);
   const recovery = runtime.handleTerminal("internal-turn", "failed", undefined, new Error("lost"));
   const row = db.prepare("SELECT adapter_id, conversation_key FROM source_contexts WHERE id = ?").get(recovery.recoveryContextId!) as any;
   assert.equal(row.adapter_id, null);
@@ -399,36 +482,37 @@ test("a steer proven not admitted stays pending when the owning turn completes",
   const deliveries = new DeliveryStore(db);
   const conversations = new ConversationStore(db, deliveries);
   for (const id of ["owner", "restored"]) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText: id, attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
-  conversations.reserveStart("owner");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "owner" });
+  conversations.reserveStart(lease.attemptId, "owner");
   conversations.markSubmitted(lease.attemptId, "owner", "turn");
   conversations.reserveNextSteer(lease.attemptId);
   conversations.restorePending(lease.attemptId, "restored");
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.hydrateActive();
+  runtime.activateAttempt(lease.attemptId);
   runtime.handleTerminal("turn", "completed", "done");
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'owner'").get()!.state, "completed");
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'restored'").get()!.state, "pending");
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'restored'").get()!.state, "failed");
 });
 
-test("terminal handling cannot delete a lease with an unresolved native submission", () => {
+test("terminal handling delivers the settled turn while preserving an unresolved native submission", () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);
   const deliveries = new DeliveryStore(db);
   const conversations = new ConversationStore(db, deliveries);
   for (const id of ["owner", "unresolved"]) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText: id, attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
-  conversations.reserveStart("owner");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "owner" });
+  conversations.reserveStart(lease.attemptId, "owner");
   conversations.markSubmitted(lease.attemptId, "owner", "turn");
   conversations.reserveNextSteer(lease.attemptId);
   const runtime = new AssistantRuntime(db, operations, deliveries, { binding });
-  runtime.hydrateActive();
+  runtime.activateAttempt(lease.attemptId);
 
-  runtime.handleTerminal("turn", "completed", "premature");
+  runtime.handleTerminal("turn", "completed", "final now");
 
-  assert.equal(db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.state, "active");
-  assert.ok(db.prepare("SELECT attempt_id FROM assistant_turn_lease WHERE attempt_id = ?").get(lease.attemptId));
+  assert.equal(db.prepare("SELECT state FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.state, "completed");
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'owner'").get()!.state, "completed");
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'unresolved'").get()!.state, "steer_submitting");
-  assert.equal(deliveries.get("assistant:turn"), undefined);
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'unresolved'").get()!.state, "active");
+  assert.equal(deliveries.get("assistant:turn")?.body, "final now");
 });

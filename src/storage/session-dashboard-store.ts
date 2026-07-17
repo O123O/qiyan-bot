@@ -26,7 +26,6 @@ export interface StoredSessionFacts {
   tokenUsage: DashboardTokenUsage | null;
   goalObserved: boolean;
   goal: DashboardGoal | null;
-  lifecycleObservedAt: number | null;
   newestObservationAt: number | null;
 }
 
@@ -54,11 +53,18 @@ export interface SessionDashboardStoreOptions {
 
 export class SessionDashboardStore {
   private recoveryRequested = false;
+  private readonly changeListeners = new Set<() => void>();
+  private changeScheduled = false;
 
   constructor(
     private readonly db: Database,
     private readonly options: SessionDashboardStoreOptions = {},
   ) {}
+
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
+  }
 
   assertMetadataHealthy(): void {
     const rows = this.db.prepare("SELECT * FROM session_dashboard_meta").all() as Array<Record<string, unknown>>;
@@ -182,18 +188,6 @@ export class SessionDashboardStore {
     const row = this.db.prepare(`SELECT turn_ordinal FROM session_turn_order
       WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?`).get(identity.endpointId, identity.threadId, turnId) as { turn_ordinal: number } | undefined;
     return row ? Number(row.turn_ordinal) : undefined;
-  }
-
-  observeLifecycle(identity: DashboardIdentity, observedAt: number): boolean {
-    this.guardMetadata();
-    this.ensureFacts(identity);
-    const row = this.rawFacts(identity)!;
-    if (row.lifecycle_observed_at !== null && Number(row.lifecycle_observed_at) >= observedAt) return false;
-    this.db.prepare(`UPDATE session_dashboard_facts SET lifecycle_observed_at = ?,
-      newest_observation_at = MAX(COALESCE(newest_observation_at, ?), ?) WHERE endpoint_id = ? AND thread_id = ?`)
-      .run(observedAt, observedAt, observedAt, identity.endpointId, identity.threadId);
-    this.advanceRevision();
-    return true;
   }
 
   observeLastSent(identity: DashboardIdentity, value: LastSent, operationSequence: number): boolean {
@@ -330,7 +324,6 @@ export class SessionDashboardStore {
       tokenUsage: null,
       goalObserved: false,
       goal: null,
-      lifecycleObservedAt: null,
       newestObservationAt: null,
     };
     const goalObserved = Number(row.goal_observed) === 1;
@@ -347,7 +340,6 @@ export class SessionDashboardStore {
       tokenUsage: row.token_usage_json === null ? null : DashboardTokenUsageSchema.parse(JSON.parse(String(row.token_usage_json))),
       goalObserved,
       goal: goalValue === null ? null : DashboardGoalSchema.parse(goalValue),
-      lifecycleObservedAt: row.lifecycle_observed_at === null ? null : Number(row.lifecycle_observed_at),
       newestObservationAt: row.newest_observation_at === null ? null : Number(row.newest_observation_at),
     };
   }
@@ -430,6 +422,12 @@ export class SessionDashboardStore {
 
   private advanceRevision(): void {
     this.db.prepare("UPDATE session_dashboard_meta SET dirty = 1, revision = revision + 1 WHERE singleton = 1").run();
+    if (this.changeScheduled) return;
+    this.changeScheduled = true;
+    queueMicrotask(() => {
+      this.changeScheduled = false;
+      for (const listener of this.changeListeners) listener();
+    });
   }
 
   private nextObservationSequence(): number {

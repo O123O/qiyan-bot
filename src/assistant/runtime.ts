@@ -20,53 +20,35 @@ export function classifyAttemptEffects(operations: readonly Pick<OperationRecord
     && new Set(["dispatched", "uncertain", "succeeded"]).has(operation.state));
 }
 
+const DEFAULT_MAX_EFFECT_FREE_ATTEMPTS = 3;
+
 export class AssistantRuntime {
   private active: ActiveAssistantContext | undefined;
   private readonly activeTools = new Map<string, number>();
   private readonly toolWaiters = new Map<string, Set<() => void>>();
   private readonly allToolsWaiters = new Set<() => void>();
+  private readonly ownerBinding: () => ConversationBinding;
+  private readonly maxEffectFreeAttempts: number;
 
   constructor(
     private readonly db: Database,
     private readonly operations: OperationStore,
     private readonly deliveries: DeliveryStore,
-    _options: { binding: ConversationBinding | (() => ConversationBinding) },
-  ) {}
-
-  beginUserAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "chat"); }
-  beginInternalAttempt(contextId: string, attemptId: string, turnId: string): void { this.begin(contextId, attemptId, turnId, "internal"); }
-
-  prepareAttempt(contextId: string, attemptId: string, triggerKind: "user" | "internal" | "chat"): void {
-    const provisionalTurnId = `pending:${attemptId}`;
-    const source = this.operations.getSourceContext(contextId);
-    inTransaction(this.db, () => {
-      this.db.prepare(`INSERT OR IGNORE INTO assistant_attempts
-        (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
-        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`)
-        .run(attemptId, contextId, provisionalTurnId, triggerKind === "chat" ? "user" : triggerKind, Date.now(),
-          source?.binding?.adapterId ?? null, source?.binding?.conversationKey ?? null,
-          source?.binding === undefined ? null : JSON.stringify(source.binding.destination),
-          source?.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply));
-      this.operations.setSourceState(contextId, "active");
-      this.db.prepare("UPDATE event_batches SET state = 'active' WHERE id = ?").run(contextId);
-    });
-    this.active = {
-      contextId,
-      attemptId,
-      turnId: provisionalTurnId,
-      triggerKind: triggerKind === "user" ? "chat" : triggerKind,
-      ...(source?.binding ? { binding: source.binding } : {}),
-      toolFence: 0,
-    };
+    options: { binding: ConversationBinding | (() => ConversationBinding); maxEffectFreeAttempts?: number },
+  ) {
+    if (typeof options.binding === "function") this.ownerBinding = options.binding;
+    else {
+      const binding = options.binding;
+      this.ownerBinding = () => binding;
+    }
+    this.maxEffectFreeAttempts = options.maxEffectFreeAttempts ?? DEFAULT_MAX_EFFECT_FREE_ATTEMPTS;
+    if (!Number.isSafeInteger(this.maxEffectFreeAttempts) || this.maxEffectFreeAttempts < 1) {
+      throw new RangeError("maxEffectFreeAttempts must be a positive integer");
+    }
   }
 
-  bindTurn(attemptId: string, turnId: string): void {
-    this.db.prepare("UPDATE assistant_attempts SET turn_id = ? WHERE id = ? AND state = 'active'").run(turnId, attemptId);
-    if (this.active?.attemptId === attemptId) this.active = { ...this.active, turnId };
-  }
-
-  hydrateActive(): ActiveAssistantContext | undefined {
-    const row = this.admissibleRow();
+  activateAttempt(attemptId: string): ActiveAssistantContext | undefined {
+    const row = this.admissibleRow(attemptId);
     if (!row) {
       this.active = undefined;
       return undefined;
@@ -74,6 +56,8 @@ export class AssistantRuntime {
     this.active = this.parseActive(row);
     return this.current();
   }
+
+  clearActive(): void { this.active = undefined; }
 
   current(): ActiveAssistantContext | undefined {
     if (!this.active) return undefined;
@@ -95,18 +79,10 @@ export class AssistantRuntime {
     return row ? this.parseActive(row) : undefined;
   }
 
-  contextForLease(attemptId: string, turnId: string): ActiveAssistantContext | undefined {
-    const row = this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_turn_lease l
-      JOIN assistant_attempts a ON a.id = l.attempt_id
-      WHERE l.singleton = 1 AND l.phase = 'terminalizing' AND l.attempt_id = ? AND l.turn_id = ?
-        AND a.state = 'active' AND a.turn_id = ?`).get(attemptId, turnId, turnId) as Record<string, unknown> | undefined;
-    return row ? this.parseActive(row) : undefined;
-  }
-
   activeAttempts(): ActiveAssistantContext[] {
     return (this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
-        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
-      FROM assistant_attempts a LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id
+        a.destination_json, a.native_reply_json, a.tool_fence
+      FROM assistant_attempts a
       WHERE a.state = 'active' ORDER BY a.created_at, a.id`).all() as Array<Record<string, unknown>>).map((row) => this.parseActive(row));
   }
 
@@ -114,11 +90,6 @@ export class AssistantRuntime {
     const row = this.attemptRow(turnId);
     if (!row) return undefined;
     return this.terminalizeAttempt(String(row.id), turnId);
-  }
-
-  beginLeaseTerminalizing(attemptId: string, turnId: string): ActiveAssistantContext | undefined {
-    if (!this.contextForLease(attemptId, turnId)) return undefined;
-    return this.terminalizeAttempt(attemptId, turnId);
   }
 
   fenceToolAdmission(): void {
@@ -130,12 +101,7 @@ export class AssistantRuntime {
       this.db.prepare(`UPDATE assistant_attempts
         SET tool_fence = tool_fence + CASE WHEN accepting_tools = 1 THEN 1 ELSE 0 END, accepting_tools = 0
         WHERE id = ? AND state = 'active'`).run(attemptId);
-      if (turnId) {
-        this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
-          WHERE attempt_id = ? AND turn_id = ?`).run(attemptId, turnId);
-      }
-      const refreshed = this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
-        LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.id = ?`).get(attemptId) as Record<string, unknown>;
+      const refreshed = this.db.prepare("SELECT * FROM assistant_attempts WHERE id = ?").get(attemptId) as Record<string, unknown>;
       const active = this.parseActive(refreshed);
       if (this.active?.attemptId === attemptId) this.active = active;
       return active;
@@ -143,8 +109,11 @@ export class AssistantRuntime {
   }
 
   registerTool(attemptId: string): number {
+    if (this.active?.attemptId !== attemptId) {
+      throw new Error("assistant attempt is not active in this process, is not accepting tools, or has terminalized");
+    }
     const row = this.admissibleRow(attemptId);
-    if (!row) throw new Error("assistant attempt has no active assistant lease for tools or has terminalized");
+    if (!row) throw new Error("assistant attempt is not accepting tools or has terminalized");
     this.activeTools.set(attemptId, (this.activeTools.get(attemptId) ?? 0) + 1);
     return Number(row.tool_fence);
   }
@@ -211,9 +180,6 @@ export class AssistantRuntime {
       const recovery = this.existingRecovery(String(attempt.id));
       return recovery ? { recoveryContextId: recovery } : {};
     }
-    const unresolved = this.db.prepare(`SELECT context_id FROM assistant_attempt_sources
-      WHERE attempt_id = ? AND state IN ('start_submitting', 'steer_submitting', 'uncertain') LIMIT 1`).get(String(attempt.id));
-    if (unresolved) return {};
     this.beginTerminalizing(turnId);
     this.operations.markAttemptOperationsUncertain(String(attempt.id));
     const missingChatFinal = status === "completed" && this.triggerKind(attempt) === "chat" && !text;
@@ -245,7 +211,6 @@ export class AssistantRuntime {
         if (!binding) throw new Error("chat assistant attempt is missing its immutable conversation binding");
         this.deliveries.prepare({ id: `assistant:${String(attempt.turn_id)}`, kind: "assistant_final", binding, body: finalText, mandatory: true });
       }
-      this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
     });
     return {};
   }
@@ -255,14 +220,30 @@ export class AssistantRuntime {
     const members = this.memberContextIds(attempt);
     const effects = this.operations.listForAttempt(attemptId);
     if (!classifyAttemptEffects(effects)) {
+      const exhausted = new Set(members.filter((contextId) =>
+        this.failedAttempts(contextId) + 1 >= this.maxEffectFreeAttempts));
+      let warningBinding: ConversationBinding | undefined;
       inTransaction(this.db, () => {
         this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ?").run(attemptId);
         this.db.prepare("UPDATE assistant_attempt_sources SET state = 'failed', updated_at = ? WHERE attempt_id = ? AND state NOT IN ('completed','superseded')").run(Date.now(), attemptId);
         for (const contextId of members) {
-          this.operations.setSourceState(contextId, "pending");
-          this.db.prepare("UPDATE event_batches SET state = 'pending' WHERE id = ?").run(contextId);
+          if (!exhausted.has(contextId)) {
+            this.operations.setSourceState(contextId, "pending");
+            this.db.prepare("UPDATE event_batches SET state = 'pending' WHERE id = ?").run(contextId);
+            continue;
+          }
+          this.operations.setSourceState(contextId, "completed");
+          this.finalizeEventBatch(contextId, "processed");
+          this.releaseSourceAttachments(contextId);
+          warningBinding ??= this.bindingForAttempt(attempt) ?? this.ownerBinding();
+          this.deliveries.prepare({
+            id: `assistant-attempts-exhausted:${contextId}`,
+            kind: "system_warning",
+            binding: warningBinding,
+            body: `[system] assistant work needs attention; automatic retry stopped after ${this.maxEffectFreeAttempts} failed attempts`,
+            mandatory: true,
+          });
         }
-        this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
       });
       return {};
     }
@@ -287,32 +268,28 @@ export class AssistantRuntime {
         this.finalizeEventBatch(contextId, "superseded");
         this.releaseSourceAttachments(contextId);
       }
-      this.db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
       return { recoveryContextId: recoveryId };
     });
   }
 
-  private begin(contextId: string, attemptId: string, turnId: string, triggerKind: "chat" | "internal"): void {
-    this.prepareAttempt(contextId, attemptId, triggerKind);
-    this.bindTurn(attemptId, turnId);
-  }
-
   private attemptRow(turnId: string): Record<string, unknown> | undefined {
-    return this.db.prepare(`SELECT a.*, l.trigger_kind AS lease_trigger_kind FROM assistant_attempts a
-      LEFT JOIN assistant_turn_lease l ON l.attempt_id = a.id WHERE a.turn_id = ?
-      ORDER BY (l.singleton IS NOT NULL) DESC, (a.state = 'active') DESC, a.created_at DESC, a.id DESC LIMIT 1`).get(turnId) as Record<string, unknown> | undefined;
+    return this.db.prepare(`SELECT * FROM assistant_attempts WHERE turn_id = ?
+      ORDER BY (state = 'active') DESC, created_at DESC, id DESC LIMIT 1`).get(turnId) as Record<string, unknown> | undefined;
   }
 
   private admissibleRow(attemptId?: string): Record<string, unknown> | undefined {
     return this.db.prepare(`SELECT a.id, a.context_id, a.turn_id, a.trigger_kind, a.adapter_id, a.conversation_key,
-        a.destination_json, a.native_reply_json, a.tool_fence, l.trigger_kind AS lease_trigger_kind
-      FROM assistant_turn_lease l JOIN assistant_attempts a ON a.id = l.attempt_id
-      WHERE l.singleton = 1 AND a.state = 'active' AND a.accepting_tools = 1
-        AND l.phase IN ('starting', 'active')
-        AND ((l.phase = 'starting' AND l.turn_id IS NULL AND a.turn_id IS NULL)
-          OR (l.phase = 'active' AND l.turn_id IS NOT NULL AND a.turn_id = l.turn_id))
+        a.destination_json, a.native_reply_json, a.tool_fence
+      FROM assistant_attempts a
+      WHERE a.state = 'active' AND a.accepting_tools = 1
         AND (? IS NULL OR a.id = ?)
-      LIMIT 1`).get(attemptId ?? null, attemptId ?? null) as Record<string, unknown> | undefined;
+        AND EXISTS (
+          SELECT 1 FROM assistant_attempt_sources m
+          WHERE m.attempt_id = a.id AND m.submission_kind = 'start'
+            AND ((a.turn_id IS NULL AND m.state IN ('start_submitting', 'uncertain'))
+              OR (a.turn_id IS NOT NULL AND m.state IN ('submitted', 'completed') AND m.observed_turn_id = a.turn_id))
+        )
+      ORDER BY a.created_at, a.id LIMIT 1`).get(attemptId ?? null, attemptId ?? null) as Record<string, unknown> | undefined;
   }
 
   private memberContextIds(attempt: Record<string, unknown>): string[] {
@@ -330,8 +307,17 @@ export class AssistantRuntime {
     return legacy?.superseded_by;
   }
 
+  private failedAttempts(contextId: string): number {
+    const row = this.db.prepare(`SELECT COUNT(DISTINCT a.id) AS count
+      FROM assistant_attempt_sources member
+      JOIN assistant_attempts a ON a.id = member.attempt_id
+      WHERE member.context_id = ? AND a.state = 'failed'
+        AND a.turn_id IS NOT NULL AND member.observed_turn_id = a.turn_id`).get(contextId) as { count: number };
+    return Number(row.count);
+  }
+
   private triggerKind(attempt: Record<string, unknown>): "chat" | "internal" {
-    return attempt.lease_trigger_kind === "chat" || attempt.trigger_kind === "user" ? "chat" : "internal";
+    return attempt.trigger_kind === "user" ? "chat" : "internal";
   }
 
   private bindingForAttempt(attempt: Record<string, unknown>): ConversationBinding | undefined {

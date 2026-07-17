@@ -31,7 +31,6 @@ const LEGACY_DESTINATIONS = [
   { table: "latest_owner_route", destination: "destination_json" },
   { table: "source_contexts", destination: "destination_json" },
   { table: "assistant_attempts", destination: "destination_json" },
-  { table: "assistant_turn_lease", destination: "destination_json" },
   { table: "deliveries", destination: "destination_json" },
 ] as const;
 

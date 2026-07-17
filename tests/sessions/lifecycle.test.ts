@@ -12,7 +12,9 @@ import { SessionRegistry, type RegistrySession } from "../../src/registry/sessio
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { ManagedEpochStore } from "../../src/storage/managed-epoch-store.ts";
+import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
+import { SessionControlStore } from "../../src/storage/session-control-store.ts";
 import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 import type { EndpointManager } from "../../src/endpoints/manager.ts";
 import { WorkspaceRouter } from "../../src/endpoints/workspace-router.ts";
@@ -129,15 +131,20 @@ async function fixture(ownership?: {
   });
   const endpoint = new LifecycleEndpoint();
   endpoint.cwd = dir;
-  const runtime = new RuntimeStore(createTestDatabase());
+  const db = createTestDatabase();
+  const epochs = new ManagedEpochStore(db);
+  const native = new NativeSessionState();
+  const controls = new SessionControlStore(db);
   const project = { path: dir, created: false, fallback: false, identity: { device: "1", inode: "1" } };
   const checked: string[] = [];
   const workspaceFailure: { error?: unknown } = {};
   const gate = new ThreadGate();
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 2 });
   const lifecycle = new SessionLifecycle(
-    new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
+    pool,
     registry,
-    runtime,
+    epochs,
+    native,
     { now: () => 10_000 },
     {
       prepareExisting: async (path) => {
@@ -155,7 +162,7 @@ async function fixture(ownership?: {
     } : undefined,
     beforeManagedOwnership,
   );
-  return { dir, registry, endpoint, runtime, lifecycle, project, checked, gate, workspaceFailure };
+  return { db, dir, registry, endpoint, epochs, native, controls, pool, lifecycle, project, checked, gate, workspaceFailure };
 }
 
 function required(registry: SessionRegistry, nickname = "payments"): RegistrySession {
@@ -188,14 +195,14 @@ test("thread-without-rollout evidence requires the exact RPC code, message, and 
 });
 
 test("create establishes one generation-safe managed epoch", async () => {
-  const { registry, endpoint, runtime, lifecycle, project } = await fixture();
+  const { registry, endpoint, epochs, native, lifecycle, project } = await fixture();
   const settings = await lifecycle.create("payments", "local", project, "operation-1");
   assert.deepEqual(settings, { model: "gpt-5", effort: "high" });
   const session = required(registry);
   assert.equal(session.lifecycle_state, "managed");
   assert.match(session.mapping_id, /^mapping_/u);
-  assert.equal(runtime.getSession("local", endpoint.threadId, session.mapping_id)?.managementState, "managed");
-  assert.equal(runtime.currentEpoch("local", endpoint.threadId, session.mapping_id)?.baselineTurnId, undefined);
+  assert.equal(native.view({ endpointId: "local", threadId: endpoint.threadId, mappingId: session.mapping_id })?.status, "idle");
+  assert.equal(epochs.current("local", endpoint.threadId, session.mapping_id)?.baselineTurnId, undefined);
 });
 
 test("create accepts a nullable start-response rollout path without a follow-up read", async () => {
@@ -250,7 +257,7 @@ test("create rejects malformed successful start responses before registry public
 });
 
 test("adopt reserves before resume, uses only native cwd, and promotes after a second idle read", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle, checked } = await fixture();
+  const { dir, registry, endpoint, epochs, lifecycle, checked } = await fixture();
   endpoint.onResume = () => { assert.equal(required(registry).lifecycle_state, "adopting"); };
   await lifecycle.adopt("payments", "local", "thread-1");
   const session = required(registry);
@@ -259,11 +266,11 @@ test("adopt reserves before resume, uses only native cwd, and promotes after a s
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
   assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
   assert.deepEqual(checked, [dir, dir]);
-  assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id)?.baselineTurnId, "historical");
+  assert.equal(epochs.current("local", "thread-1", session.mapping_id)?.baselineTurnId, "historical");
 });
 
 test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async () => {
-  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  const { registry, endpoint, native, lifecycle } = await fixture();
   endpoint.status = "notLoaded";
   endpoint.onResume = () => {
     assert.equal(required(registry).lifecycle_state, "adopting");
@@ -274,7 +281,7 @@ test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async
 
   const session = required(registry);
   assert.equal(session.lifecycle_state, "managed");
-  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.nativeStatus, "idle");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: session.mapping_id })?.status, "idle");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
@@ -322,14 +329,14 @@ test("loaded-empty adoption failure removes only its reservation and preserves o
 });
 
 test("adopt resumes an exact read-not-loaded thread and validates it before promotion", async () => {
-  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  const { registry, endpoint, native, lifecycle } = await fixture();
   endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
 
   await lifecycle.adopt("payments", "local", "thread-1");
 
   const session = required(registry);
   assert.equal(session.lifecycle_state, "managed");
-  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "managed");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: session.mapping_id })?.availability, "ready");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
@@ -545,12 +552,12 @@ test("duplicate nickname or native identity fails before resume", async () => {
 });
 
 test("an uncertain resume remains adopting and startup reconciliation promotes only that generation", async () => {
-  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  const { registry, endpoint, lifecycle } = await fixture();
   endpoint.failResume = true;
   await assert.rejects(lifecycle.adopt("payments", "local", "thread-1"), /resume response lost/);
   const reserved = required(registry);
   assert.equal(reserved.lifecycle_state, "adopting");
-  assert.equal(runtime.getSession("local", "thread-1", reserved.mapping_id)?.managementState, "adopting");
+  assert.equal(reserved.lifecycle_state, "adopting");
 
   endpoint.failResume = false;
   endpoint.status = "notLoaded";
@@ -619,10 +626,9 @@ test("loaded-empty adopting reconciliation failure retains its mapping without u
 });
 
 test("startup reconciliation can isolate one unavailable transitional mapping", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const { dir, registry, endpoint, lifecycle } = await fixture();
   const adopting = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-offline", lifecycle_state: "adopting" as const };
   await registry.reserve("offline", adopting);
-  runtime.setSession("local", "thread-1", adopting.mapping_id, "adopting", "notLoaded");
   endpoint.failResume = true;
   const failures: string[] = [];
   await lifecycle.reconcileAdopting({ onError: (nickname) => { failures.push(nickname); } });
@@ -630,8 +636,8 @@ test("startup reconciliation can isolate one unavailable transitional mapping", 
   assert.equal(registry.get("offline")?.lifecycle_state, "adopting");
 });
 
-test("startup reconstructs a missing runtime row for an exact managed generation", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+test("startup reconstructs live state for an exact managed generation", async () => {
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture();
   const managed = { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" };
   await registry.createManaged("payments", managed);
 
@@ -640,11 +646,11 @@ test("startup reconstructs a missing runtime row for an exact managed generation
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
   assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
   assert.equal(resumed.thread.id, "thread-1");
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-durable")?.managementState, "managed");
-  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-durable" })?.availability, "ready");
+  assert.equal(epochs.current("local", "thread-1", "mapping-durable")?.baselineTurnId, "historical");
 });
 
-test("missing managed runtime state is legacy-unknown before goal validation and ownership", async () => {
+test("missing goal-control intent is unknown before goal validation and ownership", async () => {
   let value!: Awaited<ReturnType<typeof fixture>>;
   const seen: string[] = [];
   value = await fixture({
@@ -653,16 +659,16 @@ test("missing managed runtime state is legacy-unknown before goal validation and
     },
     inspectIfInitialized: async (identity) => {
       seen.push("ownership");
-      assert.equal(value.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id), true);
+      assert.equal(value.controls.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id), true);
       return { state: "owned" };
     },
     release: () => undefined,
   }, undefined, async (identity, _lease, thread) => {
-    const control = value.runtime.goalControl(identity.endpoint, identity.thread_id, identity.mapping_id);
+    const control = value.controls.goalControl(identity.endpoint, identity.thread_id, identity.mapping_id);
     assert.equal(control.known, false);
     assert.equal(thread?.turns.at(-1)?.id, "legacy-goal-turn");
     seen.push("goal");
-    value.runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
+    value.controls.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
     return { authorizedTurnId: thread!.turns.at(-1)!.id };
   });
   await value.registry.createManaged("payments", {
@@ -674,11 +680,11 @@ test("missing managed runtime state is legacy-unknown before goal validation and
   await value.lifecycle.reconcileManaged("payments", required(value.registry));
 
   assert.deepEqual(seen, ["goal", "ownership", "initialize:legacy-goal-turn"]);
-  assert.equal(value.runtime.goalControlled("local", "thread-1", "mapping-legacy"), true);
+  assert.equal(value.controls.goalControlled("local", "thread-1", "mapping-legacy"), true);
 });
 
 test("managed recovery restores a loaded empty thread without rollout resume", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const { dir, registry, endpoint, native, lifecycle } = await fixture();
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-empty",
   });
@@ -689,7 +695,7 @@ test("managed recovery restores a loaded empty thread without rollout resume", a
   const recovered = await lifecycle.reconcileManaged("payments", required(registry));
 
   assert.equal(recovered.thread.id, "thread-1");
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-empty")?.managementState, "managed");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-empty" })?.availability, "ready");
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [
     ["thread/read", false],
     ["thread/turns/list", undefined],
@@ -697,7 +703,7 @@ test("managed recovery restores a loaded empty thread without rollout resume", a
 });
 
 test("managed recovery of an already-managed idle thread reads metadata only (no full read, no resume)", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture();
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-idle",
   });
@@ -705,25 +711,25 @@ test("managed recovery of an already-managed idle thread reads metadata only (no
   endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "completed" }]; // has rollout history
   endpoint.failResume = true; // resume would throw — proves an already-loaded thread is never resumed
   // A persisted epoch (as after a bot restart) means the delivery baseline is already known.
-  runtime.beginEpoch("local", "thread-1", "mapping-idle", "t2", 0);
+  epochs.begin("local", "thread-1", "mapping-idle", "t2", 0);
 
   const recovered = await lifecycle.reconcileManaged("payments", required(registry));
 
   assert.equal(recovered.thread.id, "thread-1");
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-idle")?.managementState, "managed");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-idle" })?.status, "idle");
   // The whole point: an idle, already-managed thread is recovered from a single metadata-only read —
   // codex is NOT asked to re-materialize the full rollout, and the thread is not resumed.
   assert.deepEqual(endpoint.calls.map((call) => [call.method, call.params?.includeTurns]), [["thread/read", false]]);
 });
 
 test("managed recovery rebinds an idle thread to a replacement notification connection", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture();
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-rebound",
   });
   endpoint.status = "idle";
   endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "completed" }];
-  runtime.beginEpoch("local", "thread-1", "mapping-rebound", "t2", 0);
+  epochs.begin("local", "thread-1", "mapping-rebound", "t2", 0);
 
   const recovered = await lifecycle.reconcileManaged(
     "payments",
@@ -736,7 +742,7 @@ test("managed recovery rebinds an idle thread to a replacement notification conn
   assert.equal(recovered.thread.id, "thread-1");
   assert.deepEqual(recovered.thread.turns, []);
   assert.deepEqual(endpoint.turns.map((turn) => turn.id), ["t1", "t2"]);
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-rebound")?.managementState, "managed");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-rebound" })?.status, "idle");
   assert.deepEqual(endpoint.calls, [
     { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
     { method: "thread/turns/list", params: { threadId: "thread-1", limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
@@ -745,7 +751,7 @@ test("managed recovery rebinds an idle thread to a replacement notification conn
 });
 
 test("managed connection recovery preserves an active turn without transferring persisted history", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture(undefined, undefined, async (_identity, _lease, thread) => {
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture(undefined, undefined, async (_identity, _lease, thread) => {
     assert.deepEqual(thread?.turns.map((turn) => turn.id), ["t2"]);
   });
   await registry.createManaged("payments", {
@@ -753,9 +759,7 @@ test("managed connection recovery preserves an active turn without transferring 
   });
   endpoint.status = "active";
   endpoint.turns = [{ id: "t1", status: "completed" }, { id: "t2", status: "inProgress" }];
-  runtime.setSession("local", "thread-1", "mapping-active-rebound", "unavailable", "active");
-  runtime.setActiveTurn("local", "thread-1", "mapping-active-rebound", "t2");
-  runtime.beginEpoch("local", "thread-1", "mapping-active-rebound", "t1", 0);
+  epochs.begin("local", "thread-1", "mapping-active-rebound", "t1", 0);
 
   const recovered = await lifecycle.reconcileManaged(
     "payments",
@@ -767,7 +771,7 @@ test("managed connection recovery preserves an active turn without transferring 
 
   assert.equal(recovered.thread.status.type, "active");
   assert.deepEqual(recovered.thread.turns, []);
-  assert.equal(runtime.activeTurn("local", "thread-1", "mapping-active-rebound"), "t2");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-active-rebound" })?.activeTurnId, "t2");
   assert.deepEqual(endpoint.turns.map((turn) => turn.id), ["t1", "t2"]);
   assert.deepEqual(endpoint.calls, [
     { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
@@ -778,7 +782,7 @@ test("managed connection recovery preserves an active turn without transferring 
 
 test("managed connection recovery establishes a baseline from one bounded turn summary", async () => {
   const initialization: Array<{ allowUnmaterialized?: boolean }> = [];
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture({
     initialize: async (_identity, _path, _lease, options) => { initialization.push(options ?? {}); },
     inspectIfInitialized: async () => ({ state: "uninitialized" }),
     release: () => undefined,
@@ -799,8 +803,8 @@ test("managed connection recovery establishes a baseline from one bounded turn s
 
   assert.equal(recovered.thread.id, "thread-1");
   assert.deepEqual(recovered.thread.turns, []);
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-empty-rebound")?.managementState, "managed");
-  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-empty-rebound")?.baselineTurnId, "t2");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-empty-rebound" })?.status, "idle");
+  assert.equal(epochs.current("local", "thread-1", "mapping-empty-rebound")?.baselineTurnId, "t2");
   assert.deepEqual(initialization, [{ allowUnmaterialized: false }]);
   assert.deepEqual(endpoint.calls, [
     { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } },
@@ -810,7 +814,7 @@ test("managed connection recovery establishes a baseline from one bounded turn s
 });
 
 test("managed connection recovery treats the exact pre-message turns-list error as empty", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture();
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-never-started",
   });
@@ -827,14 +831,14 @@ test("managed connection recovery treats the exact pre-message turns-list error 
   );
 
   assert.deepEqual(recovered.thread.turns, []);
-  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-never-started")?.baselineTurnId, undefined);
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-never-started")?.managementState, "managed");
+  assert.equal(epochs.current("local", "thread-1", "mapping-never-started")?.baselineTurnId, undefined);
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-never-started" })?.status, "idle");
 });
 
 test("create-completion recovery drops a managed mapping whose rollout never materialized", async () => {
   const requireFlags: Array<boolean | undefined> = [];
   const released: string[] = [];
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+  const { dir, registry, endpoint, epochs, lifecycle } = await fixture({
     initialize: async () => { assert.fail("a non-durable create must be dropped before ownership initialization"); },
     inspectIfInitialized: async (_identity, _lease, options) => {
       requireFlags.push(options?.requireMaterialized);
@@ -858,11 +862,11 @@ test("create-completion recovery drops a managed mapping whose rollout never mat
   assert.deepEqual(requireFlags, [true]);
   assert.equal(registry.get("payments"), undefined, "the phantom mapping must be removed");
   assert.deepEqual(released, ["mapping-phantom"]);
-  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-phantom"), undefined);
+  assert.equal(epochs.current("local", "thread-1", "mapping-phantom"), undefined);
 });
 
 test("default managed recovery still restores an unmaterialized 0-turn thread", async () => {
-  const { dir, registry, runtime, endpoint, lifecycle } = await fixture({
+  const { dir, registry, native, endpoint, lifecycle } = await fixture({
     initialize: async () => undefined,
     inspectIfInitialized: async (_identity, _lease, options) => (options?.requireMaterialized ? { state: "lost" } : { state: "owned" }),
     release: () => undefined,
@@ -878,7 +882,7 @@ test("default managed recovery still restores an unmaterialized 0-turn thread", 
 
   assert.equal(recovered.thread.id, "thread-1");
   assert.equal(registry.get("payments")?.lifecycle_state, "managed");
-  assert.equal(runtime.getSession("local", "thread-1", "mapping-live")?.managementState, "managed");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-live" })?.availability, "ready");
 });
 
 test("managed recovery validates native goal state before ownership after resuming an exact read-not-loaded mapping", async () => {
@@ -904,8 +908,8 @@ test("managed recovery validates native goal state before ownership after resumi
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
-test("managed recovery rejects a wrong immediate resume identity before projecting settings", async () => {
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture();
+test("managed recovery rejects a wrong immediate resume identity without publishing live state", async () => {
+  const { dir, registry, endpoint, native, controls, lifecycle } = await fixture();
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
   });
@@ -916,13 +920,8 @@ test("managed recovery rejects a wrong immediate resume identity before projecti
     return true;
   });
 
-  assert.deepEqual(runtime.getSession("local", "thread-1", "mapping-durable"), {
-    managementState: "unavailable",
-    restoreState: "managed",
-    nativeStatus: "notLoaded",
-    nativeObservationSequence: 0,
-  });
-  assert.equal(runtime.goalControl("local", "thread-1", "mapping-durable").known, false);
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-durable" }), undefined);
+  assert.equal(controls.goalControl("local", "thread-1", "mapping-durable").known, false);
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume"]);
 });
 
@@ -942,12 +941,11 @@ test("stopping managed recovery while native resume is blocked fences every succ
       run: (current: EndpointWorkLease | undefined) => Promise<T>,
     ): Promise<T> => run(existing ?? lease),
   } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">;
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture(undefined, endpoints);
+  const { dir, registry, endpoint, epochs, native, lifecycle } = await fixture(undefined, endpoints);
   const session = {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable",
   };
   await registry.createManaged("payments", session);
-  runtime.setSession("local", "thread-1", session.mapping_id, "unavailable", "notLoaded");
   let signalResume!: () => void;
   let releaseResume!: () => void;
   const resumeStarted = new Promise<void>((resolve) => { signalResume = resolve; });
@@ -983,8 +981,8 @@ test("stopping managed recovery while native resume is blocked fences every succ
   assert.deepEqual(await recovering, { recovery: "none", sharedWake: "stale" });
   await stopping;
 
-  assert.equal(runtime.getSession("local", "thread-1", session.mapping_id)?.managementState, "unavailable");
-  assert.equal(runtime.currentEpoch("local", "thread-1", session.mapping_id), undefined);
+  assert.equal(native.view({ endpointId: "local", threadId: "thread-1", mappingId: session.mapping_id }), undefined);
+  assert.equal(epochs.current("local", "thread-1", session.mapping_id), undefined);
   assert.equal(capacityPublications, 0);
   assert.equal(dashboardPublications, 0);
   assert.equal(observationPublications, 0);
@@ -1010,24 +1008,27 @@ test("managed recovery checks an existing rollout guard after validating native 
 });
 
 test("managed recovery retry-tags only an unclassified ownership boundary", async () => {
-  const { dir, registry, endpoint, lifecycle } = await fixture({
+  const { dir, registry, endpoint, native, lifecycle } = await fixture({
     initialize: async () => undefined,
     inspectIfInitialized: async () => ({ state: "unclassified", turnId: "not-classified" }),
     release: () => undefined,
   });
   await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-durable" });
+  endpoint.status = "active";
+  endpoint.turns = [{ id: "not-classified", status: "inProgress" }];
 
   await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => {
     assert.equal((error as AppError).code, "OPERATION_UNCERTAIN");
     assert.equal((error as AppError).details?.recovery, "ownership_unclassified");
     return true;
   });
+  assert.deepEqual(native.view({ endpointId: "local", threadId: "thread-1", mappingId: "mapping-durable" })?.status, "active");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
 });
 
 test("managed recovery terminally removes a pathless mapping whose volatile thread was lost", async () => {
   const released: string[] = [];
-  const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+  const { dir, registry, endpoint, epochs, lifecycle } = await fixture({
     initialize: async () => undefined,
     inspectIfInitialized: async () => ({ state: "lost" }),
     release: (identity) => { released.push(identity.mapping_id); },
@@ -1035,15 +1036,14 @@ test("managed recovery terminally removes a pathless mapping whose volatile thre
   await registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-pathless",
   });
-  runtime.setSession("local", "thread-1", "mapping-pathless", "managed", "idle");
-  runtime.beginEpoch("local", "thread-1", "mapping-pathless", undefined, 1);
+  epochs.begin("local", "thread-1", "mapping-pathless", undefined, 1);
 
   await assert.rejects(lifecycle.reconcileManaged("payments", required(registry)), (error: unknown) => (
     error instanceof AppError && error.code === "THREAD_NOT_FOUND" && error.details?.recovery === "pathless_thread_lost"
   ));
 
   assert.equal(registry.get("payments"), undefined);
-  assert.equal(runtime.currentEpoch("local", "thread-1", "mapping-pathless"), undefined);
+  assert.equal(epochs.current("local", "thread-1", "mapping-pathless"), undefined);
   assert.deepEqual(released, ["mapping-pathless"]);
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read"]);
 });
@@ -1176,10 +1176,12 @@ test("successful remote thread/start performs no later SSH workspace checks", as
   });
   const endpoint = new LifecycleEndpoint("devbox");
   endpoint.cwd = projectDir;
+  const db = createTestDatabase();
   const lifecycle = new SessionLifecycle(
     new AppServerPool([endpoint], { maxConcurrentTurns: 2 }),
     registry,
-    new RuntimeStore(createTestDatabase()),
+    new ManagedEpochStore(db),
+    new NativeSessionState(),
     { now: () => 10_000 },
     new WorkspaceRouter(() => policy) as never,
     new ThreadGate(),
@@ -1194,7 +1196,7 @@ test("successful remote thread/start performs no later SSH workspace checks", as
 });
 
 test("unadopt is idle-only, unsubscribes without archive, and removes exactly one mapping", async () => {
-  const { registry, endpoint, runtime, lifecycle } = await fixture();
+  const { registry, endpoint, epochs, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
   const session = required(registry);
   endpoint.status = "active";
@@ -1209,7 +1211,7 @@ test("unadopt is idle-only, unsubscribes without archive, and removes exactly on
   await lifecycle.unadopt("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
   assert.equal(registry.get("payments"), undefined);
   assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_unsubscribed", "removed"]);
-  assert.ok(runtime.latestEpoch("local", "thread-1", session.mapping_id)?.endedAt);
+  assert.ok(epochs.latest("local", "thread-1", session.mapping_id)?.endedAt);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), true);
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive" || call.method === "thread/delete"), false);
 });
@@ -1217,14 +1219,13 @@ test("unadopt is idle-only, unsubscribes without archive, and removes exactly on
 test("unadopt treats native notLoaded status and exact read absence as already unsubscribed", async () => {
   for (const absence of ["status", "error"] as const) {
     const released: string[] = [];
-    const { dir, registry, endpoint, runtime, lifecycle } = await fixture({
+    const { dir, registry, endpoint, lifecycle } = await fixture({
       initialize: async () => undefined,
       release: (identity) => { released.push(identity.mapping_id); },
     });
     await registry.createManaged("payments", {
       endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: `mapping-${absence}`,
     });
-    runtime.setSession("local", "thread-1", `mapping-${absence}`, "managed", absence === "status" ? "notLoaded" : "idle");
     if (absence === "status") endpoint.status = "notLoaded";
     else endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
     const checkpoints: string[] = [];

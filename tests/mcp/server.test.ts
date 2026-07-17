@@ -196,12 +196,12 @@ test("shutdown fences a pending attempt after readiness but before tool registra
   const operations = new OperationStore(db);
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.createInternalSource({ id: "ctx", kind: "event_batch", sourceId: "ctx", rawText: "", attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "ctx" }, "claim");
-  conversations.reserveStart("ctx");
+  const lease = conversations.createAttempt({ kind: "internal", contextId: "ctx" });
+  conversations.reserveStart(lease.attemptId, "ctx");
   const runtime = new AssistantRuntime(db, operations, new DeliveryStore(db), {
     binding: { adapterId: "telegram", conversationKey: "telegram:42", destination: { chatId: "42" } },
   });
-  runtime.hydrateActive();
+  runtime.activateAttempt(lease.attemptId);
   assert.equal(runtime.current()?.turnId, undefined);
 
   const gate = new ToolReadinessGate();

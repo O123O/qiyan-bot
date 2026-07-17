@@ -26,8 +26,8 @@ function fixture() {
   accept("pass-two", "/pass second");
   accept("collect-one", "/collect 2");
   accept("collect-two", "/collect 3");
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
-  conversations.reserveStart("primary");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "primary" });
+  conversations.reserveStart(lease.attemptId, "primary");
   conversations.markSubmitted(lease.attemptId, "primary", "turn");
   const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
   return { db, operations, conversations, lease, scope };
@@ -120,8 +120,8 @@ test("an unrelated failed attachment does not invalidate another source's pass",
     { id: "failed-ordinary", rawText: "also ordinary", failedAttachments: [{ nativeId: "F1", displayName: "missing.txt", reasonCode: "not_accessible" }] },
     { id: "valid-pass", rawText: "/pass exact", failedAttachments: [] },
   ]) conversations.acceptChatSource({ ...source, nativeSourceId: `native:${source.id}`, binding, attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
-  conversations.reserveStart("primary");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "primary" });
+  conversations.reserveStart(lease.attemptId, "primary");
   conversations.markSubmitted(lease.attemptId, "primary", "turn");
   const failed = conversations.reserveNextSteer(lease.attemptId)!;
   conversations.markSubmitted(lease.attemptId, failed.contextId, "turn");
@@ -165,8 +165,8 @@ test("malformed admitted safeguard blocks fallback and restored pending rejects 
   const operations = new OperationStore(db);
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   for (const [id, rawText] of [["primary", "ordinary"], ["bad", "/pass\tchanged"]] as const) conversations.acceptChatSource({ id, nativeSourceId: id, binding, rawText, attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "primary" }, "claim");
-  conversations.reserveStart("primary");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "primary" });
+  conversations.reserveStart(lease.attemptId, "primary");
   conversations.markSubmitted(lease.attemptId, "primary", "turn");
   const reserved = conversations.reserveNextSteer(lease.attemptId)!;
   const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
@@ -215,8 +215,8 @@ test("an attachment-bearing steer waits for positive native admission before dis
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.acceptChatSource({ id: "owner", nativeSourceId: "owner", binding, rawText: "owner", attachmentIds: [], receivedAt: 1 });
   conversations.acceptChatSource({ id: "with-file", nativeSourceId: "with-file", binding, rawText: "ordinary follow-up", attachmentIds: ["file"], receivedAt: 2 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
-  conversations.reserveStart("owner");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "owner" });
+  conversations.reserveStart(lease.attemptId, "owner");
   conversations.markSubmitted(lease.attemptId, "owner", "turn");
   const pending = conversations.reserveNextSteer(lease.attemptId)!;
   const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
@@ -241,8 +241,8 @@ test("an attachment-bearing steer proven absent rejects before preparing an oper
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.acceptChatSource({ id: "owner", nativeSourceId: "owner", binding, rawText: "owner", attachmentIds: [], receivedAt: 1 });
   conversations.acceptChatSource({ id: "with-file", nativeSourceId: "with-file", binding, rawText: "ordinary follow-up", attachmentIds: ["file"], receivedAt: 2 });
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
-  conversations.reserveStart("owner");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "owner" });
+  conversations.reserveStart(lease.attemptId, "owner");
   conversations.markSubmitted(lease.attemptId, "owner", "turn");
   const pending = conversations.reserveNextSteer(lease.attemptId)!;
   const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });

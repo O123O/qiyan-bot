@@ -5,7 +5,6 @@ import { AppError } from "../core/errors.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import { inTransaction, type Database } from "../storage/database.ts";
 import type { OperationStore } from "../storage/operation-store.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { AppServerPool } from "../app-server/pool.ts";
 import { isExactThreadNoRollout, isExactThreadNotLoaded, isExactThreadNotMaterialized } from "../app-server/thread-errors.ts";
@@ -64,6 +63,10 @@ export type RolloutPathResolver = (
   lease?: EndpointWorkLease,
 ) => Promise<RolloutPathResolution>;
 
+interface GoalControlReader {
+  goalControlled(endpointId: string, threadId: string, mappingId: string): boolean;
+}
+
 export function createAppServerRolloutPathResolver(
   pool: Pick<AppServerPool, "request">,
 ): RolloutPathResolver {
@@ -114,7 +117,7 @@ function externalTurn(threadId: string): AppError {
 export class SessionOwnershipGuard {
   constructor(
     private readonly db: Database,
-    private readonly runtime: RuntimeStore,
+    private readonly controls: GoalControlReader,
     private readonly operations: OperationStore,
     private readonly access: RolloutAccess,
     private readonly resolvePath?: RolloutPathResolver,
@@ -177,7 +180,7 @@ export class SessionOwnershipGuard {
     }
     const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
-    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
+    const goalControlled = this.controls.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
     const pendingUnclassified = result.openTurn
       && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
       && !this.ownsObservedTurn(identity, result.openTurn)
@@ -205,8 +208,6 @@ export class SessionOwnershipGuard {
       for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
       if (external) {
         this.revokeAuthorizedTurn(identity, external.turnId);
-        const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
-        if (state) this.runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "unadopting", state.nativeStatus);
       }
     });
     if (external) throw externalTurn(identity.thread_id);
@@ -261,7 +262,7 @@ export class SessionOwnershipGuard {
     }
     const result = materialization.result;
     if (!result) throw ownershipUnclassified("rollout ownership scan returned no result");
-    const goalControlled = this.runtime.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
+    const goalControlled = this.controls.goalControlled(identity.endpoint, identity.thread_id, identity.mapping_id);
     const unclassified = result.openTurn && !result.starts.some((turn) => turn.turnId === result.openTurn!.turnId)
       && !this.ownsObservedTurn(identity, result.openTurn) ? result.openTurn : undefined;
     const candidates = [...result.starts];
@@ -280,10 +281,6 @@ export class SessionOwnershipGuard {
       for (const item of classified) if (item.state === "owned") this.recordOwnedTurn(identity, item.turn.turnId);
       if (incidentTurnId) this.revokeAuthorizedTurn(identity, incidentTurnId);
       this.updateCursor(identity, existing, result.cursor, external?.turnId);
-      if (incidentTurnId) {
-        const state = this.runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id);
-        if (state) this.runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "unadopting", state.nativeStatus);
-      }
     });
     if (incidentTurnId) return { state: "external", turnId: incidentTurnId };
     return { state: "owned" };

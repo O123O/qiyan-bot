@@ -67,6 +67,7 @@ test("same-socket worker subscriptions deduplicate but rejection invalidates the
   assert.equal(sameWorkerSubscriptionTarget(target, { ...target, mappingId: "replacement" }), false);
 
   const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /if \(!nickname\) \{[\s\S]{0,200}workerSubscriptionTargetRef\.current = null;/u);
+  assert.match(source, /const streamNickname = nickname \?\? ASSIST_STREAM;/u);
+  assert.match(source, /if \(!session\) \{[\s\S]{0,200}workerSubscriptionTargetRef\.current = null;/u);
   assert.match(source, /m\.type === "worker\/subscription-error"[\s\S]{0,500}workerSubscriptionTargetRef\.current = null;/u);
 });

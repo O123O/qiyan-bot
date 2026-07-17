@@ -6,8 +6,8 @@
 // session id. `thread/start` pre-reserves a session id (claude's --session-id) and
 // returns a synthetic idle thread — no subprocess yet. `turn/start` runs `claude -p`
 // asynchronously (fire-and-resume: --session-id on the first turn, --resume after)
-// and, on exit, pushes a synthesized `turn/completed`; the relay then re-reads the
-// transcript-reconstructed `thread/read` for authoritative content. `turn/interrupt`
+// and, on exit, pushes a synthesized `turn/completed`; the relay then uses bounded
+// transcript turn/item pages for authoritative content. `turn/interrupt`
 // kills the subprocess.
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -20,6 +20,7 @@ import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import { claudeModelCatalog } from "./claude-models.ts";
 import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
+import { ClaudeTranscriptHistory } from "./claude-history.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
 interface ThreadState {
@@ -39,6 +40,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private endpointState: "starting" | "ready" | "unavailable" | "stopped" = "starting";
   private readonly emitter = new EventEmitter();
   private readonly threads = new Map<string, ThreadState>();
+  private readonly history: ClaudeTranscriptHistory;
 
   constructor(private readonly options: {
     id: string;
@@ -57,6 +59,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     steer?: (threadId: string, message: string) => Promise<void>;
   }) {
     this.id = options.id;
+    this.history = new ClaudeTranscriptHistory(options.runner);
     this.emitter.setMaxListeners(100);
   }
 
@@ -105,6 +108,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/start": return this.threadStart(args) as T;
       case "thread/read": return this.threadRead(args) as unknown as T;
       case "thread/resume": return this.threadResume(args) as unknown as T;
+      case "thread/turns/list": return await this.threadTurnsList(args) as T;
+      case "thread/items/list": return await this.threadItemsList(args) as T;
       case "turn/start": return await this.turnStart(args) as T;
       case "turn/interrupt": return this.turnInterrupt(args) as T;
       case "thread/list": return await this.threadList(args) as T;
@@ -150,10 +155,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
 
   private async threadRead(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
-    const state = this.threads.get(threadId);
-    const projected = params.includeTurns !== true && state
-      ? this.stateOnlyThread(threadId, state)
-      : await this.reconstruct(threadId);
+    const state = await this.ensureState(threadId);
+    const projected = params.includeTurns === true
+      ? await this.reconstruct(threadId, state)
+      : this.stateOnlyThread(threadId, state);
     const thread = await this.withPath(threadId, projected);
     return { thread: params.includeTurns === true ? thread : { ...thread, turns: [] } };
   }
@@ -162,7 +167,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadId = requireString(params.threadId, "threadId");
     // Re-adopting a thread un-tombstones it (Codex parity: resuming an archived thread revives it).
     this.options.archives?.remove(this.id, threadId);
-    const thread = await this.withPath(threadId, await this.reconstruct(threadId));
+    const state = await this.ensureState(threadId);
+    const projected = params.excludeTurns === true
+      ? this.stateOnlyThread(threadId, state)
+      : await this.reconstruct(threadId, state);
+    const thread = await this.withPath(threadId, projected);
     return { thread: params.excludeTurns === true ? { ...thread, turns: [] } : thread };
   }
 
@@ -175,7 +184,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return path === undefined ? view : { ...view, path };
   }
 
-  private async reconstruct(threadId: string): Promise<ClaudeThreadView> {
+  private async ensureState(threadId: string): Promise<ThreadState> {
     let state = this.threads.get(threadId);
     // Cold-start recovery: after a QiYan restart the in-memory map is empty, but the
     // Claude transcript is durable on disk. Rehydrate an unknown-but-on-disk session
@@ -183,18 +192,59 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // A reserved-but-unmaterialized thread (state present, materialized false) reads
     // as an empty idle thread. A truly unknown thread with no transcript reproduces
     // the exact Codex `no rollout` error so recovery paths behave.
-    const records = state?.materialized === false ? [] : await this.options.runner.readTranscript(threadId, state?.cwd ?? "");
     if (!state) {
-      if (records.length === 0) throw noRollout(threadId);
-      state = { cwd: cwdFromRecords(records), materialized: true, terminalTurns: new Set() };
+      const cwd = await this.history.sessionCwd(threadId, "");
+      if (cwd === undefined) throw noRollout(threadId);
+      state = { cwd, materialized: true, terminalTurns: new Set() };
       this.threads.set(threadId, state);
     }
+    return state;
+  }
+
+  private async reconstruct(threadId: string, knownState?: ThreadState): Promise<ClaudeThreadView> {
+    const state = knownState ?? await this.ensureState(threadId);
+    const records = state.materialized === false
+      ? []
+      : await this.history.fullRecords(threadId, state.cwd) ?? [];
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,
       ...(state.running === undefined ? {} : { runningTurnId: state.running.turnId }),
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
       ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
+    });
+  }
+
+  private async threadTurnsList(params: Record<string, unknown>): Promise<unknown> {
+    const threadId = requireString(params.threadId, "threadId");
+    const state = await this.ensureState(threadId);
+    const limit = requirePositiveInteger(params.limit, "limit");
+    const sortDirection = requireDirection(params.sortDirection);
+    const itemsView = requireItemsView(params.itemsView);
+    const page = await this.history.turnsPage(threadId, state.cwd, {
+      ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
+      limit,
+      sortDirection,
+      itemsView,
+    });
+    if (!state.running) return page;
+    return {
+      ...page,
+      data: page.data.map((turn) => turn.id === state.running?.turnId
+        ? { ...turn, status: "inProgress" }
+        : turn),
+    };
+  }
+
+  private async threadItemsList(params: Record<string, unknown>): Promise<unknown> {
+    const threadId = requireString(params.threadId, "threadId");
+    const turnId = requireString(params.turnId, "turnId");
+    const state = await this.ensureState(threadId);
+    return this.history.itemsPage(threadId, state.cwd, {
+      turnId,
+      ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
+      limit: requirePositiveInteger(params.limit, "limit"),
+      sortDirection: requireDirection(params.sortDirection),
     });
   }
 
@@ -258,13 +308,21 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // A failed turn is marked terminal so reconstruct synthesizes a findable
       // terminal turn even if `claude` never wrote its user row (relay would else hang).
       if (status === "failed") state.terminalTurns.add(clientId);
-      // The relay ignores this body and re-reads thread/read; {threadId, turn:{id}}
-      // is the minimal trigger.
-      this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
+      // Successful turns use the minimal trigger and are hydrated through bounded native
+      // paging. A failure may have no JSONL user row, so emit its complete synthetic terminal.
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: status === "failed"
+          ? { id: clientId, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${clientId}:user`, clientId }] }
+          : { id: clientId },
+      });
     }).catch(() => {
       delete state.running;
       state.terminalTurns.add(clientId);
-      this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: { id: clientId, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${clientId}:user`, clientId }] },
+      });
     });
 
     return { turn: { id: clientId, status: "inProgress" } };
@@ -319,6 +377,25 @@ function requireString(value: unknown, field: string): string {
   return value;
 }
 
+function requirePositiveInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new AppError("CONFIGURATION_ERROR", `claude endpoint: invalid ${field}`);
+  }
+  return Number(value);
+}
+
+function requireDirection(value: unknown): "asc" | "desc" {
+  if (value !== "asc" && value !== "desc") throw new AppError("CONFIGURATION_ERROR", "claude endpoint: invalid sortDirection");
+  return value;
+}
+
+function requireItemsView(value: unknown): "full" | "summary" | "notLoaded" {
+  if (value !== "full" && value !== "summary" && value !== "notLoaded") {
+    throw new AppError("CONFIGURATION_ERROR", "claude endpoint: invalid itemsView");
+  }
+  return value;
+}
+
 // The goal statuses QiYan's recovery/dashboard accept (production-app parseManagedGoal);
 // reject anything else at write time rather than letting recovery throw later.
 const CLAUDE_GOAL_STATUSES = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
@@ -350,18 +427,6 @@ function inputToText(input: unknown): string {
     // localImage/mention from the file bridge), and a skill reference has no meaning for `claude -p`.
   }
   return parts.join("\n");
-}
-
-// Every transcript row carries the session cwd; used to rehydrate a cold-started
-// session whose in-memory state was lost on QiYan restart.
-function cwdFromRecords(records: readonly unknown[]): string {
-  for (const record of records) {
-    if (record && typeof record === "object" && !Array.isArray(record)) {
-      const cwd = (record as Record<string, unknown>).cwd;
-      if (typeof cwd === "string" && cwd.length > 0) return cwd;
-    }
-  }
-  return "";
 }
 
 function noRollout(threadId: string): JsonRpcResponseError {

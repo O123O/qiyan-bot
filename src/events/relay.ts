@@ -4,14 +4,18 @@ import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { FinalMessageStore } from "../sessions/final-messages.ts";
 import type { Database } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { ManagedEpochStore } from "../storage/managed-epoch-store.ts";
+import type { SessionDeliveryProgressStore } from "../storage/session-delivery-progress-store.ts";
 import type { AttachmentStore } from "../attachments/store.ts";
 import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { MappingIdentity } from "../registry/session-registry.ts";
 import type { ThreadGate } from "../sessions/thread-gate.ts";
-import type { OwnershipInspection } from "../sessions/rollout-ownership.ts";
-import type { ThreadHistoryTurn } from "../app-server/thread-history.ts";
+import {
+  createHistoryScanBudget,
+  isHistoryScanBudgetExhausted,
+  type ThreadHistoryTurn,
+} from "../app-server/thread-history.ts";
 
 interface TerminalTurn {
   id: string;
@@ -23,7 +27,6 @@ interface TerminalTurn {
 }
 
 interface TerminalOwnership {
-  inspect(identity: MappingIdentity, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
   ownsTurn(identity: MappingIdentity, turnId: string): boolean;
 }
 
@@ -51,7 +54,7 @@ const nodeRelayTimers: RelayTimers = {
   clearTimeout: (handle) => clearTimeout(handle),
 };
 
-export type RelayOutcome = "handled" | "conclusively_ignored" | "retry";
+export type RelayOutcome = "handled" | "conclusively_ignored" | "needs_attention" | "retry";
 
 export interface TerminalObservation {
   endpointId: string;
@@ -65,10 +68,6 @@ export interface TerminalObservation {
 
 function relayTargetKey(target: RelayTarget): string {
   return [target.endpointId, target.threadId, target.turnId, target.mappingId, target.epochId].join("\0");
-}
-
-function ownershipNeedsRetry(inspection: OwnershipInspection): boolean {
-  return inspection.state === "unclassified" || inspection.state === "pending" || inspection.state === "lost";
 }
 
 export class EventRelay {
@@ -85,7 +84,8 @@ export class EventRelay {
     private readonly db: Database,
     private readonly pool: AppServerPool,
     private readonly registry: SessionRegistry,
-    private readonly runtime: RuntimeStore,
+    private readonly epochs: ManagedEpochStore,
+    private readonly progress: SessionDeliveryProgressStore,
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
     private readonly options: {
@@ -98,6 +98,7 @@ export class EventRelay {
         existingLease: EndpointWorkLease | undefined,
         run: (lease: EndpointWorkLease) => Promise<T>,
       ): Promise<T>;
+      maxRecoveryAttempts?: number;
     },
     private readonly attachments: Pick<AttachmentStore, "releaseTurn"> | undefined,
     private readonly ownership: TerminalOwnership | undefined,
@@ -138,8 +139,7 @@ export class EventRelay {
   ): Promise<void> {
     if (!event.threadId) return;
     const mapping = this.mapping(endpointId, event.threadId);
-    const state = mapping ? this.runtime.getSession(endpointId, event.threadId, mapping.session.mapping_id) : undefined;
-    if (!mapping || mapping.session.lifecycle_state !== "managed" || state?.managementState !== "managed") return;
+    if (!mapping || mapping.session.lifecycle_state !== "managed") return;
     const nickname = mapping.nickname;
     const key = `permission:${endpointId}:${event.threadId}:${event.turnId ?? "unknown"}:${event.method}`;
     this.deliveries.prepare({
@@ -149,7 +149,6 @@ export class EventRelay {
       body: `[${nickname}] blocked by a permission request`,
       mandatory: true,
     });
-    this.runtime.setSession(endpointId, event.threadId, mapping.session.mapping_id, "managed", "permissionBlocked");
     const inserted = this.persistEvent(key, endpointId, event.threadId, event.turnId, "permission_blocked", {
       nickname,
       turnId: event.turnId ?? null,
@@ -216,7 +215,7 @@ export class EventRelay {
   private captureTarget(endpointId: string, threadId: string, turnId: string, fullTurn?: TerminalTurn): RelayTarget | undefined {
     const mapping = this.mapping(endpointId, threadId);
     if (!mapping || mapping.session.lifecycle_state !== "managed") return undefined;
-    const epoch = this.runtime.currentEpoch(endpointId, threadId, mapping.session.mapping_id);
+    const epoch = this.epochs.current(endpointId, threadId, mapping.session.mapping_id);
     if (!epoch) return undefined;
     return {
       endpointId,
@@ -239,7 +238,11 @@ export class EventRelay {
         target.threadId,
         () => this.projectTarget(target, activeLease, generation),
       ));
-    } catch {
+    } catch (error) {
+      if (isHistoryScanBudgetExhausted(error)) {
+        this.degradeMapping(target.endpointId, target.threadId, target.mappingId, "native history scan budget was exhausted");
+        return "needs_attention";
+      }
       return "retry";
     }
   }
@@ -252,47 +255,44 @@ export class EventRelay {
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
     const stateBefore = this.targetState(target);
     if (stateBefore !== "deliverable") return stateBefore === "stale" ? "conclusively_ignored" : "retry";
-    const mappingBefore = this.mapping(target.endpointId, target.threadId)!;
-    const firstOwnership = await this.inspectOwnership(mappingBefore.session, lease);
-    if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (ownershipNeedsRetry(firstOwnership)) return "retry";
-
-    const epoch = this.runtime.currentEpoch(target.endpointId, target.threadId, target.mappingId)!;
+    const epoch = this.epochs.current(target.endpointId, target.threadId, target.mappingId)!;
     if (target.turnId === epoch.baselineTurnId) return "conclusively_ignored";
+    if (target.fullTurn) {
+      const current = this.mapping(target.endpointId, target.threadId);
+      if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
+      if (!this.isTerminal(target.fullTurn.status)) return "retry";
+      if (this.ownership && !this.ownership.ownsTurn(current.session, target.turnId)) return "conclusively_ignored";
+      if (!this.runIsCurrent(target.endpointId, generation) || this.targetState(target) !== "deliverable") return "retry";
+      return this.commitTerminal(target, target.fullTurn, lease);
+    }
+    if (!target.fullTurn && this.progress.recoveryIncident(target.endpointId, target.threadId, target.mappingId)) return "needs_attention";
     const reader = this.pool.historyReader(target.endpointId, lease);
+    const budget = createHistoryScanBudget();
     const suffix = epoch.baselineTurnId
-      ? await reader.descendingSuffix(target.threadId, epoch.baselineTurnId)
+      ? await reader.descendingSuffix(target.threadId, epoch.baselineTurnId, budget)
       : undefined;
     if (suffix && !suffix.anchorFound) return "retry";
     const metadata = suffix
       ? suffix.turns.find((candidate) => candidate.id === target.turnId)
-      : await reader.findTurn(target.threadId, target.turnId);
+      : await reader.findTurn(target.threadId, target.turnId, budget);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
 
     if (!metadata) {
       if (suffix && epoch.baselineTurnId) {
         const relation = await reader.classifyTurnAgainstAnchor(
-          target.threadId, target.turnId, epoch.baselineTurnId,
+          target.threadId, target.turnId, epoch.baselineTurnId, budget,
         );
         if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
         if (relation === "anchor" || relation === "older") return "conclusively_ignored";
       }
       return "retry";
     }
-    let turn: TerminalTurn;
-    if (target.fullTurn) turn = { ...metadata, ...target.fullTurn };
-    else {
-      const exact = await reader.exactTurnItems(target.threadId, target.turnId, { allowLegacySummary: true });
-      turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
-    }
+    const exact = await reader.exactTurnItems(target.threadId, target.turnId, { budget, allowLegacySummary: true });
+    const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
     if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
 
     const current = this.mapping(target.endpointId, target.threadId);
     if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
-    const secondOwnership = await this.inspectOwnership(current.session, lease);
-    if (!this.runIsCurrent(target.endpointId, generation)) return "retry";
-    if (ownershipNeedsRetry(secondOwnership)) return "retry";
-
     const stateAfter = this.targetState(target);
     if (stateAfter !== "deliverable") return stateAfter === "stale" ? "conclusively_ignored" : "retry";
     if (!this.isTerminal(turn.status)) return "retry";
@@ -306,42 +306,39 @@ export class EventRelay {
     for (const session of Object.values(this.registry.managedSnapshot().sessions)) {
       if (session.endpoint !== endpointId) continue;
       if (!this.runIsCurrent(endpointId, generation)) return false;
-      const sessionComplete = await this.gate.run(endpointId, session.thread_id, async () => {
+      let sessionComplete: boolean;
+      try {
+        sessionComplete = await this.gate.run(endpointId, session.thread_id, async () => {
         const mapping = this.mapping(endpointId, session.thread_id);
-        const state = mapping ? this.runtime.getSession(endpointId, session.thread_id, mapping.session.mapping_id) : undefined;
-        const epoch = mapping ? this.runtime.currentEpoch(endpointId, session.thread_id, mapping.session.mapping_id) : undefined;
+        const epoch = mapping ? this.epochs.current(endpointId, session.thread_id, mapping.session.mapping_id) : undefined;
         if (!mapping) return true;
         if (mapping.session.mapping_id !== session.mapping_id) return false;
-        if (mapping.session.lifecycle_state !== "managed"
-          || !state || !this.isDeliverableState(state.managementState) || !epoch) return true;
+        if (mapping.session.lifecycle_state !== "managed" || !epoch) return true;
+        if (this.progress.recoveryIncident(endpointId, session.thread_id, session.mapping_id)) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
-        const before = await this.inspectOwnership(session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(before)) return false;
-        const anchorTurnId = state.deliveryCursor ?? epoch.baselineTurnId;
-        const suffix = await this.pool.historyReader(endpointId, lease).descendingSuffix(session.thread_id, anchorTurnId);
+        const anchorTurnId = this.progress.cursor(endpointId, session.thread_id, session.mapping_id) ?? epoch.baselineTurnId;
+        const budget = createHistoryScanBudget();
+        const suffix = await this.pool.historyReader(endpointId, lease).descendingSuffix(session.thread_id, anchorTurnId, budget);
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
         if (current.session.mapping_id !== session.mapping_id) return false;
-        const after = await this.inspectOwnership(current.session, lease);
-        if (!this.runIsCurrent(endpointId, generation) || ownershipNeedsRetry(after)
+        if (!this.runIsCurrent(endpointId, generation)
           || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
         if (!suffix.anchorFound) return false;
         const reader = this.pool.historyReader(endpointId, lease);
         for (const metadata of [...suffix.turns].reverse()) {
-          const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { allowLegacySummary: true });
+          const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { budget, allowLegacySummary: true });
           const turn = terminalTurn(metadata, exact.summaryTurn, exact.items);
           if (!this.runIsCurrent(endpointId, generation)) return false;
           const currentAfterItems = this.mapping(endpointId, session.thread_id);
           if (!currentAfterItems || currentAfterItems.session.mapping_id !== session.mapping_id) return false;
-          const afterItems = await this.inspectOwnership(currentAfterItems.session, lease);
           if (!this.runIsCurrent(endpointId, generation)
-            || (after.state !== "external" && afterItems.state === "external") || ownershipNeedsRetry(afterItems)
             || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
           if (!this.isTerminal(turn.status)) break;
           if (this.ownership && !this.ownership.ownsTurn(currentAfterItems.session, turn.id)) {
             if (!this.runIsCurrent(endpointId, generation)) return false;
-            this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
+            this.progress.setCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
             if (!this.runIsCurrent(endpointId, generation)) return false;
             this.retryTargets.delete(relayTargetKey({
               endpointId,
@@ -366,10 +363,15 @@ export class EventRelay {
           if (outcome !== "handled") return false;
           this.retryTargets.delete(relayTargetKey(target));
           if (!this.runIsCurrent(endpointId, generation)) return false;
-          this.runtime.setDeliveryCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
+          this.progress.setCursor(endpointId, session.thread_id, session.mapping_id, turn.id);
         }
         return true;
-      });
+        });
+      } catch (error) {
+        if (!isHistoryScanBudgetExhausted(error)) throw error;
+        this.degradeMapping(endpointId, session.thread_id, session.mapping_id, "native history scan budget was exhausted");
+        sessionComplete = true;
+      }
       if (!sessionComplete) complete = false;
     }
     return complete;
@@ -379,8 +381,6 @@ export class EventRelay {
     if (this.targetState(target) !== "deliverable") return "conclusively_ignored";
     const mapping = this.mapping(target.endpointId, target.threadId)!;
     const nickname = mapping.nickname;
-    this.runtime.clearActiveTurn(target.endpointId, target.threadId, target.mappingId, turn.id);
-    this.pool.markTurnTerminal(target.endpointId, target.threadId, turn.id);
     const messages = this.finals.persistTerminalTurn(target.endpointId, target.threadId, turn, this.options.clock.now());
     const eventId = `terminal:${target.endpointId}:${target.threadId}:${turn.id}`;
     await this.options.onTerminal?.({
@@ -430,10 +430,9 @@ export class EventRelay {
   private targetState(target: RelayTarget): "deliverable" | "retry" | "stale" {
     const mapping = this.mapping(target.endpointId, target.threadId);
     if (!mapping || mapping.session.mapping_id !== target.mappingId || mapping.session.lifecycle_state !== "managed") return "stale";
-    const epoch = this.runtime.currentEpoch(target.endpointId, target.threadId, target.mappingId);
+    const epoch = this.epochs.current(target.endpointId, target.threadId, target.mappingId);
     if (!epoch || epoch.id !== target.epochId) return "stale";
-    const state = this.runtime.getSession(target.endpointId, target.threadId, target.mappingId);
-    return this.isDeliverableState(state?.managementState) ? "deliverable" : "retry";
+    return "deliverable";
   }
 
   private isDeliverableGeneration(
@@ -442,24 +441,14 @@ export class EventRelay {
     expected: { mappingId: string; epochId: string },
   ): boolean {
     const current = this.mapping(endpointId, threadId);
-    const state = current ? this.runtime.getSession(endpointId, threadId, current.session.mapping_id) : undefined;
-    const epoch = current ? this.runtime.currentEpoch(endpointId, threadId, current.session.mapping_id) : undefined;
+    const epoch = current ? this.epochs.current(endpointId, threadId, current.session.mapping_id) : undefined;
     return current?.session.mapping_id === expected.mappingId
       && current.session.lifecycle_state === "managed"
-      && this.isDeliverableState(state?.managementState)
       && epoch?.id === expected.epochId;
-  }
-
-  private isDeliverableState(state: string | undefined): boolean {
-    return state === "managed" || state === "unadopting";
   }
 
   private isTerminal(status: string): boolean {
     return status === "completed" || status === "failed" || status === "interrupted";
-  }
-
-  private inspectOwnership(identity: MappingIdentity, lease: EndpointWorkLease): Promise<OwnershipInspection> {
-    return this.ownership?.inspect(identity, lease) ?? Promise.resolve({ state: "owned" });
   }
 
   private settleTarget(
@@ -489,6 +478,10 @@ export class EventRelay {
     }
     if (this.unavailableEndpoints.has(endpointId) || this.retryTimers.has(endpointId)) return;
     const attempt = this.retryAttempts.get(endpointId) ?? 0;
+    if (attempt >= (this.options.maxRecoveryAttempts ?? 6)) {
+      this.degradePendingEndpoint(endpointId, "native history remained unavailable after bounded retries");
+      return;
+    }
     const delay = Math.min(1_000 * 2 ** attempt, 30_000);
     const generation = this.endpointGeneration(endpointId);
     let handle: ReturnType<typeof setTimeout>;
@@ -543,6 +536,34 @@ export class EventRelay {
 
   private endpointGeneration(endpointId: string): number {
     return this.endpointGenerations.get(endpointId) ?? 0;
+  }
+
+  private degradePendingEndpoint(endpointId: string, reason: string): void {
+    for (const target of this.targetsForEndpoint(endpointId)) {
+      this.degradeMapping(target.endpointId, target.threadId, target.mappingId, reason);
+      this.retryTargets.delete(relayTargetKey(target));
+    }
+    if (this.scanPendingEndpoints.delete(endpointId)) {
+      for (const [nickname, session] of Object.entries(this.registry.managedSnapshot().sessions)) {
+        if (session.endpoint !== endpointId) continue;
+        this.degradeMapping(endpointId, session.thread_id, session.mapping_id, reason, nickname);
+      }
+    }
+    this.clearRetryTimer(endpointId);
+    this.retryAttempts.delete(endpointId);
+  }
+
+  private degradeMapping(endpointId: string, threadId: string, mappingId: string, reason: string, knownNickname?: string): void {
+    if (!this.progress.markRecoveryIncident(endpointId, threadId, mappingId, reason)) return;
+    const mapping = this.mapping(endpointId, threadId);
+    const nickname = knownNickname ?? (mapping?.session.mapping_id === mappingId ? mapping.nickname : "session");
+    this.deliveries.prepare({
+      id: `worker-history-needs-attention:${endpointId}:${threadId}:${mappingId}`,
+      kind: "worker_warning",
+      binding: this.options.binding(),
+      body: `[${nickname}] message recovery needs attention; ${reason}`,
+      mandatory: true,
+    });
   }
 
   private advanceEndpointGeneration(endpointId: string): number {

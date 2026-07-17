@@ -5,7 +5,7 @@ import { RpcRequestTimeoutError } from "../../src/app-server/rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { reportOperationalSafely } from "../../src/production-app.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { SessionControlStore } from "../../src/storage/session-control-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 
@@ -21,13 +21,11 @@ function fixture(options: {
     clearTimeout(handle: any): void;
   };
   onError?: (error: unknown) => void;
-  onIdleTurn?: (event: { endpointId: string; threadId: string; turnId: string }) => Promise<void>;
   onGoalTurnStarted?: (event: { endpointId: string; threadId: string; mappingId: string; turnId: string }) => void;
 } = {}) {
   const db = createTestDatabase();
   const store = new SessionDashboardStore(db);
-  const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
+  const controls = new SessionControlStore(db);
   const registry = { snapshot: () => ({
     version: 3 as const,
     assistant: { endpoint: "assistant-local", thread_id: "manager", project_dir: "/manager" },
@@ -35,7 +33,7 @@ function fixture(options: {
   }) };
   let changes = 0;
   const errors: unknown[] = [];
-  const processor = new SessionObservationProcessor(store, registry, runtime, {
+  const processor = new SessionObservationProcessor(store, registry, controls, {
     now: () => 1_000,
     readThread: options.readThread ?? (async () => ({ turns: [] })),
     readGoal: options.readGoal ?? (async () => ({ goal: null })),
@@ -44,50 +42,22 @@ function fixture(options: {
       errors.push(error);
       options.onError?.(error);
     },
-    ...(options.onIdleTurn ? { onIdleTurn: options.onIdleTurn } : {}),
     ...(options.onGoalTurnStarted ? { onGoalTurnStarted: options.onGoalTurnStarted } : {}),
     ...(options.classifyFailure ? { classifyFailure: options.classifyFailure } : {}),
     ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
     ...(options.timers ? { timers: options.timers } : {}),
   });
-  return { db, store, runtime, processor, changes: () => changes, errors };
+  return { db, store, controls, processor, changes: () => changes, errors };
 }
 
-test("an idle status durably recovers a missing terminal notification before clearing its turn", async () => {
-  const clock = fakeTimers();
-  const attempts: Array<{ endpointId: string; threadId: string; turnId: string }> = [];
-  let fail = true;
-  let value: ReturnType<typeof fixture>;
-  value = fixture({
-    onIdleTurn: async (event) => {
-      attempts.push(event);
-      assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
-      if (fail) throw new RpcRequestTimeoutError("thread/read");
-    },
-    classifyFailure: (error) => error instanceof RpcRequestTimeoutError ? "retry" : "sleep",
-    retryMs: 25,
-    timers: clock.api,
-  });
-  value.runtime.setActiveTurn("local", "thread-1", mappingId, "turn-1");
-
-  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+test("lifecycle status is rejected by the facts projector instead of becoming durable state", async () => {
+  const value = fixture();
+  assert.equal(value.processor.accept("local", "thread/status/changed", {
+    threadId: "thread-1", status: { type: "active" }, activeTurnId: "turn-1",
+  }), false);
   await value.processor.idle();
-
-  assert.deepEqual(attempts, [{ endpointId: "local", threadId: "thread-1", turnId: "turn-1" }]);
-  assert.equal(value.store.pendingNotifications().length, 1);
-  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "turn-1");
-  assert.equal(clock.timers.length, 1);
-
-  fail = false;
-  await settleTimer(clock.timers[0]!);
-  await value.processor.idle();
-
-  assert.deepEqual(attempts, [
-    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
-    { endpointId: "local", threadId: "thread-1", turnId: "turn-1" },
-  ]);
   assert.equal(value.store.pendingNotifications().length, 0);
-  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), undefined);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).newestObservationAt, null);
 });
 
 interface FakeTimer {
@@ -122,13 +92,13 @@ const usage = {
   modelContextWindow: 100,
 };
 
-test("accepts body-free observations durably and processes settings, status, tokens, and goals", async () => {
+test("accepts body-free fact observations durably and ignores lifecycle status", async () => {
   const value = fixture({ readThread: async () => ({ turns: [{ id: "turn-1", startedAt: 1 }] }) });
   assert.equal(value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress", startedAt: 1, items: [{ type: "agentMessage", text: "secret body" }] } }), true);
   assert.equal(value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high", cwd: "/ignored" } }), true);
   assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "turn-1", tokenUsage: usage }), true);
   assert.equal(value.processor.accept("local", "thread/goal/updated", { threadId: "thread-1", turnId: null, goal: { threadId: "thread-1", objective: "finish", status: "active", tokenBudget: null, tokensUsed: 1, timeUsedSeconds: 2, createdAt: 1, updatedAt: 2 } }), true);
-  assert.equal(value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } }), true);
+  assert.equal(value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } }), false);
   await value.processor.idle();
 
   const persisted = value.db.prepare("SELECT params_json FROM session_dashboard_notifications ORDER BY sequence").all() as Array<{ params_json: string }>;
@@ -138,14 +108,13 @@ test("accepts body-free observations durably and processes settings, status, tok
   assert.equal(facts.currentSettings.model, "gpt-5");
   assert.equal(facts.tokenUsage?.total.total_tokens, 10);
   assert.equal(facts.goal?.objective, "finish");
-  assert.equal(value.runtime.getSession("local", "thread-1", mappingId)?.nativeStatus, "idle");
   assert.ok(value.changes() >= 1);
 });
 
 test("only an exact active-goal notification authorizes its turn before a later pause", async () => {
   const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
   const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
   value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "goal-turn", startedAt: 1 } });
   await value.processor.idle();
   assert.equal(started.length, 0);
@@ -155,7 +124,7 @@ test("only an exact active-goal notification authorizes its turn before a later 
     turnId: "goal-turn",
     goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
   });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, false);
+  value.controls.setGoalControlled("local", "thread-1", mappingId, false);
 
   await value.processor.idle();
 
@@ -167,7 +136,7 @@ test("only an exact active-goal notification authorizes its turn before a later 
 test("an exact terminal goal notification authorizes its turn before revoking goal control", async () => {
   const observed: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
   const value = fixture({ onGoalTurnStarted: (event) => { observed.push(event); } });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
   value.processor.accept("local", "thread/goal/updated", {
     threadId: "thread-1",
@@ -178,15 +147,15 @@ test("an exact terminal goal notification authorizes its turn before revoking go
 
   assert.ok(observed.length >= 1);
   assert.equal(observed.every((event) => event.turnId === "completed-goal-turn"), true);
-  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), false);
+  assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), false);
 });
 
 test("a fast idle cannot clear a newly armed goal before its ordered goal update", async () => {
   const value = fixture();
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
   value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
   await value.processor.idle();
-  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+  assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), true);
 
   value.processor.accept("local", "thread/goal/updated", {
     threadId: "thread-1",
@@ -196,7 +165,7 @@ test("a fast idle cannot clear a newly armed goal before its ordered goal update
 
   await value.processor.idle();
 
-  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), false);
+  assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), false);
 });
 
 test("a stale non-active goal update cannot clear a newer activation", async () => {
@@ -206,16 +175,16 @@ test("a stale non-active goal update cannot clear a newer activation", async () 
     turnId: null,
     goal: { objective: "finish", status: "paused", tokenBudget: null, updatedAt: 2 },
   });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
   await value.processor.idle();
 
-  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+  assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), true);
 });
 
 test("an unknown goal status cannot revoke controlled-goal ownership", async () => {
   const value = fixture();
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
   assert.equal(value.processor.accept("local", "thread/goal/updated", {
     threadId: "thread-1",
@@ -224,23 +193,23 @@ test("an unknown goal status cannot revoke controlled-goal ownership", async () 
   }), false);
   await value.processor.idle();
 
-  assert.equal(value.runtime.goalControlled("local", "thread-1", mappingId), true);
+  assert.equal(value.controls.goalControlled("local", "thread-1", mappingId), true);
 });
 
-test("a goal turn received while its managed mapping is unavailable is authorized after restore", async () => {
+test("a goal turn is authorized from durable control intent without consulting cached availability", async () => {
   const started: Array<{ endpointId: string; threadId: string; mappingId: string; turnId: string }> = [];
   const value = fixture({ onGoalTurnStarted: (event) => { started.push(event); } });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
-  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
   assert.equal(value.processor.accept("local", "thread/goal/updated", {
     threadId: "thread-1",
     turnId: "deferred-goal-turn",
     goal: { objective: "finish", status: "active", tokenBudget: null, updatedAt: 2 },
   }), true);
   await value.processor.idle();
-  assert.deepEqual(started, [{ endpointId: "local", threadId: "thread-1", mappingId, turnId: "deferred-goal-turn" }]);
+  assert.ok(started.length >= 1);
+  assert.equal(started.every((event) => event.endpointId === "local" && event.threadId === "thread-1"
+    && event.mappingId === mappingId && event.turnId === "deferred-goal-turn"), true);
 
-  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
   await value.processor.endpointReady("local");
   assert.equal(started.every((event) => event.turnId === "deferred-goal-turn"), true);
 });
@@ -253,7 +222,7 @@ test("goal authorization failure cannot prevent the durable observation from bei
       if (attempts === 1) throw new Error("ownership guard is not ready");
     },
   });
-  value.runtime.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
+  value.controls.setGoalControlled("local", "thread-1", mappingId, true, value.store.allocateObservationSequence());
 
   assert.doesNotThrow(() => value.processor.accept("local", "thread/goal/updated", {
     threadId: "thread-1",
@@ -301,11 +270,9 @@ test("a fresh equal resume watermark rejects an older delayed settings observati
 
 test("a resume response keeps its receipt order so a later settings notification wins", async () => {
   const value = fixture();
-  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
   const resumeSequence = value.store.allocateObservationSequence();
   value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "new", effort: "high" } });
   await value.processor.idle();
-  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
 
   value.processor.observeResume("local", "thread-1", {
     model: "old",
@@ -319,24 +286,19 @@ test("a resume response keeps its receipt order so a later settings notification
   assert.equal(current.effort, "high");
 });
 
-test("resume orders native state at the later authoritative thread response", async () => {
+test("resume projects settings and turn order but never persists native liveness", async () => {
   const value = fixture();
-  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
   const settingsSequence = value.store.allocateObservationSequence();
-  value.processor.accept("local", "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
-  await value.processor.idle();
-  const nativeSequence = value.store.allocateObservationSequence();
-  value.runtime.setSession("local", "thread-1", mappingId, "managed", "notLoaded");
 
   value.processor.observeResume("local", "thread-1", {
     model: "gpt-5",
     reasoningEffort: "high",
     thread: { status: { type: "active" }, turns: [{ id: "active-turn", status: "inProgress", startedAt: 2 }] },
-  }, 300, { settings: settingsSequence, native: nativeSequence });
+  }, 300, { settings: settingsSequence });
   await value.processor.drain("local");
 
-  assert.equal(value.runtime.getSession("local", "thread-1", mappingId)?.nativeStatus, "active");
-  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "active-turn");
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
+  assert.equal(value.store.turnOrdinal({ endpointId: "local", threadId: "thread-1" }, "active-turn"), 1);
 });
 
 test("idle waits for a blocked handler and leaves endpoint failures pending for retry", async () => {
@@ -588,20 +550,6 @@ test("observation stop cancels timers, awaits tails, and fences stale callbacks"
   assert.equal(reads, 2);
 });
 
-test("defers observations for an unavailable session that will be restored as managed", async () => {
-  const value = fixture();
-  value.runtime.setSession("local", "thread-1", mappingId, "unavailable", "notLoaded");
-  value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
-  await value.processor.idle();
-
-  assert.equal(value.store.pendingNotifications().length, 1);
-  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, null);
-  value.runtime.setSession("local", "thread-1", mappingId, "managed", "idle");
-  await value.processor.drain("local");
-  assert.equal(value.store.pendingNotifications().length, 0);
-  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
-});
-
 test("quarantines an invalid durable observation without starving later rows", async () => {
   const clock = fakeTimers();
   const value = fixture({ timers: clock.api });
@@ -630,11 +578,9 @@ test("an unorderable token observation stays pending without starving later rows
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
 });
 
-test("terminal observation stores only metadata and cannot clear a newer active turn", async () => {
+test("terminal observation stores only metadata and has no lifecycle side effect", async () => {
   const value = fixture({ readThread: async () => ({ turns: [{ id: "old", startedAt: 1 }, { id: "new", startedAt: 2 }] }) });
-  value.runtime.setActiveTurn("local", "thread-1", mappingId, "new");
   await value.processor.observeTerminal({ endpointId: "local", threadId: "thread-1", turnId: "old", status: "completed", startedAt: 1, completedAt: 2, finalMessageId: "message-1" });
-  assert.equal(value.runtime.activeTurn("local", "thread-1", mappingId), "new");
   assert.deepEqual(value.store.facts({ endpointId: "local", threadId: "thread-1" }).lastWorkerEvent, {
     message_id: "message-1", turn_id: "old", status: "completed", at: "1970-01-01T00:00:02.000Z",
   });

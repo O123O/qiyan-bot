@@ -12,11 +12,13 @@ import { SessionRegistry } from "../../src/registry/session-registry.ts";
 import { FinalMessageStore } from "../../src/sessions/final-messages.ts";
 import { SessionService } from "../../src/sessions/service.ts";
 import { SessionLifecycle } from "../../src/sessions/lifecycle.ts";
+import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
 import type { OwnershipInspection } from "../../src/sessions/rollout-ownership.ts";
 import { ThreadGate } from "../../src/sessions/thread-gate.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
-import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { SessionControlStore } from "../../src/storage/session-control-store.ts";
+import { ManagedEpochStore } from "../../src/storage/managed-epoch-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
 
 const mappingId = "mapping-1";
@@ -137,9 +139,12 @@ async function fixture(ownership?: {
   const db = createTestDatabase();
   const endpoint = new ServiceEndpoint();
   endpoint.cwd = dir;
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 4 });
-  const runtime = new RuntimeStore(db);
-  runtime.setSession("local", "thread", mappingId, "managed", "idle");
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 4, reconciliationTimeoutMs: 20, reconciliationPollMs: 1 });
+  const native = new NativeSessionState();
+  const nativeGeneration = pool.endpointGeneration("local").generation;
+  native.register({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration);
+  native.applyRefresh(native.captureRefresh({ endpointId: "local", threadId: "thread", mappingId }, nativeGeneration), { status: "idle" });
+  const controls = new SessionControlStore(db);
   const finals = new FinalMessageStore(db);
   const deliveries = new DeliveryStore(db);
   let workspaceFailure: Error | undefined;
@@ -150,16 +155,24 @@ async function fixture(ownership?: {
     assertDispatchable: async () => { onWorkspaceCheck?.(); await workspaceBarrier; if (workspaceFailure) throw workspaceFailure; },
   };
   const gate = new ThreadGate();
-  const service = new SessionService(pool, registry, runtime, finals, deliveries, workspaces, gate, undefined, ownership);
+  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, undefined, ownership);
+  const observeNative = (status: "idle" | "active", turnId?: string) => {
+    if (status === "active" && turnId) {
+      native.observe("local", nativeGeneration, "turn/started", { threadId: "thread", turn: { id: turnId, status: "inProgress" } });
+    } else {
+      native.observe("local", nativeGeneration, "thread/status/changed", { threadId: "thread", status: { type: status } });
+    }
+  };
   return {
-    db, dir, endpoint, pool, registry, runtime, finals, deliveries, service, gate, workspaces,
+    db, dir, endpoint, pool, registry, native, nativeGeneration, controls, finals, deliveries, service, gate, workspaces,
+    observeNative,
     failWorkspace: () => { workspaceFailure = new AppError("CONFIGURATION_ERROR", "project workspace changed unexpectedly"); },
     setWorkspaceBarrier: (barrier: Promise<void> | undefined, onCheck?: () => void) => { workspaceBarrier = barrier; onWorkspaceCheck = onCheck; },
   };
 }
 
 test("starts idle sessions, steers active sessions, and interrupts the exact turn", async () => {
-  const { endpoint, runtime, service } = await fixture();
+  const { endpoint, controls, service } = await fixture();
   await service.setModel("payments", "gpt-5");
   await service.setEffort("payments", "high");
   const started = await service.send("payments", "hello", { clientUserMessageId: "msg-1" });
@@ -168,12 +181,39 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
     threadId: "thread", cwd: endpoint.cwd, clientUserMessageId: "msg-1", input: [{ type: "text", text: "hello", text_elements: [] }], model: "gpt-5", effort: "high",
   });
   assert.deepEqual(started.appliedSettings, { model: "gpt-5", effort: "high" });
-  assert.deepEqual(runtime.settings("local", "thread", mappingId), {});
+  assert.deepEqual(controls.settings("local", "thread", mappingId), {});
 
-  runtime.setActiveTurn("local", "thread", mappingId, "active-1");
   assert.equal((await service.send("payments", "more")).mode, "steer");
-  await service.interrupt("payments", "active-1");
-  assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "active-1"));
+  await service.interrupt("payments", "started-1");
+  assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "started-1"));
+});
+
+test("an id-less active event refreshes once and fails closed instead of starting a second turn", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.threadTurns = [];
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+  });
+
+  await assert.rejects(value.service.send("payments", "must not overlap", { mode: "start" }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    return true;
+  });
+  assert.equal(value.endpoint.calls.filter((call) => call.method === "thread/read").length, 2, "workspace check plus one status refresh");
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), false);
+});
+
+test("native error state cannot admit a new turn", async () => {
+  const value = await fixture();
+  const identity = { endpointId: "local", threadId: "thread", mappingId };
+  value.native.applyRefresh(value.native.captureRefresh(identity, value.nativeGeneration), { status: "error" });
+
+  await assert.rejects(value.service.send("payments", "must not start"), (error: unknown) => (
+    error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
+  ));
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), false);
 });
 
 test("prepares worker input inside the verified execution fence before native dispatch", async () => {
@@ -251,12 +291,12 @@ test("execution rechecks rollout ownership after input preparation and immediate
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
 });
 
-test("interrupt ownership-fences the cached active turn before touching the App Server", async () => {
+test("a poisoned persisted active turn cannot authorize interrupt", async () => {
   const value = await fixture({ inspect: async () => ({ state: "external", turnId: "outside" }) });
-  value.runtime.setActiveTurn("local", "thread", mappingId, "outside");
+  assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);
 
   await assert.rejects(value.service.interrupt("payments", "outside"), (error: unknown) => {
-    assert.equal((error as { code?: string }).code, "SESSION_DETACHED");
+    assert.equal((error as { code?: string }).code, "SESSION_IDLE");
     return true;
   });
 
@@ -274,29 +314,27 @@ test("interrupt recovery resumes the exact native active turn when runtime cache
     && call.params.turnId === "recovered-active"));
 });
 
-test("an unavailable registered worker with managed restore state can be interrupted from authoritative history", async () => {
+test("an unavailable live view is refreshed and interrupted without persisted restore state", async () => {
   const value = await fixture({ inspect: async () => ({ state: "owned" }) });
-  value.runtime.setSession("local", "thread", mappingId, "unavailable", "notLoaded");
+  value.native.invalidateEndpoint("local", value.nativeGeneration);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
 
   assert.equal(await value.service.interrupt("payments"), "remote-active");
 
   assert.ok(value.endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "remote-active"));
-  assert.equal(value.runtime.activeTurn("local", "thread", mappingId), undefined);
+  assert.equal(value.native.view({ endpointId: "local", threadId: "thread", mappingId })?.activeTurnId, null);
 });
 
-test("unavailable interrupt rejects a runtime row whose restore state is not managed", async () => {
+test("registry-managed interrupt has no persisted management mirror to poison", async () => {
   const value = await fixture({ inspect: async () => ({ state: "owned" }) });
-  value.runtime.setSession("local", "thread", mappingId, "archiving", "active");
-  value.runtime.setSession("local", "thread", mappingId, "unavailable", "notLoaded");
+  assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
+  value.native.invalidateEndpoint("local", value.nativeGeneration);
 
-  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => (
-    error instanceof AppError && error.code === "SESSION_DETACHED"
-  ));
-  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), false);
+  assert.equal(await value.service.interrupt("payments"), "remote-active");
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), true);
 });
 
 test("compaction requires an idle managed worker and observes a new native compaction item", async () => {
@@ -324,6 +362,23 @@ test("compaction requires an idle managed worker and observes a new native compa
   ));
 });
 
+test("all turn-starting mutations fail closed when the authoritative native state is error", async () => {
+  const value = await fixture();
+  value.endpoint.status = "error";
+
+  for (const mutate of [
+    () => value.service.compact("payments"),
+    () => value.service.setGoal("payments", "ship it"),
+    () => value.service.resumeGoal("payments"),
+  ]) {
+    await assert.rejects(mutate(), (error: unknown) => (
+      error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
+    ));
+  }
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/compact/start"), false);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/goal/set"), false);
+});
+
 test("legacy compaction recovery stays unresolved without dispatching another compaction", async () => {
   const value = await fixture({ inspect: async () => ({ state: "owned" }) });
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
@@ -348,9 +403,9 @@ test("active goal transition snapshots exact native turn ownership before marker
   assert.deepEqual(authorized, ["goal-active"]);
 });
 
-test("an unclassified cached active turn cannot be steered or interrupted", async () => {
+test("an unclassified live active turn cannot be steered or interrupted", async () => {
   const value = await fixture({ inspect: async () => ({ state: "unclassified", turnId: "boundary-turn" }) });
-  value.runtime.setActiveTurn("local", "thread", mappingId, "boundary-turn");
+  value.observeNative("active", "boundary-turn");
 
   await assert.rejects(value.service.send("payments", "do not steer"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
   await assert.rejects(value.service.interrupt("payments", "boundary-turn"), (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
@@ -385,7 +440,7 @@ test("native cwd drift and mapping generation replacement block execution inside
 
 test("unadopt waits for an in-flight execution check and cannot transition after the turn starts", async () => {
   const value = await fixture();
-  const lifecycle = new SessionLifecycle(value.pool, value.registry, value.runtime, { now: () => 10 }, value.workspaces, value.gate);
+  const lifecycle = new SessionLifecycle(value.pool, value.registry, new ManagedEpochStore(value.db), value.native, { now: () => 10 }, value.workspaces, value.gate);
   let release!: () => void;
   let entered!: () => void;
   const barrier = new Promise<void>((resolve) => { release = resolve; });
@@ -416,16 +471,14 @@ test("send enforces managed state and start/steer preconditions", async () => {
 
 test("execution is rejected for every transitional mapping lifecycle", async () => {
   for (const state of ["adopting", "unadopting", "archiving"] as const) {
-    const { registry, endpoint, runtime, service } = await fixture();
+    const { registry, endpoint, service } = await fixture();
     const current = registry.get("payments")!;
     if (state === "adopting") {
       await registry.transition("payments", current, "unadopting");
       await registry.removeIfMatch("payments", current);
       await registry.reserve("payments", { ...current, mapping_id: "mapping-adopting", lifecycle_state: "adopting" });
-      runtime.setSession("local", "thread", "mapping-adopting", "adopting", "idle");
     } else {
       await registry.transition("payments", current, state);
-      runtime.setSession("local", "thread", current.mapping_id, state, "idle");
     }
     endpoint.calls.length = 0;
     await assert.rejects(service.send("payments", "must not run"), (error: unknown) => error instanceof AppError && error.code === "SESSION_DETACHED");
@@ -433,9 +486,9 @@ test("execution is rejected for every transitional mapping lifecycle", async () 
   }
 });
 
-test("status composes registry, runtime, native state, settings, and goal", async () => {
-  const { runtime, service } = await fixture();
-  runtime.setModel("local", "thread", mappingId, "gpt-5");
+test("status composes registry, live native state, and goal", async () => {
+  const { controls, service } = await fixture();
+  controls.setModel("local", "thread", mappingId, "gpt-5");
   const status = await service.status("payments") as any;
   assert.equal(status.nickname, "payments");
   assert.equal(status.managementState, "managed");
@@ -446,9 +499,8 @@ test("status composes registry, runtime, native state, settings, and goal", asyn
   assert.equal(status.goal, null);
 });
 
-test("status derives the active turn from authoritative history instead of cached runtime", async () => {
-  const { endpoint, runtime, service } = await fixture();
-  runtime.setActiveTurn("local", "thread", mappingId, "stale-turn");
+test("status derives the active turn from authoritative history without a runtime cache", async () => {
+  const { endpoint, service } = await fixture();
   endpoint.status = "active";
   endpoint.threadTurns = [
     { id: "finished", status: "completed", items: [] },
@@ -462,7 +514,7 @@ test("status derives the active turn from authoritative history instead of cache
 });
 
 test("status binds its native snapshot before a blocked goal read so a newer notification wins", async () => {
-  const { db, endpoint, registry, runtime, service } = await fixture();
+  const { endpoint, native, nativeGeneration, service } = await fixture();
   endpoint.status = "active";
   endpoint.threadTurns = [{ id: "old-turn", status: "inProgress", items: [] }];
   let releaseGoal!: () => void;
@@ -470,35 +522,24 @@ test("status binds its native snapshot before a blocked goal read so a newer not
   let goalRequested!: () => void;
   const waitingForGoal = new Promise<void>((resolve) => { goalRequested = resolve; });
   endpoint.onGoalRequest = goalRequested;
-  const dashboardStore = new SessionDashboardStore(db);
-  const processor = new SessionObservationProcessor(dashboardStore, registry, runtime, {
-    now: () => 1_000,
-    readThread: async () => ({ turns: endpoint.threadTurns ?? [] }),
-    readGoal: async () => ({ goal: null }),
-    onChanged: () => undefined,
-    onError: (error) => { throw error; },
-  });
   let nativeObserved = false;
 
   const status = service.status("payments", {
     observeNative: ({ nativeStatus, activeTurnId }) => {
       nativeObserved = true;
-      const statusSequence = dashboardStore.allocateObservationSequence();
-      runtime.reconcileNativeState("local", "thread", mappingId, nativeStatus, activeTurnId ?? undefined, statusSequence);
     },
   });
   await waitingForGoal;
-  processor.accept("local", "turn/started", { threadId: "thread", turn: { id: "new-turn", startedAt: 2 } });
-  await processor.idle();
+  native.observe("local", nativeGeneration, "turn/started", { threadId: "thread", turn: { id: "new-turn", startedAt: 2 } });
   releaseGoal();
   await status;
 
   assert.equal(nativeObserved, true);
-  assert.equal(runtime.activeTurn("local", "thread", mappingId), "new-turn");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread", mappingId })?.activeTurnId, "new-turn");
 });
 
 test("status orders a notification received during thread read before the response snapshot", async () => {
-  const { db, endpoint, registry, runtime, service } = await fixture();
+  const { endpoint, native, nativeGeneration, service } = await fixture();
   endpoint.status = "active";
   endpoint.threadTurns = [{ id: "response-turn", status: "inProgress", items: [] }];
   let releaseRead!: () => void;
@@ -506,60 +547,46 @@ test("status orders a notification received during thread read before the respon
   let readRequested!: () => void;
   const waitingForRead = new Promise<void>((resolve) => { readRequested = resolve; });
   endpoint.onThreadReadRequest = readRequested;
-  const dashboardStore = new SessionDashboardStore(db);
-  const processor = new SessionObservationProcessor(dashboardStore, registry, runtime, {
-    now: () => 1_000,
-    readThread: async () => ({ turns: endpoint.threadTurns ?? [] }),
-    readGoal: async () => ({ goal: null }),
-    onChanged: () => undefined,
-    onError: (error) => { throw error; },
-  });
-
-  const status = service.status("payments", {
-    observeNative: ({ nativeStatus, activeTurnId }) => {
-      const statusSequence = dashboardStore.allocateObservationSequence();
-      runtime.reconcileNativeState("local", "thread", mappingId, nativeStatus, activeTurnId ?? undefined, statusSequence);
-    },
-  });
+  const status = service.status("payments");
   await waitingForRead;
-  processor.accept("local", "thread/status/changed", { threadId: "thread", status: { type: "idle" } });
-  await processor.idle();
-  assert.equal(runtime.getSession("local", "thread", mappingId)?.nativeStatus, "idle");
+  native.observe("local", nativeGeneration, "thread/status/changed", { threadId: "thread", status: { type: "idle" } });
+  assert.equal(native.view({ endpointId: "local", threadId: "thread", mappingId })?.status, "idle");
   releaseRead();
-  await status;
+  const result = await status as any;
 
-  assert.equal(runtime.getSession("local", "thread", mappingId)?.nativeStatus, "active");
-  assert.equal(runtime.activeTurn("local", "thread", mappingId), "response-turn");
+  assert.equal(result.nativeStatus, "idle");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread", mappingId })?.status, "idle");
+  assert.equal(native.view({ endpointId: "local", threadId: "thread", mappingId })?.activeTurnId, null);
 });
 
 test("a failed start retains pending settings and steer never consumes them", async () => {
-  const { endpoint, runtime, service } = await fixture();
-  runtime.setModel("local", "thread", mappingId, "gpt-5");
+  const { endpoint, controls, observeNative, service } = await fixture();
+  controls.setModel("local", "thread", mappingId, "gpt-5");
   endpoint.failNextStart = true;
   await assert.rejects(service.send("payments", "first", { mode: "start" }), /start failed/);
-  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "gpt-5" });
-  runtime.setActiveTurn("local", "thread", mappingId, "active-1");
+  assert.deepEqual(controls.settings("local", "thread", mappingId), { model: "gpt-5" });
+  observeNative("active", "active-1");
   const steered = await service.send("payments", "more", { mode: "steer", settings: { model: "ignored" } });
   assert.equal("appliedSettings" in steered, false);
-  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "gpt-5" });
+  assert.deepEqual(controls.settings("local", "thread", mappingId), { model: "gpt-5" });
 });
 
 test("uses the exact supplied settings snapshot and leaves a concurrent replacement pending", async () => {
-  const { endpoint, runtime, service } = await fixture();
-  runtime.setModel("local", "thread", mappingId, "old-model");
-  const dispatched = runtime.settings("local", "thread", mappingId);
-  runtime.setModel("local", "thread", mappingId, "next-model");
+  const { endpoint, controls, service } = await fixture();
+  controls.setModel("local", "thread", mappingId, "old-model");
+  const dispatched = controls.settings("local", "thread", mappingId);
+  controls.setModel("local", "thread", mappingId, "next-model");
   const result = await service.send("payments", "work", { mode: "start", settings: dispatched });
   assert.equal(endpoint.calls.find((call) => call.method === "turn/start")?.params.model, "old-model");
   assert.deepEqual(result.appliedSettings, { model: "old-model" });
-  assert.deepEqual(runtime.settings("local", "thread", mappingId), { model: "next-model" });
+  assert.deepEqual(controls.settings("local", "thread", mappingId), { model: "next-model" });
 });
 
 test("a turn already terminal when turn/start resolves is not recorded as active", async () => {
-  const { endpoint, runtime, service } = await fixture();
+  const { endpoint, native, service } = await fixture();
   endpoint.historyTurnStatus = "completed";
   await service.send("payments", "fast", { clientUserMessageId: "fast-message" });
-  assert.equal(runtime.activeTurn("local", "thread", mappingId), undefined);
+  assert.equal(native.view({ endpointId: "local", threadId: "thread", mappingId })?.activeTurnId, null);
 });
 
 test("collect returns assistant bodies or creates chronological direct deliveries", async () => {
@@ -706,22 +733,22 @@ test("consumeSettingsIfNative clears pending settings for a native (Codex) endpo
   // This is the single shared guard behind BOTH the live send AND the crashed-send recovery
   // path in production-app — the site the parity plan flagged as the blocking regression.
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const controls = new SessionControlStore(db);
+  const native = new NativeSessionState();
   for (const endpoint of ["codex-ep", "claude-local"]) {
-    runtime.setSession(endpoint, "thread", "m", "managed", "idle");
-    runtime.setModel(endpoint, "thread", "m", "some-model");
-    runtime.setEffort(endpoint, "thread", "m", "high");
+    controls.setModel(endpoint, "thread", "m", "some-model");
+    controls.setEffort(endpoint, "thread", "m", "high");
   }
   const service = new SessionService(
-    undefined as never, undefined as never, runtime, undefined as never, undefined as never,
+    undefined as never, undefined as never, native, controls, undefined as never, undefined as never,
     undefined as never, undefined as never, undefined, undefined,
-    (id) => id !== "claude-local", // Codex persists natively; Claude does not
+    (id: string) => id !== "claude-local", // Codex persists natively; Claude does not
   );
 
   service.consumeSettingsIfNative("codex-ep", "thread", "m", { model: "some-model", effort: "high" });
-  assert.deepEqual(runtime.settings("codex-ep", "thread", "m"), {}, "Codex pending settings consumed");
+  assert.deepEqual(controls.settings("codex-ep", "thread", "m"), {}, "Codex pending settings consumed");
 
   service.consumeSettingsIfNative("claude-local", "thread", "m", { model: "some-model", effort: "high" });
-  assert.deepEqual(runtime.settings("claude-local", "thread", "m"), { model: "some-model", effort: "high" },
+  assert.deepEqual(controls.settings("claude-local", "thread", "m"), { model: "some-model", effort: "high" },
     "Claude settings stay sticky (never consumed) so they re-apply every turn / survive recovery");
 });

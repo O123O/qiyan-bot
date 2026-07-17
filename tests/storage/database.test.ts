@@ -11,7 +11,6 @@ import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
-import { RuntimeStore } from "../../src/storage/runtime-store.ts";
 
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {
@@ -303,7 +302,7 @@ test("operation recovery protocol migration marks old rows legacy and new rows c
   db.close();
 });
 
-test("goal ownership migration distinguishes legacy mappings from newly created mappings", () => {
+test("goal ownership migration marks legacy mappings as not yet observed", () => {
   const knownMigrationIndex = migrations.findIndex((migration) =>
     typeof migration === "function" && migration.toString().includes("goal_control_known"));
   assert.ok(knownMigrationIndex > 0);
@@ -321,9 +320,6 @@ test("goal ownership migration distinguishes legacy mappings from newly created 
 
   assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
     WHERE mapping_id = 'legacy-mapping'`).get()!.goal_control_known, 0);
-  new RuntimeStore(db).setSession("local", "new-thread", "new-mapping", "managed", "idle");
-  assert.equal(db.prepare(`SELECT goal_control_known FROM session_runtime
-    WHERE mapping_id = 'new-mapping'`).get()!.goal_control_known, 1);
   db.close();
 });
 

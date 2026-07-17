@@ -29,11 +29,21 @@ function pagedHistory<T>(method: string, params: any, thread: {
   turns: Array<{ id: string; status: string; itemsView?: "full" | "summary" | "notLoaded"; items?: any[] }>;
 }): T {
   if (method === "thread/read") return { thread: { status: thread.status } } as T;
-  if (method === "thread/turns/list") return {
-    data: [...thread.turns].reverse().map((turn) => ({ ...turn, itemsView: params.itemsView ?? turn.itemsView ?? "summary", items: params.itemsView === "notLoaded" ? [] : turn.items ?? [] })),
-    nextCursor: null,
-    backwardsCursor: thread.turns.length > 0 ? "back" : null,
-  } as T;
+  if (method === "thread/turns/list") {
+    const ordered = params.sortDirection === "asc" ? [...thread.turns] : [...thread.turns].reverse();
+    const offset = params.cursor === undefined ? 0 : Number(params.cursor);
+    const limit = Number(params.limit);
+    const data = ordered.slice(offset, offset + limit).map((turn) => ({
+      ...turn,
+      itemsView: params.itemsView ?? turn.itemsView ?? "summary",
+      items: params.itemsView === "notLoaded" ? [] : turn.items ?? [],
+    }));
+    return {
+      data,
+      nextCursor: offset + data.length < ordered.length ? String(offset + data.length) : null,
+      backwardsCursor: offset > 0 ? String(Math.max(0, offset - limit)) : null,
+    } as T;
+  }
   if (method === "thread/items/list") {
     const turn = thread.turns.find((candidate) => candidate.id === params.turnId);
     return { data: turn?.items ?? [], nextCursor: null, backwardsCursor: turn?.items?.length ? "back" : null } as T;
@@ -121,7 +131,7 @@ test("implicit starts send a correlation and retain capacity when a response is 
   assert.notEqual(sent?.clientUserMessageId, "");
   assert.equal(pool.activeTurnCount, 1);
   pool.markEndpointUnavailable("local", "connection-lost");
-  assert.equal(pool.activeTurnCount, 1);
+  assert.equal(pool.activeTurnCount, 0);
   pool.markEndpointUnavailable("local", "runtime-lost");
   assert.equal(pool.activeTurnCount, 0);
 });
@@ -307,7 +317,7 @@ test("an invalid active restore cannot reserve capacity", () => {
   assert.equal(pool.activeTurnCount, 0);
 });
 
-test("ambiguous starts and endpoint loss retain caller-owned provisional claims", async () => {
+test("endpoint loss releases caller-owned provisional claims", async () => {
   const endpoint: AppServerEndpoint = {
     id: "local", state: "ready",
     request: async <T>(method: string) => {
@@ -322,8 +332,7 @@ test("ambiguous starts and endpoint loss retain caller-owned provisional claims"
     (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
   );
   pool.markEndpointUnavailable("local");
-  assert.equal(pool.activeTurnCount, 1);
-  pool.releaseTurnCapacityClaim(claim);
+  assert.equal(pool.activeTurnCount, 0);
 });
 
 test("active thread state prevents empty full history from proving a lost start absent", async () => {
@@ -434,7 +443,7 @@ test("a replacement generation ignores stale endpoint callbacks", () => {
   assert.equal(current.generation, old.generation + 1);
 });
 
-test("connection loss retains and coalesces cold active and provisional claims", async () => {
+test("connection loss releases reconstructed claims until a new native snapshot reclaims them", async () => {
   let terminal = false;
   const endpoint: AppServerEndpoint = {
     id: "devbox", state: "ready",
@@ -448,9 +457,9 @@ test("connection loss retains and coalesces cold active and provisional claims",
   pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:op-a", "message-a", null);
   assert.equal(pool.activeTurnCount, 2);
   pool.markEndpointUnavailable("devbox", "connection-lost");
-  assert.equal(pool.activeTurnCount, 2);
+  assert.equal(pool.activeTurnCount, 0);
   await pool.reconcileEndpointClaims("devbox");
-  assert.equal(pool.activeTurnCount, 1);
+  assert.equal(pool.activeTurnCount, 0);
   terminal = true;
   await pool.reconcileEndpointClaims("devbox");
   assert.equal(pool.activeTurnCount, 0);
@@ -631,6 +640,29 @@ test("legacy restored provisional claims without a baseline remain unresolved", 
 
   assert.equal(itemReads, 0);
   assert.equal(pool.activeTurnCount, 1);
+});
+
+test("claim reconciliation reads one bounded turn page and preserves an uncovered baseline", async () => {
+  let turnPageReads = 0;
+  const turns = Array.from({ length: 129 }, (_, index) => ({
+    id: `turn-${index}`,
+    status: "completed",
+    items: [{ type: "userMessage", id: `user-${index}`, clientId: `other-${index}` }],
+  }));
+  const endpoint: AppServerEndpoint = {
+    id: "devbox", state: "ready",
+    request: async <T>(method: string, params: any) => {
+      if (method === "thread/turns/list") turnPageReads += 1;
+      return pagedHistory<T>(method, params, { status: "idle", turns });
+    },
+  };
+  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  pool.restoreProvisionalTurnCapacity("devbox", "thread-a", "recovered:bounded-page", "message-a", null);
+
+  await pool.reconcileEndpointClaims("devbox");
+
+  assert.equal(turnPageReads, 1);
+  assert.equal(pool.activeTurnCount, 1, "a partial page cannot prove a start absent from an empty-thread baseline");
 });
 
 test("a restored provisional claim cannot change its stable message correlation", () => {

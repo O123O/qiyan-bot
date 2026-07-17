@@ -32,11 +32,11 @@ The page reader enforces these invariants before exposing buffered results to a 
 
 ### Provider contract
 
-Pool and relay recovery are provider-neutral. Codex calls use App Server's native `thread/turns/list` and `thread/items/list` methods. `ClaudeCodeRuntime` deliberately reports those methods as unsupported because its runtime exposes only a reconstructed transcript. For Claude only, each operation-scoped `ThreadHistoryReader` lazily performs exactly one `thread/read { includeTurns: true }`, projects validated turn/item pages locally, and discards the snapshot when that recovery operation ends. This preserves the prior one-transcript-transfer-per-operation behavior without creating a global or long-lived message-flow cache. It is not bounded on the wire and remains the documented provider exception until Claude can project history remotely.
+Pool and relay recovery are provider-neutral. Codex calls use App Server's native `thread/turns/list` and `thread/items/list` methods. `ClaudeCodeRuntime` implements the same methods over positional transcript windows: 256 KiB for turn pages and 4 MiB for an exact turn. Its opaque cursor pins device, inode, and size, and remote windows cross SSH through a byte-capped response. The generic reader has no full-thread provider fallback.
 
 ### Managed worker recovery
 
-Recovery reads one latest `notLoaded` turn for the delivery baseline and ownership initialization, then resumes without turns. The durable runtime active-turn ID remains authoritative across connection loss; the latest native turn is a bounded fallback for ownership preparation. The exact pre-first-message pagination error is classified as an empty latest-turn result, so a managed thread that has never received a user message remains restorable.
+Recovery reads one latest `notLoaded` turn for the delivery baseline and ownership initialization, then resumes without turns. The current-generation native snapshot/notification is authoritative; a latest bounded turn page only resolves an ID-less active snapshot for ownership preparation. The exact pre-first-message pagination error is classified as an empty latest-turn result, so a managed thread that has never received a user message remains restorable.
 
 ### Capacity claims
 
@@ -52,7 +52,7 @@ Completed conversation-cutover state needs no assistant history. An unfinished o
 
 ### Automatic operation recovery
 
-Every automatic recovery/reconciliation call site is part of this migration, including startup operation replay and AppServerPool's uncertain start/interrupt reconciliation. Send recovery finds exact turn status and client correlation through metadata plus exact-turn items. Goal recovery uses the authoritative goal API plus metadata when it must authorize an active turn. Compact/model recovery pages exact `contextCompaction` items instead of scanning the whole thread. Interrupt recovery locates the exact/active turn through metadata pages. Attachment terminal checks, deferred assistant compaction, assistant status recovery, and active-turn authorization use the same bounded projections. No Codex reconnect, endpoint-ready callback, startup replay, retry timer, or operation reconciler may issue `thread/read { includeTurns: true }`; the operation-scoped Claude adapter above is the sole provider exception.
+Every automatic recovery/reconciliation call site is part of this migration, including startup operation replay and AppServerPool's uncertain start/interrupt reconciliation. Send recovery finds exact turn status and client correlation through metadata plus exact-turn items. Goal recovery uses the authoritative goal API plus metadata when it must authorize an active turn. Compact/model recovery pages exact `contextCompaction` items instead of scanning the whole thread. Interrupt recovery locates the exact/active turn through metadata pages. Attachment terminal checks, deferred assistant compaction, assistant status recovery, and active-turn authorization use the same bounded projections. No Codex reconnect, endpoint-ready callback, startup replay, retry timer, or operation reconciler may issue `thread/read { includeTurns: true }`; Claude is bounded by the same provider-neutral page contract.
 
 Legacy stores cannot expose `contextCompaction` through the summary fallback. If exact item pagination is unsupported, compact/model and deferred-compaction recovery remains explicitly unresolved without dispatching another compaction, consuming pending settings, completing notifications, or advancing operation state. That is a safe, visible uncertain operation rather than a duplicated mutation. Tests cover both supported proof and legacy no-side-effect behavior.
 
@@ -60,8 +60,8 @@ Interactive actions whose explicit purpose is to show/read native history may re
 
 ## Implementation plan
 
-1. Add failing contract tests for the shared page reader, exact empty-thread classification, Codex resume persistence, and Claude's operation-scoped adapter.
-2. Implement typed turn/item paging and cursor validation; add the one-snapshot-per-operation Claude projection fallback.
+1. Add failing contract tests for the shared page reader, exact empty-thread classification, Codex resume persistence, and Claude's bounded adapter.
+2. Implement typed turn/item paging and cursor validation, including positional Claude transcript windows.
 3. Replace recovery-time full reads in lifecycle, capacity reconciliation, terminal relay, assistant cutover/dispatcher, observations, durable operation replay, pool start/interrupt reconciliation, deferred actions, and attachment/status checks. Keep only audited explicit interactive full-history APIs unchanged.
 4. Run focused recovery tests, the full `npm run check`, and the same-reviewer code review. Re-run both after every accepted finding.
 5. Squash-merge the feature/notification chain to `main`, exclude the abandoned WebSocket-limit increase, delete the superseded task branches, push, deploy, and validate a long remote worker in place.
@@ -73,10 +73,10 @@ Tests must prove:
 - Resume responses contain no turns while the fake server's persisted history remains unchanged and later pagination still returns it.
 - Active-turn and goal ownership survive connection replacement.
 - Empty, never-materialized workers recover successfully.
-- Codex claims, relay endpoint wake, and assistant startup never issue `thread/read { includeTurns: true }` on recovery; Claude's operation-scoped projection is the explicit provider exception.
+- Codex claims, relay endpoint wake, assistant startup, and Claude recovery never issue an unbounded `thread/read { includeTurns: true }`.
 - Every automatic operation/start/interrupt/retry reconciliation path avoids full reads; an allowlisted source audit prevents new recovery-time full reads.
 - Cursor pages preserve baseline/delivery ordering and exact absence rules; malformed, repeated, and missing-anchor pages have no side effects.
-- Codex uses bounded native paging. Claude exposes the same reader contract through one operation-scoped transcript snapshot, with tests proving that it performs no more than one full read per reader. Exact-turn item paging preserves multiple final responses where supported, and the exact legacy-Codex-store fallback is tested to recover only the summary's last agent response without a full read.
+- Codex uses bounded native paging. Claude exposes the same reader contract through snapshot-pinned positional windows, with tests proving the runner never returns more than the requested bytes. Exact-turn item paging preserves multiple final responses where supported, and the exact legacy-Codex-store fallback is tested to recover only the summary's last agent response without a full read.
 - The 1 MiB WebSocket bound remains enforced.
 
 After deployment, record the existing worker rollout size and latest turn ID, restart QiYan, and verify the same latest turn remains pageable while the worker reconnects without a large frame or repeated endpoint outage.

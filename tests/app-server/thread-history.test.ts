@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
-import { ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
+import {
+  createHistoryScanBudget,
+  HistoryScanBudgetExhaustedError,
+  ThreadHistoryReader,
+} from "../../src/app-server/thread-history.ts";
 import { AppError } from "../../src/core/errors.ts";
 
 test("descending suffix buffers pages until its anchor is proven", async () => {
@@ -15,7 +19,7 @@ test("descending suffix buffers pages until its anchor is proven", async () => {
     return pages.get(String((params as any).cursor ?? ""));
   });
 
-  const suffix = await reader.descendingSuffix("thread", "t2");
+  const suffix = await reader.descendingSuffix("thread", "t2", createHistoryScanBudget());
 
   assert.equal(suffix.anchorFound, true);
   assert.equal(suffix.exhausted, true);
@@ -29,7 +33,7 @@ test("missing anchors and malformed pagination remain uncertain without exposing
     nextCursor: null,
     backwardsCursor: "back",
   }));
-  const suffix = await missing.descendingSuffix("thread", "absent");
+  const suffix = await missing.descendingSuffix("thread", "absent", createHistoryScanBudget());
   assert.equal(suffix.anchorFound, false);
   assert.deepEqual(suffix.turns, []);
 
@@ -39,7 +43,7 @@ test("missing anchors and malformed pagination remain uncertain without exposing
     backwardsCursor: "back",
   }));
   await assert.rejects(
-    repeated.descendingSuffix("thread"),
+    repeated.descendingSuffix("thread", undefined, createHistoryScanBudget()),
     (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
   );
 });
@@ -50,7 +54,7 @@ test("the exact pre-message turns-list error is an empty history, not a failed w
   });
 
   assert.deepEqual(await reader.latestTurn("empty"), undefined);
-  assert.deepEqual(await reader.descendingSuffix("empty"), { turns: [], anchorFound: true, exhausted: true });
+  assert.deepEqual(await reader.descendingSuffix("empty", undefined, createHistoryScanBudget()), { turns: [], anchorFound: true, exhausted: true });
 });
 
 test("exact item paging preserves multiple finals and scans past non-user leading items", async () => {
@@ -74,7 +78,7 @@ test("exact item paging preserves multiple finals and scans past non-user leadin
     };
   });
 
-  const items = await reader.exactTurnItems("thread", "turn");
+  const items = await reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget() });
   assert.equal(items.complete, true);
   assert.equal(items.firstUserMessage?.clientId, "client");
   assert.deepEqual(items.items.filter((item) => item.type === "agentMessage").map((item: any) => item.text), ["one", "two"]);
@@ -101,14 +105,14 @@ test("legacy item stores degrade only user/agent recovery to one summary turn", 
     };
   });
 
-  const items = await reader.exactTurnItems("thread", "turn", { allowLegacySummary: true });
+  const items = await reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget(), allowLegacySummary: true });
   assert.equal(items.complete, false);
   assert.equal(items.firstUserMessage?.clientId, "client");
   assert.deepEqual(items.items.map((item) => item.id), ["u", "a"]);
   assert.deepEqual(calls, ["thread/items/list", "thread/turns/list"]);
 
   await assert.rejects(
-    reader.exactTurnItems("thread", "turn"),
+    reader.exactTurnItems("thread", "turn", { budget: createHistoryScanBudget() }),
     (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
   );
 });
@@ -118,10 +122,22 @@ test("turn ordering distinguishes older targets from missing history", async () 
     id, status: "completed", itemsView: "notLoaded", items: [],
   }));
   const reader = new ThreadHistoryReader(async () => ({ data: turns, nextCursor: null, backwardsCursor: null }));
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "new", "anchor"), "newer");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "anchor", "anchor"), "anchor");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "old", "anchor"), "older");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "absent", "anchor"), "missing");
+  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "new", "anchor", createHistoryScanBudget()), "newer");
+  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "anchor", "anchor", createHistoryScanBudget()), "anchor");
+  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "old", "anchor", createHistoryScanBudget()), "older");
+  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "absent", "anchor", createHistoryScanBudget()), "missing");
+});
+
+test("multi-page scans terminate with an explicit budget-exhausted outcome", async () => {
+  const reader = new ThreadHistoryReader(async (_method, params) => ({
+    data: [{ id: String((params as any).cursor ?? "first"), status: "completed", itemsView: "notLoaded", items: [] }],
+    nextCursor: (params as any).cursor ? "third" : "second",
+    backwardsCursor: null,
+  }));
+  await assert.rejects(
+    reader.descendingSuffix("thread", "absent", createHistoryScanBudget({ maxPages: 1 })),
+    (error: unknown) => error instanceof HistoryScanBudgetExhaustedError,
+  );
 });
 
 test("single pages reject duplicate rows, empty continuations, and non-advancing cursors", async () => {
@@ -147,16 +163,15 @@ test("single pages reject duplicate rows, empty continuations, and non-advancing
   }));
 });
 
-test("invalid Claude fallback cursors fail before the operation-scoped full history read", async () => {
-  let fullReads = 0;
+test("unsupported provider paging fails closed without falling back to a full thread read", async () => {
+  const calls: string[] = [];
   const reader = new ThreadHistoryReader(async (method) => {
-    if (method === "thread/turns/list") throw new AppError("UNSUPPORTED_CAPABILITY", "Claude paging is projected by the reader");
-    if (method === "thread/read") fullReads += 1;
-    return { thread: { turns: [] } };
+    calls.push(method);
+    throw new AppError("UNSUPPORTED_CAPABILITY", "provider paging is unavailable");
   });
 
   await assert.rejects(reader.turnsPage("thread", {
     cursor: "not+a+base64url+cursor", limit: 1, sortDirection: "desc", itemsView: "notLoaded",
-  }), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
-  assert.equal(fullReads, 0);
+  }), (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY");
+  assert.deepEqual(calls, ["thread/turns/list"]);
 });

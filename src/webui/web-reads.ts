@@ -1,11 +1,14 @@
 import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { SessionDashboardDocument } from "../assistant/dashboard-schema.ts";
 import type { WorkerNativeHistoryPage } from "./worker-history-reader.ts";
+import type { NativeSessionView } from "../sessions/native-session-state.ts";
 
 export interface WebReadsDeps {
   registrySnapshot(): RegistryDocument;
   dashboardSnapshot(): SessionDashboardDocument;
   assistantSession(): WebSessionSummary;
+  nativeSession(endpointId: string, threadId: string, mappingId: string): NativeSessionView | undefined;
+  onSessionsChanged?(listener: () => void): () => void;
   // Raw native turns for the active Web UI subscription. Production must acquire an already-ready
   // endpoint lease and pass the AbortSignal through; mapping happens only after identity revalidation.
   readWorkerTurns(endpointId: string, threadId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
@@ -70,6 +73,7 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
   const dashboard = deps.dashboardSnapshot();
   return Object.entries(registry.sessions).map(([nickname, session]) => {
     const info = dashboard.sessions[nickname]?.auto_session_info;
+    const native = deps.nativeSession(session.endpoint, session.thread_id, session.mapping_id);
     const goal = info?.goal ?? null;
     return {
       nickname,
@@ -78,8 +82,8 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       provider: deps.provider(session.endpoint),
       projectDir: session.project_dir,
       lifecycleState: session.lifecycle_state,
-      nativeStatus: info?.native_status ?? null,
-      activeTurnId: info?.active_turn_id ?? null,
+      nativeStatus: native?.availability === "ready" ? native.status : null,
+      activeTurnId: native?.availability === "ready" ? native.activeTurnId : null,
       model: info?.model.current ?? null,
       effort: info?.reasoning_effort.current ?? null,
       host: deps.host(session.endpoint),
@@ -97,7 +101,8 @@ export function sessionSnapshot(deps: WebReadsDeps): { sessions: WebSessionSumma
 // so `hasOlder` and the client's `before` cursor stay consistent; the client hides blank bodies.
 export function assistantTranscript(deps: WebReadsDeps, limit: number, before?: number): WebPage<WebConvoMessage> {
   const clamped = Math.max(1, Math.min(50, limit));
-  const raw = deps.listOwnerConversation(before, clamped);
+  const raw = deps.listOwnerConversation(before, clamped)
+    .filter((message) => message.deliveryKind !== "queue_notice");
   // Delivery kind is the authority for authorship; prefix parsing alone would mislabel a QiYan reply
   // that happens to start with "[worker]". Keep presentation after unadopt, but route files only while
   // the nickname still resolves to a managed session.

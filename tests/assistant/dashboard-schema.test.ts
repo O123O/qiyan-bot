@@ -6,16 +6,13 @@ import {
   normalizeTokenUsage,
 } from "../../src/assistant/dashboard-schema.ts";
 
-test("parses a complete strict version-2 dashboard", () => {
+test("parses a complete strict facts-only version-3 dashboard", () => {
   const document = {
-    version: 2,
+    version: 3,
     sessions: {
       payments: {
         identity: { thread_id: "thread-1", endpoint: "local", project_dir: "/projects/payments" },
         auto_session_info: {
-          management_state: "managed",
-          native_status: "idle",
-          active_turn_id: null,
           last_sent: { text: "run tests", mode: "start", attachment_ids: ["a1"], turn_id: "turn-1", at: "2026-07-01T00:00:00.000Z" },
           last_worker_event: { message_id: "msg-1", turn_id: "turn-1", status: "completed", at: "2026-07-01T00:01:00.000Z" },
           model: { current: "gpt-5", pending: null },
@@ -38,10 +35,10 @@ test("parses a complete strict version-2 dashboard", () => {
   assert.deepEqual(SessionDashboardDocumentSchema.parse(document), document);
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, extra: true }));
   assert.throws(() => SessionDashboardDocumentSchema.parse({ ...document, sessions: { payments: { ...document.sessions.payments, extra: true } } }));
-  for (const state of ["adopting", "unadopting", "archiving", "detached", "attaching", "archived"]) {
+  for (const forbidden of ["management_state", "native_status", "active_turn_id"]) {
     assert.throws(() => SessionDashboardDocumentSchema.parse({
       ...document,
-      sessions: { payments: { ...document.sessions.payments, auto_session_info: { ...document.sessions.payments.auto_session_info, management_state: state } } },
+      sessions: { payments: { ...document.sessions.payments, auto_session_info: { ...document.sessions.payments.auto_session_info, [forbidden]: null } } },
     }));
   }
 });

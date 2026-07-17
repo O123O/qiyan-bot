@@ -4,7 +4,7 @@ import type { WebSocket } from "ws";
 import type { WorkerChatEvent } from "./worker-stream.ts";
 
 export type WebEvent =
-  | { type: "message"; body: string; at: number }
+  | { type: "message"; id?: string; body: string; at: number; kind?: string; worker?: string; origin?: string }
   | { type: "sessions"; sessions: unknown[]; assistant: unknown; at: number };
 
 export interface WorkerSubscriptionTarget {

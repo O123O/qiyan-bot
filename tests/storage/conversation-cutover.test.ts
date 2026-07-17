@@ -97,9 +97,11 @@ test("finalization reconciles one active attempt from full history", async () =>
     threadId: "assistant",
     turns: [{ id: "turn-1", status: "inProgress", itemsView: "full", items: [{ type: "userMessage", clientId: "chat-pending" }] }],
   });
-  const lease = db.prepare("SELECT phase, attempt_id, turn_id, conversation_key, trigger_kind FROM assistant_turn_lease").get()!;
-  assert.deepEqual({ ...lease }, { phase: "active", attempt_id: "attempt-active", turn_id: "turn-1", conversation_key: "telegram:42", trigger_kind: "chat" });
-  assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources").get()!.state, "submitted");
+  const attempt = db.prepare("SELECT id, turn_id, conversation_key, trigger_kind, accepting_tools FROM assistant_attempts WHERE id = 'attempt-active'").get()!;
+  assert.deepEqual({ ...attempt }, { id: "attempt-active", turn_id: "turn-1", conversation_key: "telegram:42", trigger_kind: "user", accepting_tools: 1 });
+  assert.deepEqual({ ...db.prepare("SELECT state, client_user_message_id FROM assistant_attempt_sources").get()! }, {
+    state: "submitted", client_user_message_id: "qiyan:attempt-active:1",
+  });
   assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "complete");
   assert.equal(db.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 3);
   db.close();
@@ -115,7 +117,7 @@ test("client-correlated cutover history cannot replace a provisional attempt ide
     turns: [{ id: "rollout-1874", status: "completed", itemsView: "full", items: [{ type: "userMessage", clientId: "chat-pending" }] }],
   }), /exact|authoritative|identity/iu);
   assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = 'attempt-active'").get()!.turn_id, "pending:attempt-active");
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM assistant_turn_lease").get()!.count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM assistant_attempt_sources").get()!.count, 0);
   assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "routing_backfilled");
   db.close();
 });
@@ -130,7 +132,7 @@ test("metadata-only history finalizes an exact active legacy attempt", async () 
     turns: [{ id: "turn-1", status: "inProgress", itemsView: "notLoaded", items: [] }],
   });
   assert.equal(db.prepare("SELECT phase FROM conversation_cutover WHERE singleton = 1").get()!.phase, "complete");
-  assert.equal(db.prepare("SELECT phase FROM assistant_turn_lease WHERE singleton = 1").get()!.phase, "active");
+  assert.equal(db.prepare("SELECT accepting_tools FROM assistant_attempts WHERE id = 'attempt-active'").get()!.accepting_tools, 1);
   assert.equal(db.prepare("SELECT state_version FROM qiyan_state WHERE product = 'qiyan-bot'").get()!.state_version, 3);
   db.close();
 });

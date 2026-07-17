@@ -3,9 +3,10 @@
 // `claude -p` directly; a future ssh runner will run `ssh <host> claude -p` over the
 // existing ControlMaster (1.4). The runtime above depends only on this interface.
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { AppError } from "../core/errors.ts";
 
 // Stable per-session launch flags. They sit in the cached prompt prefix, so the
 // runtime MUST pass byte-identical values every turn of a session (design §5).
@@ -44,10 +45,29 @@ export interface ClaudeTurnHandle {
   interrupt(): void;
 }
 
+export interface ClaudeTranscriptSnapshot {
+  device: string;
+  inode: string;
+  size: number;
+}
+
+export interface ClaudeTranscriptChunk {
+  snapshot: ClaudeTranscriptSnapshot;
+  offset: number;
+  bytes: Uint8Array;
+}
+
+export interface ClaudeTranscriptChunkRequest {
+  offset: number | "tail";
+  length: number;
+  expected?: ClaudeTranscriptSnapshot;
+}
+
 export interface ClaudeCommandRunner {
   startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle;
-  // Returns the parsed transcript records for a session, or [] if none exists yet.
-  readTranscript(threadId: string, cwd: string): Promise<unknown[]>;
+  // Reads at most `length` transcript bytes from the worker host. Snapshot pinning makes
+  // pagination fail closed if the JSONL is replaced, truncated, or appended between pages.
+  readTranscriptChunk(threadId: string, cwd: string, request: ClaudeTranscriptChunkRequest): Promise<ClaudeTranscriptChunk | undefined>;
   // The transcript file path (used as the ownership "rollout path"), or undefined
   // before the session is materialized.
   transcriptPath(threadId: string, cwd: string): Promise<string | undefined>;
@@ -134,20 +154,42 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
     return { done, interrupt: () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } } };
   }
 
-  async readTranscript(threadId: string, cwd: string): Promise<unknown[]> {
-    const path = await this.transcriptPath(threadId, cwd);
-    if (!path) return [];
-    let text: string;
-    try { text = await readFile(path, "utf8"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
-    const records: unknown[] = [];
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try { records.push(JSON.parse(trimmed)); }
-      catch { /* a partial trailing line written concurrently — skip it */ }
+  async readTranscriptChunk(
+    threadId: string,
+    cwd: string,
+    request: ClaudeTranscriptChunkRequest,
+  ): Promise<ClaudeTranscriptChunk | undefined> {
+    if (!Number.isSafeInteger(request.length) || request.length <= 0) {
+      throw new AppError("CONFIGURATION_ERROR", "invalid Claude transcript chunk length");
     }
-    return records;
+    const path = await this.transcriptPath(threadId, cwd);
+    if (!path) return undefined;
+    let handle;
+    try { handle = await open(path, "r"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.pathCache.delete(threadId);
+        return undefined;
+      }
+      throw error;
+    }
+    try {
+      const before = transcriptSnapshot(await handle.stat());
+      requireExpectedSnapshot(before, request.expected);
+      const offset = request.offset === "tail"
+        ? Math.max(0, before.size - request.length)
+        : request.offset;
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > before.size) {
+        throw new AppError("OPERATION_UNCERTAIN", "Claude transcript cursor is outside the pinned snapshot");
+      }
+      const bytes = Buffer.alloc(Math.min(request.length, before.size - offset));
+      const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset);
+      const after = transcriptSnapshot(await handle.stat());
+      requireExpectedSnapshot(after, before);
+      return { snapshot: before, offset, bytes: bytes.subarray(0, bytesRead) };
+    } finally {
+      await handle.close();
+    }
   }
 
   // A session's transcript is `<home>/.claude/projects/<cwd-hash>/<threadId>.jsonl`.
@@ -194,7 +236,17 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
 async function readClaudeThreadMeta(id: string, path: string): Promise<ClaudeThreadMeta | undefined> {
   let text: string;
   let updatedAt: number;
-  try { text = await readFile(path, "utf8"); updatedAt = (await stat(path)).mtimeMs; }
+  try {
+    const handle = await open(path, "r");
+    try {
+      const bytes = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+      text = bytes.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    updatedAt = (await stat(path)).mtimeMs;
+  }
   catch { return undefined; }
   const records: unknown[] = [];
   let cwd: string | undefined;
@@ -214,4 +266,15 @@ async function readClaudeThreadMeta(id: string, path: string): Promise<ClaudeThr
   }
   if (cwd === undefined) return undefined;
   return { id, cwd, updatedAt, preview: claudePreviewFromRecords(records) };
+}
+
+function transcriptSnapshot(value: { dev: number | bigint; ino: number | bigint; size: number }): ClaudeTranscriptSnapshot {
+  return { device: String(value.dev), inode: String(value.ino), size: value.size };
+}
+
+function requireExpectedSnapshot(actual: ClaudeTranscriptSnapshot, expected: ClaudeTranscriptSnapshot | undefined): void {
+  if (!expected) return;
+  if (actual.device !== expected.device || actual.inode !== expected.inode || actual.size !== expected.size) {
+    throw new AppError("OPERATION_UNCERTAIN", "Claude transcript changed during bounded history paging");
+  }
 }

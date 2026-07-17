@@ -9,6 +9,7 @@ import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
+import { mergeAssistantConversation } from "./assistant-chat-stream";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
 import {
@@ -54,6 +55,7 @@ const MENTION = "#qyfile:"; // a fragment scheme: react-markdown never strips it
 // route these through the preview too, or a bare path would navigate to the SPA fallback (chat page).
 const isLocalHref = (h: string) => h.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(h) && !h.startsWith("//") && !h.startsWith("#") && /[./]/.test(h);
 const ASSIST = " assistant"; // log key for the QiYan tab (selected === null)
+const ASSIST_STREAM = "assistant";
 const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
@@ -187,6 +189,7 @@ export function App() {
   const selectedMappingId = selectedSession?.mappingId ?? null;
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const sessionsRef = useRef(sessions); sessionsRef.current = sessions;
+  const assistantSessionRef = useRef(assistantSession); assistantSessionRef.current = assistantSession;
   const workerRef = useRef<WorkerStreamState | null>(workerChat); workerRef.current = workerChat;
   const workerDraftsRef = useRef<WorkerDraftCache>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
@@ -292,18 +295,21 @@ export function App() {
   const subscribeWorker = useCallback((socket: WebSocket | null, nickname: string | null) => {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const previous = workerRef.current;
-    const session = nickname ? sessionsRef.current.find((candidate) => candidate.nickname === nickname) : undefined;
+    const streamNickname = nickname ?? ASSIST_STREAM;
+    const session = nickname
+      ? sessionsRef.current.find((candidate) => candidate.nickname === nickname)
+      : assistantSessionRef.current ?? undefined;
     const mappingId = session?.mappingId ?? "";
-    const target = nickname ? { socket, nickname, mappingId } : null;
+    const target = session ? { socket, nickname: streamNickname, mappingId } : null;
     if (target && sameWorkerSubscriptionTarget(workerSubscriptionTargetRef.current, target)
-      && previous?.nickname === nickname && previous.mappingId === mappingId) return;
+      && previous?.nickname === streamNickname && previous.mappingId === mappingId) return;
     clearRecoveryRetries();
     workerHistoryAutoFillsRef.current.clear();
-    const sameWorker = previous?.nickname === nickname && previous.mappingId === mappingId;
+    const sameWorker = previous?.nickname === streamNickname && previous.mappingId === mappingId;
     if (previous && !sameWorker) {
       storeWorkerDraftMessages(workerDraftsRef.current, previous);
     }
-    if (!nickname) {
+    if (!session) {
       workerSubscriptionTargetRef.current = null;
       replaceWorker(null);
       socket.send(JSON.stringify({ type: "worker/unsubscribe", requestId: createBrowserUuid() }));
@@ -313,10 +319,10 @@ export function App() {
     const requestId = createBrowserUuid();
     const retained = sameWorker && previous
       ? retainWorkerDraftMessages(previous)
-      : takeWorkerDraftMessages(workerDraftsRef.current, nickname, mappingId);
-    const next = beginWorkerSubscription(nickname, session?.provider ?? "codex", requestId, retained, mappingId);
+      : takeWorkerDraftMessages(workerDraftsRef.current, streamNickname, mappingId);
+    const next = beginWorkerSubscription(streamNickname, session.provider ?? "codex", requestId, retained, mappingId);
     replaceWorker(next);
-    socket.send(JSON.stringify({ type: "worker/subscribe", nickname, requestId }));
+    socket.send(JSON.stringify({ type: "worker/subscribe", nickname: streamNickname, requestId }));
   }, [clearRecoveryRetries, replaceWorker]);
 
   useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
@@ -337,8 +343,13 @@ export function App() {
         setLive(false); if (!stop) setTimeout(connect, 2000);
       };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.type === "sessions") { setSessions(m.sessions); setAssistantSession(m.assistant); }
-        else if (m.type === "message") { push(ASSIST, { role: "assistant", body: m.body, at: m.at, ...(typeof m.worker === "string" ? { worker: m.worker } : {}), ...(typeof m.origin === "string" ? { origin: m.origin } : {}) }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
+        if (m.type === "sessions") {
+          sessionsRef.current = m.sessions;
+          assistantSessionRef.current = m.assistant;
+          setSessions(m.sessions); setAssistantSession(m.assistant);
+          subscribeWorker(ws, selectedRef.current);
+        }
+        else if (m.type === "message") { push(ASSIST, { ...(typeof m.id === "string" ? { id: m.id } : {}), role: "assistant", body: m.body, at: m.at, ...(typeof m.worker === "string" ? { worker: m.worker } : {}), ...(typeof m.origin === "string" ? { origin: m.origin } : {}) }); if (selectedRef.current === null && !stickRef.current) setVisible((v) => v + 1); }
         else if (m.type === "worker/subscribed") {
           const current = workerRef.current;
           if (!current || current.nickname !== m.nickname || current.requestId !== m.requestId || typeof m.subscriptionId !== "string") return;
@@ -387,8 +398,12 @@ export function App() {
   // The visible conversation: QiYan uses its durable owner history; the worker uses only the
   // foreground subscription's Codex snapshot/live reducer plus ephemeral exec/error cards.
   const shown: Msg[] = useMemo(() => {
-    const workerMessages: Msg[] = workerChat?.nickname === selected ? workerChat.messages : [];
-    const base = selected === null ? [...history, ...(log[ASSIST] ?? [])] : [...workerMessages, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b)
+    const streamNickname = selected ?? ASSIST_STREAM;
+    const workerMessages: Msg[] = workerChat?.nickname === streamNickname ? workerChat.messages : [];
+    const assistantLive = selected === null ? workerMessages.filter((message) => message.role !== "you") : [];
+    const base = selected === null
+      ? mergeAssistantConversation([...history, ...(log[ASSIST] ?? [])], assistantLive)
+      : [...workerMessages, ...(log[selected] ?? [])].sort((a, b) => when(a) - when(b)
       || (a.turnOrder ?? Number.MAX_SAFE_INTEGER) - (b.turnOrder ?? Number.MAX_SAFE_INTEGER)
       || (a.itemOrder ?? Number.MAX_SAFE_INTEGER) - (b.itemOrder ?? Number.MAX_SAFE_INTEGER));
     return base.filter((m) => m.body.trim());

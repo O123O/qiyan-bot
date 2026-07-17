@@ -1,8 +1,7 @@
 // Claude transcript → Codex `thread/read` reconstruction (Phase 1.2).
 //
 // The pool/relay address a Claude session through the Codex request surface and,
-// crucially, the relay does NOT trust the `turn/completed` notification body — after
-// a turn completes it re-reads authoritative history via `thread/read`
+// successful turn completion is hydrated through bounded authoritative transcript pages
 // (`events/relay.ts` projectTarget). So the source of truth for delivered content is
 // the transcript on disk, not the live stream: a COMPLETED turn is fully persisted
 // by the time `claude -p` exits (spike 0.2/interrupt finding — only interrupted
@@ -51,8 +50,7 @@ export interface ReconstructClaudeThreadParams {
   records: readonly unknown[];
   threadSource?: string;
   model?: string;
-  // Turn ids the runtime knows were interrupted (subprocess killed). An open turn
-  // not listed here is reported `inProgress`.
+  // Turn ids the runtime knows were interrupted (subprocess killed).
   interruptedTurnIds?: ReadonlySet<string>;
   // The turn whose `claude -p` subprocess is running right now (in-memory, authoritative).
   // A turn can be executing before `claude` flushes its user row, so disk reconstruction
@@ -68,12 +66,15 @@ interface TurnAccumulator {
 export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): ClaudeThreadView {
   const turns: ClaudeThreadTurn[] = [];
   let current: TurnAccumulator | undefined;
-  let itemSeq = 0;
+  let assistantRecordSeq = 0;
 
   const finalize = (accumulator: TurnAccumulator | undefined): void => {
     if (!accumulator) return;
     if (!accumulator.terminal) {
-      accumulator.turn.status = params.interruptedTurnIds?.has(accumulator.turn.id) ? "interrupted" : "inProgress";
+      // Claude is a headless child process, not a resumable daemon. Only the child
+      // owned by this runtime can make a turn live. A trailing transcript row after
+      // restart means the former process exited without a terminal record.
+      accumulator.turn.status = params.runningTurnId === accumulator.turn.id ? "inProgress" : "interrupted";
     }
     turns.push(accumulator.turn);
   };
@@ -84,31 +85,32 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     const type = record.type;
 
     if (type === "user") {
-      const promptSource = record.promptSource;
-      if (typeof promptSource !== "string" || promptSource.length === 0) continue; // tool_result: mid-turn
       const promptId = turnIdOf(record);
-      if (!promptId) continue;
+      const turnId = claudeTurnIdFromRecord(record);
+      if (!promptId || !turnId) continue; // tool_result or malformed user row
       finalize(current);
       const marker = extractClientMarker(record.message);
       // turn.id is the QiYan clientUserMessageId marker when owned (so it equals the
       // id `turn/start` returned and `turn/completed` pushes, letting the relay find
       // the turn), else the Claude promptId for external/human turns.
-      const turnId = marker ?? promptId;
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
         id: idOf(record) ?? `${promptId}:user`,
         clientId: marker ?? null,
       };
       current = { turn: { id: turnId, status: "completed", itemsView: "full", items: [userItem] }, terminal: false };
+      assistantRecordSeq = 0;
       continue;
     }
 
     if (type === "assistant" && current) {
       const terminal = isTurnEnd(record);
-      for (const block of textBlocks(record.message)) {
+      const recordId = idOf(record) ?? `${current.turn.id}:assistant:${assistantRecordSeq}`;
+      assistantRecordSeq += 1;
+      for (const [blockIndex, block] of textBlocks(record.message).entries()) {
         current.turn.items.push({
           type: "agentMessage",
-          id: `${idOf(record) ?? current.turn.id}:${itemSeq++}`,
+          id: `${recordId}:${blockIndex}`,
           text: block,
           phase: terminal ? "final_answer" : "commentary",
         });
@@ -148,6 +150,15 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     ...(params.threadSource === undefined ? {} : { threadSource: params.threadSource }),
     ...(params.model === undefined ? {} : { model: params.model }),
   };
+}
+
+export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) return undefined;
+  const promptId = turnIdOf(record);
+  if (!promptId) return undefined;
+  return extractClientMarker(record.message) ?? promptId;
 }
 
 function turnIdOf(record: Record<string, unknown>): string | undefined {

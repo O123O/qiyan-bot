@@ -196,7 +196,7 @@ test("all adapters share the real dispatcher while WeChat tools keep the initiat
   assert.equal(runner.steers.length, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM source_contexts WHERE adapter_id = 'weixin'").get()!.count, 2);
 
-  const lease = conversations.lease()!;
+  const lease = conversations.incompleteAttempts()[0]!;
   const binding = attemptBinding(db, lease.attemptId);
   const routeTokenId = (binding.destination as { routeTokenId?: string }).routeTokenId;
   assert.equal(typeof routeTokenId, "string");

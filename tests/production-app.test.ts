@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assistantEventIsActionable,
   createOperationReconciliationLoop,
   createAttachmentCleanupOwner,
   createManagedSessionRecoveryOwner,
@@ -61,9 +62,13 @@ import {
   commitAssistantTerminalFinals,
   resolveAssistantTerminalTurn,
   settleAssistantTerminalTools,
+  settleStartupCapacityBootstrap,
   startupProjectEndpointReferences,
+  throwAssistantNativeRecoveryFailure,
   runOperationRecoveryTarget,
   runOperationRecoveryChains,
+  routePendingAssistantEvents,
+  hydrateSelectedThreadTurns,
   stopRelayRecovery,
   stopRecoveryOwnerSet,
   wakeRestoredSessionOwners,
@@ -78,10 +83,72 @@ import { ChatAdapterRegistry } from "../src/chat-apps/shared/adapter-registry.ts
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
 import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
+import { HistoryScanBudgetExhaustedError } from "../src/app-server/thread-history.ts";
 import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
 import { SessionOwnershipWatcher } from "../src/sessions/ownership-watcher.ts";
+
+test("delivery receipts cannot schedule assistant turns", () => {
+  assert.equal(assistantEventIsActionable("delivery_status"), false);
+  assert.equal(assistantEventIsActionable("turn_terminal"), true);
+});
+
+test("legacy delivery receipts are coalesced without parsing or scheduling them", () => {
+  const db = createTestDatabase();
+  db.prepare(`INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at)
+    VALUES ('legacy-receipt', 'local', 'assistant', 'delivery_status', '{not-json', 'pending', 1)`).run();
+  const scheduled: unknown[] = [];
+
+  routePendingAssistantEvents(db, (event) => scheduled.push(event));
+
+  assert.deepEqual(scheduled, []);
+  assert.equal(db.prepare("SELECT state FROM events WHERE id = 'legacy-receipt'").get()!.state, "coalesced");
+});
+
+test("assistant recovery keeps bounded turn metadata when exact item hydration exceeds its budget", async () => {
+  const turn = { id: "large-terminal", status: "completed", itemsView: "notLoaded", items: [] };
+  const reader = {
+    exactTurnItems: async () => { throw new HistoryScanBudgetExhaustedError(); },
+  };
+
+  const recovered = await hydrateSelectedThreadTurns(
+    "assistant",
+    { status: "idle", turns: [turn] },
+    [turn.id],
+    reader,
+    { retainPartialOnBudgetExhaustion: true },
+  );
+
+  assert.deepEqual(recovered, { status: "idle", turns: [turn] });
+  await assert.rejects(
+    hydrateSelectedThreadTurns("assistant", { turns: [turn] }, [turn.id], reader),
+    HistoryScanBudgetExhaustedError,
+  );
+});
+
+test("startup capacity bootstrap settles every referenced endpoint before ingress can continue", async () => {
+  let releaseA!: () => void;
+  let releaseB!: () => void;
+  const a = new Promise<void>((resolve) => { releaseA = resolve; });
+  const b = new Promise<void>((resolve) => { releaseB = resolve; });
+  const failures: string[] = [];
+  let settled = false;
+  const bootstrap = settleStartupCapacityBootstrap(["a", "b"], async (endpointId) => {
+    await (endpointId === "a" ? a : b);
+    if (endpointId === "b") throw new Error("unavailable");
+  }, (endpointId) => { failures.push(endpointId); }).then((value) => {
+    settled = true;
+    return value;
+  });
+
+  releaseA();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releaseB();
+  assert.deepEqual([...await bootstrap].sort(), ["a", "b"]);
+  assert.deepEqual(failures, ["b"]);
+});
 
 test("only remote Codex recovery rejoins threads on the replacement connection", () => {
   assert.equal(managedRecoveryRequiresConnectionResume("codex", true), true);
@@ -108,52 +175,46 @@ test("assistant startup wiring always finalizes cutover but drains only an idle 
 
 test("assistant commentary from an active web turn is durably queued while terminal and final items stay excluded", () => {
   const prepared: unknown[] = [];
-  const lease = {
-    phase: "active" as const,
-    attemptId: "attempt",
-    primaryContextId: "context",
-    binding: { adapterId: "web", conversationKey: "web:owner", destination: { surface: "web" } },
-    clientUserMessageId: "client-message",
-    turnId: "turn-1",
-    triggerKind: "chat" as const,
-    capacityClaimId: "claim",
-    steerPaused: false,
-  };
+  const binding = { adapterId: "web", conversationKey: "web:owner", destination: { surface: "web" } };
   const deliveries = { prepare: (delivery: unknown) => { prepared.push(delivery); } };
 
   assert.equal(prepareAssistantWebCommentary(
-    { lease: () => lease },
+    { bindingForTurn: () => binding },
     deliveries,
     "assistant-thread",
+    (turnId) => turnId === "turn-1",
     "item/completed",
     { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-1", text: "Still working", phase: "commentary" } },
   ), true);
   assert.deepEqual(prepared, [{
     id: "assistant-commentary:turn-1:update-1",
     kind: "assistant_commentary",
-    binding: lease.binding,
+    binding,
     body: "Still working",
     mandatory: true,
   }]);
 
   assert.equal(prepareAssistantWebCommentary(
-    { lease: () => lease },
+    { bindingForTurn: () => binding },
     deliveries,
     "assistant-thread",
+    () => true,
     "item/completed",
     { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "final-1", text: "Done", phase: "final_answer" } },
   ), false);
   assert.equal(prepareAssistantWebCommentary(
-    { lease: () => ({ ...lease, binding: { ...lease.binding, adapterId: "slack" } }) },
+    { bindingForTurn: () => ({ ...binding, adapterId: "slack" }) },
     deliveries,
     "assistant-thread",
+    () => true,
     "item/completed",
     { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-2", text: "Still working", phase: "commentary" } },
   ), false);
   assert.equal(prepareAssistantWebCommentary(
-    { lease: () => ({ ...lease, phase: "terminalizing" }) },
+    { bindingForTurn: () => binding },
     deliveries,
     "assistant-thread",
+    () => false,
     "item/completed",
     { threadId: "assistant-thread", turnId: "turn-1", item: { type: "agentMessage", id: "update-3", text: "Stale update", phase: "commentary" } },
   ), false);
@@ -2538,7 +2599,7 @@ test("assistant terminal commit resolves from history and commits once", async (
   assert.equal(body, "answer");
 });
 
-test("only a full exact history turn can enrich a partial assistant completion", async () => {
+test("only authoritative history that retains observed items can enrich a partial assistant completion", async () => {
   const notification = { id: "turn", status: "completed", itemsView: "summary", items: [] };
   const full = {
     id: "turn",
@@ -2558,6 +2619,48 @@ test("only a full exact history turn can enrich a partial assistant completion",
     { id: "other", status: "completed", itemsView: "full", items: full.items },
   ]), notification);
   assert.equal(await resolveAssistantTerminalTurn(notification, async () => { throw new Error("history unavailable"); }), notification);
+});
+
+test("an authoritative legacy summary can supply a missing assistant final", async () => {
+  const notification = { id: "turn", status: "completed", itemsView: "notLoaded", items: [] };
+  const summary = {
+    id: "turn",
+    status: "completed",
+    itemsView: "summary",
+    items: [
+      { type: "userMessage", id: "user", clientId: "qiyan:attempt:1" },
+      { type: "agentMessage", id: "final", text: "answer", phase: "final_answer" },
+    ],
+  };
+
+  assert.equal(await resolveAssistantTerminalTurn(notification, async () => [summary]), summary);
+});
+
+test("a legacy summary merges its final with live tool evidence", async () => {
+  type Terminal = { id: string; status: string; itemsView: string; items: Array<Record<string, unknown>> };
+  const tool = { type: "mcpToolCall", id: "tool", status: "completed" };
+  const notification: Terminal = { id: "turn", status: "completed", itemsView: "notLoaded", items: [tool] };
+  const summary: Terminal = {
+    id: "turn",
+    status: "completed",
+    itemsView: "summary",
+    items: [
+      { type: "userMessage", id: "user", clientId: "qiyan:attempt:1" },
+      { type: "agentMessage", id: "final", text: "answer", phase: "final_answer" },
+    ],
+  };
+
+  const resolved = await resolveAssistantTerminalTurn(notification, async () => [summary]);
+  assert.deepEqual(resolved.items, [...summary.items, tool]);
+});
+
+test("assistant native recovery rethrows every captured failure and synthesizes only an absent one", () => {
+  const controlled = new AppError("OPERATION_UNCERTAIN", "controlled failure");
+  const transport = new Error("wire closed");
+  assert.throws(() => throwAssistantNativeRecoveryFailure(controlled), (error) => error === controlled);
+  assert.throws(() => throwAssistantNativeRecoveryFailure(transport), (error) => error === transport);
+  assert.throws(() => throwAssistantNativeRecoveryFailure(undefined), (error) =>
+    error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" && error.message === "assistant native recovery snapshot is unavailable");
 });
 
 test("assistant uncertainty is preserved even while the endpoint still reports ready", () => {

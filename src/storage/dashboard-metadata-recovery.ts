@@ -574,7 +574,6 @@ function nextSequence(db: Database): number {
     "SELECT COALESCE(MAX(current_settings_observation_sequence), 0) AS value FROM damaged.session_dashboard_facts",
     "SELECT COALESCE(MAX(token_observation_sequence), 0) AS value FROM damaged.session_dashboard_facts",
     "SELECT COALESCE(MAX(goal_observation_sequence), 0) AS value FROM damaged.session_dashboard_facts",
-    "SELECT COALESCE(MAX(native_observation_sequence), 0) AS value FROM damaged.session_runtime",
   ];
   let maximum = 0;
   for (const query of queries) {

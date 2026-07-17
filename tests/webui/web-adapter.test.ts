@@ -46,12 +46,29 @@ test("sendMessage includes authoritative delivery provenance in the live broadca
   bus.add(fakeSocket(events) as never);
   const dir = await mkdtemp(join(tmpdir(), "qiyan-out-"));
   const adapter = createWebAdapter(bus, { dir, maxBytes: 1024, ttlMs: 1e9 }, undefined,
-    (deliveryId) => deliveryId === "worker-1" ? { worker: "payments", origin: "payments" } : {});
+    (deliveryId) => deliveryId === "worker-1" ? { kind: "worker_final", worker: "payments", origin: "payments" } : {});
 
   await adapter.delivery.sendMessage({ surface: "web" }, "[payments] shipped", undefined, { deliveryId: "worker-1" });
   assert.equal(events.length, 1);
   assert.equal(events[0]?.type, "message");
+  assert.equal(events[0]?.id, "worker-1");
   assert.equal(events[0]?.body, "[payments] shipped");
   assert.equal(events[0]?.worker, "payments");
   assert.equal(events[0]?.origin, "payments");
+});
+
+test("sendMessage does not broadcast a Web queue acknowledgement", async () => {
+  const bus = new WebBus();
+  const events: Array<Record<string, unknown>> = [];
+  bus.add(fakeSocket(events) as never);
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-out-"));
+  const adapter = createWebAdapter(bus, { dir, maxBytes: 1024, ttlMs: 1e9 }, undefined,
+    () => ({ kind: "queue_notice" }));
+
+  const result = await adapter.delivery.sendMessage(
+    { surface: "web" }, "[system] queued", undefined, { deliveryId: "queued:web:1" },
+  );
+
+  assert.deepEqual(result, { delivered: true });
+  assert.deepEqual(events, []);
 });

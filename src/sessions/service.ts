@@ -3,7 +3,7 @@ import { AppError } from "../core/errors.ts";
 import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { ConversationBinding } from "../chat-apps/shared/binding.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { SessionControlStore } from "../storage/session-control-store.ts";
 import type { FinalMessageStore, LogicalFinalMessage } from "./final-messages.ts";
 import type { ProjectWorkspacePolicy } from "./project-workspace.ts";
 import type { ThreadGate } from "./thread-gate.ts";
@@ -12,6 +12,9 @@ import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
 import { isExactThreadItemsUnsupported } from "../app-server/thread-errors.ts";
+import type { NativeSessionIdentity, NativeSessionView } from "./native-session-state.ts";
+import { NativeSessionState } from "./native-session-state.ts";
+import { createHistoryScanBudget } from "../app-server/thread-history.ts";
 
 interface SessionOwnershipCheck {
   inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
@@ -22,7 +25,8 @@ export class SessionService {
   constructor(
     private readonly pool: AppServerPool,
     private readonly registry: SessionRegistry,
-    private readonly runtime: RuntimeStore,
+    private readonly native: NativeSessionState,
+    private readonly controls: SessionControlStore,
     private readonly finals: FinalMessageStore,
     private readonly deliveries: DeliveryStore,
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable"> | WorkspaceRouter,
@@ -31,7 +35,7 @@ export class SessionService {
     private readonly ownership?: SessionOwnershipCheck,
     // Does the endpoint's backend persist model/effort itself (Codex app-server), so a turn
     // CONSUMES the pending setting? For Claude there is no server: the setting must stay sticky
-    // in the RuntimeStore and re-apply every turn, so this returns false and consume is skipped.
+    // in SessionControlStore and re-apply every turn, so this returns false and consume is skipped.
     private readonly settingsPersistNatively: (endpointId: string) => boolean = () => true,
   ) {}
 
@@ -50,7 +54,14 @@ export class SessionService {
     }): void | Promise<void>;
   } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     return this.runVerifiedExecution(nickname, async (session, cwd, lease) => {
-      const activeTurn = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+      const current = await this.currentNative(session, lease);
+      if (current.status === "error") {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
+      }
+      const activeTurn = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
+      if (current.status === "active" && !activeTurn) {
+        throw new AppError("SESSION_BUSY", `${nickname} has an active turn whose identity is still being refreshed`);
+      }
       const mode = options.mode ?? "auto";
       if (activeTurn) {
         if (mode === "start") throw new AppError("SESSION_BUSY", `${nickname} already has an active turn`);
@@ -72,26 +83,35 @@ export class SessionService {
         } catch (error) {
           if (!options.clientUserMessageId) throw error;
           const items = await this.pool.historyReader(session.endpoint, lease).exactTurnItems(
-            session.thread_id, activeTurn, { allowLegacySummary: true },
+            session.thread_id, activeTurn, { budget: createHistoryScanBudget(), allowLegacySummary: true },
           );
           const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
           if (!proven) throw error;
           return { mode: "steer" as const, turnId: activeTurn };
         }
       }
-      const settings = options.settings ?? this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
+      const settings = options.settings ?? this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);
       this.assertExactManaged(nickname, session.mapping_id);
       const baselineTurnId = (await this.pool.historyReader(session.endpoint, lease).latestTurn(session.thread_id))?.id ?? null;
       await options.onBeforeNativeDispatch?.({ session, mode: "start", baselineTurnId, ...(lease ? { lease } : {}) });
       this.assertExactManaged(nickname, session.mapping_id);
       await this.assertOwned(nickname, session, lease);
       this.assertExactManaged(nickname, session.mapping_id);
+      const generation = this.endpointGeneration(session.endpoint, lease);
+      const startToken = this.native.captureStart(this.nativeIdentity(session), generation);
       const response = await this.pool.startTurn<{ turn: { id: string; status?: string } }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
       }, undefined, lease, baselineTurnId);
       this.consumeSettingsIfNative(session.endpoint, session.thread_id, session.mapping_id, settings);
       const terminal = new Set(["completed", "failed", "interrupted"]).has(response.turn.status ?? "");
-      if (!terminal) this.runtime.setActiveTurn(session.endpoint, session.thread_id, session.mapping_id, response.turn.id);
+      if (terminal) {
+        this.native.observe(session.endpoint, generation, "turn/completed", {
+          threadId: session.thread_id,
+          turn: response.turn,
+        });
+      } else if (this.native.applyStartResponse(startToken, response.turn.id) === "refresh-required") {
+        await this.refreshNative(session, lease);
+      }
       return { mode: "start" as const, turnId: response.turn.id, terminal, appliedSettings: settings };
     });
   }
@@ -104,14 +124,18 @@ export class SessionService {
     const expected = this.registeredControl(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactRegisteredControl(nickname, expected.mapping_id);
-      let active = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
-      const state = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-      if (state?.managementState === "unavailable" || (!active && options.recoverExactTurn && turnId)) {
-        const native = await this.readWithTurns(session.endpoint, session.thread_id, lease);
-        const target = turnId ? native.thread.turns.find((candidate: any) => candidate.id === turnId) : undefined;
+      let current = await this.currentNative(session, lease);
+      if (options.recoverExactTurn && current.status !== "active") current = await this.refreshNative(session, lease);
+      let active = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
+      if (current.status === "active" && !active) {
+        throw new AppError("SESSION_BUSY", `${nickname} has an active turn whose identity is still being refreshed`);
+      }
+      if (!active && options.recoverExactTurn && turnId) {
+        const target = await this.pool.historyReader(session.endpoint, lease).findTurn(
+          session.thread_id, turnId, createHistoryScanBudget(),
+        );
         if (target && isTerminalStatus(target.status) && options.recoverExactTurn) return turnId!;
         if (turnId && !target) throw new AppError("OPERATION_UNCERTAIN", `turn ${turnId} is not present in authoritative history`);
-        active = [...native.thread.turns].reverse().find((candidate: any) => !isTerminalStatus(candidate.status))?.id;
       }
       if (!active) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
       if (turnId && turnId !== active) throw new AppError("OPERATION_CONFLICT", `active turn is ${active}, not ${turnId}`);
@@ -119,7 +143,10 @@ export class SessionService {
       this.assertExactRegisteredControl(nickname, expected.mapping_id);
       options.onBeforeNativeDispatch?.(String(active));
       await this.pool.interrupt(session.endpoint, session.thread_id, active, lease);
-      this.runtime.reconcileNativeState(session.endpoint, session.thread_id, session.mapping_id, "idle");
+      this.native.observe(session.endpoint, this.endpointGeneration(session.endpoint, lease), "turn/completed", {
+        threadId: session.thread_id,
+        turn: { id: active, status: "interrupted" },
+      });
       return String(active);
     }), options.existingLease);
   }
@@ -168,13 +195,14 @@ export class SessionService {
     lease?: EndpointWorkLease,
   ): Promise<string[]> {
     const reader = this.pool.historyReader(endpointId, lease);
-    const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined);
+    const budget = createHistoryScanBudget();
+    const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined, budget);
     if (baselineTurnId && !suffix.anchorFound) {
       throw new AppError("OPERATION_UNCERTAIN", "compaction baseline turn is absent from authoritative history");
     }
     const ids: string[] = [];
     for (const turn of [...suffix.turns].reverse()) {
-      const exact = await reader.exactTurnItems(threadId, turn.id);
+      const exact = await reader.exactTurnItems(threadId, turn.id, { budget });
       ids.push(...exact.items.filter((item) => item.type === "contextCompaction").map((item) => item.id));
     }
     return ids;
@@ -208,7 +236,7 @@ export class SessionService {
 
   activeTurnId(nickname: string): string {
     const session = this.managed(nickname);
-    const turnId = this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id);
+    const turnId = this.native.view(this.nativeIdentity(session))?.activeTurnId ?? undefined;
     if (!turnId) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
     return turnId;
   }
@@ -250,22 +278,23 @@ export class SessionService {
     observeNative?(snapshot: { nativeStatus: string; activeTurnId: string | null }): void;
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
-    const native = await this.readWithTurns(session.endpoint, session.thread_id);
-    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-    const nativeStatus = native.thread.status?.type ?? "unknown";
-    const activeTurnId = nativeStatus === "active"
-      ? [...(native.thread.turns ?? [])].reverse().find((turn: any) => !isTerminalStatus(turn.status))?.id ?? null
-      : null;
+    const current = await this.refreshNative(session);
+    const nativeStatus = current.status;
+    const activeTurnId = current.activeTurnId;
     options.observeNative?.({ nativeStatus, activeTurnId });
     const goal = await this.getGoal(nickname);
     return {
       nickname,
       identity: { endpoint: session.endpoint, threadId: session.thread_id, projectDir: session.project_dir },
-      managementState: runtime?.managementState ?? "unavailable",
+      managementState: session.lifecycle_state,
       nativeStatus,
       activeTurnId,
       goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
     };
+  }
+
+  async refreshNativeState(nickname: string): Promise<void> {
+    await this.refreshNative(this.required(nickname));
   }
 
   async models(endpointId: string): Promise<unknown> { return { data: await this.listModels(endpointId), nextCursor: null }; }
@@ -283,19 +312,19 @@ export class SessionService {
   async setModelForIdentity(endpointId: string, threadId: string, mappingId: string, model: string): Promise<void> {
     const available = await this.listModels(endpointId);
     if (!available.some((candidate) => candidate.id === model || candidate.model === model)) throw new AppError("UNSUPPORTED_CAPABILITY", `unknown model for ${endpointId}: ${model}`);
-    this.runtime.setModel(endpointId, threadId, mappingId, model);
+    this.controls.setModel(endpointId, threadId, mappingId, model);
   }
 
   async setEffortForIdentity(endpointId: string, threadId: string, mappingId: string, effort: string): Promise<void> {
     const available = await this.listModels(endpointId);
-    const pendingModel = this.runtime.settings(endpointId, threadId, mappingId).model;
+    const pendingModel = this.controls.settings(endpointId, threadId, mappingId).model;
     const native = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false });
     const configuredModel = pendingModel ?? native.thread.model;
     const model = available.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
     if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
-    this.runtime.setEffort(endpointId, threadId, mappingId, effort);
+    this.controls.setEffort(endpointId, threadId, mappingId, effort);
   }
 
   // Consume the pending model/effort ONLY when the endpoint's backend persists them itself
@@ -303,7 +332,7 @@ export class SessionService {
   // value re-applies every turn. Shared by the live send AND the crashed-send recovery path
   // (production-app) so the two consume sites can never diverge on the provider guard.
   consumeSettingsIfNative(endpointId: string, threadId: string, mappingId: string, settings: { model?: string; effort?: string }): void {
-    if (this.settingsPersistNatively(endpointId)) this.runtime.consumeSettings(endpointId, threadId, mappingId, settings);
+    if (this.settingsPersistNatively(endpointId)) this.controls.consumeSettings(endpointId, threadId, mappingId, settings);
   }
 
   getGoal(nickname: string): Promise<unknown> {
@@ -382,12 +411,24 @@ export class SessionService {
       await this.assertOwned(nickname, session, lease);
       this.assertExactManaged(nickname, expected.mapping_id);
       const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
+      this.assertMutationNativeState(nickname, native.thread?.status);
       const project = await this.prepareExisting(session.endpoint, String(native.thread.cwd), lease);
       await this.assertDispatchable(session.endpoint, project, lease);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed thread cwd changed");
       this.assertExactManaged(nickname, expected.mapping_id);
       return mutate(session, project.path, lease);
     }));
+  }
+
+  private assertMutationNativeState(nickname: string, status: unknown): void {
+    const type = typeof status === "string"
+      ? status
+      : status && typeof status === "object" && !Array.isArray(status)
+        ? (status as { type?: unknown }).type
+        : undefined;
+    if (type === "error" || type === "systemError") {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
+    }
   }
 
   private withMutationLease<T>(endpointId: string, run: (lease?: EndpointWorkLease) => Promise<T>, existingLease?: EndpointWorkLease): Promise<T> {
@@ -407,12 +448,10 @@ export class SessionService {
   }
 
   private async authorizeActiveTurnForSession(session: RegistrySession, lease?: EndpointWorkLease): Promise<string | undefined> {
-    const native = await this.readWithTurns(session.endpoint, session.thread_id, lease);
-    if (native.thread.id !== session.thread_id || native.thread.status?.type !== "active") return undefined;
-    const turn = [...native.thread.turns].reverse().find((candidate: any) => !isTerminalStatus(candidate.status));
-    if (!turn) return undefined;
-    this.ownership?.authorizeTurn?.(session, turn.id);
-    return String(turn.id);
+    const current = await this.refreshNative(session, lease);
+    if (current.status !== "active" || !current.activeTurnId) return undefined;
+    this.ownership?.authorizeTurn?.(session, current.activeTurnId);
+    return current.activeTurnId;
   }
 
   private prepareExisting(endpointId: string, path: string, lease?: EndpointWorkLease) {
@@ -432,8 +471,6 @@ export class SessionService {
     if (!session || session.mapping_id !== mappingId || session.lifecycle_state !== "managed") {
       throw new AppError("SESSION_DETACHED", `${nickname} mapping changed or is not managed`);
     }
-    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-    if (runtime?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
 
@@ -441,11 +478,6 @@ export class SessionService {
     const session = this.registry.get(nickname);
     if (!session || session.mapping_id !== mappingId || session.lifecycle_state !== "managed") {
       throw new AppError("SESSION_DETACHED", `${nickname} mapping changed or is not managed`);
-    }
-    const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-    if (!runtime || (runtime.managementState !== "managed"
-      && !(runtime.managementState === "unavailable" && runtime.restoreState === "managed"))) {
-      throw new AppError("SESSION_DETACHED", `${nickname} is not available for managed control`);
     }
     return session;
   }
@@ -465,10 +497,8 @@ export class SessionService {
     const response = await this.pool.request<any>(
       endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
     );
-    const turns = await this.pool.historyReader(endpointId, lease).allTurns(threadId, {
-      sortDirection: "asc",
-      itemsView: "notLoaded",
-    });
+    const latest = await this.pool.historyReader(endpointId, lease).latestTurn(threadId);
+    const turns = latest ? [latest] : [];
     return { ...response, thread: { ...response.thread, turns } };
   }
 
@@ -480,13 +510,55 @@ export class SessionService {
 
   private managed(nickname: string) {
     const session = this.required(nickname);
-    if (session.lifecycle_state !== "managed" || this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id)?.managementState !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
+    if (session.lifecycle_state !== "managed") throw new AppError("SESSION_DETACHED", `${nickname} is not managed`);
     return session;
   }
 
   private registeredControl(nickname: string): RegistrySession {
     const session = this.required(nickname);
     return this.assertExactRegisteredControl(nickname, session.mapping_id);
+  }
+
+  private nativeIdentity(session: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">): NativeSessionIdentity {
+    return { endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id };
+  }
+
+  private endpointGeneration(endpointId: string, lease?: EndpointWorkLease): number {
+    return lease?.endpointGeneration ?? this.pool.endpointGeneration(endpointId).generation;
+  }
+
+  private async currentNative(session: RegistrySession, lease?: EndpointWorkLease): Promise<NativeSessionView> {
+    const generation = this.endpointGeneration(session.endpoint, lease);
+    const current = this.native.view(this.nativeIdentity(session));
+    if (current?.availability === "ready" && current.endpointGeneration === generation
+      && current.status !== "unknown" && (current.status !== "active" || current.activeTurnId !== null)) return current;
+    return this.refreshNative(session, lease);
+  }
+
+  private async refreshNative(session: RegistrySession, lease?: EndpointWorkLease): Promise<NativeSessionView> {
+    const identity = this.nativeIdentity(session);
+    const generation = this.endpointGeneration(session.endpoint, lease);
+    const existing = this.native.view(identity);
+    if (!existing || existing.endpointGeneration !== generation || existing.availability !== "ready") {
+      this.native.register(identity, generation);
+    }
+    const token = this.native.captureRefresh(identity, generation);
+    const response = await this.pool.request<any>(session.endpoint, "thread/read", {
+      threadId: session.thread_id,
+      includeTurns: false,
+    }, undefined, lease);
+    const status = response.thread?.status?.type ?? response.thread?.status ?? "unknown";
+    let activeTurnId: string | null = null;
+    if (status === "active") {
+      const latest = await this.pool.historyReader(session.endpoint, lease).latestTurn(session.thread_id);
+      if (latest && !isTerminalStatus(latest.status)) activeTurnId = latest.id;
+    }
+    this.native.applyRefresh(token, { status, activeTurnId });
+    const current = this.native.view(identity);
+    if (!current || current.endpointGeneration !== generation || current.availability !== "ready") {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `native session generation changed: ${session.endpoint}/${session.thread_id}`);
+    }
+    return current;
   }
 }
 

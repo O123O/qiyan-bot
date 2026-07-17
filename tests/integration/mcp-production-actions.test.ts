@@ -216,8 +216,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
   const coverage = new Set<AssistantToolName>();
   const endpointCoverage = new Map<AssistantToolName, Set<string>>();
   const createScope = async (rawText = "ordinary acceptance source") => {
-    await waitFor(() => Number((db.prepare("SELECT COUNT(*) AS count FROM assistant_turn_lease").get() as { count: number }).count) === 0,
-      operationTimeoutMs, "assistant lease availability");
     const sequence = ++scopeSequence;
     const contextId = `acceptance:${sequence}`;
     const attemptId = `acceptance-attempt:${sequence}`;
@@ -239,12 +237,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
       (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, observed_turn_id, created_at, updated_at)
       VALUES (?, ?, 1, ?, 'start', 'submitted', ?, ?, ?)`)
       .run(attemptId, contextId, `acceptance-client:${sequence}`, turnId, now, now);
-    db.prepare(`INSERT INTO assistant_turn_lease
-      (singleton, phase, attempt_id, primary_context_id, adapter_id, conversation_key, destination_json,
-        client_user_message_id, turn_id, trigger_kind, capacity_claim_id, steer_paused)
-      VALUES (1, 'active', ?, ?, ?, ?, ?, ?, ?, 'chat', ?, 0)`)
-      .run(attemptId, contextId, adapter.primaryBinding.adapterId, adapter.primaryBinding.conversationKey,
-        JSON.stringify(adapter.primaryBinding.destination), `acceptance-client:${sequence}`, turnId, `acceptance-capacity:${sequence}`);
     db.prepare("UPDATE source_contexts SET state = 'active' WHERE id = ?").run(contextId);
     active = { contextId, attemptId, turnId };
     return {
@@ -265,10 +257,10 @@ test("the exact production MCP map succeeds for every local and remote manager a
             WHERE attempt_id = ? AND kind = ? ORDER BY sequence DESC LIMIT 1`).get(attemptId, name);
           const nickname = typeof args.nickname === "string" ? args.nickname : undefined;
           const mapping = nickname ? (await registryDocument(config.sessionRegistryPath)).sessions[nickname] : undefined;
-          const runtimeState = mapping ? db.prepare(`SELECT management_state, restore_state, native_status, active_turn_id, goal_controlled
-            FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
+          const controls = mapping ? db.prepare(`SELECT model, effort, goal_controlled, goal_control_known, goal_control_sequence
+            FROM session_controls WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
             .get(mapping.endpoint, mapping.thread_id, mapping.mapping_id) : undefined;
-          throw new Error(`${name} returned an MCP error: ${text?.text ?? "no structured detail"}; durable=${JSON.stringify(durable)}; mapping=${JSON.stringify(mapping)}; runtime=${JSON.stringify(runtimeState)}`);
+          throw new Error(`${name} returned an MCP error: ${text?.text ?? "no structured detail"}; durable=${JSON.stringify(durable)}; mapping=${JSON.stringify(mapping)}; controls=${JSON.stringify(controls)}`);
         }
         const result = JSON.parse(text?.text ?? "null");
         if (name === "search_slack" || name === "get_slack_mentions") {
@@ -294,7 +286,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
         return result;
       },
       close(): void {
-        db.prepare("DELETE FROM assistant_turn_lease WHERE attempt_id = ?").run(attemptId);
         db.prepare("UPDATE assistant_attempts SET state = 'completed', accepting_tools = 0 WHERE id = ?").run(attemptId);
         db.prepare("UPDATE assistant_attempt_sources SET state = 'completed', updated_at = ? WHERE attempt_id = ?").run(Date.now(), attemptId);
         db.prepare("UPDATE source_contexts SET state = 'completed' WHERE id = ?").run(contextId);
@@ -381,11 +372,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const firstFinal = await waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages
       WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ? ORDER BY item_order DESC LIMIT 1`)
       .get(fixture.endpoint, session.thread_id, firstSend.turnId) as { id: string } | undefined, workerTimeoutMs, `${fixture.nickname} first final`);
-    await waitFor(() => {
-      const row = db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-        .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined;
-      return row?.native_status === "idle";
-    }, workerTimeoutMs, `${fixture.nickname} first turn to become idle`);
     const read = await call("read_worker_message", { nickname: fixture.nickname, message_id: firstFinal.id }, fixture.endpoint);
     assert.equal(read.endpointId, fixture.endpoint);
     assert.equal(read.threadId, session.thread_id);
@@ -433,20 +419,10 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(goal.goal.objective, "MCP acceptance goal");
     await call("pause_goal", { nickname: fixture.nickname }, fixture.endpoint);
     await call("interrupt_session", { nickname: fixture.nickname }, fixture.endpoint);
-    await waitFor(() => {
-      const row = db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-        .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined;
-      return row?.native_status === "idle";
-    }, workerTimeoutMs, `${fixture.nickname} paused goal turn to become idle`);
     const ownedBeforeResume = ownedTurnCount();
     await call("resume_goal", { nickname: fixture.nickname }, fixture.endpoint);
     await waitFor(() => ownedTurnCount() > ownedBeforeResume, workerTimeoutMs, `${fixture.nickname} resumed goal turn ownership`);
     await call("cancel_goal", { nickname: fixture.nickname, interrupt_active_turn: true }, fixture.endpoint);
-    await waitFor(() => {
-      const row = db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-        .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined;
-      return row?.native_status === "idle";
-    }, workerTimeoutMs, `${fixture.nickname} cancelled goal turn to become idle`);
     await call("compact_session", { nickname: fixture.nickname }, fixture.endpoint);
 
     const longContent = "Run a shell command that sleeps for 120 seconds, then reply done.";
@@ -459,14 +435,9 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(steered.mode, "steer");
     assert.equal(steered.turnId, longStart.turnId);
     await call("interrupt_session", { nickname: fixture.nickname }, fixture.endpoint);
-    await waitFor(() => {
-      const row = db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-        .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined;
-      return row?.native_status === "idle";
-    }, workerTimeoutMs, `${fixture.nickname} interruption`);
 
     const beforeRestart = (await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname];
-    db.prepare(`UPDATE session_runtime SET goal_controlled = 1, goal_control_sequence = 0
+    db.prepare(`UPDATE session_controls SET goal_controlled = 1, goal_control_sequence = 0
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
       .run(fixture.endpoint, session.thread_id, session.mapping_id);
     await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
@@ -474,7 +445,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.deepEqual(afterRestart, beforeRestart, `${fixture.endpoint} restart changed the mapping`);
     const postRestartStatus = await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
     assert.equal(postRestartStatus.auto_session_info.native_status, "idle", `${fixture.endpoint} restart did not restore an idle managed thread`);
-    const goalMarker = db.prepare(`SELECT goal_controlled FROM session_runtime
+    const goalMarker = db.prepare(`SELECT goal_controlled FROM session_controls
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
       .get(fixture.endpoint, session.thread_id, session.mapping_id) as { goal_controlled: number };
     assert.equal(goalMarker.goal_controlled, 0, `${fixture.endpoint} restart retained a stale goal marker`);
@@ -548,9 +519,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const final = await waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages
       WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ? ORDER BY item_order DESC LIMIT 1`)
       .get(fixture.endpoint, session.thread_id, send.turnId) as { id: string } | undefined, workerTimeoutMs, `${fixture.nickname} first final delivered`);
-    await waitFor(() => (db.prepare(`SELECT native_status FROM session_runtime WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
-      .get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined)?.native_status === "idle",
-      workerTimeoutMs, `${fixture.nickname} first turn idle`);
     const read = await call("read_worker_message", { nickname: fixture.nickname, message_id: final.id }, fixture.endpoint);
     assert.match(read.body, new RegExp(marker, "u"), `${fixture.nickname} reply not delivered`);
     const collected = await call("collect_messages", { nickname: fixture.nickname, count: 1 }, fixture.endpoint);
@@ -561,8 +529,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.ok(ownRow && !ownRow.external_turn_id, `${fixture.nickname} first turn was misclassified external`);
     await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);
 
-    const waitForIdle = (label: string): Promise<void> => waitFor(() => (db.prepare(`SELECT native_status FROM session_runtime
-      WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`).get(fixture.endpoint, session.thread_id, session.mapping_id) as { native_status: string } | undefined)?.native_status === "idle", workerTimeoutMs, label);
     const deliverTurn = (turnId: string, label: string): Promise<{ id: string }> => waitForValue(() => db.prepare(`SELECT id FROM logical_final_messages
       WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ? LIMIT 1`).get(fixture.endpoint, session.thread_id, turnId) as { id: string } | undefined, workerTimeoutMs, label);
 
@@ -584,7 +550,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     await waitFor(() => driveCount() > beforeGoal, workerTimeoutMs, `${fixture.nickname} goal auto-drive did not fire a pursuit turn`);
     assert.equal((await call("get_goal", { nickname: fixture.nickname }, fixture.endpoint)).goal.objective, objective);
     await call("cancel_goal", { nickname: fixture.nickname, interrupt_active_turn: true }, fixture.endpoint);
-    await waitForIdle(`${fixture.nickname} cancelled goal idle`);
 
     // Worker self-scheduling: instruct the worker to call its own schedule_wakeup MCP tool →
     // a durable schedule persists. Local reaches the loopback MCP directly; remote reaches it
@@ -593,9 +558,9 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const scheduleCount = (): number => (schedules.get(fixture.endpoint, session.thread_id) as { count: number }).count;
     const beforeSchedule = scheduleCount();
     const scheduleAsk = "Use your schedule_wakeup tool with delay_seconds 3600 and message CONTINUE. Then reply exactly SCHEDULEDOK.";
-    await call("send_to_session", { nickname: fixture.nickname, content: scheduleAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${scheduleAsk}`);
+    const scheduleSend = await call("send_to_session", { nickname: fixture.nickname, content: scheduleAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${scheduleAsk}`);
     await waitFor(() => scheduleCount() > beforeSchedule, workerTimeoutMs, `${fixture.nickname} worker schedule_wakeup did not persist (MCP unreachable?)`);
-    await waitForIdle(`${fixture.nickname} post-schedule idle`);
+    await deliverTurn(scheduleSend.turnId, `${fixture.nickname} post-schedule final`);
 
     // Worker `monitor`: the check must run on the SESSION's OWN host — locally here, over ssh
     // for a remote worker (previously `monitor` was gated OFF for remote). Prove routing AND
@@ -619,7 +584,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const finals = db.prepare(`SELECT COUNT(*) AS count FROM logical_final_messages WHERE endpoint_id = ? AND thread_id = ?`);
     const finalCount = (): number => (finals.get(fixture.endpoint, session.thread_id) as { count: number }).count;
     const beforeFire = sendCount();
-    const beforeMonitorFinals = finalCount(); // session is idle here (prior step ended in waitForIdle)
+    const beforeMonitorFinals = finalCount();
     const monitorAsk = `Use your monitor tool with check ${JSON.stringify(monitorSpec)}, poll_seconds 2, and message MONITORFIRED. Then reply exactly MONITOROK.`;
     await call("send_to_session", { nickname: fixture.nickname, content: monitorAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${monitorAsk}`);
     await waitFor(() => monitorCount() > 0, workerTimeoutMs, `${fixture.nickname} worker monitor did not persist (tool missing for this host?)`);
@@ -635,7 +600,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     db.prepare(`UPDATE session_schedules SET state = 'cancelled' WHERE endpoint_id = ? AND thread_id = ? AND kind = 'monitor' AND state = 'armed'`).run(fixture.endpoint, session.thread_id);
     await removeMarker();
     await waitFor(() => finalCount() >= beforeMonitorFinals + 2, workerTimeoutMs, `${fixture.nickname} monitor set + delivery turns did not both complete`);
-    await waitForIdle(`${fixture.nickname} post-monitor idle`);
 
     // ---- Per-session model + effort must ACTUALLY reach `claude -p` (regressions: set_session_model
     // threw on empty list_models; set_reasoning_effort was a silent no-op). Proof is the resolved
@@ -648,14 +612,12 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const modelAsk = "Reply with exactly MODELSET.";
     const modelSend = await call("send_to_session", { nickname: fixture.nickname, content: modelAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${modelAsk}`);
     await deliverTurn(modelSend.turnId, `${fixture.nickname} model turn delivered`);
-    await waitForIdle(`${fixture.nickname} model turn idle`);
     assert.ok((await claudeTranscriptModels(fixture.endpoint, session.thread_id)).some((m) => /haiku/iu.test(m)),
       `${fixture.nickname} set_session_model not applied to claude -p`);
     // Sticky: a SECOND turn without re-setting still runs on haiku (Claude settings are NOT consumed).
     const stickyAsk = "Reply with exactly MODELSTICK.";
     const stickySend = await call("send_to_session", { nickname: fixture.nickname, content: stickyAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${stickyAsk}`);
     await deliverTurn(stickySend.turnId, `${fixture.nickname} sticky turn delivered`);
-    await waitForIdle(`${fixture.nickname} sticky turn idle`);
     assert.ok((await claudeTranscriptModels(fixture.endpoint, session.thread_id)).some((m) => /haiku/iu.test(m)),
       `${fixture.nickname} sticky model lost on the next turn (settings were consumed)`);
     // An invalid effort is rejected, not silently accepted.

@@ -4,7 +4,7 @@ import { ThreadHistoryReader } from "../app-server/thread-history.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
 import type { MappingIdentity, MappingLifecycleState, RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { ManagedEpochStore } from "../storage/managed-epoch-store.ts";
 import type { PreparedProjectWorkspace, ProjectWorkspacePolicy } from "./project-workspace.ts";
 import type { ThreadGate } from "./thread-gate.ts";
 import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
@@ -12,6 +12,8 @@ import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
 import { isExactThreadNoRollout, isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
+import type { NativeSessionIdentity } from "./native-session-state.ts";
+import { NativeSessionState } from "./native-session-state.ts";
 
 interface ThreadView { id: string; cwd: string; path?: string | null; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -51,7 +53,8 @@ export class SessionLifecycle {
   constructor(
     private readonly pool: AppServerPool,
     private readonly registry: SessionRegistry,
-    private readonly runtime: RuntimeStore,
+    private readonly epochs: ManagedEpochStore,
+    private readonly native: NativeSessionState,
     private readonly clock: Clock,
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
     private readonly gate: ThreadGate,
@@ -91,8 +94,8 @@ export class SessionLifecycle {
       };
       this.ownership?.recordUnmaterialized(identity, response.thread.path ?? undefined);
       await this.registry.createManaged(nickname, identity);
-      this.runtime.setSession(endpointId, response.thread.id, mappingId, "managed", response.thread.status.type);
-      this.runtime.beginEpoch(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
+      this.observeManaged(identity, response.thread, lease);
+      this.epochs.begin(endpointId, response.thread.id, mappingId, this.baseline(response.thread), this.clock.now());
     });
     return settings;
     }, existingLease);
@@ -140,7 +143,6 @@ export class SessionLifecycle {
           lifecycle_state: "adopting",
         };
         await this.registry.reserve(nickname, reserved);
-        this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "adopting", before.thread.status.type);
         let after = before;
         if (!resumed && this.requiresResume(before.thread)) {
           resumeAttempted = true;
@@ -157,8 +159,8 @@ export class SessionLifecycle {
           allowUnmaterialized: after.thread.turns.length === 0,
         });
         await this.registry.promote(nickname, reserved);
-        this.runtime.setSession(endpointId, threadId, reserved.mapping_id, "managed", after.thread.status.type);
-        this.runtime.beginEpoch(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
+        this.observeManaged(reserved, after.thread, lease);
+        this.epochs.begin(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
       } catch (error) {
         if (resumed) {
           try {
@@ -199,13 +201,13 @@ export class SessionLifecycle {
       if (native && native.thread.status.type !== "notLoaded") this.requireIdle(native.thread);
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transition_intent"));
       await this.registry.transition(nickname, session, "unadopting");
-      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "unadopting", native?.thread.status.type ?? "notLoaded");
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transitioned"));
       if (!alreadyUnsubscribed) {
         await this.unsubscribeOrConfirmAbsent(session.endpoint, session.thread_id, lease);
       }
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "native_unsubscribed"));
-      this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.native.unregister(this.nativeIdentity(session));
       if (!await this.registry.removeIfMatch(nickname, session)) {
         throw new AppError("OPERATION_UNCERTAIN", "native unadoption completed but the exact session mapping was not removed");
       }
@@ -228,11 +230,11 @@ export class SessionLifecycle {
       if (native) this.requireIdle(native.thread);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transition_intent"));
       await this.registry.transition(nickname, session, "archiving");
-      this.runtime.setSession(session.endpoint, session.thread_id, session.mapping_id, "archiving", native?.thread.status.type ?? "notLoaded");
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transitioned"));
       if (native) await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id }, undefined, lease);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "native_archived"));
-      this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+      this.native.unregister(this.nativeIdentity(session));
       if (!await this.registry.removeIfMatch(nickname, session)) {
         throw new AppError("OPERATION_UNCERTAIN", "native archive completed but the exact session mapping was not removed");
       }
@@ -291,9 +293,9 @@ export class SessionLifecycle {
             allowUnmaterialized: native.thread.turns.length === 0,
           });
           await this.registry.promote(nickname, promotable);
-          this.runtime.setSession(promotable.endpoint, promotable.thread_id, promotable.mapping_id, "managed", native.thread.status.type);
-          if (!this.runtime.currentEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
-            this.runtime.beginEpoch(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
+          this.observeManaged(promotable, native.thread, lease);
+          if (!this.epochs.current(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
+            this.epochs.begin(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
           }
         } catch (error) {
           const current = this.registry.get(nickname);
@@ -335,10 +337,10 @@ export class SessionLifecycle {
       let resumed: ThreadResponse | undefined;
       const resumeForConnection = options?.resumeForConnection === true;
       // Connection recovery only needs thread metadata and a live notification subscription. The
-      // persisted epoch and runtime active-turn id already contain QiYan's recovery cursors, so do not
+      // The persisted managed epoch contains QiYan's ownership recovery cursor, so do not
       // transfer the rollout through the replacement connection. A missing epoch needs only the latest
       // turn id for its delivery baseline, which is obtained from one bounded summary page below.
-      const hasEpoch = this.runtime.currentEpoch(session.endpoint, session.thread_id, session.mapping_id) !== undefined;
+      const hasEpoch = this.epochs.current(session.endpoint, session.thread_id, session.mapping_id) !== undefined;
       let before: ThreadResponse;
       try {
         if (resumeForConnection || hasEpoch) {
@@ -373,7 +375,6 @@ export class SessionLifecycle {
       this.requireThreadIdentity(before.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
-      this.runtime.restoreMissingManagedSession(session.endpoint, session.thread_id, session.mapping_id);
       const recoveryLatestTurn = resumeForConnection
         ? await this.latestTurn(session.endpoint, session.thread_id, lease)
         : undefined;
@@ -381,6 +382,13 @@ export class SessionLifecycle {
       const ownershipThread = recoveryLatestTurn === undefined
         ? before.thread
         : { ...before.thread, turns: [recoveryLatestTurn] };
+      // Capacity and status must converge before ownership/delivery recovery, which may
+      // legitimately defer. An external or unclassified active turn still consumes native
+      // capacity until that exact mapping is released.
+      if (before.thread.status.type === "active") {
+        this.observeManaged(session, before.thread, lease,
+          recoveryLatestTurn && !isTerminalTurnStatus(recoveryLatestTurn.status) ? recoveryLatestTurn.id : undefined);
+      }
       const ownershipPreparation = await this.beforeManagedOwnership?.(session, lease, ownershipThread);
       assertCurrent();
       if (ownershipPreparation?.authorizedTurnId) {
@@ -394,7 +402,8 @@ export class SessionLifecycle {
       }
       if (guarded?.state === "lost") {
         assertCurrent();
-        this.runtime.endEpoch(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+        this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+        this.native.unregister(this.nativeIdentity(session));
         if (!await this.registry.removeIfMatch(nickname, session)) {
           throw new AppError("OPERATION_UNCERTAIN", "lost volatile thread mapping changed before removal");
         }
@@ -453,9 +462,10 @@ export class SessionLifecycle {
       assertCurrent();
       const current = this.assertExact(nickname, expected, "managed");
       assertCurrent();
-      this.runtime.setSession(current.endpoint, current.thread_id, current.mapping_id, "managed", authoritative.thread.status.type);
-      if (!this.runtime.currentEpoch(current.endpoint, current.thread_id, current.mapping_id)) {
-        this.runtime.beginEpoch(
+      this.observeManaged(current, authoritative.thread, lease,
+        recoveryLatestTurn && !isTerminalTurnStatus(recoveryLatestTurn.status) ? recoveryLatestTurn.id : undefined);
+      if (!this.epochs.current(current.endpoint, current.thread_id, current.mapping_id)) {
+        this.epochs.begin(
           current.endpoint,
           current.thread_id,
           current.mapping_id,
@@ -504,7 +514,8 @@ export class SessionLifecycle {
       } else {
         await this.pool.request(current.endpoint, "thread/archive", { threadId: current.thread_id }, undefined, lease);
       }
-      this.runtime.endEpoch(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
+      this.epochs.end(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
+      this.native.unregister(this.nativeIdentity(current));
       if (!await this.registry.removeIfMatch(nickname, current)) {
         throw new AppError("OPERATION_UNCERTAIN", "native removal completed but the exact session mapping was not removed");
       }
@@ -535,10 +546,8 @@ export class SessionLifecycle {
     const response = await this.pool.request<ThreadResponse>(
       endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
     );
-    const turns = await this.pool.historyReader(endpointId, lease).allTurns(threadId, {
-      sortDirection: "asc",
-      itemsView: "notLoaded",
-    });
+    const latest = await this.pool.historyReader(endpointId, lease).latestTurn(threadId);
+    const turns = latest ? [latest] : [];
     return { ...response, thread: { ...response.thread, turns } };
   }
 
@@ -644,6 +653,24 @@ export class SessionLifecycle {
     return this.workspaces instanceof WorkspaceRouter ? this.workspaces.assertDispatchable(endpointId, project, lease) : this.workspaces.assertDispatchable(project);
   }
 
+  private nativeIdentity(identity: MappingIdentity): NativeSessionIdentity {
+    return { endpointId: identity.endpoint, threadId: identity.thread_id, mappingId: identity.mapping_id };
+  }
+
+  private observeManaged(identity: MappingIdentity, thread: ThreadView, lease?: EndpointWorkLease, knownActiveTurnId?: string): void {
+    const generation = lease?.endpointGeneration ?? this.pool.endpointGeneration(identity.endpoint).generation;
+    const nativeIdentity = this.nativeIdentity(identity);
+    const existing = this.native.view(nativeIdentity);
+    if (!existing || existing.endpointGeneration !== generation || existing.availability !== "ready") {
+      this.native.register(nativeIdentity, generation);
+    }
+    const token = this.native.captureRefresh(nativeIdentity, generation);
+    const activeTurnId = thread.status.type === "active"
+      ? knownActiveTurnId ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
+      : null;
+    this.native.applyRefresh(token, { status: thread.status.type, activeTurnId });
+  }
+
   private baseline(thread: ThreadView): string | undefined { return thread.turns.at(-1)?.id; }
   private responseSettings(response: ThreadResponse): CurrentSessionSettings {
     return {
@@ -670,4 +697,9 @@ export class SessionLifecycle {
 
 function sameMapping(left: RegistrySession, right: MappingIdentity): boolean {
   return left.endpoint === right.endpoint && left.thread_id === right.thread_id && left.mapping_id === right.mapping_id;
+}
+
+function isTerminalTurnStatus(status: unknown): boolean {
+  const value = typeof status === "string" ? status : String((status as { type?: unknown } | undefined)?.type ?? "");
+  return value === "completed" || value === "failed" || value === "interrupted";
 }

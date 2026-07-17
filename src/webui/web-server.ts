@@ -16,7 +16,6 @@ import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGit
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
-const POLL_MS = 1_000;
 const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_WS_INPUT_BYTES = 4 * 1024;
@@ -176,41 +175,31 @@ export function createWebServer(options: WebServerOptions): WebServer {
   // manual web-UI toggle — a closed ws.Server rejects later handleUpgrade calls.
   let wss: WebSocketServer | undefined;
   let server: Server | undefined;
-  let poll: ReturnType<typeof setInterval> | undefined;
+  let unsubscribeSessions: (() => void) | undefined;
   let uploadSweep: ReturnType<typeof setInterval> | undefined;
   let lastSessions = "";
-  let lastSessionSnapshot: ReturnType<typeof sessionSnapshot> | undefined;
   let historyReader: WorkerHistoryReader | undefined;
 
-  const pollSessions = (): void => {
+  const streamIdentity = (nickname: string) => {
+    if (nickname === "assistant") {
+      const session = options.reads.assistantSession();
+      return { endpointId: session.endpoint, threadId: options.reads.registrySnapshot().assistant.thread_id, mappingId: session.mappingId };
+    }
+    const session = options.reads.registrySnapshot().sessions[nickname];
+    return session ? { endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id } : undefined;
+  };
+
+  const publishSessions = (socket?: WebSocket): void => {
+    if (!socket && options.bus.size === 0) return;
     try {
       const snapshot = sessionSnapshot(options.reads);
       const serialized = JSON.stringify(snapshot);
-      if (serialized !== lastSessions) {
+      if (socket) options.bus.send(socket, { type: "sessions", ...snapshot, at: Date.now() });
+      else if (serialized !== lastSessions) {
         lastSessions = serialized;
-        lastSessionSnapshot = snapshot;
         options.bus.broadcast({ type: "sessions", ...snapshot, at: Date.now() });
       }
     } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
-  };
-
-  const sendCurrentSessions = (socket: WebSocket): void => {
-    if (!lastSessionSnapshot) { pollSessions(); return; }
-    options.bus.send(socket, { type: "sessions", ...lastSessionSnapshot, at: Date.now() });
-  };
-
-  const startSessionsPolling = (): void => {
-    if (poll) return;
-    pollSessions();
-    poll = setInterval(pollSessions, POLL_MS);
-    poll.unref?.();
-  };
-
-  const stopSessionsPolling = (): void => {
-    if (poll) clearInterval(poll);
-    poll = undefined;
-    lastSessions = "";
-    lastSessionSnapshot = undefined;
   };
 
   const json = (response: ServerResponse, status: number, body: unknown): void => {
@@ -424,20 +413,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
   return {
     async start() {
       wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_INPUT_BYTES });
-      historyReader = createWorkerHistoryReader({ bus: options.bus, registrySnapshot: options.reads.registrySnapshot, readTurns: options.reads.readWorkerTurns });
-      lastSessions = ""; // re-broadcast the first poll after a restart
+      historyReader = createWorkerHistoryReader({ bus: options.bus, resolveSession: streamIdentity, readTurns: options.reads.readWorkerTurns });
+      lastSessions = "";
+      unsubscribeSessions = options.reads.onSessionsChanged?.(() => publishSessions());
       server = createServer((request, response) => { void handle(request, response).catch(() => { try { response.writeHead(500); response.end("error"); } catch { /* already sent */ } }); });
       server.on("upgrade", (request, socket, head) => {
         const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
         if (url.pathname !== "/ws" || !wss || !tokenValid(options.token, tokenFromRequest(request, url))) { socket.destroy(); return; }
         wss.handleUpgrade(request, socket, head, (ws) => {
-          const polling = poll !== undefined;
           options.bus.add(ws);
-          if (polling) sendCurrentSessions(ws); else startSessionsPolling();
+          publishSessions(ws);
           ws.on("message", (raw) => handleWorkerCommand(ws, raw));
           const remove = () => {
             options.bus.remove(ws);
-            if (options.bus.size === 0) stopSessionsPolling();
           };
           ws.on("close", remove);
           ws.on("error", remove);
@@ -467,7 +455,9 @@ export function createWebServer(options: WebServerOptions): WebServer {
     },
     async stop() {
       options.closeGoalAdmission();
-      stopSessionsPolling();
+      unsubscribeSessions?.();
+      unsubscribeSessions = undefined;
+      lastSessions = "";
       if (uploadSweep) clearInterval(uploadSweep);
       historyReader?.dispose(); historyReader = undefined;
       if (wss) { for (const ws of wss.clients) { try { ws.close(); } catch { /* closing */ } } wss.close(); wss = undefined; }
@@ -503,10 +493,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     const nickname = typeof command.nickname === "string" ? command.nickname : "";
     if (command.type !== "worker/subscribe" || !NICKNAME.test(nickname)) { subscriptionError(socket, requestId, "invalid-request"); return; }
-    const session = options.reads.registrySnapshot().sessions[nickname];
+    const session = streamIdentity(nickname);
     if (!session) { options.bus.unsubscribe(socket); subscriptionError(socket, requestId, "unknown-worker"); return; }
     const subscription = options.bus.subscribe(socket, {
-      nickname, endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id, requestId,
+      nickname, ...session, requestId,
     });
     options.bus.send(socket, {
       type: "worker/subscribed", nickname, requestId,

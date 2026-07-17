@@ -49,7 +49,7 @@ test("metadata-dependent boundaries request recovery once before mutating durabl
       throw new Error("private restart failure");
     },
   });
-  store.observeLifecycle(identity, 1);
+  store.observeCurrentSettings(identity, { model: "initial", observedAt: 1 }, 1);
   store.updateNotes(identity, "notes-before-loss", { project_summary: "preserved" }, 1);
   store.acceptNotification("local", "thread/settings/updated", { threadId: identity.threadId }, 1);
   const factsBefore = store.facts(identity);
@@ -69,7 +69,6 @@ test("metadata-dependent boundaries request recovery once before mutating durabl
   const boundaries: Array<() => unknown> = [
     () => store.allocateObservationSequence(),
     () => store.acceptNotification("local", "thread/settings/updated", { threadId: identity.threadId }, 2),
-    () => store.observeLifecycle(identity, 2),
     () => store.observeLastSent(identity, {
       text: "new", mode: "start", attachment_ids: [], turn_id: "turn-1", at: "1970-01-01T00:00:02.000Z",
     }, 1),
@@ -128,6 +127,27 @@ test("newer equal settings advance their watermark without dirtying the rendered
   assert.equal(store.renderState().dirty, false);
   assert.equal(store.renderState().revision, revision);
   assert.deepEqual(store.facts(identity).currentSettings, { model: "gpt-5", effort: "high", observedAt: 100, observationSequence: 3 });
+});
+
+test("dashboard view changes publish one coalesced event after durable writes", async () => {
+  const store = new SessionDashboardStore(createTestDatabase());
+  let changes = 0;
+  const unsubscribe = store.onChange(() => { changes += 1; });
+
+  store.observeCurrentSettings(identity, { model: "gpt-5", effort: "high", observedAt: 100 }, 1);
+  store.observeGoal(identity, { objective: "ship", status: "active", token_budget: null }, 100, 2, 100);
+  assert.equal(changes, 0, "listeners must not read from inside a storage transaction");
+  await Promise.resolve();
+  assert.equal(changes, 1);
+
+  store.observeCurrentSettings(identity, { model: "gpt-5", effort: "high", observedAt: 200 }, 3);
+  await Promise.resolve();
+  assert.equal(changes, 1, "watermark-only writes do not change the projected dashboard");
+
+  unsubscribe();
+  store.markDirty();
+  await Promise.resolve();
+  assert.equal(changes, 1);
 });
 
 test("orders sends, terminal events, token usage, and goals monotonically", () => {

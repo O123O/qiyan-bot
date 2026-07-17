@@ -25,6 +25,5 @@ test("automatic recovery has no unbounded full-thread reads", async () => {
 
   assert.deepEqual(matches, [
     "src/app-server/pool.ts", // Explicit interactive full-history API.
-    "src/app-server/thread-history.ts", // Operation-scoped Claude transcript adapter.
   ]);
 });

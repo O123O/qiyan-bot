@@ -144,18 +144,18 @@ test("durable operation errors are projected consistently and cleared by recover
   assert.equal(store.findForCall("attempt", "call", "create_session")?.error, undefined);
 });
 
-test("a durable current attempt is actionable after process-local tool handlers are lost", () => {
+test("a durable attempt does not restore live tool admission after process-local handlers are lost", () => {
   const db = createTestDatabase();
   const store = new OperationStore(db);
   const conversations = new ConversationStore(db, new DeliveryStore(db));
   conversations.createInternalSource({ id: "ctx", kind: "event_batch", sourceId: "batch", rawText: "", attachmentIds: [], receivedAt: 1 });
-  const lease = conversations.acquireLease({ kind: "internal", contextId: "ctx" }, "claim");
-  conversations.reserveStart("ctx");
+  const lease = conversations.createAttempt({ kind: "internal", contextId: "ctx" });
+  conversations.reserveStart(lease.attemptId, "ctx");
   const operation = store.prepare({ contextId: "ctx", attemptId: lease.attemptId, callId: "call", kind: "send_chat_message", args: {} });
   store.markDispatched(operation.id);
 
   const afterRestart = new AssistantRuntime(db, store, new DeliveryStore(db), { binding: { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } } });
-  assert.equal(afterRestart.hydrateActive()?.attemptId, lease.attemptId);
+  assert.equal(afterRestart.current(), undefined);
   assert.equal(afterRestart.hasActiveTools(lease.attemptId), false);
   assert.equal(operationRecoveryAction({ state: store.listRecoverable()[0]!.state, activeHandler: afterRestart.hasActiveTools(lease.attemptId) }), "attempt");
 });

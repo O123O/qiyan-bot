@@ -1,4 +1,3 @@
-import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { WebBus } from "./web-bus.ts";
 
 export type WorkerChatItem =
@@ -71,7 +70,13 @@ export function offerWorkerNotification(stream: WorkerStream, endpointId: string
   catch { /* detailed Web UI flow is best-effort and never owns routing */ }
 }
 
-export function createWorkerStream(deps: { bus: WebBus; registrySnapshot(): RegistryDocument }): WorkerStream {
+export interface StreamSessionIdentity {
+  endpointId: string;
+  threadId: string;
+  mappingId: string;
+}
+
+export function createWorkerStream(deps: { bus: WebBus; resolveSession(nickname: string): StreamSessionIdentity | undefined }): WorkerStream {
   return {
     handleNotification(endpointId, method, rawParams) {
       if (!METHODS.has(method)) return;
@@ -79,10 +84,9 @@ export function createWorkerStream(deps: { bus: WebBus; registrySnapshot(): Regi
       const threadId = string(params?.threadId);
       if (!params || !threadId || !deps.bus.hasWorkerSubscriber(endpointId, threadId)) return;
 
-      const sessions = deps.registrySnapshot().sessions;
       deps.bus.pruneWorkerSubscriptions(endpointId, threadId, (subscription) => {
-        const current = sessions[subscription.nickname];
-        return current?.endpoint === endpointId && current.thread_id === threadId && current.mapping_id === subscription.mappingId;
+        const current = deps.resolveSession(subscription.nickname);
+        return current?.endpointId === endpointId && current.threadId === threadId && current.mappingId === subscription.mappingId;
       });
       if (!deps.bus.hasWorkerSubscriber(endpointId, threadId)) return;
       const event = normalize(method, params);

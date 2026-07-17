@@ -46,3 +46,23 @@ test("preview is the first USER message, marker-stripped and length-capped; neve
   assert.ok(preview.startsWith("hello world"));
   assert.ok(preview.length <= CLAUDE_PREVIEW_MAX);
 });
+
+test("transcript reads are positional, byte-bounded, and snapshot-pinned", async () => {
+  const home = await mkdtemp(join(tmpdir(), "claude-home-"));
+  await writeTranscript(home, "hash", "large", [
+    { type: "user", cwd: "/work", promptSource: "sdk", promptId: "p", message: { content: "x".repeat(100_000) } },
+  ]);
+  const runner = new LocalClaudeCommandRunner({ home });
+  const tail = await runner.readTranscriptChunk("large", "/work", { offset: "tail", length: 128 });
+  assert.ok(tail);
+  assert.equal(tail.bytes.length, 128);
+  assert.equal(tail.offset, tail.snapshot.size - 128);
+
+  await writeTranscript(home, "hash", "large", [
+    { type: "user", cwd: "/work", promptSource: "sdk", promptId: "changed", message: { content: "changed" } },
+  ]);
+  await assert.rejects(
+    runner.readTranscriptChunk("large", "/work", { offset: 0, length: 128, expected: tail.snapshot }),
+    /changed during bounded history paging/u,
+  );
+});

@@ -57,9 +57,6 @@ export const SessionNotesPatchSchema = z.object({
 }).strict().refine((value) => Object.keys(value).length > 0, "at least one manager note field is required");
 
 export const AutoSessionInfoSchema = z.object({
-  management_state: z.enum(["managed", "unavailable"]),
-  native_status: z.string(),
-  active_turn_id: z.string().nullable(),
   last_sent: LastSentSchema.nullable(),
   last_worker_event: LastWorkerEventSchema.nullable(),
   model: z.object({ current: z.string().nullable(), pending: z.string().nullable() }).strict(),
@@ -76,9 +73,27 @@ export const SessionDashboardEntrySchema = z.object({
 }).strict();
 
 export const SessionDashboardDocumentSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   sessions: z.record(z.string().min(1), SessionDashboardEntrySchema),
 }).strict();
+
+const LegacyAutoSessionInfoSchema = AutoSessionInfoSchema.extend({
+  management_state: z.enum(["managed", "unavailable"]),
+  native_status: z.string(),
+  active_turn_id: z.string().nullable(),
+}).strict();
+
+const LegacySessionDashboardDocumentSchema = z.object({
+  version: z.literal(2),
+  sessions: z.record(z.string().min(1), SessionDashboardEntrySchema.extend({
+    auto_session_info: LegacyAutoSessionInfoSchema,
+  }).strict()),
+}).strict();
+
+export const ExistingSessionDashboardDocumentSchema = z.union([
+  SessionDashboardDocumentSchema,
+  LegacySessionDashboardDocumentSchema,
+]);
 
 const appServerTokenUsage = z.object({
   total: z.object({ totalTokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative() }).strict(),

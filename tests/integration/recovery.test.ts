@@ -21,8 +21,12 @@ test("process restart recovers Telegram ambiguity and assistant effects without 
   deliveries.prepare({ id: "d_crash", kind: "text", binding, body: "[worker] result", mandatory: true });
   deliveries.markDispatched("d_crash");
   const operations = new OperationStore(db);
-  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "go", attachmentIds: [] });
-  const operation = operations.prepare({ contextId: "ctx", attemptId: "a", callId: "c", kind: "send", args: { text: "go" } });
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "1", rawText: "go", attachmentIds: [], binding });
+  const conversations = new ConversationStore(db, deliveries);
+  const attempt = conversations.createAttempt({ kind: "chat", contextId: "ctx" });
+  conversations.reserveStart(attempt.attemptId, "ctx");
+  conversations.confirmStart(attempt.attemptId, "ctx", "turn");
+  const operation = operations.prepare({ contextId: "ctx", attemptId: attempt.attemptId, callId: "c", kind: "send", args: { text: "go" } });
   operations.markDispatched(operation.id);
   db.close();
 
@@ -33,7 +37,6 @@ test("process restart recovers Telegram ambiguity and assistant effects without 
   await new DeliveryWorker(deliveries, new ChatAdapterRegistry([{ delivery: { id: "telegram", sendMessage: async (_chat, body) => { sent.push(body); return { messageId: 9 }; } } }])).drain();
   assert.deepEqual(sent, ["[worker · recovery retry d_crash] result"]);
   const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding });
-  runtime.beginUserAttempt("ctx", "a", "turn");
   const recovery = runtime.failAttempt("turn", new Error("crashed after dispatch"));
   assert.equal(recovery?.kind, "recovery");
   assert.equal(runtime.failAttempt("turn", new Error("again"))?.id, recovery?.id);

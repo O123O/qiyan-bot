@@ -21,11 +21,10 @@ interface Watermarks {
   settings?: number;
   token?: number;
   goal?: number;
-  runtime?: number;
 }
 
 test("recovery copies every readable table exactly and rebuilds only dashboard metadata", async (t) => {
-  const value = await recoveryFixture(t, { notification: 4, settings: 7, token: 12, goal: 9, runtime: 11 });
+  const value = await recoveryFixture(t, { notification: 4, settings: 7, token: 12, goal: 9 });
   const sourceBefore = await readFile(value.databasePath);
   const reported: string[] = [];
 
@@ -63,8 +62,8 @@ test("recovery copies every readable table exactly and rebuilds only dashboard m
   assert.doesNotMatch(JSON.stringify(manifest), /private project note|private operation result|\/tmp\//u);
 });
 
-test("each persisted watermark can independently determine the next observation sequence", async (t) => {
-  for (const key of ["notification", "settings", "token", "goal", "runtime"] as const) {
+test("each persisted dashboard watermark can independently determine the next observation sequence", async (t) => {
+  for (const key of ["notification", "settings", "token", "goal"] as const) {
     const value = await recoveryFixture(t, { [key]: 41 });
     const prepared = await prepareDashboardMetadataRecovery(value.databasePath);
     assert.equal(prepared.nextObservationSequence, 42, key);
@@ -471,11 +470,6 @@ async function recoveryFixture(
         watermarks.token ?? null,
         watermarks.goal ?? null,
       );
-  }
-  if (watermarks.runtime !== undefined) {
-    db.prepare(`INSERT INTO session_runtime
-      (endpoint_id, thread_id, mapping_id, management_state, native_status, native_observation_sequence)
-      VALUES ('local', 'thread-private', 'mapping-private', 'managed', 'idle', ?)`).run(watermarks.runtime);
   }
   customize?.(db);
   const rootPage = Number(db.prepare("SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?").get(corruptTable)!.rootpage);

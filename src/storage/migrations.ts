@@ -2,6 +2,14 @@ import type { DatabaseSync } from "node:sqlite";
 
 export type Migration = string | ((db: DatabaseSync) => void);
 
+function tableColumns(db: DatabaseSync, table: string): Set<string> {
+  return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+}
+
+function tableExists(db: DatabaseSync, table: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+}
+
 export const migrations: readonly Migration[] = [
   `
   CREATE TABLE qiyan_state (
@@ -256,7 +264,8 @@ export const migrations: readonly Migration[] = [
     ON session_dashboard_notifications(state, sequence);
   `,
   (db) => {
-    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!tableExists(db, "session_runtime")) return;
+    const columns = tableColumns(db, "session_runtime");
     if (!columns.has("native_observation_sequence")) db.exec("ALTER TABLE session_runtime ADD COLUMN native_observation_sequence INTEGER NOT NULL DEFAULT 0");
   },
   (db) => {
@@ -587,21 +596,24 @@ export const migrations: readonly Migration[] = [
     }
   },
   (db) => {
-    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!tableExists(db, "session_runtime")) return;
+    const columns = tableColumns(db, "session_runtime");
     if (!columns.has("goal_controlled")) {
       db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_controlled INTEGER NOT NULL DEFAULT 0
         CHECK(goal_controlled IN (0, 1))`);
     }
   },
   (db) => {
-    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!tableExists(db, "session_runtime")) return;
+    const columns = tableColumns(db, "session_runtime");
     if (!columns.has("goal_control_sequence")) {
       db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_control_sequence INTEGER NOT NULL DEFAULT 0
         CHECK(goal_control_sequence >= 0)`);
     }
   },
   (db) => {
-    const columns = new Set((db.prepare("PRAGMA table_info(session_runtime)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!tableExists(db, "session_runtime")) return;
+    const columns = tableColumns(db, "session_runtime");
     if (!columns.has("goal_control_known")) {
       db.exec(`ALTER TABLE session_runtime ADD COLUMN goal_control_known INTEGER NOT NULL DEFAULT 0
         CHECK(goal_control_known IN (0, 1))`);
@@ -706,5 +718,81 @@ export const migrations: readonly Migration[] = [
       db.exec(`ALTER TABLE assistant_attempt_sources ADD COLUMN baseline_recorded INTEGER NOT NULL DEFAULT 0
         CHECK(baseline_recorded IN (0, 1))`);
     }
+  },
+  // Split durable control and delivery facts out of the legacy mixed runtime table. The final
+  // authoritative-lifecycle cutover drops session_runtime after every consumer has moved.
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS session_controls (
+        endpoint_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        mapping_id TEXT NOT NULL,
+        model TEXT,
+        effort TEXT,
+        goal_controlled INTEGER NOT NULL DEFAULT 0 CHECK(goal_controlled IN (0, 1)),
+        goal_control_known INTEGER NOT NULL DEFAULT 0 CHECK(goal_control_known IN (0, 1)),
+        goal_control_sequence INTEGER NOT NULL DEFAULT 0 CHECK(goal_control_sequence >= 0),
+        PRIMARY KEY(endpoint_id, thread_id, mapping_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_delivery_progress (
+        endpoint_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        mapping_id TEXT NOT NULL,
+        delivery_cursor TEXT,
+        PRIMARY KEY(endpoint_id, thread_id, mapping_id)
+      );
+      DROP INDEX IF EXISTS assistant_single_unresolved_input_idx;
+      CREATE TABLE IF NOT EXISTS assistant_input_reconciliation (
+        attempt_id TEXT NOT NULL,
+        context_id TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        deadline_at INTEGER NOT NULL,
+        next_retry_at INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('pending', 'resolved', 'needs_attention')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(attempt_id, context_id),
+        FOREIGN KEY(attempt_id, context_id) REFERENCES assistant_attempt_sources(attempt_id, context_id)
+      );
+    `);
+    if (tableExists(db, "session_runtime")) {
+      db.exec(`
+        INSERT OR IGNORE INTO session_controls(endpoint_id, thread_id, mapping_id, model, effort,
+            goal_controlled, goal_control_known, goal_control_sequence)
+          SELECT endpoint_id, thread_id, mapping_id, model, effort,
+            goal_controlled, goal_control_known, goal_control_sequence
+          FROM session_runtime;
+        INSERT OR IGNORE INTO session_delivery_progress(endpoint_id, thread_id, mapping_id, delivery_cursor)
+          SELECT endpoint_id, thread_id, mapping_id, delivery_cursor
+          FROM session_runtime WHERE delivery_cursor IS NOT NULL;
+      `);
+    }
+    if (tableExists(db, "assistant_attempt_sources")) {
+      db.exec(`
+        INSERT OR IGNORE INTO assistant_input_reconciliation(
+            attempt_id, context_id, attempt_count, deadline_at, next_retry_at, outcome, created_at, updated_at)
+          SELECT attempt_id, context_id, 0, created_at + 300000, created_at, 'pending', created_at, updated_at
+          FROM assistant_attempt_sources WHERE state IN ('start_submitting', 'steer_submitting', 'uncertain');
+      `);
+    }
+    db.exec("DROP TABLE IF EXISTS assistant_turn_lease; DROP TABLE IF EXISTS session_runtime;");
+    if (tableExists(db, "session_dashboard_facts") && tableColumns(db, "session_dashboard_facts").has("lifecycle_observed_at")) {
+      db.exec("ALTER TABLE session_dashboard_facts DROP COLUMN lifecycle_observed_at");
+    }
+  },
+  // A missing delivery cursor must open a durable mapping-scoped circuit instead of
+  // re-scanning the same remote history forever after every reconnect or restart.
+  (db) => {
+    const columns = tableColumns(db, "session_delivery_progress");
+    if (!columns.has("recovery_incident")) db.exec("ALTER TABLE session_delivery_progress ADD COLUMN recovery_incident TEXT");
+    db.exec(`CREATE TABLE IF NOT EXISTS assistant_terminal_reconciliation (
+      attempt_id TEXT PRIMARY KEY REFERENCES assistant_attempts(id),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+      deadline_at INTEGER NOT NULL,
+      next_retry_at INTEGER NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('pending', 'needs_attention')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`);
   },
 ];

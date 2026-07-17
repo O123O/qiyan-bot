@@ -34,13 +34,23 @@ test("a tool-use turn is one completed turn with a delivered final_answer", () =
   assert.equal(finalAnswers(v).length >= 1, true);
 });
 
-test("an interrupted turn is inProgress with no final_answer; thread is active", () => {
+test("a cold incomplete transcript is interrupted because no owned Claude child is running", () => {
   const v = view("interrupted");
   assert.equal(v.turns.length, 1);
-  assert.equal(v.turns[0]?.status, "inProgress");
-  assert.equal(v.status.type, "active");
+  assert.equal(v.turns[0]?.status, "interrupted");
+  assert.equal(v.status.type, "idle");
   assert.equal(finalAnswers(v).length, 0);
   assert.equal(v.turns[0]?.items[0]?.type, "userMessage");
+});
+
+test("an incomplete transcript is active only while its exact owned Claude child is running", () => {
+  const raw = records("interrupted");
+  const turnStart = raw.find((record): record is Record<string, unknown> => !!record && typeof record === "object"
+    && (record as Record<string, unknown>).type === "user" && typeof (record as Record<string, unknown>).promptSource === "string");
+  const runningTurnId = String((turnStart as Record<string, unknown>).promptId);
+  const v = reconstructClaudeThread({ threadId: "interrupted", cwd: "/tmp/x", records: raw, runningTurnId });
+  assert.equal(v.turns[0]?.status, "inProgress");
+  assert.equal(v.status.type, "active");
 });
 
 test("a known-interrupted turn id is reported interrupted (terminal)", () => {

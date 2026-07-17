@@ -116,5 +116,5 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.ok(Buffer.byteLength(policy, "utf8") < 7_800, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
-  assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 2, sessions: {} });
+  assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 3, sessions: {} });
 });

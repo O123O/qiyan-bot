@@ -18,17 +18,13 @@ export interface InternalSource {
   binding?: ConversationBinding;
 }
 
-export interface AssistantLease {
-  phase: "starting" | "active" | "terminalizing";
+export interface AssistantAttempt {
   attemptId: string;
   primaryContextId: string;
   binding?: ConversationBinding;
-  clientUserMessageId: string;
   turnId?: string;
   triggerKind: "chat" | "internal";
-  capacityClaimId: string;
-  steerPaused: boolean;
-  pauseReason?: string;
+  acceptingTools: boolean;
 }
 
 export interface AttemptSource {
@@ -54,20 +50,42 @@ export interface ChatAcceptanceEffects { commitNativeCheckpoint?: () => void }
 
 export type SubmissionConfirmation = "bound" | "already_same" | "already_terminal_same" | "conflict";
 
+export type ReconciliationDecision =
+  | { kind: "ready" }
+  | { kind: "wait"; retryAt: number }
+  | { kind: "needs_attention" };
+
+export interface ConversationStoreOptions {
+  now?(): number;
+  reconciliationDeadlineMs?: number;
+  reconciliationMaxAttempts?: number;
+  reconciliationBaseMs?: number;
+  ownerBinding?(): ConversationBinding;
+}
+
 export class ConversationStore {
+  private readonly now: () => number;
+
   constructor(
     private readonly db: Database,
     private readonly deliveries: DeliveryStore,
     private readonly attachments?: AttachmentStore,
-  ) {}
+    private readonly options: ConversationStoreOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+  }
 
-  acceptChatSource(input: CanonicalChatSource, effects: ChatAcceptanceEffects = {}): { contextId: string; disposition: "pending" | "owner" | "queued" } {
+  acceptChatSource(
+    input: CanonicalChatSource,
+    effects: ChatAcceptanceEffects = {},
+    activeAttempt?: AssistantAttempt,
+  ): { contextId: string; disposition: "pending" | "owner" | "queued" } {
     return inTransaction(this.db, () => {
       const duplicate = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id = ? AND source_id = ?")
         .get(input.binding.adapterId, input.nativeSourceId) as { id: string } | undefined;
       if (duplicate) {
         const source = this.source(duplicate.id);
-        const disposition = this.disposition(source);
+        const disposition = this.disposition(source, activeAttempt);
         if (disposition === "queued") this.ensureQueueNotice(source);
         effects.commitNativeCheckpoint?.();
         return { contextId: source.id, disposition };
@@ -97,7 +115,7 @@ export class ConversationStore {
         .run(input.binding.adapterId, input.binding.conversationKey, JSON.stringify(input.binding.destination),
           input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply), input.id, Date.now());
       const source = this.source(input.id);
-      const disposition = this.disposition(source);
+      const disposition = this.disposition(source, activeAttempt);
       if (disposition === "queued") this.ensureQueueNotice(source);
       effects.commitNativeCheckpoint?.();
       return { contextId: input.id, disposition };
@@ -123,7 +141,8 @@ export class ConversationStore {
     const cursor = before !== undefined && Number.isFinite(before);
     const NORM = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
     const rows = this.db.prepare(`SELECT id, role, body, at, delivery_kind FROM (
-        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at, kind AS delivery_kind FROM deliveries${cursor ? ` WHERE ${NORM} <= ?` : ""}
+        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at, kind AS delivery_kind FROM deliveries
+          WHERE kind <> 'queue_notice'${cursor ? ` AND ${NORM} <= ?` : ""}
         UNION ALL
         SELECT id AS id, 'you' AS role, raw_text AS body, ${NORM} AS at, NULL AS delivery_kind FROM source_contexts
           WHERE source_class = 'chat'${cursor ? ` AND ${NORM} <= ?` : ""}
@@ -150,9 +169,20 @@ export class ConversationStore {
     });
   }
 
-  lease(): AssistantLease | undefined {
-    const row = this.db.prepare("SELECT * FROM assistant_turn_lease WHERE singleton = 1").get() as Record<string, unknown> | undefined;
-    return row ? this.parseLease(row) : undefined;
+  attempt(attemptId: string): AssistantAttempt | undefined {
+    const row = this.attemptById(attemptId);
+    return row ? this.parseAttempt(row) : undefined;
+  }
+
+  attemptForTurn(turnId: string): AssistantAttempt | undefined {
+    const row = this.db.prepare(`SELECT * FROM assistant_attempts
+      WHERE state = 'active' AND turn_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`).get(turnId) as Record<string, unknown> | undefined;
+    return row ? this.parseAttempt(row) : undefined;
+  }
+
+  incompleteAttempts(): AssistantAttempt[] {
+    return (this.db.prepare(`SELECT * FROM assistant_attempts
+      WHERE state = 'active' ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => this.parseAttempt(row));
   }
 
   nextPendingCandidate(): { kind: "chat" | "internal"; contextId: string } | undefined {
@@ -161,11 +191,11 @@ export class ConversationStore {
     return row ? { kind: row.source_class === "chat" ? "chat" : "internal", contextId: row.id } : undefined;
   }
 
-  acquireLease(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {
-    return inTransaction(this.db, () => this.acquireLeaseInTransaction(candidate, capacityClaimId));
+  createAttempt(candidate: { kind: "chat" | "internal"; contextId: string }): AssistantAttempt {
+    return inTransaction(this.db, () => this.createAttemptInTransaction(candidate));
   }
 
-  materializeAndAcquireEventBatch(candidate: { batchId: string; eventIds: readonly string[]; payload: unknown; queuedAt: number }, capacityClaimId: string): AssistantLease {
+  materializeAndCreateEventAttempt(candidate: { batchId: string; eventIds: readonly string[]; payload: unknown; queuedAt: number }): AssistantAttempt {
     return inTransaction(this.db, () => {
       if (candidate.eventIds.length === 0) this.conflict("event batch is empty");
       const placeholders = candidate.eventIds.map(() => "?").join(",");
@@ -182,96 +212,93 @@ export class ConversationStore {
         .run(candidate.batchId, JSON.stringify(candidate.eventIds), candidate.queuedAt);
       const changed = Number(this.db.prepare(`UPDATE events SET state = 'batched' WHERE id IN (${placeholders}) AND state = 'pending'`).run(...candidate.eventIds).changes);
       if (changed !== candidate.eventIds.length) this.conflict("event batch changed while materializing");
-      return this.acquireLeaseInTransaction({ kind: "internal", contextId: candidate.batchId }, capacityClaimId);
+      return this.createAttemptInTransaction({ kind: "internal", contextId: candidate.batchId });
     });
   }
 
-  reserveStart(contextId: string): ReservedSubmission {
+  reserveStart(attemptId: string, contextId: string): ReservedSubmission {
     return inTransaction(this.db, () => {
-      const lease = this.requiredLease();
-      if (lease.phase !== "starting" || lease.primaryContextId !== contextId) this.conflict("start reservation does not match the lease");
-      this.assertNoUnresolvedSubmission();
-      return this.reserve(lease, this.source(contextId), "start");
+      const attempt = this.requiredAttempt(attemptId);
+      if (attempt.turnId || attempt.primaryContextId !== contextId || !attempt.acceptingTools) {
+        this.conflict("start reservation does not match the attempt");
+      }
+      this.assertNoUnresolvedSubmission(attempt.attemptId);
+      return this.reserve(attempt, this.source(contextId), "start");
     });
   }
 
   reserveNextSteer(attemptId: string): ReservedSubmission | undefined {
     return inTransaction(this.db, () => {
-      const lease = this.requiredLease();
-      if (lease.attemptId !== attemptId || lease.phase !== "active" || lease.steerPaused) this.conflict("attempt is not accepting steering");
-      this.assertNoUnresolvedSubmission();
-      if (lease.triggerKind !== "chat" || !lease.binding) return undefined;
+      const attempt = this.requiredAttempt(attemptId);
+      if (!attempt.turnId || !attempt.acceptingTools) this.conflict("attempt is not accepting steering");
+      this.assertNoUnresolvedSubmission(attempt.attemptId);
+      if (attempt.triggerKind !== "chat" || !attempt.binding) return undefined;
       const rows = this.db.prepare(`SELECT id FROM source_contexts
         WHERE state = 'pending' AND source_class = 'chat' AND adapter_id = ? AND conversation_key = ?
-        ORDER BY arrival_sequence, id`).all(lease.binding.adapterId, lease.binding.conversationKey) as Array<{ id: string }>;
+        ORDER BY arrival_sequence, id`).all(attempt.binding.adapterId, attempt.binding.conversationKey) as Array<{ id: string }>;
       const next = rows.map((row) => this.source(row.id)).find((source) => !this.membershipForSource(source.id));
-      return next ? this.reserve(lease, next, "steer") : undefined;
+      return next ? this.reserve(attempt, next, "steer") : undefined;
     });
   }
 
   confirmStart(attemptId: string, contextId: string, turnId: string, options: { terminal?: boolean } = {}): SubmissionConfirmation {
     return inTransaction(this.db, () => {
-      const lease = this.lease();
       const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
-      const attempt = this.db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as { turn_id: unknown } | undefined;
-      if (!lease || lease.attemptId !== attemptId || lease.primaryContextId !== contextId
-        || !member || member.submissionKind !== "start" || !attempt) return "conflict";
-      if (member.state === "submitted") {
-        if (member.observedTurnId !== turnId || lease.turnId !== turnId || String(attempt.turn_id) !== turnId
-          || !new Set(["active", "terminalizing"]).has(lease.phase)) return "conflict";
-        if (options.terminal && lease.phase === "active") {
-          const changed = this.db.prepare(`UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing'
-            WHERE singleton = 1 AND attempt_id = ? AND phase = 'active' AND turn_id = ?`).run(attemptId, turnId).changes;
-          if (changed !== 1) this.conflict("lease changed while terminalizing confirmed start");
-        }
-        return this.lease()?.phase === "terminalizing" ? "already_terminal_same" : "already_same";
+      const attempt = this.db.prepare("SELECT * FROM assistant_attempts WHERE id = ?").get(attemptId) as Record<string, unknown> | undefined;
+      if (!attempt || String(attempt.context_id) !== contextId || !member || member.submissionKind !== "start") return "conflict";
+      if (String(attempt.state) !== "active") {
+        const exactFinalizedStart = new Set(["completed", "failed"]).has(String(attempt.state))
+          && new Set(["completed", "failed"]).has(member.state)
+          && String(attempt.turn_id) === turnId
+          && member.observedTurnId === turnId;
+        return exactFinalizedStart ? "already_terminal_same" : "conflict";
       }
-      if (!new Set(["start_submitting", "uncertain"]).has(member.state) || lease.phase !== "starting" || lease.turnId
+      const terminalizing = Number(attempt.accepting_tools) === 0;
+      if (member.state === "submitted") {
+        if (member.observedTurnId !== turnId || String(attempt.turn_id) !== turnId) return "conflict";
+        if (options.terminal && !terminalizing) this.markAttemptTerminalizing(attemptId, turnId);
+        return options.terminal || terminalizing ? "already_terminal_same" : "already_same";
+      }
+      if (!new Set(["start_submitting", "uncertain"]).has(member.state) || attempt.turn_id !== null
         || (attempt.turn_id !== null && String(attempt.turn_id) !== turnId)) return "conflict";
       const attemptChanged = this.db.prepare(`UPDATE assistant_attempts SET turn_id = ?
         WHERE id = ? AND state = 'active' AND (turn_id IS NULL OR turn_id = ?)`).run(turnId, attemptId, turnId).changes;
       if (attemptChanged !== 1) this.conflict("attempt changed while binding start");
       const memberChanged = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'submitted', observed_turn_id = ?, updated_at = ?
         WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start' AND state IN ('start_submitting', 'uncertain')`)
-        .run(turnId, Date.now(), attemptId, contextId).changes;
+        .run(turnId, this.now(), attemptId, contextId).changes;
       if (memberChanged !== 1) this.conflict("submission changed while binding start");
-      const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease
-        SET phase = ?, turn_id = ?, steer_paused = ?, pause_reason = ?
-        WHERE singleton = 1 AND attempt_id = ? AND phase = 'starting' AND turn_id IS NULL`)
-        .run(options.terminal ? "terminalizing" : "active", turnId, options.terminal ? 1 : 0,
-          options.terminal ? "terminalizing" : null, attemptId).changes;
-      if (leaseChanged !== 1) this.conflict("lease changed while binding start");
+      this.resolveReconciliation(attemptId, contextId);
+      if (options.terminal) this.markAttemptTerminalizing(attemptId, turnId);
       return "bound";
     });
   }
 
   confirmSteer(attemptId: string, contextId: string, turnId: string): SubmissionConfirmation {
     return inTransaction(this.db, () => {
-      const lease = this.lease();
       const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
-      const attempt = this.db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as { turn_id: unknown } | undefined;
-      if (!lease || lease.attemptId !== attemptId || !member || member.submissionKind !== "steer" || !attempt) return "conflict";
+      const attempt = this.attemptById(attemptId);
+      if (!attempt || !member || member.submissionKind !== "steer") return "conflict";
+      const terminalizing = Number(attempt.accepting_tools) === 0;
       if (member.state === "submitted") {
-        if (member.observedTurnId !== turnId || member.expectedTurnId !== turnId || lease.turnId !== turnId
-          || String(attempt.turn_id) !== turnId || !new Set(["active", "terminalizing"]).has(lease.phase)) return "conflict";
-        return lease.phase === "terminalizing" ? "already_terminal_same" : "already_same";
+        if (member.observedTurnId !== turnId || member.expectedTurnId !== turnId || String(attempt.turn_id) !== turnId) return "conflict";
+        return terminalizing ? "already_terminal_same" : "already_same";
       }
       if (!new Set(["steer_submitting", "uncertain"]).has(member.state)
-        || !new Set(["active", "terminalizing"]).has(lease.phase)
-        || !lease.turnId || lease.turnId !== turnId || member.expectedTurnId !== turnId) return "conflict";
+        || attempt.turn_id === null || String(attempt.turn_id) !== turnId || member.expectedTurnId !== turnId) return "conflict";
       if (!attempt || String(attempt.turn_id) !== turnId) return "conflict";
-      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'submitted', observed_turn_id = ?, updated_at = ?
+      const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = ?, observed_turn_id = ?, updated_at = ?
         WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'steer' AND expected_turn_id = ?
           AND state IN ('steer_submitting', 'uncertain')`)
-        .run(turnId, Date.now(), attemptId, contextId, turnId).changes;
+        .run(terminalizing ? "completed" : "submitted", turnId, this.now(), attemptId, contextId, turnId).changes;
       if (changed !== 1) this.conflict("submission changed while confirming steer");
-      if (lease.phase === "active") {
-        const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 0, pause_reason = NULL
-          WHERE singleton = 1 AND attempt_id = ? AND phase = 'active' AND turn_id = ?`).run(attemptId, turnId).changes;
-        if (leaseChanged !== 1) this.conflict("lease changed while confirming steer");
-        return "bound";
+      this.resolveReconciliation(attemptId, contextId);
+      if (terminalizing) {
+        this.db.prepare("UPDATE source_contexts SET state = 'completed' WHERE id = ? AND state = 'active'").run(contextId);
+        this.finalizeEventBatch(contextId, "processed");
+        this.releaseSourceAttachments(contextId);
       }
-      return "already_terminal_same";
+      return terminalizing ? "already_terminal_same" : "bound";
     });
   }
 
@@ -280,49 +307,106 @@ export class ConversationStore {
     const result = member?.submissionKind === "start"
       ? this.confirmStart(attemptId, contextId, turnId)
       : this.confirmSteer(attemptId, contextId, turnId);
-    if (result === "conflict") this.conflict("submission confirmation conflicts with the live lease");
+    if (result === "conflict") this.conflict("submission confirmation conflicts with the assistant attempt");
   }
 
   markUncertain(attemptId: string, contextId: string): void {
     if (!this.markUncertainIfUnresolved(attemptId, contextId)) this.conflict("submission cannot become uncertain");
   }
 
+  beginReconciliation(attemptId: string, contextId: string): ReconciliationDecision {
+    return inTransaction(this.db, () => {
+      this.ensureReconciliation(attemptId, contextId);
+      const row = this.db.prepare(`SELECT * FROM assistant_input_reconciliation
+        WHERE attempt_id = ? AND context_id = ?`).get(attemptId, contextId) as Record<string, unknown> | undefined;
+      if (!row || row.outcome !== "pending") {
+        return row?.outcome === "needs_attention" ? { kind: "needs_attention" } : { kind: "wait", retryAt: this.now() };
+      }
+      const now = this.now();
+      const attempts = Number(row.attempt_count);
+      if (now >= Number(row.deadline_at) || attempts >= (this.options.reconciliationMaxAttempts ?? 6)) {
+        this.markNeedsAttention(attemptId, contextId, now);
+        return { kind: "needs_attention" };
+      }
+      if (now < Number(row.next_retry_at)) return { kind: "wait", retryAt: Number(row.next_retry_at) };
+      const exponential = Math.min((this.options.reconciliationBaseMs ?? 1_000) * 2 ** attempts, 30_000);
+      const delay = jitteredDelay(exponential, `${attemptId}\u0000${contextId}\u0000${attempts}`);
+      this.db.prepare(`UPDATE assistant_input_reconciliation
+        SET attempt_count = attempt_count + 1, next_retry_at = ?, updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND outcome = 'pending'`)
+        .run(Math.min(Number(row.deadline_at), now + delay), now, attemptId, contextId);
+      return { kind: "ready" };
+    });
+  }
+
+  beginTerminalReconciliation(attemptId: string): ReconciliationDecision {
+    return inTransaction(this.db, () => {
+      const attempt = this.attemptById(attemptId);
+      if (!attempt || attempt.state !== "active" || attempt.turn_id === null || Number(attempt.accepting_tools) !== 0) {
+        return { kind: "wait", retryAt: this.now() };
+      }
+      const createdAt = this.now();
+      const deadlineAt = createdAt + (this.options.reconciliationDeadlineMs ?? 5 * 60_000);
+      this.db.prepare(`INSERT OR IGNORE INTO assistant_terminal_reconciliation
+        (attempt_id, attempt_count, deadline_at, next_retry_at, outcome, created_at, updated_at)
+        VALUES (?, 0, ?, ?, 'pending', ?, ?)`).run(attemptId, deadlineAt, createdAt, createdAt, this.now());
+      const row = this.db.prepare("SELECT * FROM assistant_terminal_reconciliation WHERE attempt_id = ?").get(attemptId) as Record<string, unknown>;
+      if (row.outcome !== "pending") {
+        return { kind: "needs_attention" };
+      }
+      const now = this.now();
+      const attempts = Number(row.attempt_count);
+      if (now >= Number(row.deadline_at) || attempts >= (this.options.reconciliationMaxAttempts ?? 6)) {
+        this.markTerminalNeedsAttention(attemptId, now);
+        return { kind: "needs_attention" };
+      }
+      if (now < Number(row.next_retry_at)) return { kind: "wait", retryAt: Number(row.next_retry_at) };
+      const exponential = Math.min((this.options.reconciliationBaseMs ?? 1_000) * 2 ** attempts, 30_000);
+      const delay = jitteredDelay(exponential, `${attemptId}\u0000terminal\u0000${attempts}`);
+      this.db.prepare(`UPDATE assistant_terminal_reconciliation
+        SET attempt_count = attempt_count + 1, next_retry_at = ?, updated_at = ?
+        WHERE attempt_id = ? AND outcome = 'pending'`)
+        .run(Math.min(Number(row.deadline_at), now + delay), now, attemptId);
+      return { kind: "ready" };
+    });
+  }
+
+  terminalReconciliationRetryAt(attemptId: string): number | undefined {
+    const row = this.db.prepare(`SELECT next_retry_at FROM assistant_terminal_reconciliation
+      WHERE attempt_id = ? AND outcome = 'pending'`).get(attemptId) as { next_retry_at: number } | undefined;
+    return row ? Number(row.next_retry_at) : undefined;
+  }
+
   observeUnknownStartTerminal(attemptId: string, contextId: string): boolean {
     return inTransaction(this.db, () => {
-      const lease = this.lease();
       const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
-      if (!lease || lease.attemptId !== attemptId || lease.primaryContextId !== contextId
-        || lease.phase !== "starting" || lease.turnId || !member || member.submissionKind !== "start"
+      const attempt = this.attemptById(attemptId);
+      if (!attempt || String(attempt.context_id) !== contextId || attempt.turn_id !== null
+        || !member || member.submissionKind !== "start"
         || !new Set(["start_submitting", "uncertain"]).has(member.state)) return false;
       const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'uncertain', updated_at = ?
         WHERE attempt_id = ? AND context_id = ? AND submission_kind = 'start' AND state = 'start_submitting'`)
         .run(Date.now(), attemptId, contextId).changes;
-      if (this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'unknown_terminal_observed'
-        WHERE singleton = 1 AND attempt_id = ? AND phase = 'starting' AND turn_id IS NULL`)
-        .run(attemptId).changes !== 1) this.conflict("unknown terminal observation changed with the start lease");
+      this.ensureReconciliation(attemptId, contextId);
       return changed === 1;
     });
   }
 
   markUncertainIfUnresolved(attemptId: string, contextId: string): boolean {
     return inTransaction(this.db, () => {
-      const lease = this.lease();
       const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
-      if (!lease || lease.attemptId !== attemptId || !member
+      const attempt = this.attemptById(attemptId);
+      if (!attempt || !member
         || !new Set(["start_submitting", "steer_submitting"]).has(member.state)) return false;
-      const validStart = member.submissionKind === "start" && lease.phase === "starting" && !lease.turnId;
-      const validSteer = member.submissionKind === "steer" && new Set(["active", "terminalizing"]).has(lease.phase)
-        && !!lease.turnId && member.expectedTurnId === lease.turnId;
+      const validStart = member.submissionKind === "start" && attempt.turn_id === null;
+      const validSteer = member.submissionKind === "steer" && attempt.turn_id !== null
+        && member.expectedTurnId === String(attempt.turn_id);
       if (!validStart && !validSteer) return false;
       const changed = this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'uncertain', updated_at = ?
         WHERE attempt_id = ? AND context_id = ? AND state IN ('start_submitting', 'steer_submitting')`)
         .run(Date.now(), attemptId, contextId).changes;
       if (changed !== 1) this.conflict("submission changed while marking uncertainty");
-      if (lease.phase !== "terminalizing") {
-        const leaseChanged = this.db.prepare(`UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = 'submission_uncertain'
-          WHERE singleton = 1 AND attempt_id = ? AND phase = ?`).run(attemptId, lease.phase).changes;
-        if (leaseChanged !== 1) this.conflict("lease changed while marking uncertainty");
-      }
+      this.ensureReconciliation(attemptId, contextId);
       return true;
     });
   }
@@ -336,30 +420,18 @@ export class ConversationStore {
       if (this.db.prepare("UPDATE source_contexts SET state = 'pending' WHERE id = ? AND state = 'active'").run(contextId).changes !== 1) {
         this.conflict("source cannot be restored");
       }
-      this.db.prepare(`UPDATE assistant_turn_lease
-        SET steer_paused = CASE WHEN phase = 'terminalizing' THEN 1 ELSE 0 END,
-            pause_reason = CASE WHEN phase = 'terminalizing' THEN 'terminalizing' ELSE NULL END
-        WHERE attempt_id = ?`).run(attemptId);
+      this.db.prepare(`UPDATE assistant_input_reconciliation SET outcome = 'resolved', updated_at = ?
+        WHERE attempt_id = ? AND context_id = ? AND outcome = 'pending'`).run(this.now(), attemptId, contextId);
     });
   }
 
-  pauseSteering(attemptId: string, reason: string): void {
-    inTransaction(this.db, () => {
-      if (this.db.prepare("UPDATE assistant_turn_lease SET steer_paused = 1, pause_reason = ? WHERE singleton = 1 AND attempt_id = ? AND phase = 'active'")
-        .run(reason, attemptId).changes !== 1) this.conflict("attempt cannot pause steering");
-    });
-  }
-
-  beginTerminalizing(turnId: string): AssistantLease | undefined {
+  beginTerminalizing(attemptId: string, turnId: string): AssistantAttempt | undefined {
     return inTransaction(this.db, () => {
-      const current = this.lease();
-      if (!current || current.turnId !== turnId) return undefined;
-      if (current.phase === "terminalizing") return current;
-      if (current.phase !== "active") this.conflict("lease is not active");
-      if (this.db.prepare("UPDATE assistant_turn_lease SET phase = 'terminalizing', steer_paused = 1, pause_reason = 'terminalizing' WHERE singleton = 1 AND phase = 'active' AND turn_id = ?").run(turnId).changes !== 1) {
-        this.conflict("lease changed before terminalization");
-      }
-      return this.lease();
+      const row = this.db.prepare("SELECT * FROM assistant_attempts WHERE id = ? AND state = 'active' AND turn_id = ?")
+        .get(attemptId, turnId) as Record<string, unknown> | undefined;
+      if (!row) return undefined;
+      this.markAttemptTerminalizing(attemptId, turnId);
+      return this.attempt(attemptId);
     });
   }
 
@@ -404,16 +476,37 @@ export class ConversationStore {
     });
   }
 
-  clearLease(attemptId: string): void {
+  failUnstartedAttempt(attemptId: string): void {
     inTransaction(this.db, () => {
-      const current = this.lease();
+      const current = this.attemptById(attemptId);
       if (!current) return;
-      if (current.attemptId !== attemptId) this.conflict("another attempt owns the lease");
-      this.db.prepare("DELETE FROM assistant_turn_lease WHERE singleton = 1 AND attempt_id = ?").run(attemptId);
       this.db.prepare(`UPDATE assistant_attempts SET state = 'failed'
         WHERE id = ? AND state = 'active'
           AND NOT EXISTS (SELECT 1 FROM assistant_attempt_sources WHERE attempt_id = ? AND state = 'submitted')`).run(attemptId, attemptId);
     });
+  }
+
+  unresolvedSubmissions(): ReservedSubmission[] {
+    const rows = this.db.prepare(`SELECT attempt_id, context_id FROM assistant_attempt_sources
+      WHERE state IN ('start_submitting', 'steer_submitting', 'uncertain')
+      ORDER BY created_at, attempt_id, source_ordinal`).all() as Array<{ attempt_id: string; context_id: string }>;
+    return rows.map((row) => this.submissionFor(row.attempt_id, row.context_id)).filter((value): value is ReservedSubmission => value !== undefined);
+  }
+
+  reconciliationRetryAt(attemptId: string, contextId: string): number | undefined {
+    const row = this.db.prepare(`SELECT next_retry_at FROM assistant_input_reconciliation
+      WHERE attempt_id = ? AND context_id = ? AND outcome = 'pending'`).get(attemptId, contextId) as { next_retry_at: number } | undefined;
+    return row ? Number(row.next_retry_at) : undefined;
+  }
+
+  failOrphanedUnstartedAttempts(): number {
+    return Number(this.db.prepare(`UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0
+      WHERE state = 'active' AND turn_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM assistant_attempt_sources WHERE attempt_id = assistant_attempts.id)`).run().changes);
+  }
+
+  bindingForTurn(turnId: string): ConversationBinding | undefined {
+    return this.attemptForTurn(turnId)?.binding;
   }
 
   repairQueueNotices(): number {
@@ -426,22 +519,20 @@ export class ConversationStore {
     });
   }
 
-  private disposition(source: StoredSource): "pending" | "owner" | "queued" {
-    const lease = this.lease();
-    if (!lease) return "pending";
-    return lease.triggerKind === "chat" && lease.binding && source.binding && sameConversation(lease.binding, source.binding) ? "owner" : "queued";
+  private disposition(source: StoredSource, activeAttempt?: AssistantAttempt): "pending" | "owner" | "queued" {
+    if (!activeAttempt) return "pending";
+    return activeAttempt.triggerKind === "chat" && activeAttempt.binding && source.binding
+      && sameConversation(activeAttempt.binding, source.binding) ? "owner" : "queued";
   }
 
-  private acquireLeaseInTransaction(candidate: { kind: "chat" | "internal"; contextId: string }, capacityClaimId: string): AssistantLease {
-    if (this.lease()) this.conflict("assistant lease already exists");
+  private createAttemptInTransaction(candidate: { kind: "chat" | "internal"; contextId: string }): AssistantAttempt {
     const source = this.source(candidate.contextId);
-    if (source.state !== "pending") this.conflict("lease candidate is not pending");
-    if ((source.sourceClass === "chat") !== (candidate.kind === "chat")) this.conflict("lease candidate kind changed");
-    if (candidate.kind === "chat" && !source.binding) this.conflict("chat lease candidate has no binding");
+    if (source.state !== "pending") this.conflict("attempt candidate is not pending");
+    if ((source.sourceClass === "chat") !== (candidate.kind === "chat")) this.conflict("attempt candidate kind changed");
+    if (candidate.kind === "chat" && !source.binding) this.conflict("chat attempt candidate has no binding");
 
     const attemptId = `attempt_${randomUUID()}`;
-    const clientUserMessageId = nativeSubmissionId(attemptId, 1);
-    const now = Date.now();
+    const now = this.now();
     this.db.prepare(`INSERT INTO assistant_attempts
       (id, context_id, turn_id, trigger_kind, state, created_at, adapter_id, conversation_key, destination_json, native_reply_json)
       VALUES (?, ?, NULL, ?, 'active', ?, ?, ?, ?, ?)`)
@@ -449,15 +540,6 @@ export class ConversationStore {
         source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
         source.binding === undefined ? null : JSON.stringify(source.binding.destination),
         source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply));
-    this.db.prepare(`INSERT INTO assistant_turn_lease
-      (singleton, phase, attempt_id, primary_context_id, adapter_id, conversation_key, destination_json, native_reply_json,
-        client_user_message_id, turn_id, trigger_kind, capacity_claim_id, steer_paused, pause_reason)
-      VALUES (1, 'starting', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, NULL)`)
-      .run(attemptId, source.id, source.binding?.adapterId ?? null, source.binding?.conversationKey ?? null,
-        source.binding === undefined ? null : JSON.stringify(source.binding.destination),
-        source.binding?.reply === undefined ? null : JSON.stringify(source.binding.reply),
-        clientUserMessageId, candidate.kind, capacityClaimId);
-
     const pendingChats = this.db.prepare("SELECT id FROM source_contexts WHERE state = 'pending' AND source_class = 'chat' ORDER BY arrival_sequence, id")
       .all() as Array<{ id: string }>;
     for (const row of pendingChats) {
@@ -466,7 +548,7 @@ export class ConversationStore {
         this.ensureQueueNotice(pendingChat);
       }
     }
-    return this.lease()!;
+    return this.parseAttempt(this.attemptById(attemptId)!);
   }
 
   private ensureQueueNotice(source: StoredSource): boolean {
@@ -477,22 +559,22 @@ export class ConversationStore {
     return true;
   }
 
-  private reserve(lease: AssistantLease, source: StoredSource, kind: "start" | "steer"): ReservedSubmission {
+  private reserve(attempt: AssistantAttempt, source: StoredSource, kind: "start" | "steer"): ReservedSubmission {
     if (source.state !== "pending") this.conflict("source is not pending");
     const ordinal = Number((this.db.prepare("SELECT COALESCE(MAX(source_ordinal), 0) + 1 AS ordinal FROM assistant_attempt_sources WHERE attempt_id = ?")
-      .get(lease.attemptId) as { ordinal: number }).ordinal);
-    const clientUserMessageId = kind === "start" ? lease.clientUserMessageId : nativeSubmissionId(lease.attemptId, ordinal);
-    const now = Date.now();
+      .get(attempt.attemptId) as { ordinal: number }).ordinal);
+    const clientUserMessageId = nativeSubmissionId(attempt.attemptId, ordinal);
+    const now = this.now();
     this.db.prepare(`INSERT INTO assistant_attempt_sources
       (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, expected_turn_id, observed_turn_id, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`)
-      .run(lease.attemptId, source.id, ordinal, clientUserMessageId, kind,
-        kind === "start" ? "start_submitting" : "steer_submitting", kind === "steer" ? lease.turnId ?? null : null, now, now);
+      .run(attempt.attemptId, source.id, ordinal, clientUserMessageId, kind,
+        kind === "start" ? "start_submitting" : "steer_submitting", kind === "steer" ? attempt.turnId ?? null : null, now, now);
     if (this.db.prepare("UPDATE source_contexts SET state = 'active' WHERE id = ? AND state = 'pending'").run(source.id).changes !== 1) {
       this.conflict("source changed while reserving submission");
     }
     return {
-      ...this.membersForAttempt(lease.attemptId).find((member) => member.contextId === source.id)!,
+      ...this.membersForAttempt(attempt.attemptId).find((member) => member.contextId === source.id)!,
       rawText: source.rawText,
       attachmentIds: source.attachmentIds,
       failedAttachments: source.failedAttachments,
@@ -500,9 +582,9 @@ export class ConversationStore {
     };
   }
 
-  private assertNoUnresolvedSubmission(): void {
+  private assertNoUnresolvedSubmission(attemptId: string): void {
     const unresolved = this.db.prepare(`SELECT context_id FROM assistant_attempt_sources
-      WHERE state IN ('start_submitting', 'steer_submitting', 'uncertain') LIMIT 1`).get();
+      WHERE attempt_id = ? AND state IN ('start_submitting', 'steer_submitting', 'uncertain') LIMIT 1`).get(attemptId);
     if (unresolved) this.conflict("another native submission is unresolved");
   }
 
@@ -512,8 +594,8 @@ export class ConversationStore {
     return row ? this.parseMember(row) : undefined;
   }
 
-  private requiredLease(): AssistantLease {
-    return this.lease() ?? this.conflict("assistant lease is missing");
+  private requiredAttempt(attemptId: string): AssistantAttempt {
+    return this.attempt(attemptId) ?? this.conflict("assistant attempt is missing");
   }
 
   private source(id: string): StoredSource {
@@ -548,11 +630,14 @@ export class ConversationStore {
     return value;
   }
 
-  private parseLease(row: Record<string, unknown>): AssistantLease {
+  private attemptById(attemptId: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM assistant_attempts WHERE id = ? AND state = 'active'").get(attemptId) as Record<string, unknown> | undefined;
+  }
+
+  private parseAttempt(row: Record<string, unknown>): AssistantAttempt {
     return {
-      phase: String(row.phase) as AssistantLease["phase"],
-      attemptId: String(row.attempt_id),
-      primaryContextId: String(row.primary_context_id),
+      attemptId: String(row.id),
+      primaryContextId: String(row.context_id),
       ...(row.adapter_id && row.conversation_key && row.destination_json ? {
         binding: {
           adapterId: String(row.adapter_id),
@@ -561,13 +646,102 @@ export class ConversationStore {
           ...(row.native_reply_json ? { reply: JSON.parse(String(row.native_reply_json)) as JsonValue } : {}),
         },
       } : {}),
-      clientUserMessageId: String(row.client_user_message_id),
       ...(row.turn_id ? { turnId: String(row.turn_id) } : {}),
-      triggerKind: String(row.trigger_kind) as "chat" | "internal",
-      capacityClaimId: String(row.capacity_claim_id),
-      steerPaused: Number(row.steer_paused) === 1,
-      ...(row.pause_reason ? { pauseReason: String(row.pause_reason) } : {}),
+      triggerKind: row.trigger_kind === "user" ? "chat" : "internal",
+      acceptingTools: Number(row.accepting_tools) === 1,
     };
+  }
+
+  private markAttemptTerminalizing(attemptId: string, turnId: string): void {
+    this.db.prepare(`UPDATE assistant_attempts
+      SET tool_fence = tool_fence + CASE WHEN accepting_tools = 1 THEN 1 ELSE 0 END, accepting_tools = 0
+      WHERE id = ? AND state = 'active' AND turn_id = ?`).run(attemptId, turnId);
+  }
+
+  private ensureReconciliation(attemptId: string, contextId: string): void {
+    const member = this.db.prepare(`SELECT created_at FROM assistant_attempt_sources
+      WHERE attempt_id = ? AND context_id = ?`).get(attemptId, contextId) as { created_at: number } | undefined;
+    if (!member) this.conflict("unknown assistant input reconciliation");
+    const deadline = Number(member.created_at) + (this.options.reconciliationDeadlineMs ?? 5 * 60_000);
+    this.db.prepare(`INSERT OR IGNORE INTO assistant_input_reconciliation
+      (attempt_id, context_id, attempt_count, deadline_at, next_retry_at, outcome, created_at, updated_at)
+      VALUES (?, ?, 0, ?, ?, 'pending', ?, ?)`)
+      .run(attemptId, contextId, deadline, Number(member.created_at), Number(member.created_at), this.now());
+  }
+
+  private resolveReconciliation(attemptId: string, contextId: string): void {
+    this.db.prepare(`UPDATE assistant_input_reconciliation SET outcome = 'resolved', updated_at = ?
+      WHERE attempt_id = ? AND context_id = ? AND outcome = 'pending'`).run(this.now(), attemptId, contextId);
+  }
+
+  private markNeedsAttention(attemptId: string, contextId: string, now: number): void {
+    const member = this.membersForAttempt(attemptId).find((candidate) => candidate.contextId === contextId);
+    if (!member) this.conflict("unknown assistant input reconciliation");
+    const source = this.source(contextId);
+    this.db.prepare(`UPDATE assistant_input_reconciliation SET outcome = 'needs_attention', updated_at = ?
+      WHERE attempt_id = ? AND context_id = ? AND outcome = 'pending'`).run(now, attemptId, contextId);
+    this.db.prepare(`UPDATE assistant_attempt_sources SET state = 'failed', updated_at = ?
+      WHERE attempt_id = ? AND context_id = ? AND state IN ('start_submitting', 'steer_submitting', 'uncertain')`)
+      .run(now, attemptId, contextId);
+    this.db.prepare("UPDATE source_contexts SET state = 'completed' WHERE id = ? AND state = 'active'").run(contextId);
+    if (member.submissionKind === "start") {
+      this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ? AND state = 'active'").run(attemptId);
+    }
+    this.finalizeEventBatch(contextId, "processed");
+    this.releaseSourceAttachments(contextId);
+    const binding = source.binding ?? this.options.ownerBinding?.();
+    if (binding) this.deliveries.prepare({
+      id: `assistant-needs-attention:${contextId}`,
+      kind: "system_warning",
+      binding,
+      body: "[system] assistant input needs attention; native submission could not be reconciled",
+      mandatory: true,
+    });
+  }
+
+  private markTerminalNeedsAttention(attemptId: string, now: number): void {
+    const attempt = this.attemptById(attemptId);
+    if (!attempt) return;
+    const members = this.membersForAttempt(attemptId).filter((member) => member.state === "submitted");
+    this.db.prepare(`UPDATE assistant_terminal_reconciliation SET outcome = 'needs_attention', updated_at = ?
+      WHERE attempt_id = ? AND outcome = 'pending'`).run(now, attemptId);
+    this.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE id = ? AND state = 'active'").run(attemptId);
+    this.db.prepare("UPDATE assistant_attempt_sources SET state = 'failed', updated_at = ? WHERE attempt_id = ? AND state = 'submitted'")
+      .run(now, attemptId);
+    for (const member of members) {
+      this.db.prepare("UPDATE source_contexts SET state = 'completed' WHERE id = ? AND state = 'active'").run(member.contextId);
+      this.finalizeEventBatch(member.contextId, "processed");
+      this.releaseSourceAttachments(member.contextId);
+    }
+    const binding = this.parseAttempt(attempt).binding ?? this.options.ownerBinding?.();
+    if (binding) this.deliveries.prepare({
+      id: `assistant-terminal-needs-attention:${attemptId}`,
+      kind: "system_warning",
+      binding,
+      body: "[system] assistant terminal response needs attention; finalization could not be reconciled",
+      mandatory: true,
+    });
+  }
+
+  private finalizeEventBatch(contextId: string, state: "processed" | "superseded"): void {
+    const row = this.db.prepare("SELECT event_ids_json FROM event_batches WHERE id = ?").get(contextId) as { event_ids_json: string } | undefined;
+    if (!row) return;
+    const eventIds = JSON.parse(row.event_ids_json) as string[];
+    if (eventIds.length > 0) {
+      const placeholders = eventIds.map(() => "?").join(",");
+      this.db.prepare(`UPDATE events SET state = ? WHERE id IN (${placeholders})`).run(state, ...eventIds);
+    }
+    this.db.prepare("UPDATE event_batches SET state = ? WHERE id = ?").run(state, contextId);
+  }
+
+  private releaseSourceAttachments(contextId: string): void {
+    const inserted = this.db.prepare("INSERT OR IGNORE INTO source_attachment_releases(context_id, released_at) VALUES (?, ?)")
+      .run(contextId, this.now()).changes;
+    if (!inserted) return;
+    const row = this.db.prepare("SELECT attachment_ids_json FROM source_contexts WHERE id = ?").get(contextId) as { attachment_ids_json: string } | undefined;
+    for (const id of row ? JSON.parse(row.attachment_ids_json) as string[] : []) {
+      this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);
+    }
   }
 
   private parseMember(row: Record<string, unknown>): AttemptSource {
@@ -589,6 +763,16 @@ export class ConversationStore {
   private conflict(message: string): never {
     throw new AppError("OPERATION_CONFLICT", `OPERATION_CONFLICT: ${message}`);
   }
+}
+
+function jitteredDelay(delayMs: number, key: string): number {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < key.length; index += 1) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619) >>> 0;
+  }
+  const factor = 0.8 + (hash / 0xffff_ffff) * 0.4;
+  return Math.min(30_000, Math.max(1, Math.round(delayMs * factor)));
 }
 
 function nativeSubmissionId(attemptId: string, ordinal: number): string {

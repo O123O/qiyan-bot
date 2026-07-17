@@ -21,71 +21,110 @@ function message(id: string, route: ConversationBinding, attachmentIds: readonly
   return { id, nativeSourceId: `native:${id}`, binding: route, rawText: id, attachmentIds, receivedAt: 100 };
 }
 
-function fixture() {
+function fixture(options: ConstructorParameters<typeof ConversationStore>[3] = {}) {
   const db = createTestDatabase();
   const deliveries = new DeliveryStore(db);
-  return { db, deliveries, store: new ConversationStore(db, deliveries) };
+  return { db, deliveries, store: new ConversationStore(db, deliveries, undefined, options) };
 }
 
-test("chat acceptance persists only and dispatcher arbitration owns lease creation", () => {
-  const { store } = fixture();
+test("an uncertain input reaches needs-attention on its original deadline and cannot block the next input", () => {
+  let now = 1_000;
+  const route = binding("telegram", "chat-1");
+  const { db, deliveries, store } = fixture({ now: () => now, reconciliationDeadlineMs: 100 });
+  store.acceptChatSource(message("one", route));
+  store.acceptChatSource(message("two", route));
+  const first = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(first.attemptId, "one");
+  store.markUncertain(first.attemptId, "one");
+
+  now = 1_101;
+  assert.deepEqual(store.beginReconciliation(first.attemptId, "one"), { kind: "needs_attention" });
+  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'one'").get()!.state, "completed");
+  assert.match(deliveries.get("assistant-needs-attention:one")?.body ?? "", /needs attention/u);
+
+  const second = store.createAttempt({ kind: "chat", contextId: "two" });
+  assert.equal(second.primaryContextId, "two");
+});
+
+test("uncertain-input retries use deterministic jittered exponential backoff", () => {
+  let now = 1_000;
+  const { store } = fixture({ now: () => now, reconciliationBaseMs: 1_000 });
+  store.acceptChatSource(message("one", binding("telegram", "chat-1")));
+  const attempt = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(attempt.attemptId, "one");
+  store.markUncertain(attempt.attemptId, "one");
+
+  assert.deepEqual(store.beginReconciliation(attempt.attemptId, "one"), { kind: "ready" });
+  const firstRetry = store.reconciliationRetryAt(attempt.attemptId, "one")!;
+  assert.ok(firstRetry >= 1_800 && firstRetry <= 2_200);
+  assert.notEqual(firstRetry, 2_000);
+
+  now = firstRetry;
+  assert.deepEqual(store.beginReconciliation(attempt.attemptId, "one"), { kind: "ready" });
+  const secondRetry = store.reconciliationRetryAt(attempt.attemptId, "one")!;
+  assert.ok(secondRetry - now >= 1_600 && secondRetry - now <= 2_400);
+});
+
+test("chat acceptance persists only and dispatcher arbitration owns attempt creation", () => {
+  const { db, store } = fixture();
   const first = store.acceptChatSource(message("one", binding("telegram", "chat-1")));
   const second = store.acceptChatSource(message("two", binding("slack", "dm-1")));
   assert.equal(first.disposition, "pending");
   assert.equal(second.disposition, "pending");
-  assert.equal(store.lease(), undefined);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assistant_attempts").get()!.n, 0);
 
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim-one");
-  assert.equal(lease.primaryContextId, "one");
-  assert.equal(lease.capacityClaimId, "claim-one");
-  assert.equal(store.acceptChatSource(message("three", binding("telegram", "chat-1"))).disposition, "owner");
+  const attempt = store.createAttempt({ kind: "chat", contextId: "one" });
+  assert.equal(attempt.primaryContextId, "one");
+  assert.equal(store.acceptChatSource(message("three", binding("telegram", "chat-1")), {}, attempt).disposition, "owner");
 });
 
 test("cross-conversation input queues with one exact durable notice while same-owner input does not", () => {
   const { deliveries, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
-  store.acquireLease({ kind: "chat", contextId: "one" }, "claim-one");
+  const attempt = store.createAttempt({ kind: "chat", contextId: "one" });
 
-  const queued = store.acceptChatSource(message("two", binding("slack", "dm-1")));
-  const owner = store.acceptChatSource(message("three", binding("telegram", "chat-1")));
+  const queued = store.acceptChatSource(message("two", binding("slack", "dm-1")), {}, attempt);
+  const owner = store.acceptChatSource(message("three", binding("telegram", "chat-1")), {}, attempt);
   assert.equal(queued.disposition, "queued");
   assert.equal(owner.disposition, "owner");
   assert.equal(deliveries.get("queued:two")?.body, "[system] queued");
   assert.equal(deliveries.get("queued:three"), undefined);
-  assert.equal(store.lease()?.primaryContextId, "one");
+  assert.equal(store.attempt(attempt.attemptId)?.primaryContextId, "one");
 });
 
 test("native duplicates keep their first identity, sequence, and notice and repair a missing notice", () => {
   const { db, deliveries, store } = fixture();
   store.acceptChatSource(message("owner", binding("telegram", "chat-1")));
-  store.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
-  const original = store.acceptChatSource(message("queued", binding("slack", "dm-1")));
-  const duplicate = store.acceptChatSource({ ...message("replacement", binding("slack", "dm-1")), nativeSourceId: "native:queued" });
+  const attempt = store.createAttempt({ kind: "chat", contextId: "owner" });
+  const original = store.acceptChatSource(message("queued", binding("slack", "dm-1")), {}, attempt);
+  const duplicate = store.acceptChatSource(
+    { ...message("replacement", binding("slack", "dm-1")), nativeSourceId: "native:queued" }, {}, attempt,
+  );
   assert.equal(duplicate.contextId, original.contextId);
   assert.equal(duplicate.disposition, "queued");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM source_contexts WHERE adapter_id = 'slack'").get()!.n, 1);
 
   db.prepare("DELETE FROM deliveries WHERE id = 'queued:queued'").run();
-  store.acceptChatSource(message("queued", binding("slack", "dm-1")));
+  store.acceptChatSource(message("queued", binding("slack", "dm-1")), {}, attempt);
   assert.equal(deliveries.get("queued:queued")?.body, "[system] queued");
   db.prepare("DELETE FROM deliveries WHERE id = 'queued:queued'").run();
   assert.equal(store.repairQueueNotices(), 1);
   assert.equal(store.repairQueueNotices(), 0);
 });
 
-test("lease acquisition notices every already-pending losing chat, including all chats for internal work", () => {
+test("attempt creation notices every already-pending losing chat, including all chats for internal work", () => {
   const { deliveries, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
   store.acceptChatSource(message("same", binding("telegram", "chat-1")));
   store.acceptChatSource(message("other", binding("slack", "dm-1")));
-  store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
+  store.createAttempt({ kind: "chat", contextId: "one" });
   assert.equal(deliveries.get("queued:same"), undefined);
   assert.equal(deliveries.get("queued:other")?.body, "[system] queued");
 
   const next = fixture();
   next.store.acceptChatSource(message("chat", binding("telegram", "chat-1")));
   next.store.createInternalSource({ id: "internal", kind: "event_batch", sourceId: "batch", rawText: "events", attachmentIds: [], receivedAt: 90 });
-  next.store.acquireLease({ kind: "internal", contextId: "internal" }, "internal-claim");
+  next.store.createAttempt({ kind: "internal", contextId: "internal" });
   assert.equal(next.deliveries.get("queued:chat")?.body, "[system] queued");
 });
 
@@ -100,11 +139,11 @@ test("a route-bound recovery turn queues chat input and never reserves it as a s
     attachmentIds: [],
     binding: route,
   });
-  const lease = store.acquireLease({ kind: "internal", contextId: "recovery" }, "claim");
-  store.reserveStart("recovery");
+  const lease = store.createAttempt({ kind: "internal", contextId: "recovery" });
+  store.reserveStart(lease.attemptId, "recovery");
   store.markSubmitted(lease.attemptId, "recovery", "turn");
 
-  const accepted = store.acceptChatSource(message("follow-up", route));
+  const accepted = store.acceptChatSource(message("follow-up", route), {}, lease);
   assert.equal(accepted.disposition, "queued");
   assert.equal(deliveries.get("queued:follow-up")?.body, "[system] queued");
   assert.equal(store.reserveNextSteer(lease.attemptId), undefined);
@@ -115,8 +154,8 @@ test("reservations pair source and membership state and allow only one unresolve
   const { db, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
   store.acceptChatSource(message("two", binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  const start = store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  const start = store.reserveStart(lease.attemptId, "one");
   assert.equal(start.submissionKind, "start");
   assert.equal(store.membersForAttempt(lease.attemptId)[0]?.state, "start_submitting");
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'one'").get()!.state, "active");
@@ -133,53 +172,53 @@ test("reservations pair source and membership state and allow only one unresolve
 test("start confirmation binds once and is idempotent across notification and response races", () => {
   const { db, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
 
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "bound");
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "already_same");
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-b"), "conflict");
-  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(store.attempt(lease.attemptId)?.turnId, "turn-a");
   assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.turn_id, "turn-a");
   assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "one"), false);
 });
 
-test("a late start-confirmation CAS miss rolls back every earlier write", () => {
+test("a late start-confirmation attempt CAS miss rolls back every earlier write", () => {
   const { db, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
-  db.exec(`CREATE TRIGGER ignore_start_lease_update BEFORE UPDATE OF turn_id ON assistant_turn_lease
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
+  db.exec(`CREATE TRIGGER ignore_start_attempt_update BEFORE UPDATE OF turn_id ON assistant_attempts
     BEGIN SELECT RAISE(IGNORE); END;`);
 
-  assert.throws(() => store.confirmStart(lease.attemptId, "one", "turn-a"), /lease changed/iu);
+  assert.throws(() => store.confirmStart(lease.attemptId, "one", "turn-a"), /attempt changed/iu);
   assert.equal(db.prepare("SELECT turn_id FROM assistant_attempts WHERE id = ?").get(lease.attemptId)!.turn_id, null);
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'one'").get()!.state, "start_submitting");
-  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "starting", turnId: undefined });
+  assert.equal(store.attempt(lease.attemptId)?.turnId, undefined);
 });
 
-test("a correlated completion binds a starting lease directly into terminalizing", () => {
+test("a correlated completion terminalizes without leaving an arbiter that blocks later input", () => {
   const { store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
 
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a", { terminal: true }), "bound");
-  assert.deepEqual({ phase: store.lease()?.phase, turnId: store.lease()?.turnId }, { phase: "terminalizing", turnId: "turn-a" });
+  assert.equal(store.attempt(lease.attemptId)?.acceptingTools, false);
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-a"), "already_terminal_same");
   assert.equal(store.confirmStart(lease.attemptId, "one", "turn-b"), "conflict");
 });
 
-test("steer confirmation can only join the lease's immutable exact turn", () => {
+test("steer confirmation can only join the attempt's immutable exact turn", () => {
   const { db, store } = fixture();
   for (const id of ["one", "two"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
   store.confirmStart(lease.attemptId, "one", "turn-a");
   store.reserveNextSteer(lease.attemptId);
 
   assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-b"), "conflict");
-  assert.equal(store.lease()?.turnId, "turn-a");
+  assert.equal(store.attempt(lease.attemptId)?.turnId, "turn-a");
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'two'").get()!.state, "steer_submitting");
   assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "bound");
   assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "already_same");
@@ -189,41 +228,39 @@ test("steer confirmation can only join the lease's immutable exact turn", () => 
 test("an uncertain exact steer confirmation reopens active steering", () => {
   const { store } = fixture();
   for (const id of ["one", "two", "three"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
   store.confirmStart(lease.attemptId, "one", "turn-a");
   store.reserveNextSteer(lease.attemptId);
   assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "two"), true);
-  assert.equal(store.lease()?.steerPaused, true);
+  assert.equal(store.membersForAttempt(lease.attemptId).find((member) => member.contextId === "two")?.state, "uncertain");
 
   assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "bound");
-  assert.deepEqual({ paused: store.lease()?.steerPaused, reason: store.lease()?.pauseReason }, { paused: false, reason: undefined });
+  assert.equal(store.membersForAttempt(lease.attemptId).find((member) => member.contextId === "two")?.state, "submitted");
   assert.equal(store.reserveNextSteer(lease.attemptId)?.contextId, "three");
 });
 
 test("a late exact steer confirmation preserves terminal fencing and reports terminal disposition", () => {
   const { store } = fixture();
   for (const id of ["one", "two"]) store.acceptChatSource(message(id, binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
   store.confirmStart(lease.attemptId, "one", "turn-a");
   store.reserveNextSteer(lease.attemptId);
-  store.beginTerminalizing("turn-a");
+  store.beginTerminalizing(lease.attemptId, "turn-a");
 
   assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "two"), true);
-  assert.equal(store.lease()?.pauseReason, "terminalizing");
+  assert.equal(store.attempt(lease.attemptId)?.acceptingTools, false);
   assert.equal(store.confirmSteer(lease.attemptId, "two", "turn-a"), "already_terminal_same");
-  assert.deepEqual({ phase: store.lease()?.phase, paused: store.lease()?.steerPaused, reason: store.lease()?.pauseReason }, {
-    phase: "terminalizing", paused: true, reason: "terminalizing",
-  });
+  assert.equal(store.attempt(lease.attemptId)?.acceptingTools, false);
 });
 
-test("uncertainty cannot mutate an unresolved member after its lease is gone", () => {
+test("uncertainty cannot mutate an unresolved member after its attempt is terminal", () => {
   const { db, store } = fixture();
   store.acceptChatSource(message("one", binding("telegram", "chat-1")));
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
-  db.prepare("DELETE FROM assistant_turn_lease WHERE singleton = 1").run();
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
+  db.prepare("UPDATE assistant_attempts SET state = 'failed' WHERE id = ?").run(lease.attemptId);
 
   assert.equal(store.markUncertainIfUnresolved(lease.attemptId, "one"), false);
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'one'").get()!.state, "start_submitting");
@@ -235,8 +272,8 @@ test("arrival order is unique and a source cannot belong to two live attempts", 
   store.acceptChatSource(message("two", binding("telegram", "chat-1")));
   const rows = db.prepare("SELECT arrival_sequence FROM source_contexts ORDER BY arrival_sequence").all() as Array<{ arrival_sequence: number }>;
   assert.equal(new Set(rows.map((row) => row.arrival_sequence)).size, 2);
-  const lease = store.acquireLease({ kind: "chat", contextId: "one" }, "claim");
-  store.reserveStart("one");
+  const lease = store.createAttempt({ kind: "chat", contextId: "one" });
+  store.reserveStart(lease.attemptId, "one");
   assert.throws(() => db.prepare(`INSERT INTO assistant_attempt_sources
     (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, created_at, updated_at)
     VALUES (?, 'one', 2, 'duplicate', 'steer', 'submitted', 1, 1)`).run(lease.attemptId), /UNIQUE/u);
@@ -275,8 +312,8 @@ test("Slack acceptance preserves failed attachment metadata without changing own
   });
   assert.equal(store.hasChatSource("slack", "T1:D1:1.0"), true);
   assert.equal(store.hasChatSource("slack", "missing"), false);
-  const lease = store.acquireLease({ kind: "chat", contextId: "slack-source" }, "claim");
-  const submission = store.reserveStart("slack-source");
+  const lease = store.createAttempt({ kind: "chat", contextId: "slack-source" });
+  const submission = store.reserveStart(lease.attemptId, "slack-source");
   assert.equal(submission.rawText, "/pass exact");
   assert.deepEqual(submission.failedAttachments, failedAttachments);
   assert.equal(lease.binding?.adapterId, "slack");
@@ -286,11 +323,11 @@ test("Slack acceptance preserves failed attachment metadata without changing own
   assert.deepEqual(JSON.parse(String(row.failed_attachments_json)), failedAttachments);
 });
 
-test("event materialization and lease acquisition are one CAS transaction", () => {
+test("event materialization and attempt creation are one CAS transaction", () => {
   const { db, store } = fixture();
   db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e1', 'local', 'worker', 'terminal', '{}', 'pending', 1)").run();
   const candidate = { batchId: "batch:e1", eventIds: ["e1"], payload: [{ id: "e1" }], queuedAt: 1 };
-  const lease = store.materializeAndAcquireEventBatch(candidate, "event-claim");
+  const lease = store.materializeAndCreateEventAttempt(candidate);
   assert.equal(lease.primaryContextId, "batch:e1");
   assert.equal(lease.binding, undefined);
   assert.equal(db.prepare("SELECT state FROM events WHERE id = 'e1'").get()!.state, "batched");
@@ -298,7 +335,7 @@ test("event materialization and lease acquisition are one CAS transaction", () =
 
   const other = fixture();
   other.db.prepare("INSERT INTO events(id, endpoint_id, thread_id, kind, payload_json, state, created_at) VALUES ('e2', 'local', 'worker', 'terminal', '{}', 'processed', 1)").run();
-  assert.throws(() => other.store.materializeAndAcquireEventBatch({ batchId: "batch:e2", eventIds: ["e2"], payload: [], queuedAt: 1 }, "claim"), /changed/u);
+  assert.throws(() => other.store.materializeAndCreateEventAttempt({ batchId: "batch:e2", eventIds: ["e2"], payload: [], queuedAt: 1 }), /changed/u);
   assert.equal(other.db.prepare("SELECT id FROM source_contexts WHERE id = 'batch:e2'").get(), undefined);
-  assert.equal(other.store.lease(), undefined);
+  assert.equal(other.db.prepare("SELECT COUNT(*) AS n FROM assistant_attempts").get()!.n, 0);
 });

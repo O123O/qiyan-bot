@@ -4,7 +4,19 @@
 // implements the same ClaudeCommandRunner seam as the local runner, so the runtime is
 // unchanged.
 import { spawn, type ChildProcess } from "node:child_process";
-import { buildClaudeArgs, claudePreviewFromRecords, type ClaudeCommandRunner, type ClaudeThreadMeta, type ClaudeTurnHandle, type ClaudeTurnRequest } from "./claude-command-runner.ts";
+import { Buffer } from "node:buffer";
+import { AppError } from "../core/errors.ts";
+import {
+  buildClaudeArgs,
+  claudePreviewFromRecords,
+  type ClaudeCommandRunner,
+  type ClaudeThreadMeta,
+  type ClaudeTranscriptChunk,
+  type ClaudeTranscriptChunkRequest,
+  type ClaudeTranscriptSnapshot,
+  type ClaudeTurnHandle,
+  type ClaudeTurnRequest,
+} from "./claude-command-runner.ts";
 import { buildSshStreamArgs, type SshConnectionPlan } from "./ssh-config.ts";
 import { attestUserControlMaster } from "./ssh-runtime.ts";
 
@@ -59,19 +71,65 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
     return { done, interrupt: () => { interrupted = true; try { child?.kill("SIGKILL"); } catch { /* gone */ } } };
   }
 
-  async readTranscript(threadId: string, cwd: string): Promise<unknown[]> {
+  async readTranscriptChunk(
+    threadId: string,
+    cwd: string,
+    request: ClaudeTranscriptChunkRequest,
+  ): Promise<ClaudeTranscriptChunk | undefined> {
     const path = await this.transcriptPath(threadId, cwd);
-    if (!path) return [];
-    const text = await this.runCapture(`cat ${shq(path)}`);
-    const records: unknown[] = [];
-    for (const line of text.split("\n")) { const t = line.trim(); if (!t) continue; try { records.push(JSON.parse(t)); } catch { /* partial */ } }
-    return records;
+    if (!path) return undefined;
+    if (!Number.isSafeInteger(request.length) || request.length <= 0) {
+      throw new AppError("CONFIGURATION_ERROR", "invalid Claude transcript chunk length");
+    }
+    const script = [
+      "const fs=require('fs')",
+      "const p=process.argv[1]",
+      "const requested=process.argv[2]",
+      "const length=Number(process.argv[3])",
+      "const expected=process.argv[4]?JSON.parse(Buffer.from(process.argv[4],'base64url').toString('utf8')):null",
+      "const fd=fs.openSync(p,'r')",
+      "try{",
+      "const s=fs.fstatSync(fd)",
+      "const snap={device:String(s.dev),inode:String(s.ino),size:s.size}",
+      "if(expected&&(snap.device!==expected.device||snap.inode!==expected.inode||snap.size!==expected.size))process.exit(3)",
+      "const offset=requested==='tail'?Math.max(0,s.size-length):Number(requested)",
+      "if(!Number.isSafeInteger(offset)||offset<0||offset>s.size)process.exit(4)",
+      "const b=Buffer.alloc(Math.min(length,s.size-offset))",
+      "const n=fs.readSync(fd,b,0,b.length,offset)",
+      "const a=fs.fstatSync(fd)",
+      "if(String(a.dev)!==snap.device||String(a.ino)!==snap.inode||a.size!==snap.size)process.exit(5)",
+      "process.stdout.write(JSON.stringify({snapshot:snap,offset,data:b.subarray(0,n).toString('base64')}))",
+      "}finally{fs.closeSync(fd)}",
+    ].join(";");
+    const expected = request.expected === undefined
+      ? ""
+      : Buffer.from(JSON.stringify(request.expected), "utf8").toString("base64url");
+    const output = await this.runCapture(
+      `node -e ${shq(script)} ${shq(path)} ${shq(String(request.offset))} ${shq(String(request.length))} ${shq(expected)}`,
+      Math.ceil(request.length * 4 / 3) + 4_096,
+    );
+    let parsed: unknown;
+    try { parsed = JSON.parse(output); }
+    catch { throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript chunk was invalid"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript chunk was invalid");
+    }
+    const value = parsed as { snapshot?: unknown; offset?: unknown; data?: unknown };
+    const snapshot = parseSnapshot(value.snapshot);
+    if (!Number.isSafeInteger(value.offset) || typeof value.data !== "string") {
+      throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript chunk was invalid");
+    }
+    const bytes = Buffer.from(value.data, "base64");
+    if (bytes.length > request.length) {
+      throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript exceeded its requested bound");
+    }
+    return { snapshot, offset: Number(value.offset), bytes };
   }
 
   async transcriptPath(threadId: string, _cwd?: string): Promise<string | undefined> {
     const cached = this.pathCache.get(threadId);
     if (cached) return cached;
-    const found = (await this.runCapture(`find ~/.claude/projects -name ${shq(`${threadId}.jsonl`)} -print 2>/dev/null | head -1`)).trim();
+    const found = (await this.runCapture(`find ~/.claude/projects -name ${shq(`${threadId}.jsonl`)} -print 2>/dev/null | head -1`, 128 * 1024)).trim();
     if (!found) return undefined;
     this.pathCache.set(threadId, found);
     return found;
@@ -89,7 +147,7 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
       // `-E '"type": ?"user"'` tolerates compact OR pretty-printed serialization, so a future
       // format change can't SILENTLY drop every remote session from discover.
       + "grep -m1 -E '\"type\": ?\"user\"' \"$f\" 2>/dev/null; echo __QIYAN_EOT__; done";
-    const text = await this.runCapture(script);
+    const text = await this.runCapture(script, 4 * 1024 * 1024);
     const out: ClaudeThreadMeta[] = [];
     for (const block of text.split("__QIYAN_EOT__\n")) {
       const headerAt = block.indexOf("__QIYAN_H__ ");
@@ -121,15 +179,38 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
     return out;
   }
 
-  private async runCapture(remoteCommand: string): Promise<string> {
+  private async runCapture(remoteCommand: string, maxBytes: number): Promise<string> {
     try { await this.attest(); }
-    catch { return ""; }
-    return new Promise((resolve) => {
+    catch (error) { throw new AppError("ENDPOINT_UNAVAILABLE", `Claude SSH attestation failed: ${error instanceof Error ? error.message : String(error)}`); }
+    return new Promise((resolve, reject) => {
       const child = this.spawnSsh(remoteCommand);
-      let out = ""; child.stdout!.setEncoding("utf8"); child.stdout!.on("data", (c: string) => { out += c; });
+      let settled = false;
+      let bytes = 0;
+      let out = "";
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        reject(error);
+      };
+      child.stdout!.setEncoding("utf8");
+      child.stdout!.on("data", (chunk: string) => {
+        if (settled) return;
+        bytes += Buffer.byteLength(chunk, "utf8");
+        if (bytes > maxBytes) {
+          fail(new AppError("OPERATION_UNCERTAIN", "remote Claude command exceeded its output bound"));
+          return;
+        }
+        out += chunk;
+      });
       child.stdin!.end();
-      child.once("error", () => resolve(""));
-      child.once("close", () => resolve(out));
+      child.once("error", (error) => fail(error));
+      child.once("close", (code) => {
+        if (settled) return;
+        settled = true;
+        if (code === 0) resolve(out);
+        else reject(new AppError("OPERATION_UNCERTAIN", `remote Claude command exited with status ${String(code)}`));
+      });
     });
   }
 
@@ -155,4 +236,16 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
       child.once("close", (code) => finish(code === 0));
     });
   }
+}
+
+function parseSnapshot(value: unknown): ClaudeTranscriptSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript snapshot was invalid");
+  }
+  const snapshot = value as Record<string, unknown>;
+  if (typeof snapshot.device !== "string" || typeof snapshot.inode !== "string"
+    || !Number.isSafeInteger(snapshot.size) || Number(snapshot.size) < 0) {
+    throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript snapshot was invalid");
+  }
+  return { device: snapshot.device, inode: snapshot.inode, size: Number(snapshot.size) };
 }

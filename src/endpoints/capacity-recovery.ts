@@ -1,8 +1,6 @@
 import { z } from "zod";
-import type { AppServerPool } from "../app-server/pool.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 import type { RecoverableOperation } from "../storage/operation-store.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
 
 const capacityHintSchema = z.object({
   phase: z.literal("provisional-start"),
@@ -27,22 +25,13 @@ export function recoverableCapacityHint(operation: Pick<RecoverableOperation, "k
 
 export class EndpointCapacityRecovery {
   constructor(private readonly options: {
-    runtime: Pick<RuntimeStore, "listSessions">;
-    registry: Pick<SessionRegistry, "getByIdentity">;
+    registry: Pick<SessionRegistry, "snapshot">;
     operations: { listRecoverable(): RecoverableOperation[] };
-    pool: Pick<AppServerPool, "restoreObservedActiveTurn" | "restoreProvisionalTurnCapacity">;
     quarantine(operation: RecoverableOperation, reason: string): void;
   }) {}
 
   restoreBeforeIngress(): string[] {
-    const endpointIds = new Set<string>();
-    for (const state of this.options.runtime.listSessions()) {
-      if (!state.activeTurnId) continue;
-      const mapping = this.options.registry.getByIdentity(state.endpointId, state.threadId);
-      if (!mapping || mapping.session.mapping_id !== state.mappingId || mapping.session.lifecycle_state !== "managed") continue;
-      this.options.pool.restoreObservedActiveTurn(state.endpointId, state.threadId, state.activeTurnId);
-      endpointIds.add(state.endpointId);
-    }
+    const endpointIds = new Set(Object.values(this.options.registry.snapshot().sessions).map((session) => session.endpoint));
     for (const operation of this.options.operations.listRecoverable()) {
       if (operation.kind !== "send_to_session" || !operation.receipt || typeof operation.receipt !== "object"
         || !("capacityHint" in operation.receipt)) continue;
@@ -51,9 +40,9 @@ export class EndpointCapacityRecovery {
         this.options.quarantine(operation, "invalid provisional-start capacity checkpoint");
         continue;
       }
-      this.options.pool.restoreProvisionalTurnCapacity(
-        hint.endpoint, hint.threadId, `recovered:${operation.id}`, hint.clientUserMessageId, hint.baselineTurnId,
-      );
+      // A durable provisional record identifies an endpoint that needs bounded dispatch
+      // reconciliation. It never reserves live capacity; current native state does that after
+      // the endpoint generation is restored.
       endpointIds.add(hint.endpoint);
     }
     return [...endpointIds];

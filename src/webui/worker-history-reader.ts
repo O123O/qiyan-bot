@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
-import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { WebBus, WorkerSubscription } from "./web-bus.ts";
+import type { StreamSessionIdentity } from "./worker-stream.ts";
 import { openWorkerTurnIds, pageWorkerConversation, terminalWorkerTurnIds } from "./worker-conversation.ts";
 
 export type WorkerHistoryErrorCode = "busy" | "cancelled" | "stale";
@@ -59,16 +59,16 @@ interface Consumer {
 
 const identityKey = (subscription: WorkerSubscription): string => `${subscription.endpointId}\0${subscription.threadId}\0${subscription.mappingId}`;
 
-function mappingCurrent(document: RegistryDocument, subscription: WorkerSubscription): boolean {
-  const current = document.sessions[subscription.nickname];
-  return current?.endpoint === subscription.endpointId
-    && current.thread_id === subscription.threadId
-    && current.mapping_id === subscription.mappingId;
+function mappingCurrent(resolveSession: (nickname: string) => StreamSessionIdentity | undefined, subscription: WorkerSubscription): boolean {
+  const current = resolveSession(subscription.nickname);
+  return current?.endpointId === subscription.endpointId
+    && current.threadId === subscription.threadId
+    && current.mappingId === subscription.mappingId;
 }
 
 export function createWorkerHistoryReader(deps: {
   bus: WebBus;
-  registrySnapshot(): RegistryDocument;
+  resolveSession(nickname: string): StreamSessionIdentity | undefined;
   readTurns(endpointId: string, threadId: string, limit: number, cursor: string | undefined, signal: AbortSignal): Promise<WorkerNativeHistoryPage>;
 }): WorkerHistoryReader {
   const reads = new Map<string, NativeRead>();
@@ -96,7 +96,7 @@ export function createWorkerHistoryReader(deps: {
     if (disposed) throw new WorkerHistoryError("cancelled", "history reader stopped");
     if (consumers.has(subscriptionId)) throw new WorkerHistoryError("busy", "worker history read already in progress");
     const subscription = deps.bus.subscription(subscriptionId, nickname);
-    if (!subscription || !mappingCurrent(deps.registrySnapshot(), subscription)) throw new WorkerHistoryError("stale", "worker subscription is stale");
+    if (!subscription || !mappingCurrent(deps.resolveSession, subscription)) throw new WorkerHistoryError("stale", "worker subscription is stale");
     if (signal?.aborted) throw new WorkerHistoryError("cancelled", "history request was cancelled");
 
     const cursor = decodeHistoryCursor(before);
@@ -123,7 +123,7 @@ export function createWorkerHistoryReader(deps: {
       if (signal?.aborted || consumers.get(subscriptionId)?.subscription !== subscription) {
         throw new WorkerHistoryError("cancelled", "history request was cancelled");
       }
-      if (!deps.bus.isSubscriptionCurrent(subscription) || !mappingCurrent(deps.registrySnapshot(), subscription)) {
+      if (!deps.bus.isSubscriptionCurrent(subscription) || !mappingCurrent(deps.resolveSession, subscription)) {
         throw new WorkerHistoryError("stale", "worker mapping changed during history read");
       }
       const page = pageWorkerConversation(nativePage.turns, limit, cursor.messageBoundary);

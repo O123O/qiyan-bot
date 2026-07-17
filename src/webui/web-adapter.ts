@@ -23,7 +23,7 @@ export function createWebAdapter(
   bus: WebBus,
   uploads: WebUploadsConfig,
   annotateDelivery?: (deliveryId: string, appended: string) => void,
-  messageMetadata?: (deliveryId: string) => { worker?: string; origin?: string },
+  messageMetadata?: (deliveryId: string) => { kind?: string; worker?: string; origin?: string },
 ): ChatAdapter {
   return {
     primaryBinding: WEB_BINDING,
@@ -31,7 +31,9 @@ export function createWebAdapter(
       id: WEB_ADAPTER_ID,
       sendMessage: async (_destination: JsonValue, body: string, _reply, options): Promise<JsonValue> => {
         const metadata = options?.deliveryId ? messageMetadata?.(options.deliveryId) ?? {} : {};
-        bus.broadcast({ type: "message", body, at: Date.now(), ...metadata });
+        if (metadata.kind !== "queue_notice") {
+          bus.broadcast({ type: "message", ...(options?.deliveryId ? { id: options.deliveryId } : {}), body, at: Date.now(), ...metadata });
+        }
         return { delivered: true };
       },
       // The browser has no native file delivery. A file QiYan sends is persisted into the SAME backend
@@ -51,7 +53,7 @@ export function createWebAdapter(
         const suffix = `\n\n📎 ${stored.path}`;
         // Persist the path into the outbox so it survives reload, then broadcast the full message live.
         annotateDelivery?.(file.deliveryId, suffix);
-        bus.broadcast({ type: "message", body: `${file.caption ?? ""}${suffix}`, at: Date.now() });
+        bus.broadcast({ type: "message", id: file.deliveryId, body: `${file.caption ?? ""}${suffix}`, at: Date.now() });
         return { delivered: true, path: stored.path };
       },
       isSafeToRetry: () => false, // storing to disk is deterministic; don't re-copy on failure

@@ -1,6 +1,6 @@
 import { AppError } from "../core/errors.ts";
 import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint } from "../endpoints/types.ts";
-import { ThreadHistoryReader } from "./thread-history.ts";
+import { createHistoryScanBudget, ThreadHistoryReader } from "./thread-history.ts";
 
 export interface AppServerEndpoint {
   readonly id: string;
@@ -291,15 +291,23 @@ export class AppServerPool {
     for (const [threadId, states] of byThread) {
       if (!isCurrent()) return;
       let threadStatus: string | undefined;
-      let turns: Awaited<ReturnType<ThreadHistoryReader["allTurns"]>>;
+      let turns: Awaited<ReturnType<ThreadHistoryReader["turnsPage"]>>["data"];
+      let historyExhausted = false;
       const reader = this.historyReader(endpointId, lease);
+      const historyBudget = createHistoryScanBudget();
       try {
         const metadata = await this.request<{ thread: { status?: string | { type?: string } } }>(
           endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
         );
         if (!isCurrent()) return;
         threadStatus = typeof metadata.thread.status === "string" ? metadata.thread.status : metadata.thread.status?.type;
-        turns = await reader.allTurns(threadId, { sortDirection: "desc", itemsView: "notLoaded" });
+        const page = await reader.turnsPage(threadId, {
+          limit: 128,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        });
+        turns = page.data;
+        historyExhausted = page.nextCursor === null;
       }
       catch { if (!isCurrent()) return; continue; }
       if (!isCurrent()) return;
@@ -318,11 +326,14 @@ export class AppServerPool {
         try {
           if (state.clientUserMessageId === undefined || !Object.hasOwn(state, "baselineTurnId")) continue;
           const suffix = suffixAfterBaseline(turns, state.baselineTurnId ?? null);
-          if (!suffix.anchorFound) continue;
+          const anchorFound = suffix.anchorFound && (state.baselineTurnId !== null || historyExhausted);
+          if (!anchorFound) continue;
           state.scannedTurnIds ??= new Set<string>();
           for (const candidate of suffix.turns) {
             if (state.scannedTurnIds.has(candidate.id)) continue;
-            const exact = await reader.exactTurnItems(threadId, candidate.id, { allowLegacySummary: true });
+            const exact = await reader.exactTurnItems(threadId, candidate.id, {
+              budget: historyBudget, allowLegacySummary: true,
+            });
             if (isTerminal(candidate.status)) state.scannedTurnIds.add(candidate.id);
             if (exact.firstUserMessage?.clientId === state.clientUserMessageId) {
               turn = { ...candidate, itemsView: exact.complete ? "full" : "summary", items: exact.items };
@@ -332,7 +343,8 @@ export class AppServerPool {
         } catch { if (!isCurrent()) return; continue; }
         if (!turn) {
           const suffix = suffixAfterBaseline(turns, state.baselineTurnId ?? null);
-          if (fullyIdle && suffix.anchorFound) { this.resolved(state.id); this.releaseClaimState(state); }
+          const anchorFound = suffix.anchorFound && (state.baselineTurnId !== null || historyExhausted);
+          if (fullyIdle && anchorFound) { this.resolved(state.id); this.releaseClaimState(state); }
           if (!isCurrent()) return;
           continue;
         }
@@ -464,7 +476,7 @@ export class AppServerPool {
       terminal = true;
     } catch (error) {
       try {
-        const turn = await this.historyReader(endpointId, lease).findTurn(threadId, turnId);
+        const turn = await this.historyReader(endpointId, lease).findTurn(threadId, turnId, createHistoryScanBudget());
         terminal = !!turn && isTerminal(turn.status);
       } catch { /* the original interrupt outcome remains uncertain */ }
       if (!terminal) throw error;
@@ -489,10 +501,9 @@ export class AppServerPool {
     if (this.terminalBeforeStart.size > 1_000) this.terminalBeforeStart.delete(this.terminalBeforeStart.values().next().value!);
   }
 
-  markEndpointUnavailable(endpointId: string, kind: EndpointLossKind = "runtime-lost"): void {
-    if (kind === "connection-lost") return;
+  markEndpointUnavailable(endpointId: string, _kind: EndpointLossKind = "runtime-lost"): void {
     for (const state of [...this.claims.values()]) {
-      if (state.endpointId === endpointId && state.origin !== "caller") this.releaseClaimState(state);
+      if (state.endpointId === endpointId) this.releaseClaimState(state);
     }
     for (const key of this.terminalBeforeStart) if (key.startsWith(`${endpointId}:`)) this.terminalBeforeStart.delete(key);
   }
@@ -560,7 +571,10 @@ export class AppServerPool {
     baselineTurnId: string | null,
     lease?: EndpointWorkLease,
   ): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
-    const deadline = Date.now() + (this.options.reconciliationTimeoutMs ?? 30_000);
+    const timeoutMs = this.options.reconciliationTimeoutMs ?? 30_000;
+    const deadline = Date.now() + timeoutMs;
+    const budget = createHistoryScanBudget({ deadlineAt: Date.now() + Math.max(timeoutMs, 1_000) });
+    const pollMs = Math.max(this.options.reconciliationPollMs ?? 25, Math.ceil(timeoutMs / 3));
     const scannedTurnIds = new Set<string>();
     do {
       let threadStatus: string | undefined;
@@ -572,11 +586,11 @@ export class AppServerPool {
         );
         threadStatus = typeof metadata.thread.status === "string" ? metadata.thread.status : metadata.thread.status?.type;
         const reader = this.historyReader(endpointId, lease);
-        const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined);
+        const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined, budget);
         anchorFound = suffix.anchorFound;
         for (const candidate of suffix.turns) {
           if (scannedTurnIds.has(candidate.id)) continue;
-          const exact = await reader.exactTurnItems(threadId, candidate.id, { allowLegacySummary: true });
+          const exact = await reader.exactTurnItems(threadId, candidate.id, { budget, allowLegacySummary: true });
           if (isTerminal(candidate.status)) scannedTurnIds.add(candidate.id);
           if (exact.firstUserMessage?.clientId === clientUserMessageId) {
             actual = { id: candidate.id, items: exact.items };
@@ -591,7 +605,7 @@ export class AppServerPool {
         if (threadStatus === "idle" && anchorFound) throw new StartProvenAbsentError();
         throw new AppError("OPERATION_UNCERTAIN", "turn/start outcome could not be proven because thread history was incomplete");
       }
-      await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(this.options.reconciliationPollMs ?? 25);
+      await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(pollMs);
     } while (true);
   }
 

@@ -7,9 +7,9 @@ import { readReadyWorkerTurns } from "../../src/webui/worker-native-read.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 
 const turn = (text = "done") => ({ id: "turn", status: "completed", startedAt: 1, completedAt: 2, items: [{ type: "agentMessage", id: "a1", text, phase: "final_answer" }] });
-const registry = (mappingId = "m1") => ({ version: 3, assistant: { endpoint: "a", thread_id: "a", project_dir: "/a" }, sessions: {
-  worker: { endpoint: "local", thread_id: "thread", project_dir: "/p", mapping_id: mappingId, lifecycle_state: "managed" },
-} } as const);
+const resolveWorker = (mappingId = "m1") => (nickname: string) => nickname === "worker"
+  ? { endpointId: "local", threadId: "thread", mappingId }
+  : undefined;
 
 function fakeSocket(): WebSocket {
   return { readyState: 1, bufferedAmount: 0, send: () => undefined, close: () => undefined } as unknown as WebSocket;
@@ -24,7 +24,7 @@ test("shares one native read across subscriptions but rejects overlap from the s
   const bus = new WebBus(); const first = subscribe(bus, fakeSocket()), second = subscribe(bus, fakeSocket());
   let resolve!: (page: { turns: unknown[] }) => void; let reads = 0;
   const pending = new Promise<{ turns: unknown[] }>((done) => { resolve = done; });
-  const reader = createWorkerHistoryReader({ bus, registrySnapshot: () => registry() as never, readTurns: async () => { reads += 1; return pending; } });
+  const reader = createWorkerHistoryReader({ bus, resolveSession: resolveWorker(), readTurns: async () => { reads += 1; return pending; } });
 
   const one = reader.read(first.subscriptionId, "worker", 20);
   const two = reader.read(second.subscriptionId, "worker", 20);
@@ -39,7 +39,7 @@ test("subscription removal and HTTP cancellation detach consumers and abort the 
   const bus = new WebBus(); const socket = fakeSocket(); const subscription = subscribe(bus, socket);
   let aborted = false;
   const reader = createWorkerHistoryReader({
-    bus, registrySnapshot: () => registry() as never,
+    bus, resolveSession: resolveWorker(),
     readTurns: async (_endpoint, _thread, _limit, _cursor, signal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true })),
   });
   const requestAbort = new AbortController();
@@ -60,7 +60,7 @@ test("revalidates the complete mapping after the raw read before extracting text
   const bus = new WebBus(); const subscription = subscribe(bus, fakeSocket());
   let mappingId = "m1"; let resolve!: (page: { turns: unknown[] }) => void;
   const pending = new Promise<{ turns: unknown[] }>((done) => { resolve = done; });
-  const reader = createWorkerHistoryReader({ bus, registrySnapshot: () => registry(mappingId) as never, readTurns: async () => pending });
+  const reader = createWorkerHistoryReader({ bus, resolveSession: (nickname) => resolveWorker(mappingId)(nickname), readTurns: async () => pending });
   const item = new Proxy({ type: "agentMessage", id: "a1", phase: "final_answer" }, { get(target, key) { if (key === "text") throw new Error("text extracted"); return Reflect.get(target, key); } });
   const read = reader.read(subscription.subscriptionId, "worker", 20);
   mappingId = "m2";
@@ -152,14 +152,14 @@ test("history pages prove terminal turns and preserve native read failures", asy
   const bus = new WebBus(); const subscription = subscribe(bus, fakeSocket());
   const expected = new Error("thread read failed");
   const failed = createWorkerHistoryReader({
-    bus, registrySnapshot: () => registry() as never,
+    bus, resolveSession: resolveWorker(),
     readTurns: async () => { throw expected; },
   });
   await assert.rejects(failed.read(subscription.subscriptionId, "worker", 20), (error) => error === expected);
 
   const next = subscribe(bus, fakeSocket());
   const reader = createWorkerHistoryReader({
-    bus, registrySnapshot: () => registry() as never,
+    bus, resolveSession: resolveWorker(),
     readTurns: async () => ({ turns: [turn()] }),
   });
   const page = await reader.read(next.subscriptionId, "worker", 20);

@@ -6,6 +6,7 @@ import test from "node:test";
 import { LocalAppServerRuntime } from "../../src/app-server/local-runtime.ts";
 import { ManagedAppServerEndpoint } from "../../src/app-server/managed-endpoint.ts";
 import { AppServerPool } from "../../src/app-server/pool.ts";
+import { createHistoryScanBudget } from "../../src/app-server/thread-history.ts";
 import { DISCOVERY_SOURCE_KINDS } from "../../src/sessions/discovery.ts";
 
 const enabled = process.env.RUN_CODEX_INTEGRATION === "1";
@@ -104,7 +105,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   });
   assert.ok(resumedTurns.data.some((turn: any) => turn.id === started.turn.id));
   const resumedItems = await pool.historyReader(endpoint.id).exactTurnItems(
-    first.thread.id, started.turn.id, { allowLegacySummary: true },
+    first.thread.id, started.turn.id, { budget: createHistoryScanBudget(), allowLegacySummary: true },
   );
   assert.ok(resumedItems.items.some((item: any) => item.type === "userMessage" && item.clientId === "qiyan-bot-integration-1"));
   assert.ok(resumedItems.items.some((item: any) => item.type === "agentMessage" && item.text.includes("INTEGRATION_OK")));

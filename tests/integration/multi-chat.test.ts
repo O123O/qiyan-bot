@@ -27,14 +27,14 @@ test("Slack and Telegram share one durable conversation owner and arrival queue"
   const routes = new OwnerRouteStore(db, telegram);
 
   assert.equal(conversations.acceptChatSource(source("slack-start", firstThread, 1)).disposition, "pending");
-  const lease = conversations.acquireLease({ kind: "chat", contextId: "slack-start" }, "claim");
-  const start = conversations.reserveStart("slack-start");
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "slack-start" });
+  const start = conversations.reserveStart(lease.attemptId, "slack-start");
   conversations.markSubmitted(lease.attemptId, start.contextId, "turn-1");
-  assert.deepEqual(conversations.lease()?.binding, firstThread, "causal route stays frozen on the active Slack thread");
+  assert.deepEqual(conversations.incompleteAttempts()[0]?.binding, firstThread, "causal route stays frozen on the active Slack thread");
 
-  assert.equal(conversations.acceptChatSource(source("slack-follow-up", firstThread, 2)).disposition, "owner");
-  assert.equal(conversations.acceptChatSource(source("telegram-queued", telegram, 3)).disposition, "queued");
-  assert.equal(conversations.acceptChatSource(source("other-slack-queued", otherThread, 4)).disposition, "queued");
+  assert.equal(conversations.acceptChatSource(source("slack-follow-up", firstThread, 2), {}, lease).disposition, "owner");
+  assert.equal(conversations.acceptChatSource(source("telegram-queued", telegram, 3), {}, lease).disposition, "queued");
+  assert.equal(conversations.acceptChatSource(source("other-slack-queued", otherThread, 4), {}, lease).disposition, "queued");
   assert.deepEqual(deliveries.listReady().map((item) => [item.body, item.binding.adapterId, item.binding.conversationKey]), [
     ["[system] queued", "telegram", telegram.conversationKey],
     ["[system] queued", "slack", otherThread.conversationKey],
@@ -43,7 +43,7 @@ test("Slack and Telegram share one durable conversation owner and arrival queue"
   assert.equal(steer.contextId, "slack-follow-up");
   conversations.markSubmitted(lease.attemptId, steer.contextId, "turn-1");
 
-  conversations.clearLease(lease.attemptId);
+  conversations.failUnstartedAttempt(lease.attemptId);
   assert.deepEqual(conversations.nextPendingCandidate(), { kind: "chat", contextId: "telegram-queued" });
   assert.deepEqual(routes.current(), otherThread, "unsolicited output follows the most recently accepted owner route");
   assert.deepEqual(new OwnerRouteStore(db, telegram).current(), otherThread, "latest owner route survives restart");
@@ -56,9 +56,9 @@ test("another adapter with the same literal conversation key still waits", () =>
   const slack = { adapterId: "slack", conversationKey: "shared", destination: { channelId: "C1" } } as const;
   const telegramSameKey = { adapterId: "telegram", conversationKey: "shared", destination: { chatId: "42" } } as const;
   conversations.acceptChatSource(source("owner", slack, 1));
-  conversations.acquireLease({ kind: "chat", contextId: "owner" }, "claim");
+  const attempt = conversations.createAttempt({ kind: "chat", contextId: "owner" });
 
-  assert.equal(conversations.acceptChatSource(source("outsider", telegramSameKey, 2)).disposition, "queued");
+  assert.equal(conversations.acceptChatSource(source("outsider", telegramSameKey, 2), {}, attempt).disposition, "queued");
   assert.equal(deliveries.get("queued:outsider")?.binding.adapterId, "telegram");
 });
 

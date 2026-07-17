@@ -7,7 +7,7 @@ import { AppError } from "../../src/core/errors.ts";
 import { JsonRpcResponseError } from "../../src/app-server/json-rpc-client.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
-import { RuntimeStore } from "../../src/storage/runtime-store.ts";
+import { SessionControlStore } from "../../src/storage/session-control-store.ts";
 import { createAppServerRolloutPathResolver, scanLocalRollout, SessionOwnershipGuard } from "../../src/sessions/rollout-ownership.ts";
 import { RolloutAccessRouter } from "../../src/endpoints/rollout-access.ts";
 
@@ -151,10 +151,9 @@ test("a complete task start without its user record remains unclassified", async
   const path = join(root, "rollout-thread-boundary.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-boundary", mapping_id: "mapping-boundary" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -162,14 +161,13 @@ test("a complete task start without its user record remains unclassified", async
   await appendFile(path, line("event_msg", { type: "task_started", turn_id: "not-yet-classified" }));
 
   assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "not-yet-classified" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 });
 
 test("materialization-required inspection reports a never-written rollout as lost", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-nodurable.jsonl");
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-nodurable", mapping_id: "mapping-nodurable" };
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async () => assert.fail("a missing rollout must not be scanned as materialized"),
@@ -188,10 +186,9 @@ test("an ownerless autonomous turn is owned only while QiYan controls the goal",
   const path = join(root, "rollout-thread-goal.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-goal", mapping_id: "mapping-goal" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -210,9 +207,8 @@ test("goal control leaves an unproven open turn unclassified until user evidence
   const path = join(root, "rollout-thread-goal-pending.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-goal-pending", mapping_id: "mapping-goal-pending" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -233,9 +229,8 @@ test("a direct /to relay turn is owned via its recorded client id, not misread a
   const path = join(root, "rollout-thread-directto.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-directto", mapping_id: "mapping-directto" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -263,9 +258,8 @@ test("a scheduler-driven turn is owned via its send-outbox key, not misread as e
   const path = join(root, "rollout-thread-scheduled.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-scheduled", mapping_id: "mapping-scheduled" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -292,9 +286,8 @@ test("goal control recognizes a completed autonomous turn when its notification 
   const path = join(root, "rollout-thread-goal-completed.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-goal-completed", mapping_id: "mapping-goal-completed" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -322,9 +315,8 @@ test("an exact terminal goal authorization resolves an open restart boundary aft
   const path = join(root, "rollout-thread-goal-restart-terminal.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-goal-restart-terminal", mapping_id: "mapping-goal-restart-terminal" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -346,9 +338,8 @@ test("initialization persists an exact active legacy goal turn when the ownershi
   const path = join(root, "rollout-thread-legacy-active-goal.jsonl");
   await writeFile(path, line("event_msg", { type: "task_started", turn_id: "legacy-active-goal-turn" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-legacy-active-goal", mapping_id: "mapping-legacy-active-goal" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
   runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
@@ -366,9 +357,8 @@ test("initialization persists active legacy authorization before its rollout sta
   const path = join(root, "rollout-thread-legacy-late-start.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-legacy-late-start", mapping_id: "mapping-legacy-late-start" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
   runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
@@ -389,9 +379,8 @@ test("user evidence overrides exact migration authorization during ownership ini
     line("event_msg", { type: "user_message", client_id: "external-client" }),
   ].join(""));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-legacy-external-goal", mapping_id: "mapping-legacy-external-goal" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "active");
   runtime.setGoalControlled(identity.endpoint, identity.thread_id, identity.mapping_id, true);
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
@@ -409,9 +398,8 @@ test("goal control never authorizes an external client turn", async () => {
   const path = join(root, "rollout-thread-goal-external.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-goal-external", mapping_id: "mapping-goal-external" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -431,9 +419,8 @@ test("external user evidence overrides an earlier exact goal-turn authorization"
   const path = join(root, "rollout-thread-authorized-goal-external.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-authorized-goal-external", mapping_id: "mapping-authorized-goal-external" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -454,9 +441,8 @@ test("a legacy completed turn without user evidence or a goal marker remains unc
   const path = join(root, "rollout-thread-legacy-goal.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-legacy-goal", mapping_id: "mapping-legacy-goal" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -467,7 +453,6 @@ test("a legacy completed turn without user evidence or a goal marker remains unc
   ].join(""));
 
   assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "legacy-goal-turn" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 });
 
 test("a completed external turn takes precedence over a trailing unclassified start", async () => {
@@ -475,10 +460,9 @@ test("a completed external turn takes precedence over a trailing unclassified st
   const path = join(root, "rollout-thread-precedence.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-precedence", mapping_id: "mapping-precedence" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -491,7 +475,6 @@ test("a completed external turn takes precedence over a trailing unclassified st
   ].join(""));
 
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-first" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
 });
 
 test("the guard rejects malformed scans without external proof or durable state changes", async () => {
@@ -499,10 +482,9 @@ test("the guard rejects malformed scans without external proof or durable state 
   const path = join(root, "rollout-thread-uncertain.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-uncertain", mapping_id: "mapping-uncertain" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -535,7 +517,6 @@ test("the guard rejects malformed scans without external proof or durable state 
     WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
     .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { count: number };
   assert.equal(ownedCount.count, 0);
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 });
 
 test("the guard fences later external evidence despite an earlier malformed record", async () => {
@@ -543,10 +524,9 @@ test("the guard fences later external evidence despite an earlier malformed reco
   const path = join(root, "rollout-thread-malformed-external.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-malformed-external", mapping_id: "mapping-malformed-external" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -566,15 +546,13 @@ test("the guard fences later external evidence despite an earlier malformed reco
     WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
     .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { byte_offset: number }).byte_offset;
   assert.equal(storedOffset, baselineOffset);
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
 });
 
 test("initialization accepts only positive active external evidence from a malformed scan", async () => {
   const cursor = { device: "1", inode: "2", offset: 100 };
   const uncertainDb = createTestDatabase();
-  const uncertainRuntime = new RuntimeStore(uncertainDb);
+  const uncertainRuntime = new SessionControlStore(uncertainDb);
   const uncertainIdentity = { endpoint: "local", thread_id: "thread-init-uncertain", mapping_id: "mapping-init-uncertain" };
-  uncertainRuntime.setSession(uncertainIdentity.endpoint, uncertainIdentity.thread_id, uncertainIdentity.mapping_id, "managed", "idle");
   const uncertainGuard = new SessionOwnershipGuard(uncertainDb, uncertainRuntime, new OperationStore(uncertainDb), {
     scan: async () => [{ cursor, starts: [], malformed: true }],
   });
@@ -588,12 +566,10 @@ test("initialization accepts only positive active external evidence from a malfo
     WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
     .get(uncertainIdentity.endpoint, uncertainIdentity.thread_id, uncertainIdentity.mapping_id) as { count: number };
   assert.equal(uncertainRows.count, 0);
-  assert.equal(uncertainRuntime.getSession(uncertainIdentity.endpoint, uncertainIdentity.thread_id, uncertainIdentity.mapping_id)?.managementState, "managed");
 
   const externalDb = createTestDatabase();
-  const externalRuntime = new RuntimeStore(externalDb);
+  const externalRuntime = new SessionControlStore(externalDb);
   const externalIdentity = { endpoint: "local", thread_id: "thread-init-external", mapping_id: "mapping-init-external" };
-  externalRuntime.setSession(externalIdentity.endpoint, externalIdentity.thread_id, externalIdentity.mapping_id, "managed", "idle");
   const externalGuard = new SessionOwnershipGuard(externalDb, externalRuntime, new OperationStore(externalDb), {
     scan: async () => [{
       cursor,
@@ -609,12 +585,11 @@ test("initialization accepts only positive active external evidence from a malfo
     return true;
   });
   assert.deepEqual(await externalGuard.inspect(externalIdentity), { state: "external", turnId: "external-active" });
-  assert.equal(externalRuntime.getSession(externalIdentity.endpoint, externalIdentity.thread_id, externalIdentity.mapping_id)?.managementState, "unadopting");
 });
 
 test("recordUnmaterialized stores an idempotent offset-zero baseline without rollout access", () => {
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "devbox", thread_id: "thread-fresh", mapping_id: "mapping-fresh" };
   let scans = 0;
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
@@ -639,7 +614,7 @@ test("recordUnmaterialized stores an idempotent offset-zero baseline without rol
 
 test("a pathless created thread stays pending until its exact rollout path can be bound", async () => {
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "devbox", thread_id: "thread-pathless", mapping_id: "mapping-pathless" };
   let resolvedPath: string | undefined;
   let scans = 0;
@@ -679,7 +654,7 @@ test("a resolved Claude transcript path (<id>.jsonl) records and scans as owned,
   // old validator rejected — throwing "managed rollout path is invalid", which surfaced as the
   // repeating external_ownership_detection failure AND blocked the worker result's delivery.
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "claude-local", thread_id: "sess-claude", mapping_id: "map-claude" };
   const resolvedPath = "/home/u/.claude/projects/-a-b/sess-claude.jsonl";
   let scans = 0;
@@ -703,7 +678,7 @@ test("an unstarted thread (no rollout until the first turn) dispatches its first
   // "pending" of a Codex thread binding its path), and the guard must let the first turn run
   // instead of deadlocking on "waiting for its rollout to materialize".
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "claude-local", thread_id: "thread-unstarted", mapping_id: "mapping-unstarted" };
   let scans = 0;
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
@@ -759,7 +734,7 @@ test("a committed pathless mapping resumes a durable thread or terminally detect
 
 test("recordUnmaterialized never downgrades existing materialized or external evidence", () => {
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "devbox", thread_id: "thread-existing", mapping_id: "mapping-existing" };
   const path = "/tmp/rollout-thread-existing.jsonl";
   db.prepare(`INSERT INTO session_rollout_ownership
@@ -784,10 +759,9 @@ test("an empty created thread promotes a completed owned first turn from the rea
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-lazy.jsonl");
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-lazy", mapping_id: "mapping-lazy" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, new RolloutAccessRouter({ remote: () => undefined }));
 
   await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
@@ -821,9 +795,8 @@ test("a pending rollout detects active and completed external first turns with t
   const threadId = terminal ? "thread-external-completed" : "thread-external-active";
   const path = join(root, `rollout-${threadId}.jsonl`);
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: threadId, mapping_id: `mapping-${threadId}` };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), new RolloutAccessRouter({ remote: () => undefined }));
   await guard.initialize(identity, path, undefined, { allowUnmaterialized: true });
   await writeFile(path, [
@@ -833,7 +806,6 @@ test("a pending rollout detects active and completed external first turns with t
   ].join(""));
 
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-first-turn" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
   });
 });
 
@@ -841,10 +813,9 @@ test("restart initialization reclassifies an existing pending or external owners
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-restart-lazy.jsonl");
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-restart-lazy", mapping_id: "mapping-restart-lazy" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
   const access = new RolloutAccessRouter({ remote: () => undefined });
   await new SessionOwnershipGuard(db, runtime, operations, access)
     .initialize(identity, path, undefined, { allowUnmaterialized: true });
@@ -879,9 +850,8 @@ test("known-empty initialization detects a first turn that materialized before t
     line("event_msg", { type: "task_complete", turn_id: "external-before-initialize" }),
   ].join(""));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-initialize-race", mapping_id: "mapping-initialize-race" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
   const guard = new SessionOwnershipGuard(
     db,
     runtime,
@@ -906,9 +876,8 @@ test("existing-row initialization rechecks a partial first turn after its user r
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-partial-retry.jsonl");
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const identity = { endpoint: "local", thread_id: "thread-partial-retry", mapping_id: "mapping-partial-retry" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
   const guard = new SessionOwnershipGuard(
     db,
     runtime,
@@ -943,9 +912,8 @@ test("a pending baseline requires a classified turn when native metadata is no l
     const threadId = `thread-native-nonempty-${rollout}`;
     const path = join(root, `rollout-${threadId}.jsonl`);
     const db = createTestDatabase();
-    const runtime = new RuntimeStore(db);
+    const runtime = new SessionControlStore(db);
     const identity = { endpoint: "local", thread_id: threadId, mapping_id: `mapping-${threadId}` };
-    runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "adopting", "idle");
     const guard = new SessionOwnershipGuard(
       db,
       runtime,
@@ -971,10 +939,9 @@ test("a malformed record can heal in place and is reparsed from the durable curs
   const path = join(root, "rollout-thread-healing.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-healing", mapping_id: "mapping-healing" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -1013,7 +980,6 @@ test("a malformed record can heal in place and is reparsed from the durable curs
     WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
     .get(identity.endpoint, identity.thread_id, identity.mapping_id) as { byte_offset: number }).byte_offset;
   assert.equal(healedOffset, (await stat(path)).size);
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
 });
 
 test("a cursor cannot cross rollout replacement", async () => {
@@ -1051,10 +1017,9 @@ test("the guard advances owned turns and durably fences the first external turn"
   const path = join(root, "rollout-thread-4.jsonl");
   await writeFile(path, line("event_msg", { type: "task_complete", turn_id: "historical" }));
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-4", mapping_id: "mapping-4" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async (_endpointId, requests) => Promise.all(requests.map((request) => scanLocalRollout(request))),
   });
@@ -1069,14 +1034,12 @@ test("the guard advances owned turns and durably fences the first external turn"
   assert.deepEqual(await guard.inspect(identity), { state: "owned" });
   assert.equal(guard.ownsTurn(identity, "owned"), true);
   assert.equal(guard.ownsTurn(identity, "external"), false);
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "managed");
 
   await appendFile(path, [
     line("event_msg", { type: "task_started", turn_id: "external" }),
     line("event_msg", { type: "user_message" }),
   ].join(""));
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external" });
 
   operations.prepare({ contextId: "ctx-after", attemptId: "attempt-after", callId: "call-after", kind: "send_to_session", args: { nickname: "worker", content: "late" } });
@@ -1090,10 +1053,9 @@ test("the guard advances owned turns and durably fences the first external turn"
 
 test("initialization durably fences an already active external turn for managed-session recovery", async () => {
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-recovery", mapping_id: "mapping-recovery" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const cursor = { device: "1", inode: "2", offset: 100 };
   const guard = new SessionOwnershipGuard(db, runtime, operations, {
     scan: async () => [{
@@ -1110,15 +1072,13 @@ test("initialization durably fences an already active external turn for managed-
   });
 
   assert.deepEqual(await guard.inspect(identity), { state: "external", turnId: "external-active" });
-  assert.equal(runtime.getSession(identity.endpoint, identity.thread_id, identity.mapping_id)?.managementState, "unadopting");
 });
 
 test("only incomplete ownership evidence is retry-tagged while rollout identity drift is permanent", async () => {
   const db = createTestDatabase();
-  const runtime = new RuntimeStore(db);
+  const runtime = new SessionControlStore(db);
   const operations = new OperationStore(db);
   const identity = { endpoint: "local", thread_id: "thread-tags", mapping_id: "mapping-tags" };
-  runtime.setSession(identity.endpoint, identity.thread_id, identity.mapping_id, "managed", "idle");
   const cursor = { device: "1", inode: "2", offset: 0 };
   let scanResult: any = undefined;
   const guard = new SessionOwnershipGuard(db, runtime, operations, {

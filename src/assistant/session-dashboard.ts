@@ -3,10 +3,11 @@ import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { AppError } from "../core/errors.ts";
 import type { RegistryDocument } from "../registry/session-registry.ts";
-import type { RuntimeStore } from "../storage/runtime-store.ts";
+import type { SessionControlStore } from "../storage/session-control-store.ts";
 import { SessionDashboardStore } from "../storage/session-dashboard-store.ts";
 import {
   SessionDashboardDocumentSchema,
+  ExistingSessionDashboardDocumentSchema,
   type SessionDashboardDocument,
   type SessionDashboardEntry,
 } from "./dashboard-schema.ts";
@@ -25,7 +26,7 @@ export class SessionDashboard {
   constructor(
     private readonly store: SessionDashboardStore,
     private readonly registry: RegistryView,
-    private readonly runtime: RuntimeStore,
+    private readonly controls: SessionControlStore,
     private readonly options: DashboardOptions,
   ) {
     this.writer = options.writer ?? writeDashboardAtomic;
@@ -40,7 +41,7 @@ export class SessionDashboard {
     const state = await dashboardFileState(this.options.path);
     if (state === "special") throw new AppError("CONFIGURATION_ERROR", "assistant dashboard path must be a regular file");
     if (state === "regular") {
-      try { SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(this.options.path, "utf8"))); }
+      try { ExistingSessionDashboardDocumentSchema.parse(JSON.parse(await readFile(this.options.path, "utf8"))); }
       catch { throw new AppError("CONFIGURATION_ERROR", "invalid assistant dashboard session-status.json"); }
     }
     this.store.markDirty();
@@ -53,16 +54,11 @@ export class SessionDashboard {
     for (const nickname of Object.keys(registry.sessions).sort()) {
       const session = registry.sessions[nickname]!;
       const identity = { endpointId: session.endpoint, threadId: session.thread_id };
-      const runtime = this.runtime.getSession(session.endpoint, session.thread_id, session.mapping_id);
-      const managementState = runtime?.managementState === "managed" ? "managed" : "unavailable";
-      const pending = this.runtime.settings(session.endpoint, session.thread_id, session.mapping_id);
+      const pending = this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);
       const facts = this.store.facts(identity);
       sessions[nickname] = {
         identity: { thread_id: session.thread_id, endpoint: session.endpoint, project_dir: session.project_dir },
         auto_session_info: {
-          management_state: managementState,
-          native_status: runtime?.nativeStatus ?? "notLoaded",
-          active_turn_id: this.runtime.activeTurn(session.endpoint, session.thread_id, session.mapping_id) ?? null,
           last_sent: facts.lastSent,
           last_worker_event: facts.lastWorkerEvent,
           model: { current: facts.currentSettings.model, pending: pending.model ?? null },
@@ -74,7 +70,7 @@ export class SessionDashboard {
         manager_notes: this.store.notes(identity),
       } satisfies SessionDashboardEntry;
     }
-    return SessionDashboardDocumentSchema.parse({ version: 2, sessions });
+    return SessionDashboardDocumentSchema.parse({ version: 3, sessions });
   }
 
   status(nickname: string): SessionDashboardEntry & { nickname: string } {

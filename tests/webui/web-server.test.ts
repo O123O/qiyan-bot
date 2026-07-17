@@ -12,11 +12,12 @@ import type { WebGoalControlInput } from "../../src/webui/web-goal-control.ts";
 const TOKEN = "test-token-abc";
 
 const reads: WebReadsDeps = {
+  nativeSession: () => ({ availability: "ready", status: "idle", activeTurnId: null, endpointGeneration: 1, lifecycleRevision: 1, receiveSequence: 1, observedAt: 1 }),
   registrySnapshot: () => ({ version: 3, assistant: { endpoint: "assistant-local", thread_id: "a", project_dir: "/a", mapping_id: "m", lifecycle_state: "managed" }, sessions: {
     payments: { endpoint: "local", thread_id: "t1", project_dir: "/p", mapping_id: "m1", lifecycle_state: "managed" },
   } } as never),
-  dashboardSnapshot: () => ({ version: 2, sessions: {
-    payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { management_state: "managed", native_status: "idle", active_turn_id: null, last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: "high", pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
+  dashboardSnapshot: () => ({ version: 3, sessions: {
+    payments: { identity: { thread_id: "t1", endpoint: "local", project_dir: "/p" }, auto_session_info: { last_sent: null, last_worker_event: null, model: { current: "gpt-5", pending: null }, reasoning_effort: { current: "high", pending: null }, token_usage: null, goal: { objective: "ship it", status: "active", token_budget: null }, observed_at: null }, manager_notes: {} },
   } } as never),
   assistantSession: () => ({
     nickname: "assistant", mappingId: "assistant-mapping", endpoint: "assistant-local", provider: "codex",
@@ -202,6 +203,19 @@ test("derives persisted worker presentation only from trusted delivery kinds and
   ]);
 });
 
+test("legacy queue acknowledgements are absent from the Web transcript", () => {
+  const page = assistantTranscript({
+    ...reads,
+    listOwnerConversation: () => [
+      { id: "you", role: "you", body: "status?", at: 1 },
+      { id: "queued:web:1", role: "assistant", body: "[system] queued", at: 2, deliveryKind: "queue_notice" },
+      { id: "reply", role: "assistant", body: "working", at: 3, deliveryKind: "assistant_final" },
+    ],
+  }, 10);
+
+  assert.deepEqual(page.messages.map((message) => message.id), ["you", "reply"]);
+});
+
 test("paginates older messages with an inclusive before cursor (no same-ms skip)", async () => {
   await withServer(async (base) => {
     const page1 = await (await fetch(`${base}/api/assistant/messages?limit=2&token=${TOKEN}`)).json();
@@ -356,15 +370,17 @@ test("WS upgrade requires the token and receives broadcasts", async () => {
   });
 });
 
-test("session snapshots are polled only while a WebSocket client is connected", async () => {
+test("session snapshots are event-driven and do no work without a WebSocket client", async () => {
   let snapshotReads = 0;
+  let notify = () => {};
   const countedReads: WebReadsDeps = {
     ...reads,
     assistantSession: () => { snapshotReads += 1; return reads.assistantSession(); },
+    onSessionsChanged: (listener) => { notify = listener; return () => { notify = () => {}; }; },
   };
   await withServer(async (base, _calls, bus) => {
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    assert.equal(snapshotReads, 0, "an inactive Web UI must not poll session state");
+    notify();
+    assert.equal(snapshotReads, 0, "an inactive Web UI must not project session state");
 
     const ws = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
     const sessions = new Promise<void>((resolve, reject) => {
@@ -391,15 +407,15 @@ test("session snapshots are polled only while a WebSocket client is connected", 
     await new Promise<void>((resolve) => ws.once("close", resolve));
     assert.equal(bus.size, 1);
     const readsWithOneClient = snapshotReads;
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    assert.ok(snapshotReads > readsWithOneClient, "polling must continue while one client remains");
+    notify();
+    assert.equal(snapshotReads, readsWithOneClient + 1, "one native event projects one snapshot regardless of client count");
 
     second.close();
     await new Promise<void>((resolve) => second.once("close", resolve));
     assert.equal(bus.size, 0);
     const readsAfterClose = snapshotReads;
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    assert.equal(snapshotReads, readsAfterClose, "the last disconnect must stop session polling");
+    notify();
+    assert.equal(snapshotReads, readsAfterClose, "the last disconnect must stop session projection");
   }, countedReads);
 });
 
@@ -434,6 +450,30 @@ test("worker history requires the exact active WS subscription and tab switching
     ws.send(JSON.stringify({ type: "worker/unsubscribe", requestId: crypto.randomUUID() }));
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal((await fetch(`${base}/api/sessions/payments/messages?subscriptionId=${subscribed.subscriptionId}&token=${TOKEN}`)).status, 409);
+    ws.close();
+  });
+});
+
+test("the QiYan foreground can subscribe to native assistant history", async () => {
+  await withServer(async (base) => {
+    const ws = new WebSocket(`${base.replace("http", "ws")}/ws?token=${TOKEN}`);
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    const requestId = crypto.randomUUID();
+    const acknowledged = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("assistant subscription timed out")), 1_000);
+      ws.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        if (event.type === "worker/subscribed" && event.requestId === requestId) { clearTimeout(timer); resolve(event); }
+      });
+    });
+    ws.send(JSON.stringify({ type: "worker/subscribe", nickname: "assistant", requestId }));
+    const subscription = await acknowledged;
+    assert.equal(subscription.mappingId, "assistant-mapping");
+
+    const response = await fetch(`${base}/api/sessions/assistant/messages?limit=20&subscriptionId=${subscription.subscriptionId}&token=${TOKEN}`);
+    assert.equal(response.status, 200);
+    const page = await response.json() as any;
+    assert.deepEqual(page.messages.map((message: any) => message.body), ["do the thing", "final 0", "final 1"]);
     ws.close();
   });
 });

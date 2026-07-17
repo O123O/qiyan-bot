@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { SessionDashboard } from "../src/assistant/session-dashboard.ts";
 import { SessionDashboardStore } from "../src/storage/session-dashboard-store.ts";
-import { RuntimeStore } from "../src/storage/runtime-store.ts";
+import { SessionControlStore } from "../src/storage/session-control-store.ts";
 import { createTestDatabase } from "../src/storage/database.ts";
 
 test("fresh QiYan runtime has no incompatible-state migration surface", async () => {
@@ -37,7 +37,7 @@ test("a version-1 dashboard is rejected without changing its bytes", async () =>
       assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: root },
       sessions: {},
     }) },
-    new RuntimeStore(db),
+    new SessionControlStore(db),
     { root, path },
   );
   await assert.rejects(dashboard.initializeAndRender(), /invalid assistant dashboard/);

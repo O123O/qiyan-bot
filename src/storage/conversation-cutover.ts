@@ -173,16 +173,9 @@ function finalizeActiveAttempt(db: Database, attempt: Record<string, unknown>, a
   db.prepare(`INSERT OR IGNORE INTO assistant_attempt_sources
     (attempt_id, context_id, source_ordinal, client_user_message_id, submission_kind, state, observed_turn_id, created_at, updated_at)
     VALUES (?, ?, 0, ?, 'start', 'submitted', ?, ?, ?)`)
-    .run(String(attempt.id), String(attempt.context_id), String(attempt.context_id), turn.id, now, now);
-  db.prepare(`INSERT INTO assistant_turn_lease
-    (singleton, phase, attempt_id, primary_context_id, adapter_id, conversation_key, destination_json, native_reply_json,
-      client_user_message_id, turn_id, trigger_kind, capacity_claim_id)
-    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(terminal ? "terminalizing" : "active", String(attempt.id), String(attempt.context_id),
-      attempt.adapter_id == null ? null : String(attempt.adapter_id), attempt.conversation_key == null ? null : String(attempt.conversation_key),
-      attempt.destination_json == null ? null : String(attempt.destination_json), attempt.native_reply_json == null ? null : String(attempt.native_reply_json),
-      String(attempt.context_id), turn.id,
-      attempt.trigger_kind === "user" ? "chat" : "internal", `cutover:${String(attempt.id)}`);
+    .run(String(attempt.id), String(attempt.context_id), `qiyan:${String(attempt.id)}:1`, turn.id, now, now);
+  if (terminal) db.prepare(`UPDATE assistant_attempts SET accepting_tools = 0, tool_fence = tool_fence + 1
+    WHERE id = ? AND accepting_tools = 1`).run(String(attempt.id));
 }
 
 function validateRoutingBackfill(db: Database): void {

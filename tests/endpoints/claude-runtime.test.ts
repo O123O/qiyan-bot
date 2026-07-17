@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { ClaudeCodeRuntime } from "../../src/endpoints/claude-runtime.ts";
+import { CLAUDE_PAGE_WINDOW_BYTES, ClaudeTranscriptHistory } from "../../src/endpoints/claude-history.ts";
 import {
   buildClaudeArgs,
   type ClaudeCommandRunner,
+  type ClaudeTranscriptChunkRequest,
   type ClaudeTurnRequest,
   type ClaudeTurnStatus,
 } from "../../src/endpoints/claude-command-runner.ts";
@@ -19,6 +22,7 @@ import { createTestDatabase } from "../../src/storage/database.ts";
 class FakeRunner implements ClaudeCommandRunner {
   readonly requests: ClaudeTurnRequest[] = [];
   transcriptReadCount = 0;
+  readonly transcriptChunkLengths: number[] = [];
   private readonly transcripts = new Map<string, unknown[]>();
   private readonly pending: Array<{ threadId: string; marker: string; settle: (s: ClaudeTurnStatus) => void; settled: boolean }> = [];
 
@@ -26,7 +30,7 @@ class FakeRunner implements ClaudeCommandRunner {
     this.requests.push(request);
     const marker = /<!-- qiyan-cid:([^\s]+) -->/u.exec(request.message)?.[1] ?? "none";
     const recs = this.transcripts.get(request.threadId) ?? [];
-    recs.push({ type: "user", promptSource: "sdk", promptId: `prompt-${recs.length}`, uuid: `u-${recs.length}`, message: { role: "user", content: request.message } });
+    recs.push({ type: "user", cwd: request.cwd, promptSource: "sdk", promptId: `prompt-${recs.length}`, uuid: `u-${recs.length}`, message: { role: "user", content: request.message } });
     this.transcripts.set(request.threadId, recs);
     let settle!: (s: ClaudeTurnStatus) => void;
     const done = new Promise<ClaudeTurnStatus>((r) => { settle = r; });
@@ -44,7 +48,18 @@ class FakeRunner implements ClaudeCommandRunner {
     }
     entry.settle(status);
   }
-  async readTranscript(threadId: string) { this.transcriptReadCount += 1; return this.transcripts.get(threadId) ?? []; }
+  async readTranscriptChunk(threadId: string, _cwd: string, request: ClaudeTranscriptChunkRequest) {
+    this.transcriptReadCount += 1;
+    this.transcriptChunkLengths.push(request.length);
+    const records = this.transcripts.get(threadId);
+    if (!records) return undefined;
+    const all = Buffer.from(records.map((record) => `${JSON.stringify(record)}\n`).join(""), "utf8");
+    const snapshot = { device: "fake", inode: threadId, size: all.length };
+    if (request.expected) assert.deepEqual(request.expected, snapshot);
+    const offset = request.offset === "tail" ? Math.max(0, all.length - request.length) : request.offset;
+    return { snapshot, offset, bytes: all.subarray(offset, Math.min(all.length, offset + request.length)) };
+  }
+  seed(threadId: string, records: unknown[]): void { this.transcripts.set(threadId, records); }
   async transcriptPath(threadId: string) { return this.transcripts.has(threadId) ? `/fake/${threadId}.jsonl` : undefined; }
   async listThreads(cwd?: string) {
     return [...this.transcripts.keys()].map((id) => ({ id, cwd: cwd ?? "/fake", updatedAt: 0, preview: "" }));
@@ -103,7 +118,7 @@ test("first turn uses --session-id, resumes after; turn/completed fires; thread/
   assert.equal(runner.requests[1]?.resume, true); // --resume after materialization
 });
 
-test("Claude paging uses one operation-scoped full transcript fallback without backend retention", async () => {
+test("Claude paging uses bounded native transcript windows without backend retention", async () => {
   const runner = new FakeRunner();
   const rt = makeRuntime(runner);
   await rt.start();
@@ -135,22 +150,75 @@ test("Claude paging uses one operation-scoped full transcript fallback without b
   assert.equal(firstItems.data[0]?.type, "userMessage");
   assert.equal(firstItems.data[0]?.clientId, "ctx:two");
   assert.equal(typeof firstItems.nextCursor, "string");
-  assert.equal(runner.transcriptReadCount, 1);
+  assert.equal(runner.transcriptReadCount, 3);
+  assert.ok(runner.transcriptChunkLengths.every((length) => length <= 4 * 1024 * 1024));
 
   const metadata = await rt.request<any>("thread/read", { threadId: thread.id, includeTurns: false });
   assert.deepEqual(metadata.thread.turns, []);
   assert.deepEqual((await rt.request<any>("thread/read", { threadId: thread.id })).thread.turns, []);
   assert.equal(metadata.thread.status.type, "idle");
-  assert.equal(runner.transcriptReadCount, 1);
+  assert.equal(runner.transcriptReadCount, 3);
   const resumed = await rt.request<any>("thread/resume", { threadId: thread.id, excludeTurns: true });
   assert.deepEqual(resumed.thread.turns, []);
-  assert.equal(runner.transcriptReadCount, 2);
+  assert.equal(runner.transcriptReadCount, 3);
   const afterResume = new ThreadHistoryReader((method, params) => rt.request(method, params));
   const stillPersisted = await afterResume.turnsPage(thread.id, { limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
   assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["ctx:one", "ctx:two"]);
   const defaultItems = await afterResume.itemsPage(thread.id, { turnId: "ctx:two", limit: 50, sortDirection: "asc" });
   assert.equal(defaultItems.data[0]?.type, "userMessage");
-  assert.equal(runner.transcriptReadCount, 3);
+  assert.equal(runner.transcriptReadCount, 5);
+});
+
+test("descending Claude paging preserves a turn exactly aligned with the prior window boundary", async () => {
+  const runner = new FakeRunner();
+  const threadId = "aligned-history";
+  const cwd = "/w";
+  const prefix = { type: "system", cwd, value: "prefix" };
+  const older = { type: "user", cwd, promptSource: "sdk", promptId: "older", uuid: "older-user", message: { role: "user", content: "older" } };
+  const olderEndBase = { type: "assistant", cwd, uuid: "older-agent", padding: "", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "older reply" }] } };
+  const lineBytes = (record: unknown): number => Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8");
+  const paddingBytes = CLAUDE_PAGE_WINDOW_BYTES - lineBytes(older) - lineBytes(olderEndBase);
+  assert.ok(paddingBytes > 0);
+  const olderEnd = { ...olderEndBase, padding: "x".repeat(paddingBytes) };
+  const newer = { type: "user", cwd, promptSource: "sdk", promptId: "newer", uuid: "newer-user", message: { role: "user", content: "newer" } };
+  const newerEnd = { type: "assistant", cwd, uuid: "newer-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "newer reply" }] } };
+  const records = [prefix, older, olderEnd, newer, newerEnd];
+  assert.equal(lineBytes(older) + lineBytes(olderEnd), CLAUDE_PAGE_WINDOW_BYTES);
+  runner.seed(threadId, records);
+
+  const history = new ClaudeTranscriptHistory(runner);
+  const latest = await history.turnsPage(threadId, cwd, { limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+  assert.deepEqual(latest.data.map((turn) => turn.id), ["newer"]);
+  assert.equal(typeof latest.nextCursor, "string");
+  const prior = await history.turnsPage(threadId, cwd, {
+    cursor: latest.nextCursor!, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+  });
+  assert.deepEqual(prior.data.map((turn) => turn.id), ["older"]);
+});
+
+test("bounded exact-turn reconstruction keeps agent item IDs stable when the tail window shifts", async () => {
+  const runner = new FakeRunner();
+  const threadId = "stable-item-ids";
+  const cwd = "/w";
+  const turn = (id: string, paddingBytes: number) => [
+    { type: "user", cwd, promptSource: "sdk", promptId: id, uuid: `${id}-user`, message: { role: "user", content: id } },
+    { type: "assistant", cwd, uuid: `${id}-agent`, padding: "x".repeat(paddingBytes), message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `${id} reply` }] } },
+  ];
+  const before = Array.from({ length: 10 }, (_, index) => turn(`before-${index}`, 200 * 1024)).flat();
+  const target = turn("target", 0);
+  runner.seed(threadId, [...before, ...target]);
+  const history = new ClaudeTranscriptHistory(runner);
+  const first = await history.itemsPage(threadId, cwd, { turnId: "target", limit: 10, sortDirection: "asc" });
+  const firstAgentIds = first.data.filter((item) => item.type === "agentMessage").map((item) => item.id);
+
+  const after = Array.from({ length: 15 }, (_, index) => turn(`after-${index}`, 200 * 1024)).flat();
+  runner.seed(threadId, [...before, ...target, ...after]);
+  const shifted = await history.itemsPage(threadId, cwd, { turnId: "target", limit: 10, sortDirection: "asc" });
+  assert.deepEqual(
+    shifted.data.filter((item) => item.type === "agentMessage").map((item) => item.id),
+    firstAgentIds,
+  );
+  assert.deepEqual(firstAgentIds, ["target-agent:0"]);
 });
 
 test("turn/interrupt kills the running turn and marks it interrupted (terminal)", async () => {
@@ -192,6 +260,42 @@ test("a cold-started session (on disk, not in memory) is rehydrated from the tra
   assert.equal(read.thread.turns.length, 1);
   assert.equal(read.thread.turns[0].id, "ctx:c1");
   assert.equal(read.thread.turns[0].status, "completed");
+});
+
+test("cold recovery reads cwd from bounded head metadata when the final transcript row exceeds a turn page", async () => {
+  const runner = new FakeRunner();
+  const threadId = "large-final-row";
+  runner.seed(threadId, [
+    { type: "user", cwd: "/expected", promptSource: "sdk", promptId: "prompt", uuid: "user", message: { role: "user", content: "hello" } },
+    { type: "assistant", cwd: "/expected", uuid: "agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "x".repeat(300 * 1024) }] } },
+    { type: "mode", mode: "default" },
+  ]);
+  const runtime = makeRuntime(runner);
+  await runtime.start();
+
+  const read = await runtime.request<{ thread: any }>("thread/read", { threadId, includeTurns: false });
+  assert.equal(read.thread.cwd, "/expected");
+  assert.equal(read.thread.status.type, "idle");
+  assert.deepEqual(read.thread.turns, []);
+  assert.equal(Math.max(...runner.transcriptChunkLengths), 256 * 1024);
+});
+
+test("a cold incomplete transcript is terminal because no owned claude child is running", async () => {
+  const runner = new FakeRunner();
+  const a = makeRuntime(runner);
+  await a.start();
+  const { thread } = await a.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await a.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:orphaned-child",
+    input: [{ type: "text", text: "work" }],
+  });
+
+  const b = makeRuntime(runner);
+  await b.start();
+  const read = await b.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
+  assert.equal(read.thread.status.type, "idle");
+  assert.equal(read.thread.turns[0].status, "interrupted");
 });
 
 test("thread/goal get/set/status/clear are emulated via the goal store", async () => {
@@ -292,8 +396,8 @@ test("thread/list splits archived tombstones and hides them from the default pag
   const { ClaudeArchiveStore } = await import("../../src/sessions/claude-archives.ts");
   const runner = new FakeRunner();
   // Two discoverable threads via the runner's listThreads.
-  await runner.readTranscript("t-keep"); runner["transcripts"].set("t-keep", [{ cwd: "/w" }]);
-  runner["transcripts"].set("t-gone", [{ cwd: "/w" }]);
+  runner.seed("t-keep", [{ cwd: "/w" }]);
+  runner.seed("t-gone", [{ cwd: "/w" }]);
   const archives = new ClaudeArchiveStore(createTestDatabase());
   const rt = new ClaudeCodeRuntime({ id: "claude-local", runner, launchFlags: {}, archives });
   await rt.start();
