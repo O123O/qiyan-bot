@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "75b73bde5d818a9b19aeef8b07845f819611721fd065ba58c23ef3eb2442f868";
+export const REMOTE_HELPER_SHA256 = "85c8b1f66a66b96312377cec2633e7d03c47e1c9edd490b7789567681daec3d8";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 

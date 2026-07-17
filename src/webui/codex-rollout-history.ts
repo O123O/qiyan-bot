@@ -27,6 +27,7 @@ interface HistoryCursor {
   terminals: Array<{ turnId: string; status: string; at: number }>;
   skipPartial: boolean;
   pendingSkipped: boolean;
+  activeTurnId?: string;
   resolved?: ResolvedTurn;
 }
 
@@ -53,6 +54,7 @@ export interface CodexRolloutHistoryRequest {
   path: string;
   threadId: string;
   limit: number;
+  activeTurnId?: string;
   cursor?: string;
 }
 
@@ -94,6 +96,7 @@ export async function readCodexRolloutHistory(request: CodexRolloutHistoryReques
     let pageBoundaryOffset: number | undefined;
     let carryTerminal: { turnId: string; status: string; at: number } | undefined;
     let resolvedCursor: HistoryCursor | undefined;
+    let unresolvedActiveTurnId = cursor?.activeTurnId ?? (cursor ? undefined : request.activeTurnId);
 
     if (cursor?.resolved) {
       const materialized = await materializePending(
@@ -107,13 +110,16 @@ export async function readCodexRolloutHistory(request: CodexRolloutHistoryReques
       if (pending.length > 0) {
         resolvedCursor = {
           device, inode, before, pending, terminals: cursor.terminals, skipPartial: false,
-          pendingSkipped: false, resolved: cursor.resolved,
+          pendingSkipped: false, ...(cursor.activeTurnId ? { activeTurnId: cursor.activeTurnId } : {}), resolved: cursor.resolved,
         };
         return finishPage(messages, openTurnIds, terminalTurnIds, encodeCursor(resolvedCursor));
       }
       if (messages.length >= pageSize || materialized.filled) {
         const nextCursor = before > 0
-          ? encodeCursor({ device, inode, before, pending: [], terminals: [], skipPartial: false, pendingSkipped: false })
+          ? encodeCursor({
+            device, inode, before, pending: [], terminals: [], skipPartial: false, pendingSkipped: false,
+            ...(cursor.activeTurnId ? { activeTurnId: cursor.activeTurnId } : {}),
+          })
           : undefined;
         return finishPage(messages, openTurnIds, terminalTurnIds, nextCursor);
       }
@@ -136,6 +142,7 @@ export async function readCodexRolloutHistory(request: CodexRolloutHistoryReques
           continue;
         }
         if ((eventType === "task_started" || eventType === "turn_started") && turnId) {
+          if (turnId === unresolvedActiveTurnId) unresolvedActiveTurnId = undefined;
           const proof = terminal.get(turnId);
           const status = proof?.status ?? "inProgress";
           const resolved: ResolvedTurn = { turnId, status, at: proof?.at ?? -1, turnOrder: line.start };
@@ -183,6 +190,34 @@ export async function readCodexRolloutHistory(request: CodexRolloutHistoryReques
       } else if (item) pendingSkipped = true;
     }
 
+    // A single active turn can grow beyond the reverse-scan budget. The App Server already tells us
+    // its exact ID, so recent visible records do not need to wait for a task_started line several
+    // windows away. Carry that proof in the cursor until the matching start boundary is crossed.
+    if (!resolvedCursor && !pageFilled && unresolvedActiveTurnId && pending.length > 0) {
+      const resolved: ResolvedTurn = {
+        turnId: unresolvedActiveTurnId, status: "inProgress", at: -1, turnOrder: window.nextBefore,
+      };
+      const materialized = await materializePending(file, pending, resolved, parsedVisible, messages, pageSize, pageJsonBytes);
+      pageJsonBytes = materialized.pageJsonBytes;
+      oldestSelectedOffset = materialized.oldestSelectedOffset ?? oldestSelectedOffset;
+      const remaining = pending.slice(materialized.consumed);
+      rememberTurnPresentation(resolved, materialized.emitted, openTurnIds, terminalTurnIds);
+      if (remaining.length > 0) {
+        resolvedCursor = {
+          device, inode, before: window.nextBefore, pending: remaining, terminals: [], skipPartial: false,
+          pendingSkipped: false, activeTurnId: unresolvedActiveTurnId, resolved,
+        };
+        pageFilled = true;
+      } else {
+        pending = [];
+        pendingBytes = 0;
+        if (pendingSkipped || messages.length >= pageSize || materialized.filled) {
+          pageFilled = true;
+          pageBoundaryOffset = materialized.oldestSelectedOffset ?? window.nextBefore;
+        }
+      }
+    }
+
     messages.sort((left, right) => left.itemOrder - right.itemOrder);
     let nextCursor: string | undefined;
     if (resolvedCursor) {
@@ -191,14 +226,19 @@ export async function readCodexRolloutHistory(request: CodexRolloutHistoryReques
       nextCursor = encodeCursor({
         device, inode, before: oldestSelectedOffset, pending: [],
         terminals: carryTerminal ? [carryTerminal] : [], skipPartial: false, pendingSkipped: false,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
       });
     } else if (pageFilled && (pageBoundaryOffset ?? 0) > 0) {
-      nextCursor = encodeCursor({ device, inode, before: pageBoundaryOffset!, pending: [], terminals: [], skipPartial: false, pendingSkipped: false });
+      nextCursor = encodeCursor({
+        device, inode, before: pageBoundaryOffset!, pending: [], terminals: [], skipPartial: false, pendingSkipped: false,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
+      });
     } else if (window.hasMore) {
       nextCursor = encodeCursor({
         device, inode, before: window.nextBefore, pending,
         terminals: [...terminal].slice(-MAX_CURSOR_TERMINALS).map(([turnId, proof]) => ({ turnId, ...proof })),
         skipPartial: window.skipPartial, pendingSkipped,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
       });
     }
     return finishPage(messages, openTurnIds, terminalTurnIds, nextCursor);
@@ -375,7 +415,9 @@ function visibleAssistant(lineStart: number, payload: Record<string, unknown>, a
 function validateRequest(request: CodexRolloutHistoryRequest): void {
   const name = basename(request.path);
   if (!isAbsolute(request.path) || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(request.threadId)
-    || !name.startsWith("rollout-") || !name.endsWith(`-${request.threadId}.jsonl`)) {
+    || !name.startsWith("rollout-") || !name.endsWith(`-${request.threadId}.jsonl`)
+    || (request.activeTurnId !== undefined && (typeof request.activeTurnId !== "string"
+      || request.activeTurnId.length < 1 || request.activeTurnId.length > 256))) {
     throw new Error("invalid Codex rollout history request");
   }
 }
@@ -462,6 +504,8 @@ function decodeCursor(value: string | undefined): HistoryCursor | undefined {
       && Number.isSafeInteger((entry as { at?: unknown }).at))
     || (cursor.skipPartial !== undefined && typeof cursor.skipPartial !== "boolean")
     || (cursor.pendingSkipped !== undefined && typeof cursor.pendingSkipped !== "boolean")
+    || (cursor.activeTurnId !== undefined && (typeof cursor.activeTurnId !== "string"
+      || cursor.activeTurnId.length < 1 || cursor.activeTurnId.length > 256))
     || (cursor.resolved !== undefined && (!resolved || pending.length === 0 || cursor.pendingSkipped === true
       || typeof resolved.turnId !== "string" || resolved.turnId.length < 1 || resolved.turnId.length > 256
       || !TURN_STATUS.has(String(resolved.status ?? "")) || !Number.isSafeInteger(resolved.at)
@@ -472,6 +516,7 @@ function decodeCursor(value: string | undefined): HistoryCursor | undefined {
     device: String(cursor.device), inode: String(cursor.inode), before: Number(cursor.before),
     pending: pending as unknown as PendingLine[], terminals: terminals as unknown as HistoryCursor["terminals"],
     skipPartial: cursor.skipPartial === true, pendingSkipped: cursor.pendingSkipped === true,
+    ...(typeof cursor.activeTurnId === "string" ? { activeTurnId: cursor.activeTurnId } : {}),
     ...(resolved ? { resolved: resolved as unknown as ResolvedTurn } : {}),
   };
 }

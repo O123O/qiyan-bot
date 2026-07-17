@@ -60,6 +60,27 @@ test("remote Codex history matches bounded continuation and escaped-body behavio
   }
 });
 
+test("remote Codex history matches the known active-turn window", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-codex-history-active-parity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const threadId = "thread-active-parity";
+  const path = join(root, `rollout-now-${threadId}.jsonl`);
+  await writeFile(path, [
+    line("2026-01-01T00:00:00.000Z", "event_msg", { type: "task_started", turn_id: "active-turn" }),
+    line("2026-01-01T00:00:01.000Z", "response_item", { type: "function_call_output", output: "x".repeat(5 * 1024 * 1024) }),
+    line("2026-01-01T00:00:02.000Z", "response_item", {
+      type: "message", role: "assistant", id: "latest", phase: "commentary",
+      content: [{ type: "output_text", text: "still working" }],
+    }),
+  ].join(""));
+  const request = { path, threadId, limit: 20, activeTurnId: "active-turn" };
+
+  const local = await readCodexRolloutHistory(request);
+  assert.deepEqual(await readRemote(request), local);
+  assert.deepEqual(local.messages.map((message) => message.body), ["still working"]);
+  assert.deepEqual(local.openTurnIds, ["active-turn"]);
+});
+
 test("remote Codex history preserves completed status while draining a long turn", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-codex-history-long-turn-parity-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -156,6 +156,33 @@ test("Codex rollout history continues across a tool-heavy scan window", async ()
   assert.deepEqual(page.messages.map((message) => message.body), ["still reachable"]);
 });
 
+test("Codex rollout history shows the latest window of a known long-running turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-web-history-active-window-"));
+  const threadId = "thread-active-window";
+  const path = join(root, `rollout-now-${threadId}.jsonl`);
+  await writeFile(path, [
+    line("2026-01-01T00:00:00.000Z", "event_msg", { type: "task_started", turn_id: "active-turn" }),
+    line("2026-01-01T00:00:01.000Z", "event_msg", { type: "user_message", message: "original prompt" }),
+    line("2026-01-01T00:00:02.000Z", "response_item", { type: "function_call_output", output: "x".repeat(5 * 1024 * 1024) }),
+    line("2026-01-01T00:00:03.000Z", "event_msg", { type: "user_message", message: "latest steering", client_id: "latest-client" }),
+    line("2026-01-01T00:00:04.000Z", "response_item", {
+      type: "message", role: "assistant", id: "latest-commentary", phase: "commentary",
+      content: [{ type: "output_text", text: "latest progress" }],
+    }),
+  ].join(""));
+
+  const withoutActiveTurn = await readCodexRolloutHistory({ path, threadId, limit: 20 });
+  assert.deepEqual(withoutActiveTurn.messages, []);
+
+  const page = await readCodexRolloutHistory({ path, threadId, limit: 20, activeTurnId: "active-turn" });
+  assert.deepEqual(page.messages.map((message) => [message.turnId, message.body, message.terminalStatus]), [
+    ["active-turn", "latest steering", "inProgress"],
+    ["active-turn", "latest progress", "inProgress"],
+  ]);
+  assert.deepEqual(page.openTurnIds, ["active-turn"]);
+  assert.ok(page.nextCursor);
+});
+
 test("Codex rollout history continues across a record-heavy scan window", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-web-history-record-budget-"));
   const threadId = "thread-record-budget";

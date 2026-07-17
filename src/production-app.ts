@@ -3472,7 +3472,15 @@ export async function buildProductionApp(
             if (signal.aborted) throw signal.reason;
             const path = ownership.managedRolloutPath({ endpoint: endpointId, thread_id: threadId, mapping_id: mappingId });
             if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
-            const page = await codexHistoryAccess.read(endpointId, { path, threadId, limit, ...(cursor ? { cursor } : {}) }, lease, signal);
+            const native = nativeSessions.view({ endpointId, threadId, mappingId });
+            const activeTurnId = native?.availability === "ready" && native.status === "active"
+              ? native.activeTurnId
+              : null;
+            const page = await codexHistoryAccess.read(endpointId, {
+              path, threadId, limit,
+              ...(activeTurnId ? { activeTurnId } : {}),
+              ...(cursor ? { cursor } : {}),
+            }, lease, signal);
             if (signal.aborted) throw signal.reason;
             return page;
           };

@@ -381,6 +381,8 @@ async function codexHistory(value) {
   if (typeof path !== "string" || !isAbsolute(path) || typeof threadId !== "string"
     || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(threadId)
     || !name.startsWith("rollout-") || !name.endsWith(`-${threadId}.jsonl`)
+    || (value?.activeTurnId !== undefined && (typeof value.activeTurnId !== "string"
+      || value.activeTurnId.length < 1 || value.activeTurnId.length > 256))
     || !Number.isSafeInteger(value?.limit) || value.limit < 1 || value.limit > 50) throw new Error("invalid Codex history request");
   const cursor = decodeHistoryCursor(value.cursor);
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -408,6 +410,7 @@ async function codexHistory(value) {
     let pageBoundaryOffset;
     let carryTerminal;
     let resolvedCursor;
+    let unresolvedActiveTurnId = cursor?.activeTurnId ?? (cursor ? undefined : value.activeTurnId);
 
     if (cursor?.resolved) {
       const materialized = await materializeHistoryPending(file, pending, cursor.resolved, parsedVisible, messages, value.limit, pageJsonBytes);
@@ -419,13 +422,16 @@ async function codexHistory(value) {
       if (pending.length > 0) {
         resolvedCursor = {
           device, inode, before, pending, terminals: cursor.terminals, skipPartial: false,
-          pendingSkipped: false, resolved: cursor.resolved,
+          pendingSkipped: false, ...(cursor.activeTurnId ? { activeTurnId: cursor.activeTurnId } : {}), resolved: cursor.resolved,
         };
         return finishHistoryPage(messages, openTurnIds, terminalTurnIds, encodeHistoryCursor(resolvedCursor));
       }
       if (messages.length >= value.limit || materialized.filled) {
         const nextCursor = before > 0
-          ? encodeHistoryCursor({ device, inode, before, pending: [], terminals: [], skipPartial: false, pendingSkipped: false })
+          ? encodeHistoryCursor({
+            device, inode, before, pending: [], terminals: [], skipPartial: false, pendingSkipped: false,
+            ...(cursor.activeTurnId ? { activeTurnId: cursor.activeTurnId } : {}),
+          })
           : undefined;
         return finishHistoryPage(messages, openTurnIds, terminalTurnIds, nextCursor);
       }
@@ -445,6 +451,7 @@ async function codexHistory(value) {
         const status = historyTerminalStatus(eventType);
         if (status && turnId) { rememberHistoryTerminal(terminal, turnId, { status, at }); continue; }
         if ((eventType === "task_started" || eventType === "turn_started") && turnId) {
+          if (turnId === unresolvedActiveTurnId) unresolvedActiveTurnId = undefined;
           const proof = terminal.get(turnId);
           const turnStatus = proof?.status ?? "inProgress";
           const resolved = { turnId, status: turnStatus, at: proof?.at ?? -1, turnOrder: line.start };
@@ -488,6 +495,29 @@ async function codexHistory(value) {
       } else if (item) pendingSkipped = true;
     }
 
+    if (!resolvedCursor && !pageFilled && unresolvedActiveTurnId && pending.length > 0) {
+      const resolved = { turnId: unresolvedActiveTurnId, status: "inProgress", at: -1, turnOrder: window.nextBefore };
+      const materialized = await materializeHistoryPending(file, pending, resolved, parsedVisible, messages, value.limit, pageJsonBytes);
+      pageJsonBytes = materialized.pageJsonBytes;
+      oldestSelectedOffset = materialized.oldestSelectedOffset ?? oldestSelectedOffset;
+      const remaining = pending.slice(materialized.consumed);
+      rememberHistoryPresentation(resolved, materialized.emitted, openTurnIds, terminalTurnIds);
+      if (remaining.length > 0) {
+        resolvedCursor = {
+          device, inode, before: window.nextBefore, pending: remaining, terminals: [], skipPartial: false,
+          pendingSkipped: false, activeTurnId: unresolvedActiveTurnId, resolved,
+        };
+        pageFilled = true;
+      } else {
+        pending = [];
+        pendingBytes = 0;
+        if (pendingSkipped || messages.length >= value.limit || materialized.filled) {
+          pageFilled = true;
+          pageBoundaryOffset = materialized.oldestSelectedOffset ?? window.nextBefore;
+        }
+      }
+    }
+
     let nextCursor;
     if (resolvedCursor) {
       nextCursor = encodeHistoryCursor(resolvedCursor);
@@ -495,14 +525,19 @@ async function codexHistory(value) {
       nextCursor = encodeHistoryCursor({
         device, inode, before: oldestSelectedOffset, pending: [],
         terminals: carryTerminal ? [carryTerminal] : [], skipPartial: false, pendingSkipped: false,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
       });
     } else if (pageFilled && (pageBoundaryOffset ?? 0) > 0) {
-      nextCursor = encodeHistoryCursor({ device, inode, before: pageBoundaryOffset, pending: [], terminals: [], skipPartial: false, pendingSkipped: false });
+      nextCursor = encodeHistoryCursor({
+        device, inode, before: pageBoundaryOffset, pending: [], terminals: [], skipPartial: false, pendingSkipped: false,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
+      });
     } else if (window.hasMore) {
       nextCursor = encodeHistoryCursor({
         device, inode, before: window.nextBefore, pending,
         terminals: [...terminal].slice(-HISTORY_CURSOR_TERMINALS).map(([pendingTurnId, proof]) => ({ turnId: pendingTurnId, ...proof })),
         skipPartial: window.skipPartial, pendingSkipped,
+        ...(unresolvedActiveTurnId ? { activeTurnId: unresolvedActiveTurnId } : {}),
       });
     }
     return finishHistoryPage(messages, openTurnIds, terminalTurnIds, nextCursor);
@@ -667,6 +702,8 @@ function decodeHistoryCursor(value) {
       && ["completed", "failed", "interrupted"].includes(entry.status) && Number.isSafeInteger(entry.at))
     || (cursor.skipPartial !== undefined && typeof cursor.skipPartial !== "boolean")
     || (cursor.pendingSkipped !== undefined && typeof cursor.pendingSkipped !== "boolean")
+    || (cursor.activeTurnId !== undefined && (typeof cursor.activeTurnId !== "string"
+      || cursor.activeTurnId.length < 1 || cursor.activeTurnId.length > 256))
     || (cursor.resolved !== undefined && (!resolved || pending.length === 0 || cursor.pendingSkipped === true
       || typeof resolved.turnId !== "string" || resolved.turnId.length < 1 || resolved.turnId.length > 256
       || !["completed", "failed", "interrupted", "inProgress"].includes(resolved.status)
@@ -676,6 +713,7 @@ function decodeHistoryCursor(value) {
   return {
     device: cursor.device, inode: cursor.inode, before: cursor.before, pending, terminals,
     skipPartial: cursor.skipPartial === true, pendingSkipped: cursor.pendingSkipped === true,
+    ...(typeof cursor.activeTurnId === "string" ? { activeTurnId: cursor.activeTurnId } : {}),
     ...(resolved ? { resolved } : {}),
   };
 }
