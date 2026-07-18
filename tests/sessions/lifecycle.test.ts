@@ -114,6 +114,16 @@ async function fixture(ownership?: {
     lease?: EndpointWorkLease,
     options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
   ): Promise<void>;
+  initializeAdoptionBoundary?(
+    identity: { endpoint: string; thread_id: string; mapping_id: string },
+    path: string,
+    lease?: EndpointWorkLease,
+  ): Promise<void>;
+  completeAdoptionBoundary?(
+    identity: { endpoint: string; thread_id: string; mapping_id: string },
+    path: string,
+    authorizedTurnId?: string,
+  ): void;
   inspectIfInitialized?(identity: { endpoint: string; thread_id: string; mapping_id: string }, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" | "owned" | "pending" | "lost" } | { state: "external" | "unclassified"; turnId: string }
   >;
@@ -285,6 +295,83 @@ test("adopt resumes a disk-backed notLoaded thread before enforcing idle", async
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list"]);
 });
 
+test("adopt owns the goal continuation started by its resume of an idle persisted thread", async () => {
+  const initialized: Array<{ authorizedTurnId?: string }> = [];
+  const boundaries: string[] = [];
+  const completed: Array<string | undefined> = [];
+  const { registry, endpoint, epochs, native, lifecycle } = await fixture({
+    initializeAdoptionBoundary: async (_identity, path) => { boundaries.push(path); },
+    completeAdoptionBoundary: (_identity, _path, authorizedTurnId) => { completed.push(authorizedTurnId); },
+    initialize: async (_identity, _path, _lease, options) => { initialized.push(options ?? {}); },
+    release: () => undefined,
+  });
+  endpoint.status = "notLoaded";
+  endpoint.turns = [{ id: "historical", status: "completed" }];
+  endpoint.onResume = () => {
+    assert.deepEqual(boundaries, [endpoint.path], "the historical boundary must be durable before resume starts a goal turn");
+    endpoint.status = "active";
+    endpoint.turns.push({ id: "goal-continuation", status: "inProgress" });
+  };
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  const session = required(registry);
+  assert.equal(session.lifecycle_state, "managed");
+  assert.deepEqual(boundaries, [endpoint.path]);
+  assert.deepEqual(completed, ["goal-continuation"]);
+  assert.deepEqual(initialized, []);
+  assert.equal(epochs.current("local", "thread-1", session.mapping_id)?.baselineTurnId, "historical");
+  const view = native.view({ endpointId: "local", threadId: "thread-1", mappingId: session.mapping_id });
+  assert.equal(view?.availability, "ready");
+  assert.equal(view?.status, "active");
+  assert.equal(view?.activeTurnId, "goal-continuation");
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false);
+});
+
+test("adopt rejects a thread that was already active before its reservation", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.status = "active";
+  endpoint.turns = [
+    { id: "historical", status: "completed" },
+    { id: "already-running", status: "inProgress" },
+  ];
+
+  await assert.rejects(
+    lifecycle.adopt("payments", "local", "thread-1"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/resume"), false);
+});
+
+test("adopt rejects a nonterminal latest turn even when this App Server reports idle or notLoaded", async (t) => {
+  for (const status of ["idle", "notLoaded"] as const) await t.test(status, async () => {
+    const { registry, endpoint, lifecycle } = await fixture();
+    endpoint.status = status;
+    endpoint.turns = [{ id: "owned-by-another-client", status: "inProgress" }];
+
+    await assert.rejects(
+      lifecycle.adopt("payments", "local", "thread-1"),
+      (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+    );
+
+    assert.equal(registry.get("payments"), undefined);
+    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
+  });
+});
+
+test("adopt accepts an interrupted latest turn as terminal history", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.status = "notLoaded";
+  endpoint.turns = [{ id: "aborted-turn", status: "interrupted" }];
+  endpoint.onResume = () => { endpoint.status = "idle"; };
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+});
+
 test("adopt manages a loaded empty thread without requiring a nonexistent rollout resume", async () => {
   const initialized: Array<{ allowUnmaterialized?: boolean }> = [];
   const { registry, endpoint, lifecycle } = await fixture({
@@ -392,7 +479,7 @@ test("an early adoption resume rolls back wrong identity and surfaces rollback u
   });
 });
 
-test("an early adoption resume rolls back source and status validation failures", async () => {
+test("an early adoption resume rolls back source and system-error validation failures", async () => {
   const source = await fixture();
   source.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
   await assert.rejects(source.lifecycle.adopt("payments", "local", "thread-1", () => {
@@ -403,7 +490,7 @@ test("an early adoption resume rolls back source and status validation failures"
 
   const active = await fixture();
   active.endpoint.readErrors.push(new JsonRpcResponseError(-32600, "thread not loaded: thread-1"));
-  active.endpoint.onResume = () => { active.endpoint.status = "active"; };
+  active.endpoint.onResume = () => { active.endpoint.status = "systemError"; };
   await assert.rejects(active.lifecycle.adopt("payments", "local", "thread-1"), (error: unknown) => {
     assert.equal(error instanceof AppError && error.code === "SESSION_BUSY", true);
     return true;
@@ -475,24 +562,9 @@ test("adopt never treats a near-match read error as thread absence", async () =>
   }
 });
 
-test("adopt rejects active and systemError threads before reservation or resume", async (context) => {
-  for (const status of ["active", "systemError"]) await context.test(status, async () => {
-    const { registry, endpoint, lifecycle } = await fixture();
-    endpoint.status = status;
-
-    await assert.rejects(
-      lifecycle.adopt("payments", "local", "thread-1"),
-      (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
-    );
-
-    assert.equal(registry.get("payments"), undefined);
-    assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
-  });
-});
-
-test("adopt rolls back a proven subscription when the resumed thread is active", async () => {
+test("adopt rejects a systemError thread before reservation or resume", async () => {
   const { registry, endpoint, lifecycle } = await fixture();
-  endpoint.onResume = () => { endpoint.status = "active"; };
+  endpoint.status = "systemError";
 
   await assert.rejects(
     lifecycle.adopt("payments", "local", "thread-1"),
@@ -500,7 +572,22 @@ test("adopt rolls back a proven subscription when the resumed thread is active",
   );
 
   assert.equal(registry.get("payments"), undefined);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list", "thread/unsubscribe"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
+});
+
+test("adopt rolls back an active status that has no authoritative active turn", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  endpoint.onResume = () => { endpoint.status = "active"; };
+
+  await assert.rejects(
+    lifecycle.adopt("payments", "local", "thread-1"),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), [
+    "thread/read", "thread/turns/list", "thread/resume", "thread/read", "thread/turns/list", "thread/turns/list", "thread/unsubscribe",
+  ]);
 });
 
 test("adopt rolls back when rollout ownership finds an external active turn", async () => {
@@ -570,6 +657,38 @@ test("an uncertain resume remains adopting and startup reconciliation promotes o
   assert.deepEqual(endpoint.calls.find((call) => call.method === "thread/resume")?.params, { threadId: "thread-1", excludeTurns: true });
 });
 
+test("adopting reconciliation owns a goal continuation started by the uncertain resume", async () => {
+  const initialized: Array<{ authorizedTurnId?: string }> = [];
+  const boundaries: string[] = [];
+  const completed: Array<string | undefined> = [];
+  const { registry, endpoint, epochs, lifecycle } = await fixture({
+    initializeAdoptionBoundary: async (_identity, path) => { boundaries.push(path); },
+    completeAdoptionBoundary: (_identity, _path, authorizedTurnId) => { completed.push(authorizedTurnId); },
+    initialize: async (_identity, _path, _lease, options) => { initialized.push(options ?? {}); },
+    release: () => undefined,
+  });
+  endpoint.failResume = true;
+  endpoint.onResume = () => {
+    endpoint.status = "active";
+    endpoint.turns.push({ id: "goal-continuation", status: "inProgress" });
+  };
+
+  await assert.rejects(lifecycle.adopt("payments", "local", "thread-1"), /resume response lost/u);
+  const reserved = required(registry);
+  assert.equal(reserved.lifecycle_state, "adopting");
+
+  endpoint.failResume = false;
+  endpoint.calls.length = 0;
+  await lifecycle.reconcileAdopting();
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.deepEqual(boundaries, [endpoint.path]);
+  assert.deepEqual(completed, ["goal-continuation"]);
+  assert.deepEqual(initialized, []);
+  assert.equal(epochs.current("local", "thread-1", reserved.mapping_id)?.baselineTurnId, "historical");
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/resume"), false);
+});
+
 test("adopting reconciliation resumes an exact read-not-loaded durable mapping", async () => {
   const { dir, registry, endpoint, lifecycle } = await fixture();
   const adopting = {
@@ -582,6 +701,23 @@ test("adopting reconciliation resumes an exact read-not-loaded durable mapping",
 
   assert.equal(required(registry).lifecycle_state, "managed");
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/resume", "thread/read", "thread/turns/list"]);
+});
+
+test("adopting reconciliation does not skip a nonterminal turn reported while notLoaded", async () => {
+  const { dir, registry, endpoint, lifecycle } = await fixture();
+  await registry.reserve("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: dir, mapping_id: "mapping-busy", lifecycle_state: "adopting",
+  });
+  endpoint.status = "notLoaded";
+  endpoint.turns = [{ id: "still-running-elsewhere", status: "inProgress" }];
+
+  await assert.rejects(
+    lifecycle.reconcileAdopting(),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY",
+  );
+
+  assert.equal(required(registry).lifecycle_state, "adopting");
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
 });
 
 test("adopting reconciliation promotes a loaded empty thread without rollout resume", async () => {

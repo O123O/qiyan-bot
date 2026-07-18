@@ -33,6 +33,16 @@ interface SessionOwnershipLifecycle {
     lease?: EndpointWorkLease,
     options?: { allowUnmaterialized?: boolean; authorizedTurnId?: string },
   ): Promise<void>;
+  initializeAdoptionBoundary?(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+  ): Promise<void>;
+  completeAdoptionBoundary?(
+    identity: MappingIdentity,
+    path: string,
+    authorizedTurnId?: string,
+  ): void;
   authorizeTurnIfInitialized?(identity: MappingIdentity, turnId: string): boolean;
   inspectIfInitialized?(identity: MappingIdentity, lease?: EndpointWorkLease, options?: { requireMaterialized?: boolean }): Promise<
     { state: "uninitialized" } | OwnershipInspection
@@ -113,6 +123,7 @@ export class SessionLifecycle {
       this.requireAvailable(nickname, endpointId, threadId);
       let resumed = false;
       let resumeAttempted = false;
+      let adoptionBoundaryPrepared = false;
       let reserved: RegistrySession | undefined;
       try {
         let before: ThreadResponse;
@@ -145,6 +156,7 @@ export class SessionLifecycle {
         await this.registry.reserve(nickname, reserved);
         let after = before;
         if (!resumed && this.requiresResume(before.thread)) {
+          adoptionBoundaryPrepared = await this.prepareAdoptionBoundary(reserved, before.thread, lease);
           resumeAttempted = true;
           const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease);
           resumed = true;
@@ -152,15 +164,21 @@ export class SessionLifecycle {
           after = await this.read(endpointId, threadId, lease);
         }
         this.requireThreadIdentity(after.thread, threadId);
-        this.requireIdle(after.thread);
+        this.requireAdoptionOutcome(after.thread, resumed);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
-        if (this.ownership) await this.ownership.initialize(reserved, this.requireRolloutPath(after.thread), lease, {
-          allowUnmaterialized: after.thread.turns.length === 0,
-        });
+        const boundary = await this.adoptionBoundary(endpointId, after.thread, lease);
+        if (this.ownership) {
+          const path = this.requireRolloutPath(after.thread);
+          if (adoptionBoundaryPrepared) this.ownership.completeAdoptionBoundary!(reserved, path, boundary.activeTurnId);
+          else await this.ownership.initialize(reserved, path, lease, {
+            allowUnmaterialized: after.thread.turns.length === 0,
+            ...(boundary.activeTurnId ? { authorizedTurnId: boundary.activeTurnId } : {}),
+          });
+        }
         await this.registry.promote(nickname, reserved);
-        this.observeManaged(reserved, after.thread, lease);
-        this.epochs.begin(endpointId, threadId, reserved.mapping_id, this.baseline(after.thread), this.clock.now());
+        this.observeManaged(reserved, after.thread, lease, boundary.activeTurnId);
+        this.epochs.begin(endpointId, threadId, reserved.mapping_id, boundary.baselineTurnId, this.clock.now());
       } catch (error) {
         if (resumed) {
           try {
@@ -260,6 +278,7 @@ export class SessionLifecycle {
         const session = this.assertExact(nickname, expected, "adopting");
         const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
         let resumed = false;
+        let adoptionBoundaryPrepared = false;
         try {
           await this.assertDispatchable(session.endpoint, project, lease);
           if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
@@ -273,11 +292,12 @@ export class SessionLifecycle {
             before = await this.read(session.endpoint, session.thread_id, lease);
           }
           this.requireThreadIdentity(before.thread, session.thread_id);
-          this.requireAdoptableBeforeResume(before.thread);
+          this.requireReservedAdoptable(before.thread);
           await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
           this.assertExact(nickname, expected, "adopting");
           let native = before;
           if (!resumed && this.requiresResume(before.thread)) {
+            adoptionBoundaryPrepared = await this.prepareAdoptionBoundary(session, before.thread, lease);
             const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", this.resumeParams(session.thread_id), undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
@@ -285,17 +305,25 @@ export class SessionLifecycle {
             native = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
           }
           this.requireThreadIdentity(native.thread, session.thread_id);
-          this.requireIdle(native.thread);
+          this.requireAdoptionOutcome(native.thread, true);
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           const promotable = this.assertExact(nickname, expected, "adopting");
-          if (this.ownership) await this.ownership.initialize(promotable, this.requireRolloutPath(native.thread), lease, {
-            allowUnmaterialized: native.thread.turns.length === 0,
-          });
+          const boundary = await this.adoptionBoundary(session.endpoint, native.thread, lease);
+          if (this.ownership) {
+            const path = this.requireRolloutPath(native.thread);
+            const canCompletePrepared = adoptionBoundaryPrepared
+              || (native.thread.status.type === "active" && this.ownership.completeAdoptionBoundary !== undefined);
+            if (canCompletePrepared) this.ownership.completeAdoptionBoundary!(promotable, path, boundary.activeTurnId);
+            else await this.ownership.initialize(promotable, path, lease, {
+              allowUnmaterialized: native.thread.turns.length === 0,
+              ...(boundary.activeTurnId ? { authorizedTurnId: boundary.activeTurnId } : {}),
+            });
+          }
           await this.registry.promote(nickname, promotable);
-          this.observeManaged(promotable, native.thread, lease);
+          this.observeManaged(promotable, native.thread, lease, boundary.activeTurnId);
           if (!this.epochs.current(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
-            this.epochs.begin(promotable.endpoint, promotable.thread_id, promotable.mapping_id, this.baseline(native.thread), this.clock.now());
+            this.epochs.begin(promotable.endpoint, promotable.thread_id, promotable.mapping_id, boundary.baselineTurnId, this.clock.now());
           }
         } catch (error) {
           const current = this.registry.get(nickname);
@@ -583,10 +611,65 @@ export class SessionLifecycle {
     if (thread.status.type !== "idle" && thread.status.type !== "notLoaded") {
       throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
     }
+    this.requireTerminalLatestTurn(thread);
+  }
+
+  private requireReservedAdoptable(thread: ThreadView): void {
+    if (thread.status.type !== "idle" && thread.status.type !== "active" && thread.status.type !== "notLoaded") {
+      throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
+    }
+    if (thread.status.type !== "active") this.requireTerminalLatestTurn(thread);
+  }
+
+  private requireAdoptionOutcome(thread: ThreadView, allowReservedActive: boolean): void {
+    // Resuming an idle thread with a persisted active goal can immediately start its next turn.
+    // That turn belongs to the durable adopting reservation; an active preflight never does.
+    if (thread.status.type !== "idle" && !(allowReservedActive && thread.status.type === "active")) {
+      throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
+    }
+    if (thread.status.type === "idle") this.requireTerminalLatestTurn(thread);
+  }
+
+  private requireTerminalLatestTurn(thread: ThreadView): void {
+    const latest = thread.turns.at(-1);
+    if (latest && !isTerminalTurnStatus(latest.status)) {
+      throw new AppError("SESSION_BUSY", `thread ${thread.id} has a nonterminal latest turn`);
+    }
+  }
+
+  private async adoptionBoundary(
+    endpointId: string,
+    thread: ThreadView,
+    lease?: EndpointWorkLease,
+  ): Promise<{ baselineTurnId?: string; activeTurnId?: string }> {
+    if (thread.status.type !== "active") {
+      const baselineTurnId = this.baseline(thread);
+      return baselineTurnId ? { baselineTurnId } : {};
+    }
+    const page = await this.pool.historyReader(endpointId, lease).turnsPage(thread.id, {
+      limit: 2,
+      sortDirection: "desc",
+      itemsView: "notLoaded",
+    });
+    const active = page.data[0];
+    if (!active || isTerminalTurnStatus(active.status)) {
+      throw new AppError("OPERATION_UNCERTAIN", `active thread ${thread.id} has no authoritative active turn`);
+    }
+    return { activeTurnId: active.id, ...(page.data[1] ? { baselineTurnId: page.data[1].id } : {}) };
+  }
+
+  private async prepareAdoptionBoundary(
+    identity: MappingIdentity,
+    thread: ThreadView,
+    lease?: EndpointWorkLease,
+  ): Promise<boolean> {
+    if (!this.ownership?.initializeAdoptionBoundary || !this.ownership.completeAdoptionBoundary) return false;
+    await this.ownership.initializeAdoptionBoundary(identity, this.requireRolloutPath(thread), lease);
+    return true;
   }
 
   private requiresResume(thread: ThreadView): boolean {
-    return thread.status.type === "notLoaded" || thread.turns.length > 0;
+    return thread.status.type !== "active" && (thread.status.type === "notLoaded" || thread.turns.length > 0);
   }
 
   private threadNotDurable(threadId: string): AppError {

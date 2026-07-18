@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "85c8b1f66a66b96312377cec2633e7d03c47e1c9edd490b7789567681daec3d8";
+export const REMOTE_HELPER_SHA256 = "d9b4b40c9fb0deb2b2f8dfa95c1000ccb0a8cbc803e5d6189fdd5adf3700ef42";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
@@ -29,7 +29,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "claude-rollout-scan", "codex-history", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "rollout-scan", "rollout-boundary", "claude-rollout-scan", "codex-history", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),

@@ -2,8 +2,10 @@ import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
   ROLLOUT_APPENDED_WHILE_SCANNING,
+  captureLocalRolloutBoundary,
   scanLocalRollout,
   type RolloutAccess,
+  type RolloutBoundary,
   type RolloutCursor,
   type RolloutMaterialization,
   type RolloutScanResult,
@@ -38,6 +40,10 @@ const responseSchema = z.object({ results: z.array(resultSchema).max(128) }).str
 const materializationResponseSchema = z.object({
   results: z.array(z.union([resultSchema, z.object({ missing: z.literal(true) }).strict()])).length(1),
 }).strict();
+const boundaryResponseSchema = z.union([
+  z.object({ cursor: cursorSchema }).strict(),
+  z.object({ missing: z.literal(true) }).strict(),
+]);
 
 export interface RolloutScanRequest {
   path: string;
@@ -137,6 +143,29 @@ export class RolloutAccessRouter implements RolloutAccess {
     const [result] = parsed.data.results;
     if (!result || "missing" in result) return { state: "missing" };
     return { state: "present", result: publicResult(result) };
+  }
+
+  async captureBoundary(endpointId: string, request: RolloutScanRequest, lease?: EndpointWorkLease): Promise<RolloutBoundary> {
+    if (request.cursor) throw new AppError("CONFIGURATION_ERROR", "rollout boundary capture cannot use a cursor");
+    this.requireLease(endpointId, lease);
+    if (this.isLocal(endpointId)) {
+      try {
+        const cursor = await captureLocalRolloutBoundary(request);
+        this.requireLease(endpointId, lease);
+        return { state: "present", cursor };
+      } catch (error) {
+        if (!isErrno(error, "ENOENT")) throw error;
+        this.requireLease(endpointId, lease);
+        return { state: "missing" };
+      }
+    }
+    const context = this.options.remote(endpointId);
+    if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper is unavailable: ${endpointId}`);
+    const response = await context.remote.invoke("rollout-boundary", [JSON.stringify(request)], context.helperPath);
+    this.requireLease(endpointId, lease);
+    const parsed = boundaryResponseSchema.safeParse(response);
+    if (!parsed.success) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH rollout helper returned invalid data: ${endpointId}`);
+    return "missing" in parsed.data ? { state: "missing" } : { state: "present", cursor: parsed.data.cursor };
   }
 
   private requireLease(endpointId: string, lease?: EndpointWorkLease): void {

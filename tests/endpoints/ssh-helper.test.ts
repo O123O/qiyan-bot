@@ -452,6 +452,24 @@ test("the remote helper scans rollout ownership without returning message bodies
   assert.deepEqual(parseRemoteHelperResponse<any>(result.stdout, "rollout-scan").results[0].starts, [{ turnId: "turn-remote", clientId: "ctx:call", hasUserMessage: true }]);
 });
 
+test("the remote helper captures an adoption boundary without scanning rollout records", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-remote-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const threadId = "thread-boundary";
+  const path = join(root, `rollout-now-${threadId}.jsonl`);
+  await writeFile(path, `${JSON.stringify({ private: "history is not parsed" })}\n`);
+  const argument = encodeRemoteArgument(JSON.stringify({ path, threadId }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "rollout-boundary", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+  });
+
+  const boundary = parseRemoteHelperResponse<{ cursor: { device: string; inode: string; offset: number } }>(result.stdout, "rollout-boundary");
+  assert.match(boundary.cursor.device, /^\d+$/u);
+  assert.match(boundary.cursor.inode, /^\d+$/u);
+  assert.equal(boundary.cursor.offset, (await stat(path)).size);
+});
+
 test("the remote helper returns a bounded exact Codex conversation page", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-remote-history-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -163,6 +163,46 @@ test("a complete task start without its user record remains unclassified", async
   assert.deepEqual(await guard.inspect(identity), { state: "unclassified", turnId: "not-yet-classified" });
 });
 
+test("adoption records the current rollout end without scanning historical records", async () => {
+  const db = createTestDatabase();
+  const runtime = new SessionControlStore(db);
+  const identity = { endpoint: "remote", thread_id: "thread-adopt-boundary", mapping_id: "mapping-adopt-boundary" };
+  const path = "/home/user/.codex/sessions/rollout-thread-adopt-boundary.jsonl";
+  const scans: unknown[] = [];
+  const guard = new SessionOwnershipGuard(db, runtime, new OperationStore(db), {
+    captureBoundary: async () => ({ state: "present" as const, cursor: { device: "10", inode: "20", offset: 175_000_000 } }),
+    scan: async (_endpointId, requests) => {
+      scans.push(...requests);
+      return [{
+        cursor: { device: "10", inode: "20", offset: 175_000_128 },
+        starts: [{ turnId: "continued-goal" }],
+      }];
+    },
+  });
+
+  await guard.initializeAdoptionBoundary(identity, path);
+  assert.deepEqual(scans, [], "capturing an adoption boundary must not read old rollout history");
+
+  guard.completeAdoptionBoundary(identity, path, "continued-goal");
+  assert.deepEqual(scans, [], "committing the exact turn started by resume must not race the growing rollout tail");
+  assert.equal(guard.ownsTurn(identity, "continued-goal"), true);
+});
+
+test("adoption never treats a missing historical rollout as an empty boundary", async () => {
+  const db = createTestDatabase();
+  const identity = { endpoint: "remote", thread_id: "thread-missing-boundary", mapping_id: "mapping-missing-boundary" };
+  const guard = new SessionOwnershipGuard(db, new SessionControlStore(db), new OperationStore(db), {
+    captureBoundary: async () => ({ state: "missing" as const }),
+    scan: async () => assert.fail("a missing adoption boundary must not start a historical scan"),
+  });
+
+  await assert.rejects(
+    guard.initializeAdoptionBoundary(identity, "/home/user/.codex/sessions/rollout-thread-missing-boundary.jsonl"),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
+  assert.deepEqual(await guard.inspectIfInitialized(identity), { state: "uninitialized" });
+});
+
 test("materialization-required inspection reports a never-written rollout as lost", async () => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
   const path = join(root, "rollout-thread-nodurable.jsonl");

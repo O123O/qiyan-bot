@@ -44,6 +44,7 @@ try {
       case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
       case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
       case "rollout-scan": result = await scanRollouts(decodeJson(encoded, 1)); break;
+      case "rollout-boundary": result = await captureRolloutBoundary(decodeJson(encoded, 1)); break;
       case "claude-rollout-scan": result = await scanClaudeTranscripts(decodeJson(encoded, 1)); break;
       case "codex-history": result = await codexHistory(decodeJson(encoded, 1)); break;
       case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
@@ -238,6 +239,34 @@ async function scanRollouts(value) {
       ? scanRolloutAllowMissing(request, collectFromStart)
       : scanRollout(request, collectFromStart))),
   };
+}
+
+async function captureRolloutBoundary(request) {
+  const path = request?.path;
+  const threadId = request?.threadId;
+  const name = typeof path === "string" ? basename(path) : "";
+  const validName = name === `${threadId}.jsonl`
+    || (name.startsWith("rollout-") && name.endsWith(`-${threadId}.jsonl`));
+  if (typeof path !== "string" || !isAbsolute(path) || typeof threadId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(threadId) || !validName) throw new Error("invalid rollout boundary request");
+  let file;
+  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch (error) { if (error?.code === "ENOENT") return { missing: true }; throw error; }
+  try {
+    const state = await file.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!state.isFile() || state.size > BigInt(Number.MAX_SAFE_INTEGER)
+      || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid rollout file");
+    if (state.size > 0n) {
+      const finalByte = Buffer.allocUnsafe(1);
+      const { bytesRead } = await file.read(finalByte, 0, 1, Number(state.size - 1n));
+      if (bytesRead !== 1 || finalByte[0] !== 0x0a) throw new Error("rollout has an incomplete final record");
+    }
+    const after = await file.stat({ bigint: true });
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while capturing adoption boundary");
+    return { cursor: { device: state.dev.toString(10), inode: state.ino.toString(10), offset: Number(state.size) } };
+  } finally { await file.close(); }
 }
 
 async function scanRolloutAllowMissing(request, collectFromStart) {

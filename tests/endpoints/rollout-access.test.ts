@@ -201,6 +201,27 @@ test("a remote Codex rollout scan still dispatches the Codex helper op", async (
   assert.deepEqual(ops, ["rollout-scan"]);
 });
 
+test("remote adoption boundary capture uses the constant-time helper operation", async () => {
+  const calls: Array<{ operation: string; payload: unknown }> = [];
+  const cursor = { device: "1", inode: "2", offset: 175_000_000 };
+  const router = new RolloutAccessRouter({
+    remote: () => ({
+      helperPath: "/tmp/h.mjs",
+      remote: {
+        bootstrap: async () => undefined,
+        invoke: async <T>(operation: string, args: readonly string[]) => {
+          calls.push({ operation, payload: JSON.parse(args[0]!) });
+          return { cursor } as T;
+        },
+      },
+    }),
+  });
+  const request = { path: "/home/u/.codex/sessions/rollout-x-thread.jsonl", threadId: "thread" };
+
+  assert.deepEqual(await router.captureBoundary("remote", request), { state: "present", cursor });
+  assert.deepEqual(calls, [{ operation: "rollout-boundary", payload: request }]);
+});
+
 test("a Claude local scan retries on the shared concurrent-append sentinel", async () => {
   let attempts = 0;
   const stable = { cursor: { device: "1", inode: "2", offset: 5 }, starts: [] };

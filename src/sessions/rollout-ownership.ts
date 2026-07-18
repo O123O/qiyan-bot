@@ -32,8 +32,17 @@ export type RolloutMaterialization =
   | { state: "missing" }
   | { state: "present"; result: RolloutScanResult };
 
+export type RolloutBoundary =
+  | { state: "missing" }
+  | { state: "present"; cursor: RolloutCursor };
+
 export interface RolloutAccess {
   scan(endpointId: string, requests: ReadonlyArray<{ path: string; threadId: string; cursor?: RolloutCursor }>, lease?: EndpointWorkLease): Promise<RolloutScanResult[]>;
+  captureBoundary?(
+    endpointId: string,
+    request: { path: string; threadId: string },
+    lease?: EndpointWorkLease,
+  ): Promise<RolloutBoundary>;
   scanUnmaterialized?(
     endpointId: string,
     request: { path: string; threadId: string },
@@ -145,6 +154,40 @@ export class SessionOwnershipGuard {
         throw new AppError("OPERATION_UNCERTAIN", "managed rollout path changed");
       }
     });
+  }
+
+  async initializeAdoptionBoundary(
+    identity: MappingIdentity,
+    path: string,
+    lease?: EndpointWorkLease,
+  ): Promise<void> {
+    if (!validManagedRolloutPath(path, identity.thread_id)) {
+      throw new AppError("OPERATION_UNCERTAIN", "managed rollout path is invalid");
+    }
+    if (this.row(identity)) {
+      this.recordUnmaterialized(identity, path);
+      return;
+    }
+    if (!this.access.captureBoundary) {
+      throw ownershipUnclassified("rollout adoption boundary cannot be captured safely");
+    }
+    const boundary = await this.access.captureBoundary(identity.endpoint, { path, threadId: identity.thread_id }, lease);
+    if (boundary.state === "missing") {
+      throw ownershipUnclassified("rollout adoption boundary is missing");
+    }
+    this.db.prepare(`INSERT INTO session_rollout_ownership
+      (endpoint_id, thread_id, mapping_id, rollout_path, device, inode, byte_offset, materialized, external_turn_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)`).run(
+      identity.endpoint, identity.thread_id, identity.mapping_id, path,
+      boundary.cursor.device, boundary.cursor.inode, boundary.cursor.offset, Date.now(),
+    );
+  }
+
+  completeAdoptionBoundary(identity: MappingIdentity, path: string, authorizedTurnId?: string): void {
+    const existing = this.row(identity);
+    if (!existing) throw ownershipUnclassified("rollout adoption boundary is not initialized");
+    if (existing.rolloutPath !== path) throw ownershipUnclassified("managed rollout path changed");
+    if (authorizedTurnId) this.recordOwnedTurn(identity, authorizedTurnId);
   }
 
   async initialize(
@@ -461,6 +504,31 @@ export async function scanLocalRollout(request: {
     if (after.size > state.size) throw new Error(ROLLOUT_APPENDED_WHILE_SCANNING);
     if (after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while scanning");
     return parsed.result({ device, inode, offset });
+  } finally {
+    await file.close();
+  }
+}
+
+export async function captureLocalRolloutBoundary(request: {
+  path: string;
+  threadId: string;
+}): Promise<RolloutCursor> {
+  if (!validManagedRolloutPath(request.path, request.threadId)) {
+    throw new Error("invalid rollout boundary request");
+  }
+  const file = await open(request.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const state = await file.stat({ bigint: true });
+    if (!state.isFile() || state.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("invalid rollout file");
+    if (state.size > 0n) {
+      const finalByte = Buffer.allocUnsafe(1);
+      const { bytesRead } = await file.read(finalByte, 0, 1, Number(state.size - 1n));
+      if (bytesRead !== 1 || finalByte[0] !== 0x0a) throw new Error("rollout has an incomplete final record");
+    }
+    const after = await file.stat({ bigint: true });
+    if (after.dev !== state.dev || after.ino !== state.ino) throw new Error("rollout identity changed");
+    if (after.size !== state.size || after.mtimeNs !== state.mtimeNs) throw new Error("rollout changed while capturing adoption boundary");
+    return { device: state.dev.toString(10), inode: state.ino.toString(10), offset: Number(state.size) };
   } finally {
     await file.close();
   }
