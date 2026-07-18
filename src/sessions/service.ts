@@ -11,10 +11,10 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import type { OwnershipInspection } from "./rollout-ownership.ts";
-import { isExactThreadItemsUnsupported } from "../app-server/thread-errors.ts";
 import type { NativeSessionIdentity, NativeSessionView } from "./native-session-state.ts";
 import { NativeSessionState } from "./native-session-state.ts";
 import { createHistoryScanBudget } from "../app-server/thread-history.ts";
+import { waitForCompactionEvidence } from "./compaction.ts";
 
 interface SessionOwnershipCheck {
   inspect(identity: Pick<RegistrySession, "endpoint" | "thread_id" | "mapping_id">, lease?: EndpointWorkLease): Promise<OwnershipInspection>;
@@ -166,7 +166,6 @@ export class SessionService {
         throw new AppError("SESSION_BUSY", `${nickname} has an active turn`);
       }
       const baselineTurnId = before.thread.turns.at(-1)?.id ?? null;
-      await this.assertCompactionPagingSupported(session.endpoint, session.thread_id, baselineTurnId, lease);
       const baselineCompactionItemIds: string[] = [];
       options.onBeforeNativeDispatch?.({
         endpointId: session.endpoint,
@@ -176,8 +175,9 @@ export class SessionService {
         baselineTurnId,
       });
       await this.pool.request(session.endpoint, "thread/compact/start", { threadId: session.thread_id }, undefined, lease);
-      const observed = await this.compactionItemIdsAfter(session.endpoint, session.thread_id, baselineTurnId, lease);
-      const compactionItemId = observed[0];
+      const compactionItemId = await waitForCompactionEvidence(async () => (
+        await this.compactionItemIdsAfter(session.endpoint, session.thread_id, baselineTurnId, lease)
+      )[0]);
       if (!compactionItemId) throw new AppError("OPERATION_UNCERTAIN", `compaction completion is not yet visible for ${nickname}`);
       return { compactionItemId, baselineCompactionItemIds };
     });
@@ -202,28 +202,10 @@ export class SessionService {
     }
     const ids: string[] = [];
     for (const turn of [...suffix.turns].reverse()) {
-      const exact = await reader.exactTurnItems(threadId, turn.id, { budget });
+      const exact = await reader.exactTurnItems(threadId, turn.id, { budget, allowLegacySummary: true });
       ids.push(...exact.items.filter((item) => item.type === "contextCompaction").map((item) => item.id));
     }
     return ids;
-  }
-
-  async assertCompactionPagingSupported(
-    endpointId: string,
-    threadId: string,
-    baselineTurnId: string | null,
-    lease?: EndpointWorkLease,
-  ): Promise<void> {
-    try {
-      await this.pool.historyReader(endpointId, lease).itemsPage(threadId, {
-        ...(baselineTurnId ? { turnId: baselineTurnId } : {}),
-        limit: 1,
-        sortDirection: "desc",
-      });
-    } catch (error) {
-      if (!isExactThreadItemsUnsupported(error)) throw error;
-      throw new AppError("OPERATION_UNCERTAIN", "bounded compaction evidence is unavailable for this legacy session");
-    }
   }
 
   async authorizeActiveTurn(nickname: string, existingLease?: EndpointWorkLease): Promise<string | undefined> {

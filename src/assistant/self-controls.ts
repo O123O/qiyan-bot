@@ -2,12 +2,12 @@ import { isDeepStrictEqual } from "node:util";
 import { JsonRpcResponseError, RpcRequestTimeoutError } from "../app-server/rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import type { RuntimeIdentity } from "../endpoints/types.ts";
+import { waitForCompactionEvidence } from "../sessions/compaction.ts";
 import { PostTurnActionRetry, type AssistantPostTurnAction } from "./post-turn-actions.ts";
 
 interface CompactionPort {
   identity(): { endpointId: string; threadId: string };
   readThread(): Promise<{ status?: string | { type?: string }; turns?: any[] }>;
-  assertPagingSupported(baselineTurnId: string | null): Promise<void>;
   compactionItemIdsAfter(baselineTurnId: string | null): Promise<string[]>;
   compact(): Promise<void>;
 }
@@ -72,19 +72,17 @@ export async function runAssistantCompaction(
     throw new PostTurnActionRetry("assistant compaction has a legacy checkpoint without a bounded history anchor");
   }
   const baselineTurnId = (before.turns ?? []).at(-1)?.id ?? null;
-  await retryPortFailure(
-    "assistant compaction paging is temporarily unavailable",
-    () => port.assertPagingSupported(baselineTurnId), true,
-  );
   const dispatching = { ...action.payload, endpointId: identity.endpointId, threadId: identity.threadId, baselineTurnId, phase: "dispatching" };
   checkpoint(dispatching);
   await retryPortFailure("assistant compaction dispatch outcome is awaiting native evidence", () => port.compact(), true);
   checkpoint({ ...dispatching, phase: "dispatched" });
-  const after = await retryPortFailure(
-    "assistant compaction completion history is temporarily unavailable",
-    () => port.compactionItemIdsAfter(baselineTurnId), true,
-  );
-  if (after.length === 0) {
+  const completed = await waitForCompactionEvidence(async () => (
+    await retryPortFailure(
+      "assistant compaction completion history is temporarily unavailable",
+      () => port.compactionItemIdsAfter(baselineTurnId), true,
+    )
+  )[0]);
+  if (!completed) {
     throw new PostTurnActionRetry("assistant compaction completion is not yet visible");
   }
 }

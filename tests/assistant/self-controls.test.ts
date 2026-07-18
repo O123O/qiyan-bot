@@ -19,7 +19,6 @@ test("assistant compaction checkpoints a baseline and completes only after new n
   await runAssistantCompaction(action("compact", { endpointId: "assistant-local", threadId: "assistant" }), {
     identity: () => ({ endpointId: "assistant-local", threadId: "assistant" }),
     readThread: async () => ({ status: { type: "idle" }, turns }),
-    assertPagingSupported: async (baseline) => { assert.equal(baseline, "turn-1"); },
     compactionItemIdsAfter: async (baseline) => { assert.equal(baseline, "turn-1"); return compacted ? ["compact-1"] : []; },
     compact: async () => { requests += 1; compacted = true; },
   }, (payload) => { checkpoints.push(payload); });
@@ -38,7 +37,6 @@ test("assistant compaction recovery accepts new evidence and never blindly redis
   }), {
     identity: () => ({ endpointId: "assistant-local", threadId: "assistant" }),
     readThread: async () => ({ status: { type: "idle" }, turns: [] }),
-    assertPagingSupported: async () => undefined,
     compactionItemIdsAfter: async () => ["new"],
     compact: async () => { requests += 1; },
   }, () => undefined);
@@ -49,7 +47,6 @@ test("assistant compaction recovery accepts new evidence and never blindly redis
   }), {
     identity: () => ({ endpointId: "assistant-local", threadId: "assistant" }),
     readThread: async () => ({ status: { type: "idle" }, turns: [] }),
-    assertPagingSupported: async () => undefined,
     compactionItemIdsAfter: async () => [],
     compact: async () => { requests += 1; },
   }, () => undefined), (error: unknown) => error instanceof PostTurnActionRetry);
@@ -62,7 +59,6 @@ test("assistant compaction keeps a legacy unbounded checkpoint pending without r
   }), {
     identity: () => ({ endpointId: "assistant-local", threadId: "assistant" }),
     readThread: async () => ({ status: { type: "idle" }, turns: [] }),
-    assertPagingSupported: async () => assert.fail("legacy recovery must not probe or dispatch"),
     compactionItemIdsAfter: async () => assert.fail("legacy recovery has no safe bounded anchor"),
     compact: async () => { assert.fail("legacy recovery must not redispatch"); },
   }, () => undefined), (error: unknown) => error instanceof PostTurnActionRetry);
@@ -77,7 +73,6 @@ test("assistant compaction keeps an ambiguous dispatch failure pending for evide
     readThread: async () => ({ status: { type: "idle" }, turns: [{
       id: "turn-1", status: "completed", itemsView: "notLoaded", items: [],
     }] }),
-    assertPagingSupported: async () => undefined,
     compactionItemIdsAfter: async () => [],
     compact: async () => { throw new Error("response lost after dispatch"); },
   }, (payload) => { checkpoints.push(payload); }), (error: unknown) => error instanceof PostTurnActionRetry);
@@ -133,7 +128,6 @@ test("assistant self-control lets authoritative and configuration failures becom
     readThread: async () => ({ status: { type: "idle" }, turns: [{
       id: "turn-1", status: "completed", itemsView: "full", items: [],
     }] }),
-    assertPagingSupported: async () => undefined,
     compactionItemIdsAfter: async () => [],
     compact: async () => { throw compactRejection; },
   }, () => undefined), (error: unknown) => error === compactRejection);
@@ -171,7 +165,6 @@ test("assistant self-control rejects a changed thread identity", async () => {
   }), {
     identity: () => ({ endpointId: "assistant-local", threadId: "new-thread" }),
     readThread: async () => ({ status: { type: "idle" }, turns: [] }),
-    assertPagingSupported: async () => undefined,
     compactionItemIdsAfter: async () => [],
     compact: async () => undefined,
   }, () => undefined), (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");

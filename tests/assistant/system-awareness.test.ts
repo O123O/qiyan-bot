@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AssistantPostTurnActions, PostTurnActionRetry } from "../../src/assistant/post-turn-actions.ts";
-import { recordAssistantSystemAwareness } from "../../src/assistant/system-awareness.ts";
+import { recordAssistantSystemAwareness, recordCompletedSystemAction } from "../../src/assistant/system-awareness.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
+
+test("a completed worker action notifies QiYan and the originating chat exactly once", () => {
+  const db = createTestDatabase();
+  const deliveries = new DeliveryStore(db);
+  const conversations = new ConversationStore(db, deliveries);
+  const notice = {
+    binding: { adapterId: "web", conversationKey: "web:owner", destination: { surface: "web" } },
+    body: "[system] worker-a session compacted",
+  };
+
+  recordCompletedSystemAction(conversations, deliveries, "operation-1", "worker-a session compacted", notice);
+  recordCompletedSystemAction(conversations, deliveries, "operation-1", "changed on retry", notice);
+
+  assert.equal(deliveries.get("tool-system:operation-1")?.body, "[system] worker-a session compacted");
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM deliveries WHERE id = 'tool-system:operation-1'").get() as { count: number }).count, 1);
+  assert.equal((db.prepare("SELECT raw_text FROM source_contexts WHERE id = 'assistant-system:operation-1'").get() as { raw_text: string }).raw_text,
+    "[system] worker-a session compacted");
+});
 
 test("records one pending internal [system] message for a completed self action", () => {
   const db = createTestDatabase();

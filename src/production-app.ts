@@ -57,7 +57,7 @@ import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedA
 import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantPostTurnActions, type AssistantPostTurnAction } from "./assistant/post-turn-actions.ts";
 import { runAssistantCompaction, runAssistantRestart, startAssistantTurnWithPendingSettings } from "./assistant/self-controls.ts";
-import { recordAssistantSystemAwareness } from "./assistant/system-awareness.ts";
+import { recordAssistantSystemAwareness, recordCompletedSystemAction } from "./assistant/system-awareness.ts";
 import { AssistantScheduler, type EventJob } from "./assistant/scheduler.ts";
 import { ConversationDispatcher, prepareAssistantStartDispatch, type AssistantTurnPort } from "./assistant/conversation-dispatcher.ts";
 import {
@@ -2715,10 +2715,6 @@ export async function buildProductionApp(
                 const identity = registry.snapshot().assistant;
                 return readBoundedThread(identity.endpoint, identity.thread_id);
               },
-              assertPagingSupported: async (baselineTurnId) => {
-                const identity = registry.snapshot().assistant;
-                await sessions.assertCompactionPagingSupported(identity.endpoint, identity.thread_id, baselineTurnId);
-              },
               compactionItemIdsAfter: async (baselineTurnId) => {
                 const identity = registry.snapshot().assistant;
                 return sessions.compactionItemIdsAfter(identity.endpoint, identity.thread_id, baselineTurnId);
@@ -3778,7 +3774,10 @@ export async function buildProductionApp(
         const result = await sessions.compact(args.nickname, {
           onBeforeNativeDispatch: (evidence) => context.checkpoint(evidence),
         });
-        prepareToolSystemNotice(context.operationId, context.attemptId, `${args.nickname} session compacted`);
+        const body = `${args.nickname} session compacted`;
+        recordCompletedSystemAction(
+          conversations, deliveries, context.operationId, body, systemNoticeForAttempt(context.attemptId, body),
+        );
         return { nickname: args.nickname, ...result };
       },
       list_models: async (args) => sessions.models(args.endpoint === assistantEndpoint.id ? assistantEndpoint.id : projectEndpoint(args.endpoint)),
@@ -3975,11 +3974,14 @@ export async function buildProductionApp(
 
   function completeDeferredSystemNotices(action: { id: string; payload: Record<string, unknown> }): void {
     const notice = action.payload.notice as { binding?: ConversationBinding; body?: string } | undefined;
-    if (notice?.binding && typeof notice.body === "string") {
-      deliveries.prepare({ id: `tool-system:${action.id}`, kind: "system_notice", binding: notice.binding, body: notice.body, mandatory: true });
-    }
     if (typeof action.payload.awarenessBody === "string") {
-      recordAssistantSystemAwareness(conversations, action.id, action.payload.awarenessBody);
+      recordCompletedSystemAction(
+        conversations,
+        deliveries,
+        action.id,
+        action.payload.awarenessBody,
+        notice?.binding && typeof notice.body === "string" ? { binding: notice.binding, body: notice.body } : undefined,
+      );
     }
   }
 
@@ -4722,7 +4724,12 @@ export async function buildProductionApp(
               const compactionItemId = observed[0];
               if (compactionItemId) await succeedRecovered(operation, {
                 nickname: args.nickname, compactionItemId, baselineCompactionItemIds: checkpoint.baselineCompactionItemIds,
-              }, () => prepareToolSystemNotice(operation.id, operation.attemptId, `${args.nickname} session compacted`));
+              }, () => {
+                const body = `${args.nickname} session compacted`;
+                recordCompletedSystemAction(
+                  conversations, deliveries, operation.id, body, systemNoticeForAttempt(operation.attemptId, body),
+                );
+              });
             }
           }
         } else if (operation.kind === "set_session_model" || operation.kind === "set_reasoning_effort") {

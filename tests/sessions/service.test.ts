@@ -46,6 +46,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
   legacyItemsUnsupported = false;
+  compactDelayMs = 0;
   onTurnStart: (() => void) | undefined;
   constructor(id = "local") { this.id = id; }
   private historyTurns(): any[] {
@@ -102,13 +103,17 @@ class ServiceEndpoint implements AppServerEndpoint {
       } as T;
     }
     if (method === "thread/compact/start") {
-      const turns = this.threadTurns ?? (this.threadTurns = []);
-      turns.push({
-        id: `compact-turn-${turns.length + 1}`,
-        status: "completed",
-        itemsView: "full",
-        items: [{ type: "contextCompaction", id: "compact-1" }],
-      });
+      const complete = () => {
+        const turns = this.threadTurns ?? (this.threadTurns = []);
+        turns.push({
+          id: `compact-turn-${turns.length + 1}`,
+          status: "completed",
+          itemsView: "full",
+          items: [{ type: "contextCompaction", id: "compact-1" }],
+        });
+      };
+      if (this.compactDelayMs > 0) setTimeout(complete, this.compactDelayMs);
+      else complete();
       return {} as T;
     }
     if (method === "thread/goal/get") {
@@ -379,14 +384,24 @@ test("compaction requires an idle managed worker and observes a new native compa
   assert.deepEqual(result, { compactionItemId: "compact-1", baselineCompactionItemIds: [] });
   assert.ok(value.endpoint.calls.some((call) => call.method === "thread/compact/start" && call.params.threadId === "thread"));
   const itemReads = value.endpoint.calls.filter((call) => call.method === "thread/items/list");
-  assert.equal(itemReads.length, 2);
-  assert.deepEqual(itemReads.map((call) => call.params.turnId), ["finished", "compact-turn-2"]);
+  assert.equal(itemReads.length, 1);
+  assert.deepEqual(itemReads.map((call) => call.params.turnId), ["compact-turn-2"]);
 
   value.endpoint.status = "active";
   value.endpoint.threadTurns.push({ id: "active", status: "inProgress", itemsView: "full", items: [] });
   await assert.rejects(value.service.compact("payments"), (error: unknown) => (
     error instanceof AppError && error.code === "SESSION_BUSY"
   ));
+});
+
+test("compaction waits for native completion after the start response", async () => {
+  const value = await fixture({ inspect: async () => ({ state: "owned" }) });
+  value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
+  value.endpoint.compactDelayMs = 20;
+
+  assert.deepEqual(await value.service.compact("payments"), {
+    compactionItemId: "compact-1", baselineCompactionItemIds: [],
+  });
 });
 
 test("all turn-starting mutations fail closed when the authoritative native state is error", async () => {
@@ -406,15 +421,18 @@ test("all turn-starting mutations fail closed when the authoritative native stat
   assert.equal(value.endpoint.calls.some((call) => call.method === "thread/goal/set"), false);
 });
 
-test("legacy compaction recovery stays unresolved without dispatching another compaction", async () => {
+test("compaction falls back to bounded turn summaries when exact item paging is unsupported", async () => {
   const value = await fixture({ inspect: async () => ({ state: "owned" }) });
   value.endpoint.threadTurns = [{ id: "finished", status: "completed", itemsView: "full", items: [] }];
   value.endpoint.legacyItemsUnsupported = true;
 
-  await assert.rejects(value.service.compact("payments"), (error: unknown) => (
-    error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
-  ));
-  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/compact/start"), false);
+  assert.deepEqual(await value.service.compact("payments"), {
+    compactionItemId: "compact-1", baselineCompactionItemIds: [],
+  });
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/compact/start"), true);
+  assert.equal(value.endpoint.calls.some((call) => (
+    call.method === "thread/turns/list" && call.params.itemsView === "summary"
+  )), true);
 });
 
 test("active goal transition snapshots exact native turn ownership before marker revocation", async () => {
