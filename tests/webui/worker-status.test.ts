@@ -7,16 +7,20 @@ const session = (overrides: Partial<Parameters<typeof workerStatus>[0]> = {}) =>
   lifecycleState: "managed",
   nativeStatus: "idle" as string | null,
   activeTurnId: null as string | null,
+  goal: null as { status: string } | null,
   ...overrides,
 });
 
 test("maps live worker state to explicit user-facing status", () => {
   assert.deepEqual(workerStatus(session({ activeTurnId: "turn-1" })), { label: "working", tone: "working" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "active" })), { label: "working", tone: "working" });
+  assert.deepEqual(workerStatus(session({ goal: { status: "active" } })), { label: "working", tone: "working" });
+  assert.deepEqual(workerStatus(session({ goal: { status: "paused" } })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "idle" })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "notLoaded" })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "systemError" })), { label: "error", tone: "error" });
   assert.deepEqual(workerStatus(session({ nativeStatus: null })), { label: "unavailable", tone: "unavailable" });
+  assert.deepEqual(workerStatus(session({ nativeStatus: null, goal: { status: "active" } })), { label: "unavailable", tone: "unavailable" });
   assert.deepEqual(workerStatus(session({ lifecycleState: "unavailable", activeTurnId: "turn-1" })), { label: "unavailable", tone: "unavailable" });
 });
 

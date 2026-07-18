@@ -71,6 +71,29 @@ test("server close rejects a pending RPC", async (t) => {
   await assert.rejects(client.request("pending", {}), /wire closed/u);
 });
 
+test("WebSocket wire accepts bounded multi-megabyte App Server results", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-ws-large-result-"));
+  const socket = join(root, "app.sock");
+  const server = createServer();
+  const websocket = new WebSocketServer({ server });
+  t.after(async () => {
+    for (const peer of websocket.clients) peer.terminate();
+    websocket.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  websocket.on("connection", (peer) => peer.on("message", (value) => {
+    const rpc = JSON.parse(value.toString()) as { id: number };
+    peer.send(JSON.stringify({ id: rpc.id, result: { text: "x".repeat(2 * 1024 * 1024) } }));
+  }));
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  await chmod(socket, 0o600);
+  const client = new RpcClient(await WebSocketWire.connect(socket, { timeoutMs: 500, trustedRoot: root }), { requestTimeoutMs: 2_000 });
+  const result = await client.request<{ text: string }>("large-result", {});
+  assert.equal(result.text.length, 2 * 1024 * 1024);
+  client.close();
+});
+
 test("binary and oversized fragmented frames close the wire", async (t) => {
   for (const kind of ["binary", "oversized"] as const) {
     await t.test(kind, async () => {
@@ -81,8 +104,8 @@ test("binary and oversized fragmented frames close the wire", async (t) => {
       websocket.on("connection", (peer) => setTimeout(() => {
         if (kind === "binary") peer.send(Buffer.from("no"), { binary: true });
         else {
-          peer.send("x".repeat(600_000), { fin: false });
-          peer.send("x".repeat(600_000), { fin: true });
+          peer.send("x".repeat(9 * 1024 * 1024), { fin: false });
+          peer.send("x".repeat(9 * 1024 * 1024), { fin: true });
         }
       }, 10));
       await new Promise<void>((resolve) => server.listen(socket, resolve));
