@@ -550,8 +550,9 @@ export function App() {
     }
   }, [loadingOlder, selected, history, workerChat, key, loadWorkerPage]);
 
-  // Tool-heavy turns can yield a non-empty native page with only a few visible messages. Continue
-  // only until the foreground viewport can scroll; subsequent history remains lazy on scroll-up.
+  // Tool-heavy turns can yield a native page with few or no visible messages. Fill the foreground
+  // viewport and cross its latest terminal-turn boundary; both searches stay capped and older
+  // history remains lazy on scroll-up.
   useLayoutEffect(() => {
     if (selected === null || !workerChat || workerChat.nickname !== selected || !workerChat.subscriptionId
       || workerChat.pendingRecoveryTurnIds.length > 0) return;
@@ -566,6 +567,7 @@ export function App() {
       loadingOlder,
       cursor: workerChat.olderCursor,
       attempts: previous?.attempts ?? 0,
+      recentBoundaryPending: workerChat.recentBoundaryPending,
       scrollHeight: el.scrollHeight,
       clientHeight: el.clientHeight,
     });

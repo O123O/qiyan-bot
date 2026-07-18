@@ -31,12 +31,13 @@ export function nextWorkerHistoryAutoFill(options: {
   loadingOlder: boolean;
   cursor: string | undefined;
   attempts: number;
+  recentBoundaryPending: boolean;
   scrollHeight: number;
   clientHeight: number;
 }): string | undefined {
   if (!options.hasOlder || options.historyInFlight || options.loadingOlder || !options.cursor) return undefined;
   if (options.attempts >= MAX_WORKER_HISTORY_AUTO_FILLS) return undefined;
-  return options.scrollHeight <= options.clientHeight ? options.cursor : undefined;
+  return options.recentBoundaryPending || options.scrollHeight <= options.clientHeight ? options.cursor : undefined;
 }
 
 export function workerViewportRevision(

@@ -205,6 +205,40 @@ test("initial snapshot shows items from a turn that started before the panel sub
     ["a:joined:a1", "latest update", "", false],
   ]);
   assert.deepEqual(state.recoveryTurnIds, ["joined"]);
+  assert.equal(state.recentBoundaryPending, false);
+});
+
+test("initial open-turn history keeps paging until it reaches the latest terminal turn", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = beginWorkerHistory(state, true).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:open:a1", turnId: "open", body: "current update", completedAt: 3, terminalStatus: "inProgress" }],
+    hasOlder: true, nextCursor: "older-1", terminalTurnIds: [], openTurnIds: ["open"],
+  });
+  assert.equal(state.recentBoundaryPending, true);
+
+  state = beginWorkerHistory(state, false).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [], hasOlder: true, nextCursor: "older-2", terminalTurnIds: [], openTurnIds: [],
+  });
+  assert.equal(state.recentBoundaryPending, true, "tool-only history windows must not end the bridge");
+
+  state = beginWorkerHistory(state, false).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:done:final", turnId: "done", body: "latest final", completedAt: 2, terminalStatus: "completed", phase: "final_answer" }],
+    hasOlder: true, nextCursor: "older-3", terminalTurnIds: ["done"], openTurnIds: [],
+  });
+  assert.equal(state.recentBoundaryPending, false);
+  assert.deepEqual(state.messages.map((message) => message.body), ["latest final", "current update"]);
+});
+
+test("an initial tool-only history window still searches for the latest terminal turn", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = beginWorkerHistory(state, true).state;
+  state = applyWorkerSnapshot(state, {
+    messages: [], hasOlder: true, nextCursor: "older", terminalTurnIds: [], openTurnIds: [],
+  });
+  assert.equal(state.recentBoundaryPending, true);
 });
 
 test("open snapshot reconciles by item identity instead of message text", () => {

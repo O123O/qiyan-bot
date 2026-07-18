@@ -76,6 +76,7 @@ export interface WorkerStreamState {
   historyLoaded: boolean;
   hasOlder: boolean;
   olderCursor: string | undefined;
+  recentBoundaryPending: boolean;
 }
 
 const MAX_RETAINED_DRAFT_MESSAGES = 30;
@@ -106,6 +107,7 @@ export function beginWorkerSubscription(
     reconcilePending: false,
     recoveredTurnIds: [], observedTurnIds: [], terminalTurns: [],
     historyInFlight: false, historyLoaded: false, hasOlder: false, olderCursor: undefined,
+    recentBoundaryPending: false,
   };
 }
 
@@ -381,6 +383,13 @@ export function applyWorkerSnapshot(
     for (const turnId of snapshot.openTurnIds) if (!fullyObserved.has(turnId)) recovery.add(turnId);
   }
   const recoveryConfirmed = recoveredTurnId !== undefined && snapshot.terminalTurnIds.includes(recoveredTurnId);
+  const firstHistory = !state.historyLoaded;
+  let recentBoundaryPending = state.recentBoundaryPending;
+  if (firstHistory) {
+    recentBoundaryPending = snapshot.hasOlder && snapshot.terminalTurnIds.length === 0;
+  } else if (recentBoundaryPending && (!snapshot.hasOlder || snapshot.terminalTurnIds.length > 0)) {
+    recentBoundaryPending = false;
+  }
   if (recoveryConfirmed) recovery.delete(recoveredTurnId);
   let pendingRecoveryTurnIds = state.pendingRecoveryTurnIds;
   let recoveredTurnIds = state.recoveredTurnIds;
@@ -399,6 +408,7 @@ export function applyWorkerSnapshot(
     historyLoaded: true,
     hasOlder: preserveOlderCursor ? state.hasOlder : snapshot.hasOlder,
     olderCursor: preserveOlderCursor ? state.olderCursor : snapshot.nextCursor,
+    recentBoundaryPending,
   };
   return { ...next, messages: capMessages([...next.messages].sort(compareMessages)) };
 }

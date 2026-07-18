@@ -12,12 +12,22 @@ import {
 } from "../../webui-client/src/worker-chat-policy.ts";
 
 test("a sparse worker history page follows its cursor only while the viewport is underfilled", () => {
-  const common = { hasOlder: true, historyInFlight: false, loadingOlder: false, cursor: "older", attempts: 0 };
+  const common = { hasOlder: true, historyInFlight: false, loadingOlder: false, cursor: "older", attempts: 0, recentBoundaryPending: false };
   assert.equal(nextWorkerHistoryAutoFill({ ...common, scrollHeight: 400, clientHeight: 600 }), "older");
   assert.equal(nextWorkerHistoryAutoFill({ ...common, scrollHeight: 601, clientHeight: 600 }), undefined);
   assert.equal(nextWorkerHistoryAutoFill({ ...common, historyInFlight: true, scrollHeight: 400, clientHeight: 600 }), undefined);
   assert.equal(nextWorkerHistoryAutoFill({ ...common, attempts: 8, scrollHeight: 400, clientHeight: 600 }), undefined);
   assert.equal(nextWorkerHistoryAutoFill({ ...common, hasOlder: false, scrollHeight: 400, clientHeight: 600 }), undefined);
+});
+
+test("an initial open-turn page crosses the latest completed-turn boundary even when scrollable", () => {
+  const common = {
+    hasOlder: true, historyInFlight: false, loadingOlder: false, cursor: "older",
+    attempts: 0, recentBoundaryPending: true, scrollHeight: 900, clientHeight: 600,
+  };
+  assert.equal(nextWorkerHistoryAutoFill(common), "older");
+  assert.equal(nextWorkerHistoryAutoFill({ ...common, attempts: 8 }), undefined, "boundary search stays capped");
+  assert.equal(nextWorkerHistoryAutoFill({ ...common, hasOlder: false }), undefined);
 });
 
 test("a pinned panel follows body growth and auto-prepend but preserves manual prepend position", () => {
@@ -44,7 +54,7 @@ test("a history admission loss releases the consumed cursor without resetting it
   assert.deepEqual(releaseWorkerHistoryAutoFill(consumed, "different"), consumed);
   assert.equal(nextWorkerHistoryAutoFill({
     hasOlder: true, historyInFlight: false, loadingOlder: false, cursor: "older", attempts: 3,
-    scrollHeight: 400, clientHeight: 600,
+    recentBoundaryPending: false, scrollHeight: 400, clientHeight: 600,
   }), "older");
 });
 
