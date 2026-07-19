@@ -123,6 +123,7 @@ import { WorkspaceRouter } from "./endpoints/workspace-router.ts";
 import {
   parseRuntimeIdentity,
   type EndpointLossKind,
+  type EndpointLossReason,
   type EndpointWorkLease,
   type ManagedAppServerEndpoint as ManagedEndpointContract,
   type RuntimeIdentity,
@@ -2855,7 +2856,7 @@ export async function buildProductionApp(
         unsubscribers.push(assistantEndpoint.onReady(() => {
           offerWorkerDiscontinuity(webWorkerStream, assistantEndpoint.id);
         }));
-        unsubscribers.push(assistantEndpoint.onUnavailable((kind) => {
+        unsubscribers.push(assistantEndpoint.onUnavailable((kind, reason) => {
           offerWorkerDiscontinuity(webWorkerStream, assistantEndpoint.id);
           nativeSessions.invalidateEndpoint(assistantEndpoint.id, pool.endpointGeneration(assistantEndpoint.id).generation);
           assistantToolReadiness.block();
@@ -2863,7 +2864,7 @@ export async function buildProductionApp(
           if (dispatcherAvailable) {
             runBackground(() => dispatcher.nativeUnavailable(), () => recordBackgroundFailure("assistant dispatcher invalidation"));
           }
-          runBackground(() => handleEndpointUnavailable(assistantEndpoint, kind), () => recordBackgroundFailure("assistant unavailable handling"));
+          runBackground(() => handleEndpointUnavailable(assistantEndpoint, kind, reason), () => recordBackgroundFailure("assistant unavailable handling"));
         }));
         } catch (error) {
           await stopRecoveryOwners().catch(() => undefined);
@@ -3910,11 +3911,11 @@ export async function buildProductionApp(
         if (!current()) return;
         runBackground(() => relay.handlePermissionBlocked(target.id, event), () => recordBackgroundFailure("permission notification"));
       }),
-      target.onUnavailable((kind) => {
+      target.onUnavailable((kind, reason) => {
         if (!current()) return;
         offerWorkerDiscontinuity(webWorkerStream, target.id);
         nativeSessions.invalidateEndpoint(target.id, generation);
-        runBackground(() => handleEndpointUnavailable(target, kind), () => recordBackgroundFailure("project unavailable handling"));
+        runBackground(() => handleEndpointUnavailable(target, kind, reason), () => recordBackgroundFailure("project unavailable handling"));
       }),
     ];
     projectEndpointSubscriptions.set(target.id, subscriptions);
@@ -4757,8 +4758,15 @@ export async function buildProductionApp(
     return recovery;
   }
 
-  async function handleEndpointUnavailable(target: ManagedEndpointContract, kind: EndpointLossKind = "runtime-lost"): Promise<void> {
+  async function handleEndpointUnavailable(
+    target: ManagedEndpointContract,
+    kind: EndpointLossKind = "runtime-lost",
+    reason?: EndpointLossReason,
+  ): Promise<void> {
     if (stopping || !endpointsCommitted) return;
+    reportOperationalSafely(report, {
+      level: "warn", code: "endpoint_connection_lost", endpoint: target.id, reason: reason ?? kind,
+    });
     const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({
       relay,

@@ -85,7 +85,7 @@ test("production offers fenced project notifications to the Web UI observer with
 test("production marks active worker streams discontinuous at endpoint availability boundaries", async () => {
   const source = await readFile(new URL("../../src/production-app.ts", import.meta.url), "utf8");
   assert.match(source, /target\.onReady\(\(\) => \{[\s\S]{0,160}offerWorkerDiscontinuity\(webWorkerStream, target\.id\)/u);
-  assert.match(source, /target\.onUnavailable\(\(kind\) => \{[\s\S]{0,160}offerWorkerDiscontinuity\(webWorkerStream, target\.id\)/u);
+  assert.match(source, /target\.onUnavailable\(\(kind, reason\) => \{[\s\S]{0,160}offerWorkerDiscontinuity\(webWorkerStream, target\.id\)/u);
   assert.match(source, /assistantEndpoint\.onReady\(\(\) => \{[\s\S]{0,120}offerWorkerDiscontinuity\(webWorkerStream, assistantEndpoint\.id\)/u);
 });
 

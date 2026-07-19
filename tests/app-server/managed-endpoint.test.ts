@@ -9,7 +9,7 @@ import {
   type AppServerInitializeResult,
   type AppServerRuntimeService,
 } from "../../src/app-server/managed-endpoint.ts";
-import type { EndpointLossKind, RuntimeIdentity } from "../../src/endpoints/types.ts";
+import type { EndpointLossKind, EndpointLossReason, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 const firstIdentity: RuntimeIdentity = { kind: "local", pid: 10, startTime: "20" };
 const secondIdentity: RuntimeIdentity = { kind: "local", pid: 11, startTime: "21" };
@@ -49,6 +49,7 @@ class FakeConnection implements AppServerConnection {
   async confirmInitialized(): Promise<AppServerConnectionIdentity> { this.confirms += 1; return this.identity; }
   async close(): Promise<void> { this.closed = true; this.wire.close(); if (this.closeError) throw this.closeError; }
   fail(error = new Error("connection lost")): void { for (const listener of this.closes) listener(error); }
+  closeUnexpectedly(): void { for (const listener of this.closes) listener(); }
 }
 
 class FakeRuntime implements AppServerRuntimeService {
@@ -244,6 +245,31 @@ test("loss classification failure still emits one conservative reconnect event",
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(losses, ["connection-lost"]);
+});
+
+test("connection loss exposes only a bounded transport reason", async (t) => {
+  for (const [error, expected] of [
+    [Object.assign(new RangeError("Max payload size exceeded"), { code: "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH" }), "frame_too_large"],
+    [new Error("private transport detail"), "transport_error"],
+    [undefined, "transport_closed"],
+  ] as const) await t.test(expected, async () => {
+    const connection = new FakeConnection(new FakeWire(), { runtime: firstIdentity });
+    const endpoint = new ManagedAppServerEndpoint({
+      id: "worker", runtime: new FakeRuntime([connection]), minimumVersion: "0.142.5",
+    });
+    const losses: Array<{ kind: EndpointLossKind; reason: EndpointLossReason }> = [];
+    endpoint.onUnavailable((kind, reason) => {
+      assert.ok(reason);
+      losses.push({ kind, reason });
+    });
+    await endpoint.start();
+
+    if (error) connection.fail(error);
+    else connection.closeUnexpectedly();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(losses, [{ kind: "connection-lost", reason: expected }]);
+  });
 });
 
 test("cleanup failure cannot suppress loss, replace auth error, or skip shutdown", async (t) => {

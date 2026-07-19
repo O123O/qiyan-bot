@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { LinuxProcessIdentity } from "../core/process-identity.ts";
 import { AppError } from "../core/errors.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "../endpoints/types.ts";
+import { parseRuntimeIdentity, type EndpointLossKind, type EndpointLossReason, type RuntimeIdentity } from "../endpoints/types.ts";
 import { APP_VERSION } from "../version.ts";
 import type { DynamicToolCallResponse } from "./generated/v2/DynamicToolCallResponse.ts";
 import type { RpcRequest } from "./protocol.ts";
@@ -84,7 +84,7 @@ export class ManagedAppServerEndpoint {
         throw this.changed();
       }
       this.connection = connection;
-      this.removeConnectionClose = connection.onClose(() => { void this.connectionLost(generation); });
+      this.removeConnectionClose = connection.onClose((error) => { void this.connectionLost(generation, error); });
       const client = new RpcClient(connection.wire, { requestTimeoutMs: this.options.requestTimeoutMs ?? 30_000 });
       this.client = client;
       client.onNotification((method, params) => {
@@ -150,7 +150,7 @@ export class ManagedAppServerEndpoint {
     this.events.on("ready", listener);
     return () => this.events.off("ready", listener);
   }
-  onUnavailable(listener: (kind: EndpointLossKind) => void): () => void {
+  onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void {
     this.events.on("unavailable", listener);
     return () => this.events.off("unavailable", listener);
   }
@@ -164,7 +164,7 @@ export class ManagedAppServerEndpoint {
     return identity ? { ...identity } : undefined;
   }
 
-  private async connectionLost(generation: number): Promise<void> {
+  private async connectionLost(generation: number, error?: Error): Promise<void> {
     if (generation !== this.generation || (this.state !== "ready" && this.state !== "starting")) return;
     this.state = "unavailable";
     await this.disposeConnection().catch(() => undefined);
@@ -172,7 +172,9 @@ export class ManagedAppServerEndpoint {
     let kind: EndpointLossKind = "connection-lost";
     try { kind = await this.options.runtime.classifyLoss(); }
     catch { /* Unknown loss remains reconnectable connection loss. */ }
-    if (generation === this.generation && this.state === "unavailable") this.events.emit("unavailable", kind);
+    if (generation === this.generation && this.state === "unavailable") {
+      this.events.emit("unavailable", kind, classifyTransportLoss(error));
+    }
   }
 
   private async disposeConnection(): Promise<void> {
@@ -218,6 +220,14 @@ export class ManagedAppServerEndpoint {
   private changed(): AppError {
     return new AppError("ENDPOINT_UNAVAILABLE", `app-server endpoint generation changed while starting: ${this.id}`);
   }
+}
+
+function classifyTransportLoss(error?: Error): EndpointLossReason {
+  if (!error) return "transport_closed";
+  const code = (error as Error & { code?: unknown }).code;
+  if (code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH") return "frame_too_large";
+  if (error.message === "invalid App Server WebSocket frame") return "invalid_frame";
+  return "transport_error";
 }
 
 function validAccountResponse(value: unknown): value is { account: unknown | null; requiresOpenaiAuth: boolean } {

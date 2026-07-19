@@ -20,6 +20,7 @@ export type OperationalEventCode =
   | "worker_scheduling_unavailable"
   | "endpoint_recovery_paused"
   | "endpoint_reconnect_gave_up"
+  | "endpoint_connection_lost"
   | "background_task_failed";
 
 export interface OperationalEvent {

@@ -7,6 +7,7 @@ export type RuntimeIdentity =
   | { kind: "ssh"; token: string; pid: number; linuxStartTime: string; processGroupId: number };
 
 export type EndpointLossKind = "connection-lost" | "runtime-lost";
+export type EndpointLossReason = "frame_too_large" | "invalid_frame" | "transport_error" | "transport_closed";
 
 export interface EndpointWorkLease {
   readonly endpointId: string;
@@ -26,7 +27,7 @@ export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;
-  onUnavailable(listener: (kind: EndpointLossKind) => void): () => void;
+  onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void;
 }
 
