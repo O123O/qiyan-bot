@@ -71,7 +71,7 @@ test("server close rejects a pending RPC", async (t) => {
   await assert.rejects(client.request("pending", {}), /wire closed/u);
 });
 
-test("WebSocket wire accepts a full App Server turn beyond the old 16 MiB ceiling", async (t) => {
+test("WebSocket wire accepts a Codex Web UI-sized App Server history page", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-ws-large-result-"));
   const socket = join(root, "app.sock");
   const server = createServer();
@@ -84,13 +84,13 @@ test("WebSocket wire accepts a full App Server turn beyond the old 16 MiB ceilin
   });
   websocket.on("connection", (peer) => peer.on("message", (value) => {
     const rpc = JSON.parse(value.toString()) as { id: number };
-    peer.send(JSON.stringify({ id: rpc.id, result: { text: "x".repeat(17 * 1024 * 1024) } }));
+    peer.send(JSON.stringify({ id: rpc.id, result: { text: "x".repeat(65 * 1024 * 1024) } }));
   }));
   await new Promise<void>((resolve) => server.listen(socket, resolve));
   await chmod(socket, 0o600);
   const client = new RpcClient(await WebSocketWire.connect(socket, { timeoutMs: 500, trustedRoot: root }), { requestTimeoutMs: 5_000 });
   const result = await client.request<{ text: string }>("large-result", {});
-  assert.equal(result.text.length, 17 * 1024 * 1024);
+  assert.equal(result.text.length, 65 * 1024 * 1024);
   client.close();
 });
 
@@ -104,8 +104,8 @@ test("binary and oversized fragmented frames close the wire", async (t) => {
       websocket.on("connection", (peer) => setTimeout(() => {
         if (kind === "binary") peer.send(Buffer.from("no"), { binary: true });
         else {
-          peer.send("x".repeat(33 * 1024 * 1024), { fin: false });
-          peer.send("x".repeat(33 * 1024 * 1024), { fin: true });
+          peer.send("x".repeat(51 * 1024 * 1024), { fin: false });
+          peer.send("x".repeat(51 * 1024 * 1024), { fin: true });
         }
       }, 10));
       await new Promise<void>((resolve) => server.listen(socket, resolve));

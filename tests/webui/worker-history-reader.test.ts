@@ -77,7 +77,7 @@ test("ready native reads request complete turns through the existing lease and n
     withReadyWorkLease: async (endpointId, run) => { assert.equal(endpointId, "local"); return run(lease); },
     request: async (...args) => {
       requests.push(args);
-      assert.equal((args[2] as any).limit, 1, "a foreground read must request only one full native turn per frame");
+      assert.equal((args[2] as any).limit, 12, "foreground history should use Codex Web UI's bounded native turn page");
       if (args[1] === "thread/turns/list" && (args[2] as any).cursor === "older-page") return {
         data: [{ ...turn("older"), id: "older-turn", itemsView: "full" }],
         nextCursor: null,
@@ -130,7 +130,7 @@ test("native Web UI paging wraps one stable turn cursor without head-relative me
     requests += 1;
     assert.equal(method, "thread/turns/list");
     assert.equal((params as any).itemsView, "full");
-    assert.equal((params as any).limit, 1, "message count must not expand the native full-turn page");
+    assert.equal((params as any).limit, 12, "message count must not expand the bounded native turn page");
     cursors.push((params as any).cursor);
     return {
       data: [{ id: "turn", status: "completed", itemsView: "full", items: [{ type: "reasoning", id: "tool" }] }],

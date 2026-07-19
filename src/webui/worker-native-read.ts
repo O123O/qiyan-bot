@@ -68,10 +68,9 @@ export async function readReadyWorkerTurns(
     const history = new ThreadHistoryReader((method, params) => deps.request(endpointId, method, params, signal, lease));
     const page = await history.turnsPage(threadId, {
       ...(cursorState.nativeCursor === undefined ? {} : { cursor: cursorState.nativeCursor }),
-      // `limit` is a chat-message count, not a safe native-turn count. Codex 0.144.5 has no usable
-      // item-page API, and one full turn can already be large, so cross the transport one turn at a
-      // time. The wrapped native cursor loads another turn only when the foreground UI asks for it.
-      limit: 1,
+      // Match Codex Web UI's fixed native page: this avoids rescanning a large rollout once per
+      // turn. The wrapped cursor still exposes only the bounded message page requested by our UI.
+      limit: 12,
       sortDirection: "desc",
       itemsView: "full",
     });

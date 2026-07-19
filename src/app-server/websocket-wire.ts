@@ -9,7 +9,7 @@ import type { RpcWire } from "./rpc-client.ts";
 // projection; rejecting that response tears down the shared endpoint and interrupts its active
 // turns. Keep the trusted App Server transport generously but finitely bounded. Browser timelines
 // and native history remain independently paged/capped, so this is not an in-memory chat cache.
-const MAX_FRAME_BYTES = 64 * 1024 * 1024;
+const MAX_FRAME_BYTES = 100 * 1024 * 1024;
 
 export interface WebSocketByteStream {
   readonly input: Writable;
