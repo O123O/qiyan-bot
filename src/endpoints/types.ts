@@ -7,7 +7,16 @@ export type RuntimeIdentity =
   | { kind: "ssh"; token: string; pid: number; linuxStartTime: string; processGroupId: number };
 
 export type EndpointLossKind = "connection-lost" | "runtime-lost";
-export type EndpointLossReason = "frame_too_large" | "invalid_frame" | "transport_error" | "transport_closed";
+export type EndpointLossReason =
+  | "frame_too_large"
+  | "invalid_frame"
+  | "ssh_diagnostic_limit"
+  | "ssh_input_closed"
+  | "ssh_process_failed"
+  | "transport_reset"
+  | "byte_stream_error"
+  | "transport_error"
+  | "transport_closed";
 
 export interface EndpointWorkLease {
   readonly endpointId: string;

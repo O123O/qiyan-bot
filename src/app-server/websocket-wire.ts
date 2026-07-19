@@ -26,7 +26,7 @@ class SocketCompatibleDuplex extends Duplex {
     super();
     const data = (chunk: Buffer) => { if (!this.push(chunk)) stream.output.pause(); };
     const end = () => this.push(null);
-    const failed = () => this.destroy(new Error("App Server byte stream failed"));
+    const failed = (error: Error) => this.destroy(error);
     stream.output.on("data", data);
     stream.output.once("end", end);
     stream.output.once("error", failed);

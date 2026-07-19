@@ -250,6 +250,12 @@ test("loss classification failure still emits one conservative reconnect event",
 test("connection loss exposes only a bounded transport reason", async (t) => {
   for (const [error, expected] of [
     [Object.assign(new RangeError("Max payload size exceeded"), { code: "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH" }), "frame_too_large"],
+    [new Error("SSH process exceeded its diagnostic output limit"), "ssh_diagnostic_limit"],
+    [new Error("SSH process input closed"), "ssh_input_closed"],
+    [new Error("SSH process stream failed"), "ssh_process_failed"],
+    [Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }), "transport_reset"],
+    [Object.assign(new Error("Invalid WebSocket frame"), { code: "WS_ERR_INVALID_OPCODE" }), "invalid_frame"],
+    [new Error("App Server byte stream failed"), "byte_stream_error"],
     [new Error("private transport detail"), "transport_error"],
     [undefined, "transport_closed"],
   ] as const) await t.test(expected, async () => {

@@ -173,6 +173,24 @@ test("WebSocket wire performs a real handshake over a non-Socket byte stream", a
   assert.equal(closeCalls, 1);
 });
 
+test("the socket adapter preserves a byte-stream error", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const stream: ReadyProcessStream = {
+    input, output,
+    onClose: () => () => undefined,
+    close: async () => undefined,
+  };
+  const socket = createSocketCompatibleDuplex(stream);
+  const failed = once(socket, "error");
+
+  output.destroy(new Error("specific byte stream failure"));
+
+  const [error] = await failed;
+  assert.match(String(error), /specific byte stream failure/u);
+  socket.destroy();
+});
+
 test("the stream HTTP agent rejects a concurrent second request instead of queueing", async () => {
   const input = new PassThrough();
   const output = new PassThrough();

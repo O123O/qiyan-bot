@@ -226,7 +226,13 @@ function classifyTransportLoss(error?: Error): EndpointLossReason {
   if (!error) return "transport_closed";
   const code = (error as Error & { code?: unknown }).code;
   if (code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH") return "frame_too_large";
+  if (typeof code === "string" && code.startsWith("WS_ERR_")) return "invalid_frame";
+  if (code === "ECONNRESET" || code === "EPIPE") return "transport_reset";
   if (error.message === "invalid App Server WebSocket frame") return "invalid_frame";
+  if (error.message === "SSH process exceeded its diagnostic output limit") return "ssh_diagnostic_limit";
+  if (error.message === "SSH process input closed") return "ssh_input_closed";
+  if (error.message === "SSH process stream failed") return "ssh_process_failed";
+  if (error.message === "App Server byte stream failed") return "byte_stream_error";
   return "transport_error";
 }
 
