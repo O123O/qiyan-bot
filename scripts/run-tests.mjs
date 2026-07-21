@@ -15,7 +15,7 @@ async function collect(dir) {
 
 const explicit = process.argv.slice(2);
 const files = explicit.length > 0 ? explicit : (await collect("tests")).sort();
-const child = spawn(process.execPath, ["--import", "tsx", "--test", ...files], { stdio: "inherit" });
+const child = spawn(process.execPath, ["--import", "tsx", "--test", "--test-concurrency=8", ...files], { stdio: "inherit" });
 child.on("exit", (code, signal) => {
   if (signal) process.kill(process.pid, signal);
   else process.exitCode = code ?? 1;

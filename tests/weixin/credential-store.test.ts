@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -201,18 +201,21 @@ test("repairs modes only after validating ordinary owned paths", async (t) => {
 });
 
 test("per-use verification rejects content, inode, deletion, symlink, parent, and mode changes", async (t) => {
-  for (const mutate of [
-    async (value: Awaited<ReturnType<typeof fixture>>) => writeFile(value.credentialPath, "{}", { mode: 0o600 }),
-    async (value: Awaited<ReturnType<typeof fixture>>) => writeFile(value.credentialPath, await readFile(value.credentialPath), { mode: 0o600 }),
-    async (value: Awaited<ReturnType<typeof fixture>>) => { await rm(value.credentialPath); await writeFile(value.credentialPath, "{}", { mode: 0o600 }); },
-    async (value: Awaited<ReturnType<typeof fixture>>) => { await rm(value.credentialPath); const target = join(value.root, "replacement.json"); await writeFile(target, "{}", { mode: 0o600 }); await symlink(target, value.credentialPath); },
-    async (value: Awaited<ReturnType<typeof fixture>>) => chmod(value.credentialPath, 0o644),
-    async (value: Awaited<ReturnType<typeof fixture>>) => {
+  for (const { name, mutate } of [
+    { name: "content replacement", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => writeFile(value.credentialPath, "{}", { mode: 0o600 }) },
+    { name: "same-content rewrite", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => {
+      await writeFile(value.credentialPath, await readFile(value.credentialPath), { mode: 0o600 });
+      await utimes(value.credentialPath, new Date(0), new Date(0));
+    } },
+    { name: "inode replacement", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => { await rm(value.credentialPath); await writeFile(value.credentialPath, "{}", { mode: 0o600 }); } },
+    { name: "symlink replacement", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => { await rm(value.credentialPath); const target = join(value.root, "replacement.json"); await writeFile(target, "{}", { mode: 0o600 }); await symlink(target, value.credentialPath); } },
+    { name: "mode change", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => chmod(value.credentialPath, 0o644) },
+    { name: "parent replacement", mutate: async (value: Awaited<ReturnType<typeof fixture>>) => {
       const original = join(value.qiyanHome, "credentials-original");
       await rename(join(value.qiyanHome, "credentials"), original);
       await mkdir(join(value.qiyanHome, "credentials"), { mode: 0o700 });
       await writeFile(value.credentialPath, await readFile(join(original, "weixin.json")), { mode: 0o600 });
-    },
+    } },
   ]) {
     const value = await fixture(t);
     const store = new WeixinCredentialStore(value.qiyanHome);
@@ -220,7 +223,11 @@ test("per-use verification rejects content, inode, deletion, symlink, parent, an
     const handle = await store.loadPinned();
     assert.ok(handle);
     await mutate(value);
-    await assert.rejects(handle.withVerifiedCredential(async () => undefined), /credential.*changed|directory.*changed/u);
+    await assert.rejects(
+      handle.withVerifiedCredential(async () => undefined),
+      /credential.*changed|directory.*changed/u,
+      name,
+    );
   }
 });
 
