@@ -1,7 +1,7 @@
-# Design: Remote file explorer, preview & git in the web UI
+# Design: Remote file explorer, transfer & git in the web UI
 
 ## Goal
-A remote (ssh) worker's files browse / preview / stream / git in the web UI exactly like a local
+A remote (ssh) worker's files browse / preview / download / upload / git in the web UI exactly like a local
 worker's. A file path in a remote worker's message — including its `[worker] …` relay shown in the
 QiYan panel — streams from **that worker's host**.
 
@@ -30,11 +30,12 @@ config — no endpoint code changes.
 New module `src/webui/web-remote.ts` mirrors `web-files`/`web-git` over ssh:
 - `remoteBrowse(host, root, rel)` → dir listing (JSON, same shape as `browse`)
 - `remoteRead(host, root, rel)` → **stream** of file bytes (for `/api/raw`)
+- `remoteUploadFile(host, root, rel, bytes)` → size-capped, non-overwriting atomic publication
 - `remoteGit(host, repoDir, args)` / `remoteDiscover(host, root)` → git status/diff/stage/commit/discover
 
 The existing routes keep their URLs (`/api/files/:n`, `/api/raw`, `/api/git/*`); each dispatches
-local→fs or remote→ssh on the session's transport. **The client is unchanged** (it already sends
-`?session=<worker>`).
+local→fs or remote→ssh on the session's transport. Explorer upload uses `PUT /api/files/:n?path=…`
+for workers and `PUT /api/filesystem?path=…` for QiYan's owner filesystem.
 
 ## Remote transport mechanics (revised after adversarial review)
 
@@ -136,10 +137,11 @@ already true for QiYan's remote endpoints. macOS `realpath` lacks `-m` (out of s
 ## README / docs addition
 `docs/ssh-workers.md` already documents the required user-owned ControlMaster (`ControlPath
 ${XDG_RUNTIME_DIR}/qiyan-ssh-%C`, MFA-authenticated once). Add one line: the web UI's remote file
-features **reuse that same master** (via `ssh -G` discovery + `ControlMaster=no`), so remote browsing/
-preview/git work only when it is up; for a QiYan-owned-master deployment they ride the QiYan socket.
+features **reuse that same master** (via `ssh -G` discovery + `ControlMaster=no`), so remote browsing,
+transfer, and Git work only when it is up; for a QiYan-owned-master deployment they ride the QiYan socket.
 
 ## Phases (all in scope)
 1. Remote preview/stream (`/api/raw` remote) + relay-path routing.
 2. Remote tree (`/api/files` remote browse).
 3. Remote git (multi-repo panel over ssh: discover/status/diff/stage/unstage/commit).
+4. Local and remote explorer download/upload controls with project-confined, non-overwriting writes.

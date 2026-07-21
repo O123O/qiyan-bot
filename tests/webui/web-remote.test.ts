@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { remoteBrowse, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, type RemoteDeps } from "../../src/webui/web-remote.ts";
+import { remoteBrowse, remoteDiscover, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteReadStream, remoteUploadFile, type RemoteDeps } from "../../src/webui/web-remote.ts";
 
 const run = promisify(execFile);
 
@@ -61,6 +61,19 @@ test("remoteReadStream streams any readable file (unconfined preview) and keeps 
   const evil = await collect(await remoteReadStream(d, "testhost", root, "x'\"; touch " + marker + " ; echo `touch " + marker + "` $(touch " + marker + ") #"));
   assert.notEqual(evil.code, 0);                       // nonexistent literal file → error
   await assert.rejects(stat(marker));                  // nothing executed
+});
+
+test("remoteUploadFile writes a confined new file and never overwrites", async () => {
+  const d = await deps();
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rupload-"));
+  await mkdir(join(root, "sub"));
+  assert.deepEqual(await remoteUploadFile(d, "testhost", root, "sub/new file.txt", Buffer.from("remote upload\n")), {
+    ok: true, path: "sub/new file.txt",
+  });
+  assert.equal(await readFile(join(root, "sub/new file.txt"), "utf8"), "remote upload\n");
+  assert.ok("error" in await remoteUploadFile(d, "testhost", root, "sub/new file.txt", Buffer.from("replace")));
+  assert.equal((await readdir(join(root, "sub"))).some((name) => name.startsWith(".qiyan-upload-")), false);
+  assert.ok("error" in await remoteUploadFile(d, "testhost", root, "../escape.txt", Buffer.from("escape")));
 });
 
 test("remote git status/diff/stage lifecycle + diff escape refused", async () => {

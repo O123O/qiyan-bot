@@ -1,4 +1,5 @@
-import { lstat, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, lstat, mkdir, open, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 // A `path.relative()` result escapes its root only when it is exactly ".." or begins with "../" — NOT
@@ -22,6 +23,12 @@ export type WebFilesResult =
   | { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> }
   | { kind: "file"; path: string; content: string; truncated: boolean; encoding: "utf-8" | "base64" }
   | { error: string };
+
+export type WebFileWriteResult = { ok: true; path: string } | { error: string };
+
+export function validFileName(name: string): boolean {
+  return name.length > 0 && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\") && !name.includes("\0");
+}
 
 // Resolve `relPath` under `root` and PROVE (via realpath) the result stays inside the real root —
 // so no `..`, absolute path, or symlink can escape. There is no OS sandbox on this process, so this
@@ -81,6 +88,63 @@ export async function createEntry(deps: WebFilesDeps, nickname: string, relPath:
     else { const handle = await open(target, "wx"); await handle.close(); }
     return { ok: true, path: relPath };
   } catch (error) { return { error: error instanceof Error ? error.message : "create failed" }; }
+}
+
+async function writeNewFile(parent: string, name: string, bytes: Buffer, displayPath: string): Promise<WebFileWriteResult> {
+  if (!validFileName(name)) return { error: "invalid name" };
+  const info = await stat(parent).catch(() => undefined);
+  if (!info?.isDirectory()) return { error: "destination is not a directory" };
+  const target = join(parent, name);
+  const temporary = join(parent, `.qiyan-upload-${randomUUID()}`);
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(temporary, "wx", 0o600);
+  } catch {
+    return { error: "upload failed" };
+  }
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    try { await link(temporary, target); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return { error: "already exists" };
+      return { error: "upload failed" };
+    }
+    return { ok: true, path: displayPath };
+  } catch {
+    await handle.close().catch(() => {});
+    return { error: "upload failed" };
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+}
+
+// Store one browser upload beneath a worker's project. The parent must already exist and resolve
+// inside the project; a hard link publishes the staged inode atomically and refuses overwrites.
+export async function uploadConfinedFile(deps: WebFilesDeps, nickname: string, relPath: string, bytes: Buffer): Promise<WebFileWriteResult> {
+  if (bytes.length > deps.maxFileBytes) return { error: "file exceeds the size limit" };
+  if (isAbsolute(relPath) || relPath.split(/[\\/]+/u).includes("..")) return { error: "path not allowed" };
+  const root = deps.projectDir(nickname);
+  if (root === undefined) return { error: "unknown session" };
+  const name = basename(relPath);
+  const parentRel = dirname(relPath);
+  const parent = await confine(root, parentRel === "." || parentRel === "" ? "." : parentRel);
+  if (parent === undefined) return { error: "path not allowed" };
+  return writeNewFile(parent, name, bytes, relPath);
+}
+
+// QiYan's owner-only filesystem browser uses OS permissions as its boundary, so uploads follow the
+// same policy: resolve the existing destination directory, then create one new non-overwriting file.
+export async function uploadReadableFile(home: string, requestedPath: string, bytes: Buffer, maxBytes: number): Promise<WebFileWriteResult> {
+  if (bytes.length > maxBytes) return { error: "file exceeds the size limit" };
+  const candidate = requestedPath.startsWith("~/")
+    ? resolve(home, requestedPath.slice(2))
+    : isAbsolute(requestedPath) ? requestedPath : resolve(home, requestedPath);
+  const name = basename(candidate);
+  const parent = await realpath(dirname(candidate)).catch(() => undefined);
+  if (parent === undefined) return { error: "destination is not accessible" };
+  return writeNewFile(parent, name, bytes, join(parent, name));
 }
 
 // List a directory or read a file, confined to the named session's project directory (the file tree).

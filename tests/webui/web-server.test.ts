@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -62,7 +62,12 @@ async function withServer(
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
   const server = createWebServer({
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads: readsOverride,
-    files: { projectDir: () => undefined, fileTarget: () => undefined, userHome: uploadsDir, maxFileBytes: 1024 },
+    files: {
+      projectDir: (nickname) => nickname === "localworker" ? uploadsDir : undefined,
+      fileTarget: (nickname) => nickname === "localworker" ? { transport: "local", projectDir: uploadsDir } : undefined,
+      userHome: uploadsDir,
+      maxFileBytes: 1024,
+    },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
     submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
     controlGoal: async (input) => { calls.goals.push(input); return { ok: true }; },
@@ -332,7 +337,36 @@ test("browses the service user's filesystem from home or an absolute path", asyn
   });
 });
 
-test("dispatches a remote session's files over ssh (browse + raw stream)", async () => {
+test("uploads a file into the owner filesystem without overwriting it", async () => {
+  await withServer(async (base, _calls, _bus, home) => {
+    const path = join(home, "explorer-upload.txt");
+    const first = await fetch(`${base}/api/filesystem?path=${encodeURIComponent(path)}&token=${TOKEN}`, {
+      method: "PUT", body: "browser bytes",
+    });
+    assert.equal(first.status, 201);
+    assert.equal(await readFile(path, "utf8"), "browser bytes");
+    const duplicate = await fetch(`${base}/api/filesystem?path=${encodeURIComponent(path)}&token=${TOKEN}`, {
+      method: "PUT", body: "replacement",
+    });
+    assert.equal(duplicate.status, 400);
+    assert.equal(await readFile(path, "utf8"), "browser bytes");
+
+    const workerPath = join(home, "worker-upload.txt");
+    const worker = await fetch(`${base}/api/files/localworker?path=worker-upload.txt&token=${TOKEN}`, {
+      method: "PUT", body: "worker bytes",
+    });
+    assert.equal(worker.status, 201);
+    assert.equal(await readFile(workerPath, "utf8"), "worker bytes");
+
+    const oversized = await fetch(`${base}/api/filesystem?path=${encodeURIComponent(join(home, "too-large.bin"))}&token=${TOKEN}`, {
+      method: "PUT", body: Buffer.alloc(1025),
+    });
+    assert.equal(oversized.status, 413);
+    await assert.rejects(readFile(join(home, "too-large.bin")));
+  });
+});
+
+test("dispatches a remote session's files over ssh (browse + raw stream + upload)", async () => {
   const { mkdtemp, chmod } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const dir = await mkdtemp(join(tmpdir(), "qiyan-rsrv-"));
@@ -358,6 +392,11 @@ test("dispatches a remote session's files over ssh (browse + raw stream)", async
   try {
     const listing = await (await fetch(`${base}/api/files/rworker?token=${TOKEN}`)).json();
     assert.deepEqual(listing.entries?.map((e: { name: string }) => e.name), ["r.txt"]);
+    const upload = await fetch(`${base}/api/files/rworker?path=${encodeURIComponent("new.txt")}&token=${TOKEN}`, {
+      method: "PUT", body: "uploaded remotely\n",
+    });
+    assert.equal(upload.status, 201);
+    assert.equal(await readFile(join(remoteRoot, "new.txt"), "utf8"), "uploaded remotely\n");
     assert.equal(await (await fetch(`${base}/api/raw?session=rworker&path=r.txt&token=${TOKEN}`)).text(), "remote-bytes\n");
     // Owner-only preview streams ANY readable file over ssh (NOT confined to the project root): an
     // absolute path outside the root is served as-is.

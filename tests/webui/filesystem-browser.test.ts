@@ -14,4 +14,7 @@ test("the QiYan tab loads the owner filesystem route and exposes a path field", 
   const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /\/api\/filesystem/u);
   assert.match(source, /placeholder="~\/ or absolute path"/u);
+  assert.match(source, /Upload file/u);
+  assert.match(source, /method: "PUT"/u);
+  assert.match(source, /title="Download"/u);
 });

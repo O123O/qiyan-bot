@@ -69,11 +69,12 @@ interface Session { nickname: string; mappingId: string; endpoint: string; provi
 interface Msg { id?: string; body: string; completedAt?: number; terminalStatus?: string; role?: "you" | "assistant" | "worker"; at?: number; worker?: string; origin?: string; phase?: string; streaming?: boolean; turnOrder?: number; itemOrder?: number; }
 type FileResult = { kind: "dir"; path: string; entries: Array<{ name: string; type: "dir" | "file" | "other" }> } | { kind: "file"; path: string; content: string; truncated: boolean; encoding: string } | { error: string };
 interface GitStatus { branch: string; ahead: number; behind: number; staged: string[]; changes: string[]; untracked: string[] }
-type Preview =
+type Preview = { path?: string; session?: string | null } & (
   | { kind: "loading"; title: string }
   | { kind: "text"; title: string; text: string; truncated: boolean; lang?: string }
   | { kind: "image"; title: string; url: string }
-  | { kind: "error"; title: string; error: string };
+  | { kind: "error"; title: string; error: string }
+);
 
 // One streaming endpoint resolves any path (absolute → any root; relative → the session's project).
 const rawUrl = (path: string, session: string | null) => `/api/raw?path=${encodeURIComponent(path)}&session=${encodeURIComponent(session ?? "")}${TOKEN_Q}`;
@@ -351,11 +352,11 @@ export function App() {
   const openPreview = useCallback((path: string, session: string | null) => {
     setSrcMode(false);
     const url = rawUrl(path, session);
-    if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, url }); return; }
+    if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, path, session, url }); return; }
     if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
-    setPreview({ kind: "loading", title: path });
-    void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, text, truncated }))
-      .catch((e) => setPreview({ kind: "error", title: path, error: (e as { error?: string }).error ?? "unavailable" }));
+    setPreview({ kind: "loading", title: path, path, session });
+    void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, path, session, text, truncated }))
+      .catch((e) => setPreview({ kind: "error", title: path, path, session, error: (e as { error?: string }).error ?? "unavailable" }));
   }, []);
   const loadDir = useCallback(async (nickname: string | null, path: string, replaceRoot = false) => {
     const route = nickname === null
@@ -743,7 +744,37 @@ export function App() {
       .then(() => { setExpanded((s) => new Set(s).add(parent)); void loadDir(selected, parent); })
       .catch((e) => alert((e as { error?: string })?.error ?? "create failed"));
   };
-  const download = (path: string) => window.open(`${rawUrl(path, selected)}&download=1`, "_blank");
+  const explorerUploadInput = useRef<HTMLInputElement>(null);
+  const explorerUploadTarget = useRef<{ directory: string; session: string | null } | null>(null);
+  const [explorerUploading, setExplorerUploading] = useState(false);
+  const chooseExplorerUpload = (directory: string, session: string | null) => {
+    explorerUploadTarget.current = { directory, session };
+    explorerUploadInput.current?.click();
+  };
+  const uploadExplorerFile = async (file: File) => {
+    const target = explorerUploadTarget.current;
+    if (!target) return;
+    setExplorerUploading(true);
+    const path = target.session === null
+      ? joinFilesystemPath(target.directory, file.name)
+      : target.directory ? `${target.directory}/${file.name}` : file.name;
+    const route = target.session === null
+      ? `/api/filesystem?path=${encodeURIComponent(path)}`
+      : `/api/files/${target.session}?path=${encodeURIComponent(path)}`;
+    try {
+      await api(route, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: file });
+      if (selectedRef.current === target.session) {
+        setExpanded((state) => new Set(state).add(target.directory));
+        await loadDir(target.session, target.directory);
+      }
+    } catch (error) {
+      alert((error as { error?: string })?.error ?? "upload failed");
+    } finally {
+      setExplorerUploading(false);
+      explorerUploadTarget.current = null;
+    }
+  };
+  const download = (path: string, session: string | null) => window.open(`${rawUrl(path, session)}&download=1`, "_blank");
   const insertPath = (path: string) => { const proj = sessions.find((s) => s.nickname === selected)?.projectDir; setText((t) => `${t ? t.replace(/\s*$/, " ") : ""}${proj ? `${proj}/${path}` : path} `); };
   const openFilesystemPath = (path: string) => { void loadDir(null, path.trim() || "~", true); };
 
@@ -761,10 +792,11 @@ export function App() {
         return <div key={full}>
           <div className="frow dir" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => toggleDir(selected, full)}>
             <span className="tw">{open ? "▾" : "▸"}</span>📁 <span className="fname">{e.name}</span>
-            {selected && <span className="actions" onClick={(ev) => ev.stopPropagation()}>
-              <button title="New file" onClick={() => newEntry("mkfile", full)}>＋📄</button>
-              <button title="New folder" onClick={() => newEntry("mkdir", full)}>＋📁</button>
-            </span>}
+            <span className="actions" onClick={(ev) => ev.stopPropagation()}>
+              <button title="Upload file" disabled={explorerUploading} onClick={() => chooseExplorerUpload(full, selected)}>⬆</button>
+              {selected && <button title="New file" onClick={() => newEntry("mkfile", full)}>＋📄</button>}
+              {selected && <button title="New folder" onClick={() => newEntry("mkdir", full)}>＋📁</button>}
+            </span>
           </div>
           {open && renderDir(full, depth + 1)}
         </div>;
@@ -772,7 +804,7 @@ export function App() {
       return <div key={full} className={`frow ${e.type}`} style={{ paddingLeft: 24 + depth * 14 }} onClick={() => e.type === "file" ? openPreview(full, selected) : undefined}>
         {e.type === "file" ? "📄" : "🔗"} <span className="fname">{e.name}</span>
         {e.type === "file" && <span className="actions" onClick={(ev) => ev.stopPropagation()}>
-          <button title="Download" onClick={() => download(full)}>⬇</button>
+          <button title="Download" onClick={() => download(full, selected)}>⬇</button>
           <button title="Insert path into message" onClick={() => insertPath(full)}>↳</button>
         </span>}
       </div>;
@@ -910,10 +942,12 @@ export function App() {
               <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
               <button className={sidebarTab === "git" ? "on" : ""} disabled={selected === null} onClick={() => setSidebarTab("git")}>Git</button>
             </span>
-            {selected && sidebarTab === "files" && <span className="head-actions">
-              <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>
-              <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>
-              <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>
+            {sidebarTab === "files" && <span className="head-actions">
+              <input ref={explorerUploadInput} type="file" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadExplorerFile(file); event.target.value = ""; }} />
+              <button className="ghost sm" title="Upload file" disabled={explorerUploading} onClick={() => chooseExplorerUpload(selected === null ? filesystemRoot : "", selected)}>{explorerUploading ? "…" : "⬆"}</button>
+              {selected && <button className="ghost sm" title="New file at root" onClick={() => newEntry("mkfile", "")}>＋📄</button>}
+              {selected && <button className="ghost sm" title="New folder at root" onClick={() => newEntry("mkdir", "")}>＋📁</button>}
+              {selected && <button className="ghost sm" title="Refresh (no live watcher)" onClick={() => { [...new Set(["", ...Object.keys(dirs)])].forEach((p) => void loadDir(selected, p)); void loadSessions(); }}>⟳</button>}
             </span>}
           </div>
           {selected === null && <form className="filesystem-nav" onSubmit={(event) => { event.preventDefault(); openFilesystemPath(filesystemPath); }}>
@@ -968,6 +1002,8 @@ export function App() {
               <div className="sheet-head"><span>{preview.title}</span>
                 <div className="head-actions">
                   {isMd && <button className="ghost sm" onClick={() => setSrcMode((s) => !s)}>{srcMode ? "Preview" : "Source"}</button>}
+                  {preview.path !== undefined
+                    && <button className="ghost sm" title="Download" onClick={() => download(preview.path!, preview.session ?? null)}>Download</button>}
                   <button className="ghost" onClick={() => setPreview(null)}>✕</button>
                 </div>
               </div>

@@ -8,11 +8,11 @@ import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
 import { assistantTranscript, sessionSnapshot, type WebReadsDeps } from "./web-reads.ts";
 import { WorkerHistoryError, createWorkerHistoryReader, type WorkerHistoryReader } from "./worker-history-reader.ts";
-import { browse, browseReadablePath, confine, createEntry, resolvePath, type FileTarget, type WebFilesDeps } from "./web-files.ts";
+import { browse, browseReadablePath, confine, createEntry, resolvePath, uploadConfinedFile, uploadReadableFile, type FileTarget, type WebFilesDeps } from "./web-files.ts";
 import { cleanupUploads, storeUpload, type WebUploadsConfig } from "./web-uploads.ts";
 import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
-import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, type RemoteDeps } from "./web-remote.ts";
+import { remoteBrowse, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
@@ -131,6 +131,20 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   let raw = "";
   for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) return undefined; }
   try { return raw ? JSON.parse(raw) : {}; } catch { return undefined; }
+}
+
+async function readBytes(request: IncomingMessage, maxBytes: number): Promise<Buffer | undefined> {
+  const declared = Number(request.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > maxBytes) { request.resume(); return undefined; }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const bytes = Buffer.from(chunk);
+    size += bytes.length;
+    if (size > maxBytes) { request.resume(); return undefined; }
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, size);
 }
 
 function parseGoalControl(nickname: string, body: Record<string, unknown>): WebGoalControlInput | undefined {
@@ -292,6 +306,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, "error" in result ? 400 : 200, result);
       return;
     }
+    if (request.method === "PUT" && url.pathname === "/api/filesystem") {
+      if (!options.files.userHome) { json(response, 404, { error: "filesystem browser unavailable" }); return; }
+      const path = url.searchParams.get("path") ?? "";
+      if (!path) { json(response, 400, { error: "path required" }); return; }
+      const bytes = await readBytes(request, options.files.maxFileBytes);
+      if (!bytes) { json(response, 413, { error: "file exceeds the size limit" }); return; }
+      const result = await uploadReadableFile(options.files.userHome, path, bytes, options.files.maxFileBytes);
+      json(response, "error" in result ? 400 : 201, result);
+      return;
+    }
     // File tree, confined to the session's project — local via fs, remote via ssh.
     const files = /^\/api\/files\/([a-z0-9][a-z0-9_-]{0,63})$/u.exec(url.pathname);
     if (request.method === "GET" && files) {
@@ -302,6 +326,21 @@ export function createWebServer(options: WebServerOptions): WebServer {
         ? await remoteBrowse(remote, target.host, target.projectDir, path)
         : await browse(options.files, files[1]!, path);
       json(response, "error" in result ? 400 : 200, result);
+      return;
+    }
+    if (request.method === "PUT" && files) {
+      const target = options.files.fileTarget(files[1]!);
+      const path = url.searchParams.get("path") ?? "";
+      if (!target) { json(response, 404, { error: "unknown session" }); return; }
+      if (!path) { json(response, 400, { error: "path required" }); return; }
+      const bytes = await readBytes(request, options.files.maxFileBytes);
+      if (!bytes) { json(response, 413, { error: "file exceeds the size limit" }); return; }
+      const result = target.transport === "remote"
+        ? target.host && remote
+          ? await remoteUploadFile(remote, target.host, target.projectDir, path, bytes)
+          : { error: "remote host not connected" }
+        : await uploadConfinedFile(options.files, files[1]!, path, bytes);
+      json(response, "error" in result ? 400 : 201, result);
       return;
     }
     // Send-file: store the uploaded bytes in the backend upload dir; the client appends the returned

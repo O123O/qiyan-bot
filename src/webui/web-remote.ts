@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, isAbsolute } from "node:path";
 import { buildSshStreamArgs, parseSshConfig, planSshConnection, type SshConnectionPlan } from "../endpoints/ssh-config.ts";
 import { runBoundedProcess } from "../endpoints/ssh-process.ts";
-import type { WebFilesResult } from "./web-files.ts";
+import { validFileName, type WebFilesResult, type WebFileWriteResult } from "./web-files.ts";
 import { parseGitStatus, type GitStatus } from "./web-git.ts";
 
 // Remote file/git access for the web UI over ssh. REUSES the core's ssh-config machinery: the plan
@@ -42,9 +43,9 @@ function guard(root: string, path: string, absolute: boolean): string {
 const sshArgs = (plan: SshConnectionPlan, script: string): string[] => buildSshStreamArgs(plan, `exec bash -c ${q(script)}`);
 
 interface RunResult { code: number | null; stdout: string; stderr: string; timedOut: boolean }
-async function run(deps: RemoteDeps, host: string, script: string, opts: { maxBytes: number; timeoutMs: number }): Promise<RunResult> {
+async function run(deps: RemoteDeps, host: string, script: string, opts: { maxBytes: number; timeoutMs: number; input?: Buffer }): Promise<RunResult> {
   const plan = await planFor(deps, host);
-  const child = spawn(deps.sshBinary, sshArgs(plan, script), { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(deps.sshBinary, sshArgs(plan, script), { stdio: ["pipe", "pipe", "pipe"] });
   return new Promise((resolve) => {
     let stdout = "", stderr = "", size = 0, timedOut = false, done = false;
     const cap = (buf: Buffer, add: (s: string) => void): void => { if (size >= opts.maxBytes) return; const c = buf.subarray(0, opts.maxBytes - size); size += c.length; add(c.toString("utf8")); };
@@ -52,6 +53,8 @@ async function run(deps: RemoteDeps, host: string, script: string, opts: { maxBy
     child.stderr.on("data", (b: Buffer) => cap(b, (s) => { stderr += s; }));
     const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, opts.timeoutMs);
     const finish = (code: number | null): void => { if (done) return; done = true; clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); };
+    child.stdin.on("error", () => {});
+    child.stdin.end(opts.input);
     child.on("close", (code) => finish(code));
     child.on("error", () => finish(null));
   });
@@ -73,6 +76,38 @@ export async function remoteBrowse(deps: RemoteDeps, host: string, root: string,
     return { name, type: kind === "d" ? "dir" as const : kind === "f" ? "file" as const : "other" as const };
   }).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
   return { kind: "dir", path: rel, entries };
+}
+
+export async function remoteUploadFile(
+  deps: RemoteDeps,
+  host: string,
+  root: string,
+  relPath: string,
+  bytes: Buffer,
+): Promise<WebFileWriteResult> {
+  if (isAbsolute(relPath) || relPath.split(/[\\/]+/u).includes("..")) return { error: "path not allowed" };
+  const name = basename(relPath);
+  if (!validFileName(name)) return { error: "invalid name" };
+  const parent = dirname(relPath);
+  const temporary = `.qiyan-upload-${randomUUID()}`;
+  const script = `${guard(root, parent === "." ? "." : parent, false)}
+[ -d "$t" ] || exit 6
+target="$t/"${q(name)}
+temporary="$t/"${q(temporary)}
+trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+if [ -e "$target" ] || [ -L "$target" ]; then exit 7; fi
+umask 077
+set -o noclobber
+cat > "$temporary" || exit 8
+ln -- "$temporary" "$target" || { if [ -e "$target" ] || [ -L "$target" ]; then exit 7; fi; exit 8; }
+rm -f -- "$temporary"
+trap - EXIT HUP INT TERM`;
+  const result = await run(deps, host, script, { input: bytes, maxBytes: 64 << 10, timeoutMs: 60_000 });
+  if (result.code === 0) return { ok: true, path: relPath };
+  if (result.code === 4) return { error: "path not allowed" };
+  if (result.code === 6) return { error: "destination is not a directory" };
+  if (result.code === 7) return { error: "already exists" };
+  return { error: remoteError(result, "upload failed") };
 }
 
 // --- Streaming read (for /api/raw) ---

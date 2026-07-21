@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browse, browseReadablePath, createEntry, resolvePath, type WebFilesDeps } from "../../src/webui/web-files.ts";
+import { browse, browseReadablePath, createEntry, resolvePath, uploadConfinedFile, uploadReadableFile, type WebFilesDeps } from "../../src/webui/web-files.ts";
 import { stat } from "node:fs/promises";
 
 async function fixture(): Promise<{ deps: WebFilesDeps; root: string; outside: string }> {
@@ -69,6 +69,18 @@ test("createEntry creates confined files/dirs and rejects escapes / duplicates",
   assert.ok("error" in (await createEntry(deps, "proj", "..", "dir")));          // bad name
 });
 
+test("uploads a new file without escaping or overwriting a worker project", async () => {
+  const { deps, root } = await fixture();
+  assert.deepEqual(await uploadConfinedFile(deps, "proj", "src/upload.txt", Buffer.from("uploaded\n")), {
+    ok: true, path: "src/upload.txt",
+  });
+  assert.equal(await readFile(join(root, "src/upload.txt"), "utf8"), "uploaded\n");
+  assert.ok("error" in await uploadConfinedFile(deps, "proj", "src/upload.txt", Buffer.from("replace")));
+  assert.equal((await readdir(join(root, "src"))).some((name) => name.startsWith(".qiyan-upload-")), false);
+  assert.ok("error" in await uploadConfinedFile(deps, "proj", "../escape.txt", Buffer.from("escape")));
+  assert.ok("error" in await uploadConfinedFile({ ...deps, maxFileBytes: 2 }, "proj", "large.bin", Buffer.from("123")));
+});
+
 test("resolvePath returns absolute paths as-is (owner-only preview) and relative paths under the session root", async () => {
   const { root, outside } = await fixture();
   // An absolute path is returned as-is, even OUTSIDE any project root — the OS's read permission,
@@ -108,4 +120,10 @@ test("the owner filesystem browser defaults to home and accepts any readable abs
   assert.ok("kind" in external && external.kind === "dir");
   assert.equal(external.path, outside);
   assert.deepEqual(external.entries.map((entry) => entry.name), ["outside.txt"]);
+
+  assert.deepEqual(await uploadReadableFile(home, join(outside, "browser-upload.txt"), Buffer.from("from browser\n"), 1024), {
+    ok: true, path: join(outside, "browser-upload.txt"),
+  });
+  assert.equal(await readFile(join(outside, "browser-upload.txt"), "utf8"), "from browser\n");
+  assert.ok("error" in await uploadReadableFile(home, join(outside, "browser-upload.txt"), Buffer.from("replace"), 1024));
 });
