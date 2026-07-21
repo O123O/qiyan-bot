@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { parseWorkerCommand, WORKER_GOAL_HELP } from "../../webui-client/src/worker-commands.ts";
+import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP } from "../../webui-client/src/worker-commands.ts";
 
 test("parses the worker goal command namespace without consuming native slash commands", () => {
   assert.deepEqual(parseWorkerCommand("/goal ship the release"), { kind: "goal", action: "set", objective: "ship the release" });
@@ -16,6 +16,7 @@ test("parses the worker goal command namespace without consuming native slash co
   assert.equal(parseWorkerCommand("/goalish leave this native"), null);
   assert.match(WORKER_GOAL_HELP, /\/goal <objective>/u);
   assert.match(WORKER_GOAL_HELP, /pause.*resume.*cancel/su);
+  assert.ok(WORKER_COMMAND_SUGGESTIONS.every(({ insert }) => insert.startsWith("/goal")));
 });
 
 test("worker goal commands are intercepted before ordinary worker input and ship in the built client", async () => {

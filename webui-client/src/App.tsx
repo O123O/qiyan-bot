@@ -11,8 +11,9 @@ import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
 import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
 import { mergeAssistantConversation } from "./assistant-chat-stream";
+import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
-import { parseWorkerCommand, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
+import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
 import {
   advanceWorkerScrollPreservation,
   nextWorkerHistoryAutoFill,
@@ -184,7 +185,8 @@ export function App() {
   const [repoStatus, setRepoStatus] = useState<Record<string, GitStatus | { error: string } | "loading">>({});
   const [discovered, setDiscovered] = useState<string[] | null>(null);       // add-repo picker (null = closed)
   const [commitMsg, setCommitMsg] = useState<Record<string, string>>({});    // per-repo commit message
-  const [suggest, setSuggest] = useState<string[]>([]);
+  const [mentionSuggestions, setMentionSuggestions] = useState<string[]>([]);
+  const [slashSuggestionsOpen, setSlashSuggestionsOpen] = useState(true);
   const [sugIdx, setSugIdx] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
   const preserveRef = useRef<WorkerScrollPreservation | null>(null); // scroll-height baseline across a prepend read
@@ -192,6 +194,10 @@ export function App() {
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
   const selectedSession = selected === null ? assistantSession : sessions.find((session) => session.nickname === selected) ?? null;
+  const slashSuggestions = slashSuggestionsOpen
+    ? filterCommandSuggestions(text, selected === null ? ASSISTANT_COMMAND_SUGGESTIONS : WORKER_COMMAND_SUGGESTIONS)
+    : [];
+  const suggestionCount = slashSuggestions.length || mentionSuggestions.length;
   const selectedMappingId = selectedSession?.mappingId ?? null;
   const selectedRef = useRef(selected); selectedRef.current = selected; // for the WS handler's stale closure
   const sessionsRef = useRef(sessions); sessionsRef.current = sessions;
@@ -641,11 +647,14 @@ export function App() {
   };
 
   const onText = (v: string) => {
-    setText(v); setSugIdx(0);
+    setText(v); setSugIdx(0); setSlashSuggestionsOpen(true);
     const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v); // @-autocomplete of worker nicknames
-    setSuggest(at ? sessions.map((s) => s.nickname).filter((n) => n.startsWith(at[1].toLowerCase())).slice(0, 6) : []);
+    setMentionSuggestions(at ? sessions.map((s) => s.nickname).filter((n) => n.startsWith(at[1].toLowerCase())).slice(0, 6) : []);
   };
-  const pickSuggest = (nick: string) => { setText((t) => t.replace(/@[a-z0-9_-]*$/i, `@${nick} `)); setSuggest([]); };
+  const pickMentionSuggestion = (nick: string) => { setText((t) => t.replace(/@[a-z0-9_-]*$/i, `@${nick} `)); setMentionSuggestions([]); };
+  const pickCommandSuggestion = (suggestion: CommandSuggestion) => {
+    setText(suggestion.insert); setSlashSuggestionsOpen(false); setMentionSuggestions([]);
+  };
 
   // `!cmd` in a worker tab runs a one-shot shell command in that worker's project dir; the output is an
   // ephemeral card (not persisted). Only local workers have a cwd.
@@ -682,14 +691,14 @@ export function App() {
 
   const send = async () => {
     const t = text.trim(); if (!t) return;
-    if (selected && t.startsWith("!")) { setText(""); setSuggest([]); void runExec(t.slice(1).trim()); return; }
+    if (selected && t.startsWith("!")) { setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runExec(t.slice(1).trim()); return; }
     const workerCommand = selected ? parseWorkerCommand(t) : null;
-    if (workerCommand) { setText(""); setSuggest([]); void runWorkerCommand(workerCommand, t); return; }
+    if (workerCommand) { setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runWorkerCommand(workerCommand, t); return; }
     const m = /^@([a-z0-9][a-z0-9_-]*)\s+([\s\S]+)$/.exec(t);
     const redirect = m && sessions.some((s) => s.nickname === m[1]) ? m[1] : null;
     const target = redirect ?? selected ?? undefined;
     const body = redirect ? m![2] : t;
-    setText(""); setSuggest([]); stickRef.current = true;
+    setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); stickRef.current = true;
     const clientInputId = target ? createBrowserUuid() : undefined;
     const active = workerRef.current;
     if (target && target === selected && clientInputId) {
@@ -727,11 +736,17 @@ export function App() {
   };
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (suggest.length > 0) {
-      if (e.key === "ArrowDown") { e.preventDefault(); setSugIdx((i) => (i + 1) % suggest.length); return; }
-      if (e.key === "ArrowUp") { e.preventDefault(); setSugIdx((i) => (i - 1 + suggest.length) % suggest.length); return; }
-      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickSuggest(suggest[sugIdx]); return; }
-      if (e.key === "Escape") { e.preventDefault(); setSuggest([]); return; }
+    if (suggestionCount > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSugIdx((i) => (i + 1) % suggestionCount); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setSugIdx((i) => (i - 1 + suggestionCount) % suggestionCount); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        const index = sugIdx % suggestionCount;
+        if (slashSuggestions.length > 0) pickCommandSuggestion(slashSuggestions[index]!);
+        else pickMentionSuggestion(mentionSuggestions[index]!);
+        return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); setSlashSuggestionsOpen(false); setMentionSuggestions([]); return; }
     }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
   };
@@ -977,11 +992,16 @@ export function App() {
             <div className="goal-objective">{goal.objective}</div>
           </div>}
           <div className="composer">
-            {suggest.length > 0 && <div className="suggest">{suggest.map((n, i) => <div key={n} className={`srow ${i === sugIdx ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickSuggest(n); }}>@{n}</div>)}</div>}
+            {slashSuggestions.length > 0 && <div className="suggest command-suggest" role="listbox" aria-label="Command suggestions">
+              {slashSuggestions.map((suggestion, i) => <div key={suggestion.id} role="option" aria-selected={i === sugIdx % suggestionCount} className={`srow command-row ${i === sugIdx % suggestionCount ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickCommandSuggestion(suggestion); }}>
+                <span className="command-label">{suggestion.label}</span><span className="command-description">{suggestion.description}</span>
+              </div>)}
+            </div>}
+            {slashSuggestions.length === 0 && mentionSuggestions.length > 0 && <div className="suggest" role="listbox" aria-label="Worker suggestions">{mentionSuggestions.map((n, i) => <div key={n} role="option" aria-selected={i === sugIdx % suggestionCount} className={`srow ${i === sugIdx % suggestionCount ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickMentionSuggestion(n); }}>@{n}</div>)}</div>}
             <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
             <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
             <textarea value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
-              placeholder={selected === null ? "Message QiYan… (@worker to direct-message a worker)" : `Message ${selected}…`} />
+              placeholder={selected === null ? "Message QiYan… (type / for commands; @worker to direct-message)" : `Message ${selected}… (type / for commands)`} />
             <button onClick={() => void send()}>Send</button>
           </div>
           {selectedSession && <div className="worker-context" aria-label={`${selectedSession.nickname} session context`}>

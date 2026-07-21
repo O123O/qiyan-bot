@@ -98,6 +98,10 @@ body { margin:0; }
 .worker-context strong { color:var(--text); font-weight:500; overflow-wrap:anywhere; }
 .suggest { position:absolute; bottom:calc(100% + 4px); left:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 6px 20px rgba(0,0,0,.3); }
 .srow { padding:6px 14px; cursor:pointer; } .srow:hover, .srow.on { background:var(--panel2); }
+.command-suggest { width:min(520px,calc(100% - 28px)); }
+.command-row { display:flex; align-items:baseline; gap:14px; }
+.command-label { flex:0 0 190px; color:var(--text); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; }
+.command-description { min-width:0; color:var(--muted); font-size:12px; }
 
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:4vh 4vw; }
 .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(1240px,96vw); height:92vh; max-height:100%; display:flex; flex-direction:column; box-shadow:0 12px 44px rgba(0,0,0,.45); }
