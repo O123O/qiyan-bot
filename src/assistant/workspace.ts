@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 import { AppError } from "../core/errors.ts";
 
 const POLICY_FILE = "AGENTS.md";
+const POLICY_APPEND_FILE = "AGENTS.append.md";
 const DIGEST_FILE = ".qiyan-bot-agents.sha256";
 const CONTEXT_FILE = "assistant-context.json";
 const CONTEXT_DIGEST_FILE = ".qiyan-bot-context.sha256";
@@ -70,30 +71,35 @@ export async function prepareAssistantWorkspace(options: AssistantWorkspaceOptio
     assertSeparated(root, registryPath, "registry path");
 
     const policyPath = join(root, POLICY_FILE);
+    const appendPath = join(root, POLICY_APPEND_FILE);
     const digestPath = join(root, DIGEST_FILE);
     const packagedPolicy = await readFile(options.policyTemplatePath);
-    const packagedDigest = digest(packagedPolicy);
+    const appendState = await regularFileState(appendPath);
+    const expectedPolicy = appendState === "file"
+      ? Buffer.concat([packagedPolicy, Buffer.from("\n\n"), await readFile(appendPath)])
+      : packagedPolicy;
+    const expectedDigest = digest(expectedPolicy);
     const policyState = await regularFileState(policyPath);
     const digestState = await regularFileState(digestPath);
 
     if (policyState === "missing" && digestState === "missing") {
-      await atomicWrite(policyPath, packagedPolicy);
-      await atomicWrite(digestPath, Buffer.from(`${packagedDigest}\n`));
+      await atomicWrite(policyPath, expectedPolicy);
+      await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
     } else if (policyState === "file" && digestState === "missing") {
       const installed = await readFile(policyPath);
-      if (digest(installed) !== packagedDigest) throw managedError(`${policyPath} has no bot digest and does not match the packaged policy`);
-      await atomicWrite(digestPath, Buffer.from(`${packagedDigest}\n`));
+      if (digest(installed) !== expectedDigest) throw managedError(`${policyPath} has no bot digest and does not match the expected generated policy`);
+      await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
     } else if (policyState === "missing" && digestState === "file") {
       throw managedError(`digest exists but AGENTS.md is missing at ${policyPath}`);
     } else {
       const installed = await readFile(policyPath);
       const recorded = (await readFile(digestPath, "utf8")).trim();
       if (!/^[a-f0-9]{64}$/u.test(recorded) || digest(installed) !== recorded) {
-        throw managedError(`${policyPath} is managed by qiyan-bot and was modified; put custom instructions in AGENTS.override.md`);
+        throw managedError(`${policyPath} is managed by qiyan-bot and was modified; put additions in AGENTS.append.md or a complete replacement in AGENTS.override.md`);
       }
-      if (recorded !== packagedDigest) {
-        await atomicWrite(policyPath, packagedPolicy);
-        await atomicWrite(digestPath, Buffer.from(`${packagedDigest}\n`));
+      if (recorded !== expectedDigest) {
+        await atomicWrite(policyPath, expectedPolicy);
+        await atomicWrite(digestPath, Buffer.from(`${expectedDigest}\n`));
       }
     }
 

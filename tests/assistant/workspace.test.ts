@@ -53,6 +53,39 @@ test("installs the managed policy and returns the generated dashboard path", asy
   await assert.rejects(readFile(prepared.dashboardPath), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
 });
 
+test("composes AGENTS.append.md once and refreshes the managed policy when it changes", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1");
+  await mkdir(fixture.workdir, { recursive: true });
+  const appendPath = join(fixture.workdir, "AGENTS.append.md");
+  await writeFile(appendPath, "custom-v1\n");
+
+  await prepareAssistantWorkspace(fixture.options);
+  const policyPath = join(fixture.workdir, "AGENTS.md");
+  assert.equal(await readFile(policyPath, "utf8"), "policy-v1\n\ncustom-v1\n");
+  assert.equal(
+    (await readFile(join(fixture.workdir, ".qiyan-bot-agents.sha256"), "utf8")).trim(),
+    sha256("policy-v1\n\ncustom-v1\n"),
+  );
+
+  await prepareAssistantWorkspace(fixture.options);
+  assert.equal(await readFile(policyPath, "utf8"), "policy-v1\n\ncustom-v1\n");
+
+  await writeFile(appendPath, "custom-v2\n");
+  await prepareAssistantWorkspace(fixture.options);
+  assert.equal(await readFile(policyPath, "utf8"), "policy-v1\n\ncustom-v2\n");
+
+  await rm(appendPath);
+  await prepareAssistantWorkspace(fixture.options);
+  assert.equal(await readFile(policyPath, "utf8"), "policy-v1");
+});
+
+test("rejects a non-regular AGENTS.append.md without following it", async () => {
+  const fixture = await fixtureWithTemplates("policy-v1\n");
+  await mkdir(fixture.workdir, { recursive: true });
+  await symlink(fixture.policyTemplate, join(fixture.workdir, "AGENTS.append.md"));
+  await assert.rejects(prepareAssistantWorkspace(fixture.options), /AGENTS\.append\.md must be a regular file/);
+});
+
 test("updates an unchanged generated context and rejects manual replacement", async () => {
   const update = await fixtureWithTemplates("policy-v1\n");
   const initial = await prepareAssistantWorkspace(update.options);

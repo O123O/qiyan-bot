@@ -152,7 +152,7 @@ report payments /collect 3
 
 ## Assistant instructions and customization
 
-QiYan installs `<assistant-workdir>/AGENTS.md` and records its digest. Startup upgrades an unchanged policy and rejects a modified or partially missing managed pair. Put a complete replacement prompt in `AGENTS.override.md`; the bot never reads or modifies that user-owned file.
+QiYan installs `<assistant-workdir>/AGENTS.md` and records its digest. On every startup, it generates that policy from the packaged instructions plus the optional user-owned `<assistant-workdir>/AGENTS.append.md`, separated by two newlines. Changing or removing the append file safely regenerates an unchanged managed policy; a directly modified or partially missing managed pair is rejected. Put a complete replacement prompt in `AGENTS.override.md`; the bot never reads or modifies that user-owned file, and Codex gives it precedence normally.
 
 The assistant also does not inherit home-scoped user skills. Put assistant-only configuration in `<DATA_DIR>/assistant-profile/codex/config.toml`, home skills in `<DATA_DIR>/assistant-profile/home/.agents/skills`, or project-scoped skills in the assistant workdir. Workers continue to use your normal Codex configuration and skills unchanged.
 
@@ -162,6 +162,7 @@ The assistant also does not inherit home-scoped user skills. Put assistant-only 
 - `<DATA_DIR>/sessions.json`: registry v3 with assistant identity and generation-safe worker mappings
 - `<DATA_DIR>/assistant-profile/`: isolated authentication, configuration, and assistant thread storage
 - `<assistant-workdir>/AGENTS.md`: managed assistant policy
+- `<assistant-workdir>/AGENTS.append.md`: optional user-owned additions composed into the managed policy on startup
 - `<assistant-workdir>/assistant-context.json`: mode-0400 real-home/QiYan-home context
 - `<assistant-workdir>/session-status.json`: mode-0400 session dashboard
 

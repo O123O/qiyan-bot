@@ -30,7 +30,7 @@ SESSION_REGISTRY_PATH=/absolute/path/to/qiyan-data/sessions.json
 ASSISTANT_SANDBOX_MODE=danger-full-access
 ```
 
-The assistant workdir must be separate from data and registry state and is the process working directory after startup. QiYan creates managed `AGENTS.md`, read-only `assistant-context.json`, and read-only `session-status.json`. Customize the prompt with `AGENTS.override.md`; never edit generated files.
+The assistant workdir must be separate from data and registry state and is the process working directory after startup. QiYan creates managed `AGENTS.md`, read-only `assistant-context.json`, and read-only `session-status.json`. Put additions in the optional user-owned `AGENTS.append.md`; QiYan composes them after its packaged policy on every startup. Use `AGENTS.override.md` for a complete replacement, which Codex gives precedence normally. Never edit generated files.
 
 Worker projects use relevant/user-specified semantic locations, with `~/qiyan-projects/<nickname>` as the backend fallback. QiYan home, its descendants, and ancestors containing it are never worker projects.
 

@@ -29,6 +29,7 @@ test("packaged assistant policy is concise and reserves examples for exact direc
 
   assert.match(policy, /general-purpose personal assistant/iu);
   assert.match(policy, /your name is QiYan/iu);
+  assert.match(policy, /backend appends user rules from `AGENTS\.append\.md` here on every restart/iu);
   assert.match(policy, /prefer direct work for small, personal, one-off, or cross-project tasks/iu);
   assert.match(policy, /delegate deliberately.*resumable transcript/isu);
   assert.match(policy, /read `assistant-context\.json` and `session-status\.json`.*after context compaction/isu);
