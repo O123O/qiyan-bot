@@ -34,10 +34,21 @@ test("delivery progress and managed epochs have focused durable stores", () => {
   assert.deepEqual(progress.recoveryIncident(...identity), { reason: "history budget exhausted" });
 
   const epochId = epochs.begin(...identity, "turn-6", 100);
-  assert.deepEqual(epochs.current(...identity), { id: epochId, baselineTurnId: "turn-6", startedAt: 100 });
+  assert.deepEqual(epochs.current(...identity), {
+    id: epochId, baselineTurnId: "turn-6", recoveryMode: "from_beginning", startedAt: 100,
+  });
   epochs.end(...identity, 200);
   assert.equal(epochs.current(...identity), undefined);
-  assert.deepEqual(epochs.latest(...identity), { id: epochId, baselineTurnId: "turn-6", startedAt: 100, endedAt: 200 });
+  assert.deepEqual(epochs.latest(...identity), {
+    id: epochId, baselineTurnId: "turn-6", recoveryMode: "from_beginning", startedAt: 100, endedAt: 200,
+  });
+
+  const adoptionEpochId = epochs.begin(...identity, undefined, 300, "from_first_turn");
+  assert.equal(epochs.recordFirstTurn(...identity, "turn-7"), true);
+  assert.equal(epochs.recordFirstTurn(...identity, "turn-8"), false);
+  assert.deepEqual(epochs.current(...identity), {
+    id: adoptionEpochId, recoveryMode: "from_first_turn", firstTurnId: "turn-7", startedAt: 300,
+  });
 });
 
 test("focused stores contain no native status, active turn, or management state columns", () => {

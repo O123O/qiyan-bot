@@ -24,7 +24,7 @@ test("a remote Claude session drives through the pool over ssh", { skip: !enable
   const { thread } = await endpoint.request<any>("thread/start", { cwd: "/tmp", threadSource: "worker-thread" });
   assert.equal(thread.status.type, "idle");
 
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const completed = new Promise<any>((resolve) => {
     const off = endpoint.onNotification((m, p: any) => { if (m === "turn/completed" && p.threadId === thread.id) { off(); resolve(p.turn); } });
   });

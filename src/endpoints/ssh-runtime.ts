@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "461b7384cd61b070ee37d6d81c51b448f51035cf05bbe74dfbe1230eb4f8ecac";
+export const REMOTE_HELPER_SHA256 = "aaf0c10838bf495a5df71ab9ef632cc6d2dc78c998d390545f12e316c515d84f";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
@@ -29,7 +29,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
-const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "write-file", "workspace"]);
+const helperOperations = new Set(["preflight", "bootstrap", "inspect", "start", "stop", "read-file", "read-rollout-slice", "write-file", "workspace"]);
 const preflightSchema = z.object({
   uid: z.number().int().positive(),
   home: z.string().startsWith("/"),
@@ -63,9 +63,9 @@ export interface RemoteAppServerProxyRequest {
 
 export interface RemoteTransferClient {
   invokeTransfer<T>(
-    operation: "read-file" | "write-file",
+    operation: "read-file" | "read-rollout-slice" | "write-file",
     args: readonly string[],
-    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number },
+    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number; signal?: AbortSignal },
     installedHelperPath: string,
   ): Promise<T>;
 }
@@ -325,9 +325,9 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   }
 
   async invokeTransfer<T>(
-    operation: "read-file" | "write-file",
+    operation: "read-file" | "read-rollout-slice" | "write-file",
     args: readonly string[],
-    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number },
+    options: { input?: AsyncIterable<Uint8Array | string>; maxOutputBytes: number; timeoutMs?: number; signal?: AbortSignal },
     installedHelperPath: string,
   ): Promise<T> {
     validateInstalledHelperPath(installedHelperPath);
@@ -337,6 +337,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       options.input,
       options.maxOutputBytes,
       options.timeoutMs ?? REMOTE_HELPER_TIMEOUT_MS,
+      options.signal,
     );
     return parseRemoteHelperResponse<T>(result.stdout, operation);
   }

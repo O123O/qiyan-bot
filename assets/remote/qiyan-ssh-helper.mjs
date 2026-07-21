@@ -31,6 +31,7 @@ try {
       case "start": result = await start(decodeJson(encoded, 1)); break;
       case "stop": result = await stop(decodeJson(encoded, 1)); break;
       case "read-file": result = await readFileDescriptor(decodeJson(encoded, 1)); break;
+      case "read-rollout-slice": result = await readRolloutSlice(decodeJson(encoded, 1)); break;
       case "write-file": result = await writeFileDescriptor(decodeJson(encoded, 1)); break;
       case "workspace": result = await workspace(decodeJson(encoded, 1)); break;
       default: throw new Error("unsupported helper operation");
@@ -255,6 +256,64 @@ async function readFileDescriptor(value) {
       };
     } finally { await file.close(); }
   } finally { await rootHandle.close(); }
+}
+
+async function readRolloutSlice(value) {
+  const path = value?.path;
+  const threadId = value?.threadId;
+  const before = value?.before;
+  const maxBytes = value?.maxBytes;
+  if (typeof path !== "string" || !isAbsolute(path) || !SAFE_PATH.test(path)
+    || typeof threadId !== "string" || !/^[A-Za-z0-9-]{1,128}$/u.test(threadId)
+    || !basename(path).startsWith("rollout-") || !basename(path).endsWith(`-${threadId}.jsonl`)
+    || (before !== undefined && (!Number.isSafeInteger(before) || before < 0))
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) throw new Error("invalid rollout read request");
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const state = await file.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!state.isFile() || state.size > BigInt(Number.MAX_SAFE_INTEGER)
+      || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid rollout file");
+    const size = Number(state.size);
+    const end = before === undefined ? size : before;
+    if (end > size) throw new Error("invalid rollout offset");
+    const start = Math.max(0, end - maxBytes);
+    const bytes = Buffer.alloc(end - start);
+    let filled = 0;
+    while (filled < bytes.length) {
+      const result = await file.read(bytes, filled, bytes.length - filled, start + filled);
+      if (result.bytesRead === 0) throw new Error("rollout file changed");
+      filled += result.bytesRead;
+    }
+    const after = await file.stat({ bigint: true });
+    if (after.dev !== state.dev || after.ino !== state.ino || after.size < BigInt(end)) throw new Error("rollout file changed");
+    return {
+      device: state.dev.toString(10), inode: state.ino.toString(10), size, start, end,
+      rows: filteredRolloutLines(bytes, start, start === 0, end === size),
+    };
+  } finally { await file.close(); }
+}
+
+function filteredRolloutLines(bytes, absoluteStart, completeStart, completeEnd) {
+  const rows = [];
+  let start = completeStart ? 0 : bytes.indexOf(0x0a) + 1;
+  if (start <= 0 && !completeStart) return rows;
+  while (start < bytes.length) {
+    const newline = bytes.indexOf(0x0a, start);
+    const end = newline >= 0 ? newline : completeEnd ? bytes.length : -1;
+    if (end < 0) break;
+    if (end > start) {
+      const line = bytes.toString("utf8", start, end);
+      const relevant = (line.includes('"type":"response_item"') && line.includes('"type":"message"') && line.includes('"role":"assistant"'))
+        || (line.includes('"type":"event_msg"')
+          && (line.includes('"type":"user_message"') || line.includes('"type":"task_started"') || line.includes('"type":"task_complete"')
+            || line.includes('"type":"turn_aborted"') || line.includes('"type":"thread_rolled_back"')));
+      if (relevant) rows.push({ offset: absoluteStart + start, line });
+    }
+    if (newline < 0) break;
+    start = newline + 1;
+  }
+  return rows;
 }
 
 async function writeFileDescriptor(value) {

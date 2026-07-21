@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { AppServerPool } from "../app-server/pool.ts";
-import { ThreadHistoryReader } from "../app-server/thread-history.ts";
 import type { Clock } from "../core/clock.ts";
 import { AppError } from "../core/errors.ts";
 import type { MappingIdentity, MappingLifecycleState, RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
@@ -11,8 +10,9 @@ import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
 import { isExactThreadNoRollout, isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
-import type { NativeSessionIdentity } from "./native-session-state.ts";
+import type { NativeRefreshToken, NativeSessionIdentity } from "./native-session-state.ts";
 import { NativeSessionState } from "./native-session-state.ts";
+import { DISCOVERY_SOURCE_KINDS } from "./discovery.ts";
 
 interface ThreadView { id: string; cwd: string; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
@@ -91,23 +91,8 @@ export class SessionLifecycle {
       let resumeAttempted = false;
       let reserved: RegistrySession | undefined;
       try {
-        let before: ThreadResponse;
-        try { before = await this.read(endpointId, threadId, lease); }
-        catch (error) {
-          if (!isExactThreadNotLoaded(error, threadId)) throw error;
-          let response: ThreadResponse;
-          try { response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease); }
-          catch (resumeError) {
-            if (isExactThreadNoRollout(resumeError, threadId)) throw this.threadNotDurable(threadId);
-            throw resumeError;
-          }
-          resumed = true;
-          this.requireThreadIdentity(response.thread, threadId);
-          before = await this.read(endpointId, threadId, lease);
-        }
+        const before = await this.readListedMetadata(endpointId, threadId, lease);
         this.requireThreadIdentity(before.thread, threadId);
-        if (resumed) this.requireAdoptionOutcome(before.thread, true);
-        else this.requireAdoptableBeforeResume(before.thread);
         const project = await this.prepareExisting(endpointId, before.thread.cwd, lease);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, before.thread.cwd, project.path, lease);
@@ -120,28 +105,36 @@ export class SessionLifecycle {
           lifecycle_state: "adopting",
         };
         await this.registry.reserve(nickname, reserved);
+        this.epochs.begin(endpointId, threadId, reserved.mapping_id, undefined, this.clock.now(), "from_first_turn");
+        const responseToken = this.observeManaged(reserved, before.thread, lease);
         let after = before;
-        if (!resumed && this.requiresResume(before.thread)) {
-          resumeAttempted = true;
+        resumeAttempted = true;
+        try {
           const response = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease);
           resumed = true;
           this.requireThreadIdentity(response.thread, threadId);
-          after = await this.read(endpointId, threadId, lease);
+          after = this.withoutTurns(response);
+        } catch (error) {
+          if (!isExactThreadNoRollout(error, threadId)) throw error;
+          resumeAttempted = false;
+          throw this.threadNotDurable(threadId);
         }
         this.requireThreadIdentity(after.thread, threadId);
         this.requireAdoptionOutcome(after.thread, resumed);
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
-        const boundary = await this.adoptionBoundary(endpointId, after.thread, lease);
         await this.registry.promote(nickname, reserved);
-        this.observeManaged(reserved, after.thread, lease, boundary.activeTurnId);
-        this.epochs.begin(endpointId, threadId, reserved.mapping_id, boundary.baselineTurnId, this.clock.now());
+        this.applyManagedResponse(responseToken, after.thread);
       } catch (error) {
         if (resumed) {
           try {
             await this.unsubscribeOrConfirmAbsent(endpointId, threadId, lease);
             if (reserved && !await this.registry.removeIfMatch(nickname, reserved)) {
               throw new Error("adopting reservation changed during rollback");
+            }
+            if (reserved) {
+              this.epochs.end(reserved.endpoint, reserved.thread_id, reserved.mapping_id, this.clock.now());
+              this.native.unregister(this.nativeIdentity(reserved));
             }
           } catch {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its subscription rollback could not be confirmed");
@@ -150,6 +143,8 @@ export class SessionLifecycle {
           if (!await this.registry.removeIfMatch(nickname, reserved)) {
             throw new AppError("OPERATION_UNCERTAIN", "adoption failed and its reservation rollback could not be confirmed");
           }
+          this.epochs.end(reserved.endpoint, reserved.thread_id, reserved.mapping_id, this.clock.now());
+          this.native.unregister(this.nativeIdentity(reserved));
         }
         throw error;
       }
@@ -165,7 +160,7 @@ export class SessionLifecycle {
     await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExact(nickname, expected, "managed");
       let native: ThreadResponse | undefined;
-      try { native = await this.read(session.endpoint, session.thread_id, lease); }
+      try { native = await this.readLight(session.endpoint, session.thread_id, lease); }
       catch (error) {
         // A never-loaded thread OR a never-materialized one (no rollout, e.g. a Claude
         // session created but never driven) has nothing to unsubscribe — just remove it.
@@ -199,7 +194,7 @@ export class SessionLifecycle {
       // Claude session created but never driven a turn is the case this hits (Codex
       // materializes its rollout at create).
       let native: ThreadResponse | undefined;
-      try { native = await this.read(session.endpoint, session.thread_id, lease); }
+      try { native = await this.readLight(session.endpoint, session.thread_id, lease); }
       catch (error) { if (!isExactThreadNoRollout(error, session.thread_id)) throw error; }
       if (native) this.requireIdle(native.thread);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transition_intent"));
@@ -234,46 +229,45 @@ export class SessionLifecycle {
         const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
         let resumed = false;
         try {
+          if (!this.epochs.current(session.endpoint, session.thread_id, session.mapping_id)) {
+            this.epochs.begin(session.endpoint, session.thread_id, session.mapping_id, undefined, this.clock.now(), "from_first_turn");
+          }
+          const responseToken = this.captureManagedRefresh(session, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "adopting project directory changed");
-          let before: ThreadResponse;
-          try { before = await this.read(session.endpoint, session.thread_id, lease); }
-          catch (error) {
-            if (!isExactThreadNotLoaded(error, session.thread_id)) throw error;
-            const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", this.resumeParams(session.thread_id), undefined, lease);
-            resumed = true;
-            this.requireThreadIdentity(response.thread, session.thread_id);
-            before = await this.read(session.endpoint, session.thread_id, lease);
-          }
-          this.requireThreadIdentity(before.thread, session.thread_id);
-          this.requireReservedAdoptable(before.thread);
-          await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
           this.assertExact(nickname, expected, "adopting");
-          let native = before;
-          if (!resumed && this.requiresResume(before.thread)) {
+          let native: ThreadResponse;
+          try {
             const response = await this.pool.request<ThreadResponse>(session.endpoint, "thread/resume", this.resumeParams(session.thread_id), undefined, lease);
             resumed = true;
             this.requireThreadIdentity(response.thread, session.thread_id);
-            const afterResume = this.assertExact(nickname, expected, "adopting");
-            native = await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+            this.assertExact(nickname, expected, "adopting");
+            native = this.withoutTurns(response);
+          } catch (error) {
+            if (!isExactThreadNoRollout(error, session.thread_id)) throw error;
+            const current = this.assertExact(nickname, expected, "adopting");
+            this.epochs.end(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
+            this.native.unregister(this.nativeIdentity(current));
+            if (!await this.registry.removeIfMatch(nickname, current)) {
+              throw new AppError("OPERATION_UNCERTAIN", "unrestorable adoption mapping changed before removal");
+            }
+            throw this.threadNotDurable(session.thread_id);
           }
           this.requireThreadIdentity(native.thread, session.thread_id);
           this.requireAdoptionOutcome(native.thread, true);
           await this.verifyCwd(session.endpoint, native.thread.cwd, project.path, lease);
           await this.assertDispatchable(session.endpoint, project, lease);
           const promotable = this.assertExact(nickname, expected, "adopting");
-          const boundary = await this.adoptionBoundary(session.endpoint, native.thread, lease);
           await this.registry.promote(nickname, promotable);
-          this.observeManaged(promotable, native.thread, lease, boundary.activeTurnId);
-          if (!this.epochs.current(promotable.endpoint, promotable.thread_id, promotable.mapping_id)) {
-            this.epochs.begin(promotable.endpoint, promotable.thread_id, promotable.mapping_id, boundary.baselineTurnId, this.clock.now());
-          }
+          if (resumed) this.applyManagedResponse(responseToken, native.thread);
         } catch (error) {
           const current = this.registry.get(nickname);
           if (resumed && current?.lifecycle_state === "adopting" && sameMapping(current, expected)) {
             try {
               await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
               if (!await this.registry.removeIfMatch(nickname, current)) throw new Error("adopting reservation changed during rollback");
+              this.epochs.end(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
+              this.native.unregister(this.nativeIdentity(current));
             } catch {
               throw new AppError("OPERATION_UNCERTAIN", "adoption recovery failed and its subscription rollback could not be confirmed");
             }
@@ -307,20 +301,12 @@ export class SessionLifecycle {
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed project directory changed");
       let resumed: ThreadResponse | undefined;
       const resumeForConnection = options?.resumeForConnection === true;
-      // Connection recovery only needs thread metadata and a live notification subscription.
-      // A missing epoch needs only the latest turn id for its delivery baseline, obtained from
-      // one bounded summary page below.
-      const hasEpoch = this.epochs.current(session.endpoint, session.thread_id, session.mapping_id) !== undefined;
+      // Managed recovery needs metadata and, for a replacement connection, a live subscription.
+      // Historical delivery repair is owned independently by EventRelay and must never block the
+      // endpoint lifecycle by loading a large rollout here.
       let before: ThreadResponse;
       try {
-        if (resumeForConnection || hasEpoch) {
-          before = await this.readLight(session.endpoint, session.thread_id, lease);
-          if (!resumeForConnection && before.thread.status.type !== "idle") {
-            before = await this.read(session.endpoint, session.thread_id, lease);
-          }
-        } else {
-          before = await this.read(session.endpoint, session.thread_id, lease);
-        }
+        before = await this.readLight(session.endpoint, session.thread_id, lease);
       } catch (error) {
         if (options?.requireRestorable && isExactThreadNoRollout(error, session.thread_id)) {
           await this.rejectUnrestorableManaged(nickname, session, assertCurrent);
@@ -342,27 +328,16 @@ export class SessionLifecycle {
         }
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
-        before = resumeForConnection
-          ? this.withoutTurns(resumed)
-          : hasEpoch
-            ? await this.readLight(session.endpoint, session.thread_id, lease)
-            : await this.read(session.endpoint, session.thread_id, lease);
-        if (!resumeForConnection && hasEpoch && before.thread.status.type !== "idle") {
-          before = await this.read(session.endpoint, session.thread_id, lease);
-        }
+        before = this.withoutTurns(resumed);
       }
       assertCurrent();
       this.requireThreadIdentity(before.thread, session.thread_id);
       await this.verifyCwd(session.endpoint, before.thread.cwd, project.path, lease);
       assertCurrent();
-      const recoveryLatestTurn = resumeForConnection
-        ? await this.latestTurn(session.endpoint, session.thread_id, lease)
-        : undefined;
-      assertCurrent();
-      // Publish native capacity before the remaining managed-session recovery work.
+      // Publish native state before the remaining managed-session recovery work. The active turn
+      // identity is learned from live turn/item notifications, not reconstructed history.
       if (before.thread.status.type === "active") {
-        this.observeManaged(session, before.thread, lease,
-          recoveryLatestTurn && !isTerminalTurnStatus(recoveryLatestTurn.status) ? recoveryLatestTurn.id : undefined);
+        this.observeManaged(session, before.thread, lease);
       }
       await this.beforeManagedReady?.(session, lease);
       assertCurrent();
@@ -370,7 +345,7 @@ export class SessionLifecycle {
       let authoritative = before;
       // Loaded state is not a subscription: every replacement remote connection must explicitly
       // resume once, including when the native thread is active.
-      if (!resumed && (resumeForConnection || this.requiresResume(before.thread))) {
+      if (!resumed && (resumeForConnection || this.requiresManagedResume(before.thread))) {
         resumed = await this.pool.request<ThreadResponse>(
           session.endpoint,
           "thread/resume",
@@ -381,9 +356,7 @@ export class SessionLifecycle {
         assertCurrent();
         this.requireThreadIdentity(resumed.thread, session.thread_id);
         const afterResume = this.assertExact(nickname, expected, "managed");
-        authoritative = resumeForConnection
-          ? this.withoutTurns(resumed)
-          : await this.read(afterResume.endpoint, afterResume.thread_id, lease);
+        authoritative = this.withoutTurns(resumed);
       }
       assertCurrent();
       this.requireThreadIdentity(authoritative.thread, session.thread_id);
@@ -393,15 +366,15 @@ export class SessionLifecycle {
       assertCurrent();
       const current = this.assertExact(nickname, expected, "managed");
       assertCurrent();
-      this.observeManaged(current, authoritative.thread, lease,
-        recoveryLatestTurn && !isTerminalTurnStatus(recoveryLatestTurn.status) ? recoveryLatestTurn.id : undefined);
+      this.observeManaged(current, authoritative.thread, lease);
       if (!this.epochs.current(current.endpoint, current.thread_id, current.mapping_id)) {
         this.epochs.begin(
           current.endpoint,
           current.thread_id,
           current.mapping_id,
-          recoveryLatestTurn?.id ?? this.baseline(authoritative.thread),
+          undefined,
           this.clock.now(),
+          "from_first_turn",
         );
       }
       return { ...resumed, thread: authoritative.thread };
@@ -430,7 +403,7 @@ export class SessionLifecycle {
       if (current.lifecycle_state === "unadopting") {
         let alreadyUnsubscribed = false;
         try {
-          const native = await this.read(current.endpoint, current.thread_id, lease);
+          const native = await this.readLight(current.endpoint, current.thread_id, lease);
           this.requireThreadIdentity(native.thread, current.thread_id);
           alreadyUnsubscribed = native.thread.status.type === "notLoaded";
         } catch (error) {
@@ -472,15 +445,6 @@ export class SessionLifecycle {
     return current;
   }
 
-  private async read(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
-    const response = await this.pool.request<ThreadResponse>(
-      endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
-    );
-    const latest = await this.pool.historyReader(endpointId, lease).latestTurn(threadId);
-    const turns = latest ? [latest] : [];
-    return { ...response, thread: { ...response.thread, turns } };
-  }
-
   // Metadata-only read (status and cwd) — does NOT ask for turns, so codex/claude never
   // re-materializes the whole rollout. Used by managed recovery to check a thread's status cheaply
   // before deciding whether the (rare) full read is actually needed.
@@ -491,6 +455,37 @@ export class SessionLifecycle {
     return { ...response, thread: { ...response.thread, turns: [] } };
   }
 
+  private async readListedMetadata(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {
+    for (const archived of [false, true]) {
+      let cursor: string | undefined;
+      const seen = new Set<string>();
+      let complete = false;
+      for (let pageNumber = 0; pageNumber < 64; pageNumber += 1) {
+        const page = await this.pool.request<{ data: ThreadView[]; nextCursor?: string | null }>(endpointId, "thread/list", {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit: 100,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          sourceKinds: [...DISCOVERY_SOURCE_KINDS],
+          archived,
+          useStateDbOnly: true,
+        }, undefined, lease);
+        const thread = page.data.find((candidate) => candidate.id === threadId);
+        if (thread) return { thread: { ...thread, turns: [] } };
+        const next = page.nextCursor ?? undefined;
+        if (next === undefined) {
+          complete = true;
+          break;
+        }
+        if (seen.has(next)) throw new AppError("OPERATION_UNCERTAIN", "thread metadata pagination repeated a cursor");
+        seen.add(next);
+        cursor = next;
+      }
+      if (!complete) throw new AppError("OPERATION_UNCERTAIN", "thread metadata scan exceeded its page limit");
+    }
+    throw this.threadNotDurable(threadId);
+  }
+
   private resumeParams(threadId: string): { threadId: string; excludeTurns: true } {
     return { threadId, excludeTurns: true };
   }
@@ -499,68 +494,19 @@ export class SessionLifecycle {
     return { ...response, thread: { ...response.thread, turns: [] } };
   }
 
-  private async latestTurn(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<{ id: string; status?: unknown } | undefined> {
-    return new ThreadHistoryReader((method, params) => this.pool.request(
-      endpointId, method, params, undefined, lease,
-    )).latestTurn(threadId);
-  }
-
   private requireIdle(thread: ThreadView): void {
     if (thread.status.type !== "idle") throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
   }
 
-  private requireAdoptableBeforeResume(thread: ThreadView): void {
-    if (thread.status.type !== "idle" && thread.status.type !== "notLoaded") {
-      throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
-    }
-    this.requireTerminalLatestTurn(thread);
-  }
-
-  private requireReservedAdoptable(thread: ThreadView): void {
-    if (thread.status.type !== "idle" && thread.status.type !== "active" && thread.status.type !== "notLoaded") {
-      throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
-    }
-    if (thread.status.type !== "active") this.requireTerminalLatestTurn(thread);
-  }
-
   private requireAdoptionOutcome(thread: ThreadView, allowReservedActive: boolean): void {
     // Resuming an idle thread with a persisted active goal can immediately start its next turn.
-    // That turn belongs to the durable adopting reservation; an active preflight never does.
+    // Active state returned after the durable reservation belongs to the managed mapping.
     if (thread.status.type !== "idle" && !(allowReservedActive && thread.status.type === "active")) {
       throw new AppError("SESSION_BUSY", `thread ${thread.id} is ${thread.status.type}`);
     }
-    if (thread.status.type === "idle") this.requireTerminalLatestTurn(thread);
   }
 
-  private requireTerminalLatestTurn(thread: ThreadView): void {
-    const latest = thread.turns.at(-1);
-    if (latest && !isTerminalTurnStatus(latest.status)) {
-      throw new AppError("SESSION_BUSY", `thread ${thread.id} has a nonterminal latest turn`);
-    }
-  }
-
-  private async adoptionBoundary(
-    endpointId: string,
-    thread: ThreadView,
-    lease?: EndpointWorkLease,
-  ): Promise<{ baselineTurnId?: string; activeTurnId?: string }> {
-    if (thread.status.type !== "active") {
-      const baselineTurnId = this.baseline(thread);
-      return baselineTurnId ? { baselineTurnId } : {};
-    }
-    const page = await this.pool.historyReader(endpointId, lease).turnsPage(thread.id, {
-      limit: 2,
-      sortDirection: "desc",
-      itemsView: "notLoaded",
-    });
-    const active = page.data[0];
-    if (!active || isTerminalTurnStatus(active.status)) {
-      throw new AppError("OPERATION_UNCERTAIN", `active thread ${thread.id} has no authoritative active turn`);
-    }
-    return { activeTurnId: active.id, ...(page.data[1] ? { baselineTurnId: page.data[1].id } : {}) };
-  }
-
-  private requiresResume(thread: ThreadView): boolean {
+  private requiresManagedResume(thread: ThreadView): boolean {
     return thread.status.type !== "active" && (thread.status.type === "notLoaded" || thread.turns.length > 0);
   }
 
@@ -647,18 +593,40 @@ export class SessionLifecycle {
     return { endpointId: identity.endpoint, threadId: identity.thread_id, mappingId: identity.mapping_id };
   }
 
-  private observeManaged(identity: MappingIdentity, thread: ThreadView, lease?: EndpointWorkLease, knownActiveTurnId?: string): void {
+  private observeManaged(
+    identity: MappingIdentity,
+    thread: ThreadView,
+    lease?: EndpointWorkLease,
+    knownActiveTurnId?: string,
+  ): NativeRefreshToken {
+    const token = this.captureManagedRefresh(identity, lease);
+    const nativeIdentity = this.nativeIdentity(identity);
+    const generation = token.endpointGeneration;
+    const activeTurnId = thread.status.type === "active"
+      ? knownActiveTurnId ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
+      : null;
+    this.native.applyRefresh(token, { status: thread.status.type, activeTurnId });
+    return this.native.captureRefresh(nativeIdentity, generation);
+  }
+
+  private captureManagedRefresh(identity: MappingIdentity, lease?: EndpointWorkLease): NativeRefreshToken {
     const generation = lease?.endpointGeneration ?? this.pool.endpointGeneration(identity.endpoint).generation;
     const nativeIdentity = this.nativeIdentity(identity);
     const existing = this.native.view(nativeIdentity);
     if (!existing || existing.endpointGeneration !== generation || existing.availability !== "ready") {
       this.native.register(nativeIdentity, generation);
     }
-    const token = this.native.captureRefresh(nativeIdentity, generation);
+    return this.native.captureRefresh(nativeIdentity, generation);
+  }
+
+  private applyManagedResponse(token: NativeRefreshToken, thread: ThreadView): boolean {
     const activeTurnId = thread.status.type === "active"
-      ? knownActiveTurnId ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
+      ? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? undefined
       : null;
-    this.native.applyRefresh(token, { status: thread.status.type, activeTurnId });
+    return this.native.applyRefresh(token, {
+      status: thread.status.type,
+      ...(activeTurnId === undefined ? {} : { activeTurnId }),
+    });
   }
 
   private baseline(thread: ThreadView): string | undefined { return thread.turns.at(-1)?.id; }

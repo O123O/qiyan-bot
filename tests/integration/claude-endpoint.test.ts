@@ -31,7 +31,7 @@ test("a Claude endpoint drives two multiplexed sessions through the pool", { ski
   assert.notEqual(a.thread.id, b.thread.id);
   assert.equal(a.thread.status.type, "idle");
 
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 2 });
+  const pool = new AppServerPool([endpoint], {});
 
   // two sessions multiplex on one endpoint concurrently
   const termA = captureTurn(endpoint, a.thread.id);

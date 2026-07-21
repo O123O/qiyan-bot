@@ -69,7 +69,7 @@ test("pinned app-server supports multiple threads, discovery, goals, turns, and 
   assert.equal((await endpoint.request<any>("thread/goal/get", { threadId: second.thread.id })).goal.objective, "integration objective");
   await endpoint.request("thread/goal/clear", { threadId: second.thread.id });
 
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const terminal = captureNextTurn(endpoint, first.thread.id);
   const started = await pool.startTurn<any>(endpoint.id, {
     threadId: first.thread.id,
@@ -118,7 +118,7 @@ test("active turn steering persists its client correlation ID", { skip: !steerEn
   await endpoint.start();
   const startedThread = await endpoint.request<any>("thread/start", { cwd, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false });
   const threadId = startedThread.thread.id as string;
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
 
   let diagnostic = "the model completed before steering";
   for (let attempt = 1; attempt <= 3; attempt += 1) {

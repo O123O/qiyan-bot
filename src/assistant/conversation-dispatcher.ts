@@ -62,20 +62,19 @@ export type DispatcherOperationalEvent =
   | "assistant_submission_uncertain"
   | "assistant_turn_terminal";
 
-export class AssistantStartPreDispatchError extends Error {
+export class AssistantStartCheckpointError extends Error {
   constructor(cause: unknown) {
-    super("assistant start pre-dispatch history read failed", { cause });
-    this.name = "AssistantStartPreDispatchError";
+    super("assistant start dispatch checkpoint failed", { cause });
+    this.name = "AssistantStartCheckpointError";
   }
 }
 
-export async function prepareAssistantStartDispatch(
-  readBaseline: () => Promise<string | null>,
+export function checkpointAssistantStartDispatch(
   checkpointBaseline: (baselineTurnId: string | null) => void,
-): Promise<void> {
-  try { checkpointBaseline(await readBaseline()); }
+): void {
+  try { checkpointBaseline(null); }
   catch (error) {
-    throw error instanceof AssistantStartPreDispatchError ? error : new AssistantStartPreDispatchError(error);
+    throw error instanceof AssistantStartCheckpointError ? error : new AssistantStartCheckpointError(error);
   }
 }
 
@@ -86,10 +85,7 @@ export class ConversationDispatcher {
   private readonly earlyTerminals = new Map<string, TurnSnapshot>();
   private readonly publishedTerminalIds = new Set<string>();
   private earlyTerminalAttemptId: string | undefined;
-  private readonly unsubscribeCapacity: () => void;
-  private capacityWaiting = false;
   private pumpPaused = false;
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryGeneration = 0;
   private nativeSubmissionCount = 0;
@@ -114,14 +110,7 @@ export class ConversationDispatcher {
     private readonly pool: AppServerPool,
     private readonly runner: AssistantTurnPort,
     private readonly options: DispatcherOptions,
-  ) {
-    this.unsubscribeCapacity = pool.onCapacityAvailable(() => {
-      if (!this.capacityWaiting || this.stopped) return;
-      this.capacityWaiting = false;
-      this.cancelRetry();
-      void this.post(() => this.pump());
-    });
-  }
+  ) {}
 
   accept(source: CanonicalChatSource, effects: ChatAcceptanceEffects = {}): Promise<void> {
     return this.post(() => {
@@ -313,8 +302,6 @@ export class ConversationDispatcher {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    this.unsubscribeCapacity();
-    this.cancelRetry();
     this.cancelRecovery();
     if (this.admissionRetryTimer) clearTimeout(this.admissionRetryTimer);
     this.admissionRetryTimer = undefined;
@@ -359,14 +346,7 @@ export class ConversationDispatcher {
       }
       this.startAdmissionGranted = false;
       const claimId = `assistant:${candidate.contextId}`;
-      let claim: TurnCapacityClaim;
-      try {
-        claim = this.pool.claimTurnCapacity(this.options.endpointId, this.options.threadId, claimId);
-      } catch (error) {
-        if (!(error instanceof AppError && error.code === "CAPACITY_EXCEEDED")) throw error;
-        this.waitForCapacity();
-        return;
-      }
+      const claim = this.pool.claimTurnCapacity(this.options.endpointId, this.options.threadId, claimId);
       let acquired: AssistantAttempt;
       try {
         acquired = chooseEvent
@@ -519,7 +499,7 @@ export class ConversationDispatcher {
   }
 
   private handleSubmissionFailure(submission: ReservedSubmission, claim: TurnCapacityClaim | undefined, error: unknown, recoveryGeneration?: number): void {
-    if (error instanceof AssistantStartPreDispatchError && submission.submissionKind === "start" && claim) {
+    if (error instanceof AssistantStartCheckpointError && submission.submissionKind === "start" && claim) {
       this.pumpPaused = true;
       this.store.restorePending(submission.attemptId, submission.contextId);
       this.store.failUnstartedAttempt(submission.attemptId);
@@ -858,22 +838,6 @@ export class ConversationDispatcher {
       this.attemptSubmissionWaiters.delete(attemptId);
       for (const resolve of waiters) resolve();
     }
-  }
-
-  private waitForCapacity(): void {
-    this.capacityWaiting = true;
-    if (this.retryTimer || this.stopped) return;
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = undefined;
-      if (!this.capacityWaiting || this.stopped) return;
-      this.capacityWaiting = false;
-      void this.post(() => this.pump());
-    }, this.options.retryMs ?? 1_000);
-  }
-
-  private cancelRetry(): void {
-    if (this.retryTimer) clearTimeout(this.retryTimer);
-    this.retryTimer = undefined;
   }
 
   private scheduleRecovery(wakeAt = Date.now() + (this.options.retryMs ?? 1_000)): void {

@@ -126,7 +126,7 @@ class ServiceEndpoint implements AppServerEndpoint {
   }
 }
 
-async function fixture(options: { coldEndpoint?: boolean } = {}) {
+async function fixture(options: { coldEndpoint?: boolean; onTurnAccepted?(turnId: string): void } = {}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
   const endpointId = options.coldEndpoint ? "prenyx" : "local";
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
@@ -136,7 +136,7 @@ async function fixture(options: { coldEndpoint?: boolean } = {}) {
   const db = createTestDatabase();
   const endpoint = new ServiceEndpoint(endpointId);
   endpoint.cwd = dir;
-  const pool = new AppServerPool(options.coldEndpoint ? [] : [endpoint], { maxConcurrentTurns: 4, reconciliationTimeoutMs: 20, reconciliationPollMs: 1 });
+  const pool = new AppServerPool(options.coldEndpoint ? [] : [endpoint]);
   const native = new NativeSessionState();
   const nativeGeneration = options.coldEndpoint ? 0 : pool.endpointGeneration("local").generation;
   if (!options.coldEndpoint) {
@@ -174,7 +174,19 @@ async function fixture(options: { coldEndpoint?: boolean } = {}) {
     },
   } satisfies Pick<EndpointManager, "withWorkLease" | "runWithWorkLease"> : undefined;
   if (endpoints) pool.setWorkLeaseProvider((id, lease, run) => endpoints.runWithWorkLease(id, lease, run));
-  const service = new SessionService(pool, registry, native, controls, finals, deliveries, workspaces, gate, endpoints);
+  const service = new SessionService(
+    pool,
+    registry,
+    native,
+    controls,
+    finals,
+    deliveries,
+    workspaces,
+    gate,
+    endpoints,
+    undefined,
+    (_session, turnId) => options.onTurnAccepted?.(turnId),
+  );
   const observeNative = (status: "idle" | "active", turnId?: string) => {
     endpoint.status = status;
     if (status === "active" && turnId) {
@@ -258,13 +270,22 @@ test("prepares worker input inside the verified execution fence before native di
 test("execution performs a fresh native cwd and project check before every mutation", async () => {
   const { endpoint, service, failWorkspace } = await fixture();
   await service.send("payments", "start");
-  assert.deepEqual(endpoint.calls.slice(0, 3).map((call) => call.method), ["thread/read", "thread/turns/list", "turn/start"]);
-  assert.equal(endpoint.calls[2]?.params.cwd, endpoint.cwd);
+  assert.deepEqual(endpoint.calls.slice(0, 2).map((call) => call.method), ["thread/read", "turn/start"]);
+  assert.equal(endpoint.calls[1]?.params.cwd, endpoint.cwd);
 
   endpoint.calls.length = 0;
   failWorkspace();
   await assert.rejects(service.send("payments", "blocked"), /changed unexpectedly/);
   assert.equal(endpoint.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer"), false);
+});
+
+test("an authoritative native send response records the adopted epoch's first managed turn", async () => {
+  const accepted: string[] = [];
+  const { service } = await fixture({ onTurnAccepted: (turnId) => { accepted.push(turnId); } });
+
+  await service.send("payments", "start");
+
+  assert.deepEqual(accepted, ["started-1"]);
 });
 
 test("a poisoned persisted active turn cannot authorize interrupt", async () => {
@@ -290,26 +311,26 @@ test("interrupt recovery resumes the exact native active turn when runtime cache
     && call.params.turnId === "recovered-active"));
 });
 
-test("an unavailable live view is refreshed and interrupted without persisted restore state", async () => {
+test("an unavailable live view can interrupt an explicitly identified native turn", async () => {
   const value = await fixture();
   value.native.invalidateEndpoint("local", value.nativeGeneration);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
 
-  assert.equal(await value.service.interrupt("payments"), "remote-active");
+  assert.equal(await value.service.interrupt("payments", "remote-active", { recoverExactTurn: true }), "remote-active");
 
   assert.ok(value.endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "remote-active"));
   assert.equal(value.native.view({ endpointId: "local", threadId: "thread", mappingId })?.activeTurnId, null);
 });
 
-test("registry-managed interrupt has no persisted management mirror to poison", async () => {
+test("registry-managed interrupt uses an explicit native turn without persisted management state", async () => {
   const value = await fixture();
   assert.equal(value.db.prepare("SELECT name FROM sqlite_master WHERE name = 'session_runtime'").get(), undefined);
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "remote-active", status: "inProgress", itemsView: "full", items: [] }];
   value.native.invalidateEndpoint("local", value.nativeGeneration);
 
-  assert.equal(await value.service.interrupt("payments"), "remote-active");
+  assert.equal(await value.service.interrupt("payments", "remote-active", { recoverExactTurn: true }), "remote-active");
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), true);
 });
 
@@ -394,15 +415,17 @@ test("native active state is sufficient to steer and interrupt a managed session
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), true);
 });
 
-test("a fresh native read overrides a stale idle projection before auto dispatch", async () => {
+test("a fresh active native read never scans history or starts a competing turn", async () => {
   const value = await fixture();
   value.endpoint.status = "active";
   value.endpoint.threadTurns = [{ id: "native-active", status: "inProgress", items: [] }];
 
-  const result = await value.service.send("payments", "follow up");
+  await assert.rejects(value.service.send("payments", "follow up"), (error: unknown) => (
+    error instanceof AppError && error.code === "SESSION_BUSY"
+  ));
 
-  assert.deepEqual(result, { mode: "steer", turnId: "native-active" });
-  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer"), true);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/turns/list"), false);
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/steer"), false);
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), false);
 });
 
@@ -503,7 +526,7 @@ test("status activates a cold managed endpoint before reading its native generat
   assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/goal/get"]);
 });
 
-test("status derives the active turn from authoritative history without a runtime cache", async () => {
+test("status reads active native metadata without loading turn history", async () => {
   const { endpoint, service } = await fixture();
   endpoint.status = "active";
   endpoint.threadTurns = [
@@ -512,9 +535,9 @@ test("status derives the active turn from authoritative history without a runtim
   ];
 
   const status = await service.status("payments") as any;
-  assert.equal(status.activeTurnId, "active-turn");
+  assert.equal(status.activeTurnId, null);
   assert.equal(endpoint.calls.find((call) => call.method === "thread/read")?.params.includeTurns, false);
-  assert.ok(endpoint.calls.some((call) => call.method === "thread/turns/list"));
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/turns/list"), false);
 });
 
 test("status binds its native snapshot before a blocked goal read so a newer notification wins", async () => {
@@ -567,7 +590,9 @@ test("a failed start retains pending settings and steer never consumes them", as
   const { endpoint, controls, observeNative, service } = await fixture();
   controls.setModel("local", "thread", mappingId, "gpt-5");
   endpoint.failNextStart = true;
-  await assert.rejects(service.send("payments", "first", { mode: "start" }), /start failed/);
+  await assert.rejects(service.send("payments", "first", { mode: "start" }), (error: unknown) => (
+    error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
+  ));
   assert.deepEqual(controls.settings("local", "thread", mappingId), { model: "gpt-5" });
   observeNative("active", "active-1");
   const steered = await service.send("payments", "more", { mode: "steer", settings: { model: "ignored" } });

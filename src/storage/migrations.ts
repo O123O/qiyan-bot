@@ -801,4 +801,14 @@ export const migrations: readonly Migration[] = [
   DROP TABLE IF EXISTS session_rollout_owned_turns;
   DROP TABLE IF EXISTS session_rollout_ownership;
   `,
+  // Adoption does not read historical turns. Persist the first native turn observed after the
+  // reservation so missed-final recovery has an exact, clock-free inclusive boundary.
+  (db) => {
+    const columns = tableColumns(db, "managed_epochs");
+    if (!columns.has("recovery_mode")) {
+      db.exec(`ALTER TABLE managed_epochs ADD COLUMN recovery_mode TEXT NOT NULL DEFAULT 'from_beginning'
+        CHECK(recovery_mode IN ('from_beginning', 'from_first_turn'))`);
+    }
+    if (!columns.has("first_turn_id")) db.exec("ALTER TABLE managed_epochs ADD COLUMN first_turn_id TEXT");
+  },
 ];

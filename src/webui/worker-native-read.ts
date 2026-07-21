@@ -68,11 +68,11 @@ export async function readReadyWorkerTurns(
     const history = new ThreadHistoryReader((method, params) => deps.request(endpointId, method, params, signal, lease));
     const page = await history.turnsPage(threadId, {
       ...(cursorState.nativeCursor === undefined ? {} : { cursor: cursorState.nativeCursor }),
-      // Match Codex Web UI's fixed native page: this avoids rescanning a large rollout once per
-      // turn. The wrapped cursor still exposes only the bounded message page requested by our UI.
+      // The foreground panel needs conversational text, never historical tool payloads. Request
+      // Codex's summary projection so a large turn cannot fill or stall the app-server transport.
       limit: 12,
       sortDirection: "desc",
-      itemsView: "full",
+      itemsView: "summary",
     });
     const turns = [...page.data].reverse();
     const pageKey = readyPageKey(turns);

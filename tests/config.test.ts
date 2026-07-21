@@ -125,9 +125,8 @@ test("loadConfig rejects malformed Slack credential identities", () => {
   ] as const) assert.throws(() => loadConfig({ ...slack, [key]: value }, { qiyanHome }), new RegExp(key));
 });
 
-test("loadConfig applies bounded defaults", () => {
+test("loadConfig applies defaults", () => {
   const config = loadConfig(baseEnv(), { qiyanHome });
-  assert.equal(config.maxConcurrentTurns, 4);
   assert.equal(config.maxCollectCount, 20);
   assert.equal(config.mcpHost, "127.0.0.1");
   assert.equal(config.qiyanHome, qiyanHome);

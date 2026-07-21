@@ -7,12 +7,10 @@ import { reportOperationalSafely } from "../../src/production-app.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { SessionControlStore } from "../../src/storage/session-control-store.ts";
 import { SessionDashboardStore } from "../../src/storage/session-dashboard-store.ts";
-import type { EndpointWorkLease } from "../../src/endpoints/types.ts";
 
 const mappingId = "mapping-1";
 
 function fixture(options: {
-  readThread?: (endpointId: string, threadId: string, lease?: EndpointWorkLease) => Promise<any>;
   readGoal?: () => Promise<any>;
   classifyFailure?: (error: unknown) => "retry" | "endpoint" | "sleep";
   retryMs?: number;
@@ -34,7 +32,6 @@ function fixture(options: {
   const errors: unknown[] = [];
   const processor = new SessionObservationProcessor(store, registry, controls, {
     now: () => 1_000,
-    readThread: options.readThread ?? (async () => ({ turns: [] })),
     readGoal: options.readGoal ?? (async () => ({ goal: null })),
     onChanged: () => { changes += 1; },
     onError: (error) => {
@@ -91,7 +88,7 @@ const usage = {
 };
 
 test("accepts body-free fact observations durably and ignores lifecycle status", async () => {
-  const value = fixture({ readThread: async () => ({ turns: [{ id: "turn-1", startedAt: 1 }] }) });
+  const value = fixture();
   assert.equal(value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress", startedAt: 1, items: [{ type: "agentMessage", text: "secret body" }] } }), true);
   assert.equal(value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high", cwd: "/ignored" } }), true);
   assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "turn-1", tokenUsage: usage }), true);
@@ -170,7 +167,7 @@ test("an unknown goal status cannot revoke controlled-goal state", async () => {
 });
 
 test("replays a token notification accepted before a crash", async () => {
-  const value = fixture({ readThread: async () => ({ turns: [{ id: "turn-1", startedAt: 1 }] }) });
+  const value = fixture();
   value.store.acceptNotification("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "turn-1", tokenUsage: usage }, 1_000);
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).tokenUsage, null);
   await value.processor.drain();
@@ -238,8 +235,8 @@ test("resume projects settings and turn order but never persists native liveness
 test("idle waits for a blocked handler and leaves endpoint failures pending for retry", async () => {
   let reject!: (error: Error) => void;
   const blocked = new Promise<any>((_resolve, rejectPromise) => { reject = rejectPromise; });
-  const value = fixture({ readThread: async () => blocked });
-  value.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "unknown", tokenUsage: usage });
+  const value = fixture({ readGoal: async () => blocked });
+  value.processor.accept("local", "thread/goal/cleared", { threadId: "thread-1" });
   let settled = false;
   const idle = value.processor.idle().then(() => { settled = true; });
   await new Promise((resolve) => setImmediate(resolve));
@@ -384,7 +381,7 @@ test("throwing operational reporting cannot suppress repeated observation retrie
   assert.equal((value.db.prepare("SELECT COUNT(*) AS count FROM events").get() as { count: number }).count, 0);
 });
 
-test("endpoint failures and deferred observations sleep until an explicit endpoint-ready wake", async () => {
+test("endpoint failures sleep until an explicit endpoint-ready wake", async () => {
   const endpointClock = fakeTimers();
   let endpointReads = 0;
   const endpoint = fixture({
@@ -404,12 +401,6 @@ test("endpoint failures and deferred observations sleep until an explicit endpoi
   assert.equal(endpointReads, 2);
   assert.equal(endpoint.store.pendingNotifications().length, 0);
 
-  const deferredClock = fakeTimers();
-  const deferred = fixture({ readThread: async () => ({ turns: [] }), timers: deferredClock.api });
-  deferred.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "not-visible-yet", tokenUsage: usage });
-  await deferred.processor.idle();
-  assert.equal(deferredClock.timers.length, 0);
-  assert.equal(deferred.store.pendingNotifications().length, 1);
 });
 
 test("unknown and permanent observation failures remain asleep", async () => {
@@ -502,35 +493,28 @@ test("quarantines an invalid durable observation without starving later rows", a
   assert.deepEqual(JSON.parse(invalid.error_json), { message: "invalid thread/tokenUsage/updated notification" });
 });
 
-test("an unorderable token observation stays pending without starving later rows", async () => {
-  const value = fixture({ readThread: async () => ({ turns: [] }) });
+test("a token observation with a missed start event is ordered locally without a history read", async () => {
+  const value = fixture();
   value.processor.accept("local", "thread/tokenUsage/updated", { threadId: "thread-1", turnId: "not-visible-yet", tokenUsage: usage });
   value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
   await value.processor.idle();
 
-  assert.deepEqual(value.store.pendingNotifications().map((item) => item.method), ["thread/tokenUsage/updated"]);
+  assert.deepEqual(value.store.pendingNotifications(), []);
+  assert.equal(value.store.turnOrdinal({ endpointId: "local", threadId: "thread-1" }, "not-visible-yet"), 1);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).tokenUsage?.total.total_tokens, 10);
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).currentSettings.model, "gpt-5");
 });
 
 test("terminal observation stores only metadata and has no lifecycle side effect", async () => {
-  const value = fixture({ readThread: async () => ({ turns: [{ id: "old", startedAt: 1 }, { id: "new", startedAt: 2 }] }) });
+  const value = fixture();
   await value.processor.observeTerminal({ endpointId: "local", threadId: "thread-1", turnId: "old", status: "completed", startedAt: 1, completedAt: 2, finalMessageId: "message-1" });
   assert.deepEqual(value.store.facts({ endpointId: "local", threadId: "thread-1" }).lastWorkerEvent, {
     message_id: "message-1", turn_id: "old", status: "completed", at: "1970-01-01T00:00:02.000Z",
   });
 });
 
-test("terminal ordinal hydration passes through an existing endpoint lease", async () => {
-  const existingLease: EndpointWorkLease = {
-    endpointId: "local", lifecycleGeneration: 2, endpointGeneration: 3, leaseId: "terminal-observation",
-  };
-  const seen: Array<EndpointWorkLease | undefined> = [];
-  const value = fixture({
-    readThread: async (_endpointId, _threadId, lease) => {
-      seen.push(lease);
-      return { turns: [{ id: "terminal", startedAt: 1 }] };
-    },
-  });
+test("terminal observation assigns a local ordinal even when its start event was missed", async () => {
+  const value = fixture();
 
   await value.processor.observeTerminal({
     endpointId: "local",
@@ -540,7 +524,7 @@ test("terminal ordinal hydration passes through an existing endpoint lease", asy
     startedAt: 1,
     completedAt: 2,
     finalMessageId: "message-terminal",
-  }, existingLease);
+  }, { endpointId: "local", lifecycleGeneration: 2, endpointGeneration: 3, leaseId: "terminal-observation" });
 
-  assert.deepEqual(seen, [existingLease]);
+  assert.equal(value.store.turnOrdinal({ endpointId: "local", threadId: "thread-1" }, "terminal"), 1);
 });

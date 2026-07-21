@@ -118,7 +118,6 @@ test("the exact production MCP map succeeds for every local and remote manager a
     sessionRegistryPath: join(dataDir, "sessions.json"),
     endpointCatalogPath: join(qiyanHome, "endpoints.json"),
     codexBinary: "codex",
-    maxConcurrentTurns: 4,
     maxCollectCount: 20,
     mcpHost: "127.0.0.1",
     mcpPort: 0,

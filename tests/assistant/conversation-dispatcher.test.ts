@@ -14,7 +14,7 @@ import type {
   TurnStartParams,
   TurnSteerParams,
 } from "../../src/assistant/conversation-dispatcher.ts";
-import { AssistantStartPreDispatchError, ConversationDispatcher, prepareAssistantStartDispatch } from "../../src/assistant/conversation-dispatcher.ts";
+import { AssistantStartCheckpointError, checkpointAssistantStartDispatch, ConversationDispatcher } from "../../src/assistant/conversation-dispatcher.ts";
 import { AttachmentStore } from "../../src/attachments/store.ts";
 import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
@@ -82,9 +82,9 @@ class FakeRunner implements AssistantTurnPort {
   }
 }
 
-test("a proven pre-dispatch assistant baseline failure releases its claim and retries without a new message", async () => {
+test("a proven pre-dispatch assistant checkpoint failure releases its claim and retries without a new message", async () => {
   const { db, store, pool, runner, dispatcher } = fixture();
-  runner.preDispatchError = new AssistantStartPreDispatchError(new Error("history unavailable"));
+  runner.preDispatchError = new AssistantStartCheckpointError(new Error("checkpoint unavailable"));
   await dispatcher.accept(chat("first"));
   await waitFor(() => runner.starts.length === 1);
 
@@ -96,15 +96,14 @@ test("a proven pre-dispatch assistant baseline failure releases its claim and re
   await dispatcher.stop();
 });
 
-test("assistant start preparation wraps both baseline reads and checkpoint writes as proven pre-dispatch failures", async () => {
-  await assert.rejects(prepareAssistantStartDispatch(
-    async () => { throw new Error("read failed"); },
-    () => assert.fail("checkpoint must not run"),
-  ), (error: unknown) => error instanceof AssistantStartPreDispatchError);
-  await assert.rejects(prepareAssistantStartDispatch(
-    async () => "turn-1",
-    () => { throw new Error("checkpoint failed"); },
-  ), (error: unknown) => error instanceof AssistantStartPreDispatchError);
+test("assistant start preparation checkpoints dispatch without reading history", () => {
+  let baseline: string | null | undefined;
+  checkpointAssistantStartDispatch((value) => { baseline = value; });
+  assert.equal(baseline, null);
+  assert.throws(
+    () => checkpointAssistantStartDispatch(() => { throw new Error("checkpoint failed"); }),
+    (error: unknown) => error instanceof AssistantStartCheckpointError,
+  );
 });
 
 const route = (conversationKey: string): ConversationBinding => ({
@@ -133,7 +132,7 @@ const firstClientId = (store: ConversationStore): string | undefined => {
   return attempt ? store.membersForAttempt(attempt.attemptId)[0]?.clientUserMessageId : undefined;
 };
 
-function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
+function fixture(dispatcherOptions: {
   onTerminal?: (turn: TurnSnapshot) => void;
   onOperationalEvent?: (event: "assistant_turn_started" | "assistant_turn_steered" | "assistant_submission_uncertain" | "assistant_turn_terminal") => void;
   scheduler?: AssistantScheduler;
@@ -144,7 +143,7 @@ function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
   const deliveries = new DeliveryStore(db);
   const store = new ConversationStore(db, deliveries, undefined, { reconciliationBaseMs: 5 });
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns });
+  const pool = new AppServerPool([endpoint]);
   const runner = new FakeRunner();
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
     endpointId: "assistant-local",
@@ -158,7 +157,7 @@ function fixture(maxConcurrentTurns = 1, dispatcherOptions: {
 test("start admission completes before capacity, attempt creation, or submission reservation", async () => {
   const admission = deferred<void>();
   let admissions = 0;
-  const { store, runner, dispatcher } = fixture(1, {
+  const { store, runner, dispatcher } = fixture({
     beforeStartAdmission: () => { admissions += 1; return admission.promise; },
   });
 
@@ -179,7 +178,7 @@ test("start admission completes before capacity, attempt creation, or submission
 
 test("failed start admission retries on the configured timer without reserving a submission", async () => {
   let admissions = 0;
-  const { store, runner, dispatcher } = fixture(1, {
+  const { store, runner, dispatcher } = fixture({
     beforeStartAdmission: async () => { admissions += 1; throw new Error("not ready"); },
   });
   await dispatcher.accept(chat("first"));
@@ -206,7 +205,7 @@ test("stop durably marks an unresolved native submission and awaits its handler"
 
 test("starts an idle conversation and naturally steers same-conversation follow-ups", async () => {
   const operational: string[] = [];
-  const { runner, dispatcher } = fixture(1, { onOperationalEvent: (event) => { operational.push(event); } });
+  const { runner, dispatcher } = fixture({ onOperationalEvent: (event) => { operational.push(event); } });
   await dispatcher.accept(chat("first"));
   assert.equal(runner.starts.length, 1);
   const startClientId = runner.starts[0]!.params.clientUserMessageId;
@@ -264,7 +263,7 @@ test("turn/started remains authoritative when the pending start response rejects
 test("a correlated completion is authoritative before the delayed start response", async () => {
   const deferred: string[] = [];
   let deferredCommit: Promise<unknown> | undefined;
-  const { store, pool, runner, dispatcher } = fixture(1, { onTerminal: (turn) => {
+  const { store, pool, runner, dispatcher } = fixture({ onTerminal: (turn) => {
     deferred.push(turn.id);
     const terminal = {
       id: turn.id,
@@ -307,7 +306,7 @@ test("a correlated completion is authoritative before the delayed start response
 test("terminal finalization before the exact start response remains idempotent and keeps pumping", async () => {
   let runtime!: AssistantRuntime;
   const operational: string[] = [];
-  const { db, deliveries, store, runner, dispatcher } = fixture(1, {
+  const { db, deliveries, store, runner, dispatcher } = fixture({
     onOperationalEvent: (event) => operational.push(event),
     onTerminal: (turn) => { runtime.handleTerminal(turn.id, "completed", "done"); },
   });
@@ -336,7 +335,7 @@ test("an exact-attempt barrier preserves a pending steer without waiting for oth
   let runtime!: AssistantRuntime;
   let dispatcher!: ConversationDispatcher;
   let terminalSettlement: Promise<void> | undefined;
-  const value = fixture(1, {
+  const value = fixture({
     onTerminal: (turn) => {
       const attempt = runtime.contextForTurn(turn.id)!;
       terminalSettlement = dispatcher.waitForAttemptSubmissions(attempt.attemptId).then(() => {
@@ -373,7 +372,7 @@ test("an exact-attempt barrier includes delayed reconciliation of an ambiguous s
   let terminalSettlement: Promise<void> | undefined;
   let terminalSettled = false;
   const history = deferred<void>();
-  const value = fixture(1, {
+  const value = fixture({
     onTerminal: (turn) => {
       const attempt = runtime.contextForTurn(turn.id)!;
       terminalSettlement = dispatcher.waitForAttemptSubmissions(attempt.attemptId).then(() => {
@@ -420,7 +419,7 @@ test("a client-correlated completion cannot be overwritten by a delayed mismatch
   const deliveries = new DeliveryStore(db);
   const store = new ConversationStore(db, deliveries);
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
@@ -470,7 +469,7 @@ test("a real pool response mismatch pauses the notification-bound start", async 
   };
   const db = createTestDatabase();
   const store = new ConversationStore(db, new DeliveryStore(db));
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const steers: TurnSteerParams[] = [];
   const runner: AssistantTurnPort = {
     start: (params, claim) => pool.startTurn("assistant-local", { ...params }, claim),
@@ -572,7 +571,7 @@ test("terminal recovery exhausts a durable retry budget across dispatcher restar
     reconciliationMaxAttempts: 1,
   });
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const initialRunner = new FakeRunner();
   const initial = new ConversationDispatcher(store, pool, initialRunner, {
     endpointId: "assistant-local", threadId: "assistant", retryMs: 60_000,
@@ -624,7 +623,7 @@ test("a failed terminal finalization can republish only through its durable reco
     reconciliationMaxAttempts: 1,
   });
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   runner.history = {
     status: "idle",
@@ -978,7 +977,7 @@ test("holds one native steer at a time and only queues another conversation", as
 test("terminal notification fences the attempt while a steer response is pending", async () => {
   const deferred: string[] = [];
   const memberships: string[] = [];
-  const { store, runner, dispatcher } = fixture(1, {
+  const { store, runner, dispatcher } = fixture({
     onTerminal: (turn) => { deferred.push(turn.id); },
     membershipObserver: { notifyMembership: (contextId) => { memberships.push(contextId); } },
   });
@@ -999,7 +998,7 @@ test("terminal notification fences the attempt while a steer response is pending
 
 test("terminal notification resumes after a late nonsteerable response restores the owner input", async () => {
   const deferred: string[] = [];
-  const { db, store, runner, dispatcher } = fixture(1, { onTerminal: (turn) => { deferred.push(turn.id); } });
+  const { db, store, runner, dispatcher } = fixture({ onTerminal: (turn) => { deferred.push(turn.id); } });
   await dispatcher.accept(chat("first"));
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
@@ -1027,7 +1026,7 @@ test("permanently unavailable recovery isolates an uncertain steer after termina
     reconciliationMaxAttempts: 1,
   });
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const firstRunner = new FakeRunner();
   const terminal: string[] = [];
   const first = new ConversationDispatcher(store, pool, firstRunner, {
@@ -1065,7 +1064,7 @@ test("an empty completion after an admitted steer restores both chat sources", a
   const deliveries = new DeliveryStore(db);
   const store = new ConversationStore(db, deliveries);
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
   const finals = new FinalMessageStore(db);
@@ -1114,7 +1113,7 @@ test("an empty completion after an admitted steer restores both chat sources", a
 
 test("a correlated started notification consumes a matching buffered early completion", async () => {
   const deferred: string[] = [];
-  const { store, runner, dispatcher } = fixture(1, { onTerminal: (turn) => { deferred.push(turn.id); } });
+  const { store, runner, dispatcher } = fixture({ onTerminal: (turn) => { deferred.push(turn.id); } });
   await dispatcher.accept(chat("first"));
   const clientId = runner.starts[0]!.params.clientUserMessageId;
   await dispatcher.terminal({ id: "turn-a", status: "completed", itemsView: "full", items: [] });
@@ -1224,7 +1223,7 @@ test("unknown terminal evidence is reconciled from one authoritative recovery sn
   await first.dispatcher.stop();
 
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const recoveredPool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const recoveredPool = new AppServerPool([endpoint], {});
   const recoveredRunner = new FakeRunner();
   recoveredRunner.history = { status: "idle", turns: [] };
   const recovered = new ConversationDispatcher(first.store, recoveredPool, recoveredRunner, {
@@ -1253,7 +1252,7 @@ test("an idle recovery snapshot clears process-local assistant tool admission", 
   assert.equal(runtime.current()?.turnId, "turn-old");
 
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   runner.history = { status: "idle", turns: [] };
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
@@ -1274,7 +1273,7 @@ test("endpoint loss clears tool admission and fences a late start response", asy
   const store = new ConversationStore(db, deliveries);
   const runtime = new AssistantRuntime(db, new OperationStore(db), deliveries, { binding: route("chat-1") });
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   runner.history = { status: "idle", turns: [] };
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
@@ -1302,7 +1301,7 @@ test("direct terminal start paths account for one completed conversation period"
   const correlatedScheduler = new AssistantScheduler();
   let correlatedPeriods = 0;
   correlatedScheduler.noteConversationPeriodCompleted = () => { correlatedPeriods += 1; };
-  const correlated = fixture(1, { scheduler: correlatedScheduler });
+  const correlated = fixture({ scheduler: correlatedScheduler });
   await correlated.dispatcher.accept(chat("first"));
   const clientId = correlated.runner.starts[0]!.params.clientUserMessageId;
   await correlated.dispatcher.terminal({
@@ -1317,7 +1316,7 @@ test("direct terminal start paths account for one completed conversation period"
   const responseScheduler = new AssistantScheduler();
   let responsePeriods = 0;
   responseScheduler.noteConversationPeriodCompleted = () => { responsePeriods += 1; };
-  const response = fixture(1, { scheduler: responseScheduler });
+  const response = fixture({ scheduler: responseScheduler });
   await response.dispatcher.accept(chat("first"));
   response.runner.starts[0]!.result.resolve({ turn: { id: "turn-b", status: "completed", itemsView: "full", items: [] } });
   await response.dispatcher.idle();
@@ -1347,7 +1346,7 @@ test("terminal summary keeps an unproven steer durably unresolved with its attem
 
 test("terminal history restores a steer proven absent before forwarding finalization", async () => {
   const deferred: TurnSnapshot[] = [];
-  const { db, runner, dispatcher } = fixture(1, { onTerminal: (turn) => { deferred.push(turn); } });
+  const { db, runner, dispatcher } = fixture({ onTerminal: (turn) => { deferred.push(turn); } });
   await dispatcher.accept(chat("first"));
   runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
@@ -1369,7 +1368,7 @@ test("terminal history restores a steer proven absent before forwarding finaliza
 test("terminal history admits a positively correlated steer before forwarding finalization", async () => {
   const deferred: TurnSnapshot[] = [];
   const memberships: string[] = [];
-  const { db, runner, dispatcher } = fixture(1, {
+  const { db, runner, dispatcher } = fixture({
     onTerminal: (turn) => { deferred.push(turn); },
     membershipObserver: { notifyMembership: (contextId) => { memberships.push(contextId); } },
   });
@@ -1423,7 +1422,7 @@ test("submission input preserves text, image, and document source order", async 
   const document = await attachments.ingest("first", Readable.from(["doc"]), { displayName: "two.txt", mediaType: "text/plain" });
   const store = new ConversationStore(db, new DeliveryStore(db), attachments);
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   const dispatcher = new ConversationDispatcher(store, pool, runner, { endpointId: "assistant-local", threadId: "assistant", attachments });
   context.after(() => dispatcher.stop());
@@ -1456,16 +1455,14 @@ test("failed attachments are separate model input and never mutate owner text", 
   await dispatcher.idle();
 });
 
-test("capacity exhaustion leaves input pending and wakes once after capacity release", async () => {
-  const { db, pool, runner, dispatcher } = fixture();
+test("an unrelated turn claim does not block assistant input", async () => {
+  const { pool, runner, dispatcher } = fixture();
   const blocker = pool.claimTurnCapacity("assistant-local", "other", "blocker");
   await dispatcher.accept(chat("first"));
-  assert.equal(runner.starts.length, 0);
-  assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'first'").get()!.state, "pending");
-  pool.releaseTurnCapacityClaim(blocker);
-  await waitFor(() => runner.starts.length === 1);
   assert.equal(runner.starts.length, 1);
   assert.equal(runner.starts[0]?.claim.id, "assistant:first");
+  assert.equal(pool.activeTurnCount, 2);
+  pool.releaseTurnCapacityClaim(blocker);
   runner.starts[0]!.result.resolve({ turn: { id: "turn", status: "inProgress", itemsView: "full", items: [] } });
   await dispatcher.idle();
   await dispatcher.stop();
@@ -1552,7 +1549,7 @@ test("terminal post-baseline history correlation binds identity and triggers fin
   const db = createTestDatabase();
   const store = new ConversationStore(db, new DeliveryStore(db));
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   const terminal: TurnSnapshot[] = [];
   const dispatcher = new ConversationDispatcher(store, pool, runner, {
@@ -1593,7 +1590,7 @@ test("a starved internal event wins only at an attempt boundary and materializes
   scheduler.enqueueEvent({ id: "e1", sessionKey: "worker", payload: { final: true } });
   for (let index = 0; index < 5; index += 1) scheduler.noteConversationPeriodCompleted();
   const endpoint: AppServerEndpoint = { id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); } };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new FakeRunner();
   const dispatcher = new ConversationDispatcher(store, pool, runner, { endpointId: "assistant-local", threadId: "assistant", scheduler });
   await dispatcher.accept(chat("chat-pending"));

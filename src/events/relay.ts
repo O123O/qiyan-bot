@@ -152,7 +152,7 @@ export class EventRelay {
   }
 
   reconcileEndpoint(endpointId: string, lease?: EndpointWorkLease): Promise<void> {
-    return this.endpointReady(endpointId, lease);
+    return this.recoverEndpoint(endpointId, lease, true);
   }
 
   endpointUnavailable(endpointId: string): void {
@@ -163,17 +163,28 @@ export class EventRelay {
   }
 
   async endpointReady(endpointId: string, lease?: EndpointWorkLease): Promise<void> {
+    return this.recoverEndpoint(endpointId, lease, false);
+  }
+
+  private async recoverEndpoint(
+    endpointId: string,
+    lease: EndpointWorkLease | undefined,
+    reconcileHistory: boolean,
+  ): Promise<void> {
     if (this.stopped) return;
     this.unavailableEndpoints.delete(endpointId);
     const generation = this.advanceEndpointGeneration(endpointId);
     this.clearRetryTimer(endpointId);
-    this.scanPendingEndpoints.add(endpointId);
+    if (reconcileHistory) this.scanPendingEndpoints.add(endpointId);
+    if (!this.hasPendingWork(endpointId)) return;
     await this.enqueueEndpoint(endpointId, async () => {
       if (!this.runIsCurrent(endpointId, generation)) return;
       try {
         await this.options.withEndpointWorkLease(endpointId, lease, async (activeLease) => {
-          const complete = await this.reconcileHistory(endpointId, activeLease, generation);
-          if (complete && this.runIsCurrent(endpointId, generation)) this.scanPendingEndpoints.delete(endpointId);
+          if (this.scanPendingEndpoints.has(endpointId)) {
+            const complete = await this.reconcileHistory(endpointId, activeLease, generation);
+            if (complete && this.runIsCurrent(endpointId, generation)) this.scanPendingEndpoints.delete(endpointId);
+          }
           for (const target of this.targetsForEndpoint(endpointId)) {
             if (!this.runIsCurrent(endpointId, generation)) return;
             if (!this.retryTargets.has(relayTargetKey(target))) continue;
@@ -208,7 +219,7 @@ export class EventRelay {
 
   private captureTarget(endpointId: string, threadId: string, turnId: string, fullTurn?: TerminalTurn): RelayTarget | undefined {
     const mapping = this.mapping(endpointId, threadId);
-    if (!mapping || mapping.session.lifecycle_state !== "managed") return undefined;
+    if (!mapping || (mapping.session.lifecycle_state !== "managed" && mapping.session.lifecycle_state !== "adopting")) return undefined;
     const epoch = this.epochs.current(endpointId, threadId, mapping.session.mapping_id);
     if (!epoch) return undefined;
     return {
@@ -294,7 +305,11 @@ export class EventRelay {
         if (mapping.session.mapping_id !== session.mapping_id) return false;
         if (mapping.session.lifecycle_state !== "managed" || !epoch) return true;
         const targetGeneration = { mappingId: session.mapping_id, epochId: epoch.id };
+        const deliveryCursor = this.progress.cursor(endpointId, session.thread_id, session.mapping_id);
         if (this.progress.recoveryIncident(endpointId, session.thread_id, session.mapping_id)) {
+          // Without a delivered managed turn, an adopted epoch has no authority to treat the
+          // latest historical terminal as managed. Preserve the incident for operator attention.
+          if (epoch.recoveryMode === "from_first_turn" && deliveryCursor === undefined) return true;
           // A bounded historical scan may have left an acknowledged gap, but it must not poison the
           // mapping forever. Re-establish a delivery boundary from only the latest terminal; the
           // prior warning remains the durable disclosure that older finals may have been skipped.
@@ -319,9 +334,17 @@ export class EventRelay {
           }
           return false;
         }
-        const anchorTurnId = this.progress.cursor(endpointId, session.thread_id, session.mapping_id) ?? epoch.baselineTurnId;
         const budget = createHistoryScanBudget();
-        const suffix = await this.pool.historyReader(endpointId, lease).descendingSuffix(session.thread_id, anchorTurnId, budget);
+        const reader = this.pool.historyReader(endpointId, lease);
+        let suffix;
+        if (deliveryCursor !== undefined || epoch.baselineTurnId !== undefined) {
+          suffix = await reader.descendingSuffix(session.thread_id, deliveryCursor ?? epoch.baselineTurnId, budget);
+        } else if (epoch.recoveryMode === "from_first_turn") {
+          if (epoch.firstTurnId === undefined) return true;
+          suffix = await reader.descendingFrom(session.thread_id, epoch.firstTurnId, budget);
+        } else {
+          suffix = await reader.descendingSuffix(session.thread_id, undefined, budget);
+        }
         if (!this.runIsCurrent(endpointId, generation)) return false;
         const current = this.mapping(endpointId, session.thread_id);
         if (!current) return true;
@@ -329,7 +352,6 @@ export class EventRelay {
         if (!this.runIsCurrent(endpointId, generation)
           || !this.isDeliverableGeneration(endpointId, session.thread_id, targetGeneration)) return false;
         if (!suffix.anchorFound) return false;
-        const reader = this.pool.historyReader(endpointId, lease);
         for (const metadata of [...suffix.turns].reverse()) {
           const exact = await reader.exactTurnItems(session.thread_id, metadata.id, { budget });
           const turn = terminalTurn(metadata, exact.turn, exact.items);
@@ -435,10 +457,12 @@ export class EventRelay {
 
   private targetState(target: RelayTarget): "deliverable" | "retry" | "stale" {
     const mapping = this.mapping(target.endpointId, target.threadId);
-    if (!mapping || mapping.session.mapping_id !== target.mappingId || mapping.session.lifecycle_state !== "managed") return "stale";
+    if (!mapping || mapping.session.mapping_id !== target.mappingId) return "stale";
     const epoch = this.epochs.current(target.endpointId, target.threadId, target.mappingId);
     if (!epoch || epoch.id !== target.epochId) return "stale";
-    return "deliverable";
+    return mapping.session.lifecycle_state === "managed"
+      ? "deliverable"
+      : mapping.session.lifecycle_state === "adopting" ? "retry" : "stale";
   }
 
   private isDeliverableGeneration(

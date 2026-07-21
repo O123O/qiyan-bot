@@ -13,7 +13,7 @@ export type WorkerStatus = {
 export function workerStatus(session: WorkerStateSnapshot): WorkerStatus {
   if (session.lifecycleState !== "managed" || session.nativeStatus === null) return { label: "unavailable", tone: "unavailable" };
   if (session.nativeStatus === "systemError") return { label: "error", tone: "error" };
-  if (session.activeTurnId !== null || session.nativeStatus === "active" || session.goal?.status === "active") {
+  if (session.activeTurnId !== null || session.nativeStatus === "active") {
     return { label: "working", tone: "working" };
   }
   if (session.nativeStatus === "idle" || session.nativeStatus === "notLoaded") return { label: "idle", tone: "idle" };

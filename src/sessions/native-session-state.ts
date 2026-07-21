@@ -154,6 +154,7 @@ export class NativeSessionState {
     const sequence = this.nextSequence(endpointId, endpointGeneration);
     const turn = record(values?.turn);
     const turnId = string(turn?.id);
+    const directTurnId = string(values?.turnId);
     let refreshRequired = method === "turn/started" && !turnId;
 
     for (const key of keys) {
@@ -169,8 +170,24 @@ export class NativeSessionState {
         if (current.activeTurnId === turnId) {
           this.apply(current, { status: "idle", activeTurnId: null, receiveSequence: sequence });
         } else if (current.status !== "idle") {
+          // Preserve the possibly different active turn, but fence every response dispatched
+          // before this terminal evidence. The requested refresh will settle current truth.
+          this.apply(current, {
+            status: current.status,
+            activeTurnId: current.activeTurnId,
+            receiveSequence: sequence,
+          });
           refreshRequired = true;
+        } else {
+          // Even a completion whose start was missed is lifecycle evidence. Advance the revision
+          // so an older read/resume response cannot resurrect the completed turn as active.
+          this.apply(current, { status: "idle", activeTurnId: null, receiveSequence: sequence });
         }
+        continue;
+      }
+      if (method.startsWith("item/") && directTurnId
+        && !this.isTerminal(endpointId, endpointGeneration, threadId, directTurnId)) {
+        this.apply(current, { status: "active", activeTurnId: directTurnId, receiveSequence: sequence });
         continue;
       }
       if (method === "thread/status/changed") {
@@ -180,7 +197,6 @@ export class NativeSessionState {
           activeTurnId: status === "active" ? current.activeTurnId : null,
           receiveSequence: sequence,
         });
-        if (status === "active" && current.activeTurnId === null) refreshRequired = true;
       }
     }
     return refreshRequired;

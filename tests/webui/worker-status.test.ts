@@ -14,7 +14,7 @@ const session = (overrides: Partial<Parameters<typeof workerStatus>[0]> = {}) =>
 test("maps live worker state to explicit user-facing status", () => {
   assert.deepEqual(workerStatus(session({ activeTurnId: "turn-1" })), { label: "working", tone: "working" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "active" })), { label: "working", tone: "working" });
-  assert.deepEqual(workerStatus(session({ goal: { status: "active" } })), { label: "working", tone: "working" });
+  assert.deepEqual(workerStatus(session({ goal: { status: "active" } })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ goal: { status: "paused" } })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "idle" })), { label: "idle", tone: "idle" });
   assert.deepEqual(workerStatus(session({ nativeStatus: "notLoaded" })), { label: "idle", tone: "idle" });

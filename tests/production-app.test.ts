@@ -19,6 +19,8 @@ import {
   managedRecoveryDisposition,
   managedRecoveryRequiresConnectionResume,
   managedRetryKey,
+  routeWorkerNativeRefresh,
+  settleDeferredWorkerNativeRefreshes,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
   operationRecoveryAction,
@@ -34,6 +36,7 @@ import {
   stopOperationRecoveryBeforeTools,
   reconcileLifecycleTransitions,
   reconcileAbsentRecoveredSendStart,
+  reconcileRecoveredAdoptionFromRegistry,
   recoverManagedEndpointReady,
   recoverStartupManagedEndpoint,
   requireManagedRecoveryAcknowledged,
@@ -82,10 +85,40 @@ import { HistoryScanBudgetExhaustedError } from "../src/app-server/thread-histor
 import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
 import { EndpointManager } from "../src/endpoints/manager.ts";
+import { NativeSessionState } from "../src/sessions/native-session-state.ts";
 
 test("delivery receipts cannot schedule assistant turns", () => {
   assert.equal(assistantEventIsActionable("delivery_status"), false);
   assert.equal(assistantEventIsActionable("turn_terminal"), true);
+});
+
+test("an adopting completion defers native refresh until the mapping is managed", () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "local", threadId: "thread-1", mappingId: "mapping-1" };
+  native.register(identity, 7);
+  const initial = native.captureRefresh(identity, 7);
+  native.applyRefresh(initial, { status: "active", activeTurnId: null });
+  const refreshRequired = native.observe("local", 7, "turn/completed", {
+    threadId: "thread-1", turn: { id: "completed-without-start" },
+  });
+  const pending = new Map();
+  const refreshes: string[] = [];
+  const adopting = {
+    endpoint: "local", thread_id: "thread-1", project_dir: "/project", mapping_id: "mapping-1", lifecycle_state: "adopting" as const,
+  };
+
+  routeWorkerNativeRefresh(pending, { nickname: "worker", session: adopting }, refreshRequired, (nickname) => refreshes.push(nickname));
+  assert.equal(refreshes.length, 0, "adoption must not indirectly issue a native read");
+  assert.equal(pending.size, 1);
+
+  settleDeferredWorkerNativeRefreshes(pending, () => adopting, (nickname) => refreshes.push(nickname));
+  assert.equal(refreshes.length, 0);
+  assert.equal(pending.size, 1);
+
+  const managed = { ...adopting, lifecycle_state: "managed" as const };
+  settleDeferredWorkerNativeRefreshes(pending, () => managed, (nickname) => refreshes.push(nickname));
+  assert.deepEqual(refreshes, ["worker"]);
+  assert.equal(pending.size, 0);
 });
 
 test("legacy delivery receipts are coalesced without parsing or scheduling them", () => {
@@ -375,6 +408,9 @@ test("operation recovery waits only for the exact in-process tool handler", () =
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true }), "wait_for_tool");
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: true, recoveryOwned: true }), "wait_for_tool");
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: true, recoveryOwned: true }), "attempt");
+  assert.equal(operationRecoveryAction({
+    kind: "adopt_session", state: "uncertain", activeHandler: true, recoveryOwned: true,
+  }), "wait_for_tool", "adoption recovery cannot outrun its still-active pre-reservation handler");
   assert.equal(operationRecoveryAction({ state: "uncertain", activeHandler: false }), "attempt");
   assert.equal(operationRecoveryAction({ state: "dispatched", activeHandler: false }), "attempt");
 });
@@ -443,10 +479,10 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   for (const kind of localKinds) assert.deepEqual(target(kind), { policy: "local" }, kind);
   assert.deepEqual(target("prepare_chat_attachment", { owner: "assistant" }), { policy: "local" });
   assert.deepEqual(target("prepare_chat_attachment", { owner: "worker-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
-  for (const kind of ["create_session", "adopt_session"]) {
-    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" }, kind);
-    assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, `${kind} checkpoint`);
-  }
+  assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, "create_session checkpoint");
+  assert.deepEqual(target("adopt_session", { nickname: "worker-a", endpoint: "endpoint-a" }), { policy: "ready_endpoint", endpointId: "endpoint-a" });
+  assert.deepEqual(target("adopt_session", { nickname: "worker-a", endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "ready_endpoint", endpointId: "endpoint-b" }, "adopt_session checkpoint");
   assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-a", dispatchStarted: false }), { policy: "local" });
   assert.deepEqual(target("create_session", { endpoint: "endpoint-a" }, { endpoint: "endpoint-b", dispatchStarted: true }), { policy: "ready_endpoint", endpointId: "endpoint-b" });
   assert.deepEqual(target("create_session", { endpoint: "" }), { policy: "ready_endpoint", endpointId: "local" });
@@ -528,6 +564,58 @@ test("a proven no-dispatch create recovery terminalizes without an endpoint leas
   assert.equal(store.get(operation.id)?.state, "failed");
 });
 
+test("adoption recovery resolves the checkpointed registry identity before endpoint access", async () => {
+  const args = { nickname: "worker", endpoint: "devbox", thread_id: "thread" };
+  const recover = async (sessions: Record<string, any>) => {
+    const store = new OperationStore(createTestDatabase());
+    store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/adopt", attachmentIds: [] });
+    const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "adopt_session", args });
+    store.markDispatched(operation.id);
+    store.checkpoint(operation.id, { endpoint: "devbox", threadId: "thread", mappingId: "mapping-old" });
+    store.bindDirective("ctx", "adopt", args, operation.id);
+    store.fail(operation.id, { message: "SSH process failed" }, true);
+    const recovered = store.listRecoverable()[0]!;
+    const target = recoverableOperationTarget(recovered, { defaultProjectEndpointId: "local", session: () => undefined });
+    let endpointCalls = 0;
+    const terminal = await reconcileRecoveredAdoptionFromRegistry(recovered, sessions, {
+      succeed: (receipt) => store.succeed(operation.id, receipt),
+      fail: (error) => store.failAndUnbindWithReconciliation(operation.id, error),
+    });
+    if (!terminal) {
+      await runOperationRecoveryTarget(target, {
+        withReadyWorkLease: async () => { endpointCalls += 1; throw new Error("endpoint unavailable"); },
+      } as never, async () => undefined).catch(() => undefined);
+    }
+    return { store, operation, endpointCalls };
+  };
+
+  const absent = await recover({});
+  assert.equal(absent.endpointCalls, 0);
+  assert.equal(absent.store.get(absent.operation.id)?.state, "failed");
+  assert.deepEqual(absent.store.get(absent.operation.id)?.error, {
+    dispatch: { message: "SSH process failed" },
+    reconciliation: { message: "checkpointed adoption mapping is no longer registered" },
+  });
+  assert.equal(absent.store.replayDirective("ctx", "adopt", args), undefined);
+  const restart = absent.store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "restart", kind: "restart_endpoint", args: { endpoint: "devbox" } });
+  assert.equal(hasEarlierEndpointOperation(absent.store.listRecoverable(), restart.sequence, "devbox", {
+    defaultProjectEndpointId: "local", session: () => undefined,
+  }), false, "terminal adoption no longer fences endpoint restart");
+
+  const renamed = await recover({ renamed: {
+    endpoint: "devbox", thread_id: "thread", project_dir: "/project", mapping_id: "mapping-old", lifecycle_state: "managed",
+  } });
+  assert.equal(renamed.endpointCalls, 0);
+  assert.equal(renamed.store.get(renamed.operation.id)?.state, "succeeded");
+  assert.deepEqual(renamed.store.get(renamed.operation.id)?.receipt, { nickname: "worker", mapping_id: "mapping-old" });
+
+  const reused = await recover({ worker: {
+    endpoint: "devbox", thread_id: "other-thread", project_dir: "/other", mapping_id: "mapping-new", lifecycle_state: "managed",
+  } });
+  assert.equal(reused.endpointCalls, 0);
+  assert.equal(reused.store.get(reused.operation.id)?.state, "failed", "nickname reuse is not mistaken for the old mapping");
+});
+
 test("idle send recovery preserves its raw dispatch error when history proves no turn", () => {
   const store = new OperationStore(createTestDatabase());
   store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/pass private", attachmentIds: [] });
@@ -539,7 +627,7 @@ test("idle send recovery preserves its raw dispatch error when history proves no
   let released = 0;
 
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
-    thread: { status: { type: "idle" }, turns: [] },
+    thread: { status: { type: "idle" }, turns: [], historyWindow: { exhausted: true } },
   }, () => { released += 1; }), true);
 
   assert.equal(released, 1);
@@ -562,6 +650,7 @@ test("send recovery does not terminalize history containing its correlated turn"
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
     thread: {
       status: { type: "idle" },
+      historyWindow: { exhausted: false },
       turns: [{ itemsView: "summary", items: [{ type: "userMessage", clientId: "ctx:call" }] }],
     },
   }, () => { released += 1; }), false);
@@ -587,8 +676,25 @@ test("bounded start recovery proves absence from a nonempty baseline suffix and 
   store.markDispatched(operation.id);
   store.fail(operation.id, { message: "timeout" }, true);
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
-    thread: { status: { type: "idle" }, turns: recoveryTurnSuffix(turns, "old") },
+    thread: { status: { type: "idle" }, turns: recoveryTurnSuffix(turns, "old"), historyWindow: { exhausted: true } },
   }, () => undefined), true);
+});
+
+test("start recovery never proves absence from a non-exhausted bounded window", () => {
+  const store = new OperationStore(createTestDatabase());
+  const args = { nickname: "worker", content: "message", attachment_ids: [], mode: "start" };
+  const operation = store.prepare({ contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session", args });
+  store.markDispatched(operation.id);
+  store.fail(operation.id, { message: "timeout" }, true);
+
+  assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
+    thread: {
+      status: { type: "idle" },
+      turns: [{ itemsView: "summary", items: [{ type: "userMessage", clientId: "someone-else" }] }],
+      historyWindow: { exhausted: false },
+    },
+  }, () => assert.fail("partial history cannot prove absence")), false);
+  assert.equal(store.get(operation.id)?.state, "uncertain");
 });
 
 test("start recovery never proves absence from an unhydrated suffix", () => {
@@ -598,7 +704,7 @@ test("start recovery never proves absence from an unhydrated suffix", () => {
   store.markDispatched(operation.id);
   store.fail(operation.id, { message: "timeout" }, true);
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
-    thread: { status: { type: "idle" }, turns: [{ itemsView: "notLoaded", items: [] }] },
+    thread: { status: { type: "idle" }, turns: [{ itemsView: "notLoaded", items: [] }], historyWindow: { exhausted: true } },
   }, () => assert.fail("unhydrated history is not proof")), false);
 });
 
@@ -1362,7 +1468,7 @@ test("managed pending failures still wake unrelated shared owners exactly once p
     relay: { endpointReady: async () => { shared.push(`${owner}:relay`); } },
     observations: { endpointReady: async () => { shared.push(`${owner}:observations`); } },
     onError: () => assert.fail("unexpected shared owner failure"),
-  }, "endpoint-a", lease);
+  }, "endpoint-a");
   const owner = createManagedSessionRecoveryOwner({
     endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
     isLeaseCurrent: () => true,
@@ -1858,11 +1964,15 @@ test("a partial managed restore survives another mapping entering endpoint wait"
 test("restored-session downstream owners are isolated and operational reporting cannot throw", async () => {
   const calls: string[] = [];
   await wakeRestoredSessionOwners({
-    relay: { endpointReady: async () => { calls.push("relay"); throw new Error("relay failed"); } },
+    relay: { endpointReady: async (_endpointId, lease) => {
+      assert.equal(lease, undefined, "detached relay work must own a fresh endpoint lease");
+      calls.push("relay");
+      throw new Error("relay failed");
+    } },
     observations: { endpointReady: async () => { calls.push("observations"); throw new Error("observation failed"); } },
     onError: (owner) => { calls.push(`error:${owner}`); },
   }, "endpoint-a");
-  assert.deepEqual(calls, ["relay", "error:relay", "observations", "error:observations"]);
+  assert.deepEqual(calls, ["relay", "observations", "error:relay", "error:observations"]);
 
   let reports = 0;
   assert.doesNotThrow(() => reportOperationalSafely(() => {

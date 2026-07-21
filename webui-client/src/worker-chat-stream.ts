@@ -333,9 +333,13 @@ function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): Wo
   const id = `${role === "you" ? "u" : "a"}:${event.turnId}:${event.item.id}`;
   let messages = state.messages;
   const clientId = event.item.type === "user-message" ? event.item.clientId : undefined;
-  if (clientId) messages = messages.filter((message) => !(message.optimistic && message.clientId === clientId));
-  const existing = messages.find((message) => message.id === id);
-  if (!completed && existing && !existing.streaming) return messages === state.messages ? state : { ...state, messages };
+  const correlated = clientId
+    ? messages.find((message) => message.clientId === clientId && message.role === role)
+    : undefined;
+  if (clientId) messages = messages.filter((message) => message.id === id || message.clientId !== clientId || message.role !== role);
+  const existingById = messages.find((message) => message.id === id);
+  const existing = existingById ?? correlated;
+  if (!completed && existingById && !existingById.streaming) return messages === state.messages ? state : { ...state, messages };
   const resolvedClientId = clientId ?? existing?.clientId;
   const resolvedPhase = event.item.type === "agent-message" ? event.item.phase ?? existing?.phase : undefined;
   const message: WorkerChatMessage = {

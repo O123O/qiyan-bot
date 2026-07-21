@@ -206,7 +206,7 @@ test("real assistant can call its approved manager MCP while a project worker ca
       if (method === "turn/completed" && params.threadId === thread.thread.id) { clearTimeout(timeout); unsubscribe(); resolve(params.turn); }
     });
   });
-  const pool = new AppServerPool([endpoint, worker], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint, worker], {});
   const started = await pool.startTurn<any>(endpoint.id, {
     threadId: thread.thread.id,
     clientUserMessageId: "mcp-integration",

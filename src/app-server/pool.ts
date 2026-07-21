@@ -39,30 +39,14 @@ interface TurnStartResponse { turn: { id: string } }
 interface ClaimState extends TurnCapacityClaim {
   phase: "provisional" | "active";
   turnId?: string;
-  origin: "caller" | "implicit" | "cold-active" | "cold-provisional";
-  clientUserMessageId?: string;
-  baselineTurnId?: string | null;
-  scannedTurnIds?: Set<string>;
+  origin: "caller" | "implicit";
 }
 
 interface TerminalClaim extends TurnCapacityClaim { turnId: string }
 type WorkLeaseProvider = <T>(endpointId: string, existing: EndpointWorkLease | undefined, run: (lease: EndpointWorkLease | undefined) => Promise<T>) => Promise<T>;
 
-class StartProvenAbsentError extends Error {}
-
 function isTerminal(status: string): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
-}
-
-function suffixAfterBaseline<T extends { id: string }>(
-  turnsDescending: readonly T[],
-  baselineTurnId: string | null,
-): { turns: T[]; anchorFound: boolean } {
-  if (baselineTurnId === null) return { turns: [...turnsDescending], anchorFound: true };
-  const index = turnsDescending.findIndex((turn) => turn.id === baselineTurnId);
-  return index < 0
-    ? { turns: [], anchorFound: false }
-    : { turns: turnsDescending.slice(0, index), anchorFound: true };
 }
 
 export class AppServerPool {
@@ -72,14 +56,11 @@ export class AppServerPool {
   private readonly claims = new Map<string, ClaimState>();
   private readonly terminalBeforeStart = new Set<string>();
   private readonly terminalClaims = new Map<string, TerminalClaim>();
-  private readonly capacityListeners = new Set<() => void>();
   private readonly endpointStarts = new Map<string, Promise<AppServerEndpoint>>();
-  private readonly resolvedProvisional = new Set<string>();
-  private capacitySignalPending = false;
   private nextClaimGeneration = 1;
   private workLeaseProvider?: WorkLeaseProvider;
 
-  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { maxConcurrentTurns: number; reconciliationTimeoutMs?: number; reconciliationPollMs?: number; sleep?: (ms: number) => Promise<void>; resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint>; workLeaseProvider?: WorkLeaseProvider }) {
+  constructor(endpoints: readonly AppServerEndpoint[], private readonly options: { resolveEndpoint?: (id: string) => Promise<ManagedAppServerEndpoint>; workLeaseProvider?: WorkLeaseProvider } = {}) {
     if (options.workLeaseProvider) this.workLeaseProvider = options.workLeaseProvider;
     for (const endpoint of endpoints) this.publishEndpoint(endpoint);
   }
@@ -176,30 +157,6 @@ export class AppServerPool {
     return this.createClaim(endpointId, threadId, claimId, "caller");
   }
 
-  restoreTurnCapacityClaim(endpointId: string, threadId: string, claimId: string, state: { phase: "provisional" | "active"; turnId?: string }): TurnCapacityClaim {
-    if (state.phase === "active" && !state.turnId) this.conflict(`active capacity claim ${claimId} has no turn ID`);
-    const existing = this.claims.get(claimId);
-    if (existing) {
-      if (existing.endpointId !== endpointId || existing.threadId !== threadId) this.conflict(`capacity claim ${claimId} changed identity`);
-      if (state.phase === "active") {
-        if (existing.phase === "active" && existing.turnId !== state.turnId) this.conflict(`active capacity claim ${claimId} changed turn`);
-        if (existing.phase === "provisional") this.bindTurnCapacityClaim(existing, state.turnId!);
-      }
-      return this.publicClaim(existing);
-    }
-    const terminal = this.terminalClaims.get(claimId);
-    if (terminal) {
-      if (terminal.endpointId !== endpointId || terminal.threadId !== threadId) this.conflict(`terminal capacity claim ${claimId} changed identity`);
-      if (state.phase === "active" && state.turnId !== terminal.turnId) this.conflict(`terminal capacity claim ${claimId} changed turn`);
-      return this.publicClaim(terminal);
-    }
-    const claim = this.createClaim(endpointId, threadId, claimId, "caller");
-    if (state.phase === "active") {
-      this.bindTurnCapacityClaim(claim, state.turnId!);
-    }
-    return claim;
-  }
-
   bindTurnCapacityClaim(claim: TurnCapacityClaim, turnId: string): void {
     const state = this.claims.get(claim.id);
     if (!state || state.endpointId !== claim.endpointId || state.threadId !== claim.threadId || state.generation !== claim.generation) {
@@ -231,152 +188,14 @@ export class AppServerPool {
     this.releaseClaimState(state);
   }
 
-  onCapacityAvailable(listener: () => void): () => void {
-    this.capacityListeners.add(listener);
-    return () => { this.capacityListeners.delete(listener); };
-  }
-
-  restoreObservedActiveTurn(endpointId: string, threadId: string, turnId: string): TurnCapacityClaim {
-    const existing = [...this.claims.values()].find((state) => state.endpointId === endpointId && state.threadId === threadId && state.phase === "active" && state.turnId === turnId);
-    if (existing) return this.publicClaim(existing);
-    const terminal = [...this.terminalClaims.values()].find((state) => state.endpointId === endpointId && state.threadId === threadId && state.turnId === turnId);
-    if (terminal) return this.publicClaim(terminal);
-    const claim = this.createClaim(endpointId, threadId, `observed:${endpointId}:${threadId}:${turnId}`, "cold-active", true);
-    this.bindTurnCapacityClaim(claim, turnId);
-    return claim;
-  }
-
-  restoreProvisionalTurnCapacity(
-    endpointId: string,
-    threadId: string,
-    claimId: string,
-    clientUserMessageId: string,
-    baselineTurnId?: string | null,
-  ): TurnCapacityClaim | undefined {
-    if (this.resolvedProvisional.has(claimId)) return undefined;
-    const existing = this.claims.get(claimId);
-    if (existing?.clientUserMessageId !== undefined && existing.clientUserMessageId !== clientUserMessageId) {
-      this.conflict(`capacity claim ${claimId} changed message correlation`);
-    }
-    const claim = this.createClaim(endpointId, threadId, claimId, "cold-provisional", true);
-    const state = this.claims.get(claim.id);
-    if (state) {
-      if (state.clientUserMessageId === undefined) state.clientUserMessageId = clientUserMessageId;
-      if (baselineTurnId !== undefined) {
-        if (Object.hasOwn(state, "baselineTurnId") && state.baselineTurnId !== baselineTurnId) {
-          this.conflict(`capacity claim ${claimId} changed history baseline`);
-        }
-        state.baselineTurnId = baselineTurnId;
-      }
-    }
-    return claim;
-  }
-
-  hasClaims(endpointId: string): boolean {
-    return [...this.claims.values()].some((state) => state.endpointId === endpointId);
-  }
-
-  async reconcileEndpointClaims(
-    endpointId: string,
-    lease?: EndpointWorkLease,
-    isCurrent: () => boolean = () => true,
-  ): Promise<void> {
-    const byThread = new Map<string, ClaimState[]>();
-    for (const state of this.claims.values()) {
-      if (state.endpointId !== endpointId) continue;
-      const values = byThread.get(state.threadId) ?? [];
-      values.push(state);
-      byThread.set(state.threadId, values);
-    }
-    for (const [threadId, states] of byThread) {
-      if (!isCurrent()) return;
-      let threadStatus: string | undefined;
-      let turns: Awaited<ReturnType<ThreadHistoryReader["turnsPage"]>>["data"];
-      let historyExhausted = false;
-      const reader = this.historyReader(endpointId, lease);
-      const historyBudget = createHistoryScanBudget();
-      try {
-        const metadata = await this.request<{ thread: { status?: string | { type?: string } } }>(
-          endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
-        );
-        if (!isCurrent()) return;
-        threadStatus = typeof metadata.thread.status === "string" ? metadata.thread.status : metadata.thread.status?.type;
-        const page = await reader.turnsPage(threadId, {
-          limit: 128,
-          sortDirection: "desc",
-          itemsView: "notLoaded",
-        });
-        turns = page.data;
-        historyExhausted = page.nextCursor === null;
-      }
-      catch { if (!isCurrent()) return; continue; }
-      if (!isCurrent()) return;
-      const fullyIdle = threadStatus === "idle";
-      for (const state of states) {
-        if (!isCurrent()) return;
-        if (!this.claims.has(state.id)) continue;
-        if (state.phase === "active" && state.turnId) {
-          const turn = turns.find((candidate) => candidate.id === state.turnId);
-          if (turn && isTerminal(turn.status)) this.markTurnTerminal(endpointId, threadId, state.turnId);
-          else if (!turn && fullyIdle) this.releaseClaimState(state);
-          if (!isCurrent()) return;
-          continue;
-        }
-        let turn;
-        try {
-          if (state.clientUserMessageId === undefined || !Object.hasOwn(state, "baselineTurnId")) continue;
-          const suffix = suffixAfterBaseline(turns, state.baselineTurnId ?? null);
-          const anchorFound = suffix.anchorFound && (state.baselineTurnId !== null || historyExhausted);
-          if (!anchorFound) continue;
-          state.scannedTurnIds ??= new Set<string>();
-          for (const candidate of suffix.turns) {
-            if (state.scannedTurnIds.has(candidate.id)) continue;
-            const exact = await reader.exactTurnItems(threadId, candidate.id, { budget: historyBudget });
-            if (isTerminal(candidate.status)) state.scannedTurnIds.add(candidate.id);
-            if (exact.firstUserMessage?.clientId === state.clientUserMessageId) {
-              turn = { ...candidate, itemsView: exact.complete ? "full" : "summary", items: exact.items };
-              break;
-            }
-          }
-        } catch { if (!isCurrent()) return; continue; }
-        if (!turn) {
-          const suffix = suffixAfterBaseline(turns, state.baselineTurnId ?? null);
-          const anchorFound = suffix.anchorFound && (state.baselineTurnId !== null || historyExhausted);
-          if (fullyIdle && anchorFound) { this.resolved(state.id); this.releaseClaimState(state); }
-          if (!isCurrent()) return;
-          continue;
-        }
-        if (isTerminal(turn.status)) {
-          this.resolved(state.id);
-          this.recordTerminalClaim(state, turn.id);
-          this.releaseClaimState(state);
-          if (!isCurrent()) return;
-          continue;
-        }
-        const duplicate = [...this.claims.values()].find((candidate) => candidate.id !== state.id
-          && candidate.endpointId === endpointId && candidate.threadId === threadId
-          && candidate.phase === "active" && candidate.turnId === turn.id);
-        if (duplicate) {
-          this.resolved(state.id);
-          this.releaseClaimState(state);
-        } else {
-          this.resolved(state.id);
-          this.bindTurnCapacityClaim(state, turn.id);
-        }
-        if (!isCurrent()) return;
-      }
-    }
-  }
-
   async startTurn<T extends TurnStartResponse = TurnStartResponse>(
     endpointId: string,
     params: { threadId: string; [key: string]: unknown },
     callerClaim?: TurnCapacityClaim,
     lease?: EndpointWorkLease,
-    reconciliationBaselineTurnId?: string | null,
   ): Promise<T> {
     return this.withWorkLease(endpointId, lease, (admitted) => this.startTurnAdmitted<T>(
-      endpointId, params, callerClaim, admitted, reconciliationBaselineTurnId,
+      endpointId, params, callerClaim, admitted,
     ));
   }
 
@@ -385,7 +204,6 @@ export class AppServerPool {
     params: { threadId: string; [key: string]: unknown },
     callerClaim: TurnCapacityClaim | undefined,
     lease: EndpointWorkLease | undefined,
-    reconciliationBaselineTurnId: string | null | undefined,
   ): Promise<T> {
     const claim = callerClaim
       ? this.publicClaim(this.requiredClaim(callerClaim))
@@ -396,38 +214,12 @@ export class AppServerPool {
     const callerSuppliedCorrelation = typeof params.clientUserMessageId === "string";
     const clientUserMessageId = callerSuppliedCorrelation ? params.clientUserMessageId as string : crypto.randomUUID();
     const startParams = callerSuppliedCorrelation ? params : { ...params, clientUserMessageId };
-    const claimState = this.claims.get(claim.id);
-    if (claimState) {
-      claimState.clientUserMessageId = clientUserMessageId;
-      if (!callerClaim) {
-        if (reconciliationBaselineTurnId !== undefined) claimState.baselineTurnId = reconciliationBaselineTurnId;
-        else {
-          try { claimState.baselineTurnId = (await this.historyReader(endpointId, lease).latestTurn(params.threadId))?.id ?? null; }
-          catch (error) { this.releaseClaimState(claimState); throw error; }
-        }
-      }
-    }
     try {
       try {
         response = await this.request<T>(endpointId, "turn/start", startParams, undefined, lease);
-      } catch (startError) {
-        if (callerClaim) {
-          throw new AppError("OPERATION_UNCERTAIN", "caller-owned turn/start outcome is uncertain");
-        }
-        try {
-          const state = this.requiredClaim(claim);
-          if (!Object.hasOwn(state, "baselineTurnId")) throw new AppError("OPERATION_UNCERTAIN", "turn/start has no bounded history baseline");
-          const actual = await this.findStartedTurn(
-            endpointId, params.threadId, clientUserMessageId, state.baselineTurnId ?? null, lease,
-          );
-          response = { turn: actual } as unknown as T;
-        } catch (reconciliationError) {
-          if (reconciliationError instanceof StartProvenAbsentError) {
-            this.releaseTurnCapacityClaim(claim);
-            throw startError;
-          }
-          throw reconciliationError;
-        }
+      } catch {
+        if (!callerClaim) this.releaseTurnCapacityClaim(claim);
+        throw new AppError("OPERATION_UNCERTAIN", "turn/start outcome is uncertain; history reconciliation was not started");
       }
       try {
         this.bindTurnCapacityClaim(claim, response.turn.id);
@@ -436,9 +228,10 @@ export class AppServerPool {
         const expected = this.claims.get(claim.id)?.turnId ?? this.terminalClaims.get(claim.id)?.turnId;
         throw new TurnIdentityConflictError(response.turn.id, expected);
       }
+      if (!callerClaim) this.releaseTurnCapacityClaim(claim);
       return response;
     } catch (error) {
-      if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN") && !(error instanceof StartProvenAbsentError)) {
+      if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN")) {
         const state = this.claims.get(claim.id);
         if (state?.phase === "provisional") this.releaseTurnCapacityClaim(claim);
       }
@@ -508,19 +301,11 @@ export class AppServerPool {
 
   get activeTurnCount(): number { return this.claims.size; }
 
-  private resolved(claimId: string): void {
-    this.resolvedProvisional.add(claimId);
-    if (this.resolvedProvisional.size > 1_000) this.resolvedProvisional.delete(this.resolvedProvisional.values().next().value!);
-  }
-
-  private createClaim(endpointId: string, threadId: string, claimId: string, origin: ClaimState["origin"], bypassLimit = false): TurnCapacityClaim {
+  private createClaim(endpointId: string, threadId: string, claimId: string, origin: ClaimState["origin"]): TurnCapacityClaim {
     const existing = this.claims.get(claimId);
     if (existing) {
       if (existing.endpointId !== endpointId || existing.threadId !== threadId) this.conflict(`capacity claim ${claimId} changed identity`);
       return this.publicClaim(existing);
-    }
-    if (!bypassLimit && this.claims.size >= this.options.maxConcurrentTurns) {
-      throw new AppError("CAPACITY_EXCEEDED", `at most ${this.options.maxConcurrentTurns} turns may run concurrently`);
     }
     const state: ClaimState = { id: claimId, endpointId, threadId, generation: this.nextClaimGeneration++, phase: "provisional", origin };
     this.claims.set(claimId, state);
@@ -536,9 +321,7 @@ export class AppServerPool {
   }
 
   private releaseClaimState(state: ClaimState): void {
-    const wasFull = this.claims.size >= this.options.maxConcurrentTurns;
-    if (!this.claims.delete(state.id)) return;
-    if (wasFull && this.claims.size < this.options.maxConcurrentTurns) this.scheduleCapacitySignal();
+    this.claims.delete(state.id);
   }
 
   private recordTerminalClaim(state: TurnCapacityClaim, turnId: string): void {
@@ -551,60 +334,6 @@ export class AppServerPool {
       turnId,
     });
     if (this.terminalClaims.size > 1_000) this.terminalClaims.delete(this.terminalClaims.keys().next().value!);
-  }
-
-  private scheduleCapacitySignal(): void {
-    if (this.capacitySignalPending) return;
-    this.capacitySignalPending = true;
-    queueMicrotask(() => {
-      this.capacitySignalPending = false;
-      for (const listener of this.capacityListeners) listener();
-    });
-  }
-
-  private async findStartedTurn(
-    endpointId: string,
-    threadId: string,
-    clientUserMessageId: string,
-    baselineTurnId: string | null,
-    lease?: EndpointWorkLease,
-  ): Promise<{ id: string; items: Array<{ type: string; clientId?: string | null }> }> {
-    const timeoutMs = this.options.reconciliationTimeoutMs ?? 30_000;
-    const deadline = Date.now() + timeoutMs;
-    const budget = createHistoryScanBudget({ deadlineAt: Date.now() + Math.max(timeoutMs, 1_000) });
-    const pollMs = Math.max(this.options.reconciliationPollMs ?? 25, Math.ceil(timeoutMs / 3));
-    const scannedTurnIds = new Set<string>();
-    do {
-      let threadStatus: string | undefined;
-      let actual: { id: string; items: Array<{ type: string; clientId?: string | null }> } | undefined;
-      let anchorFound = false;
-      try {
-        const metadata = await this.request<{ thread: { status?: string | { type?: string } } }>(
-          endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
-        );
-        threadStatus = typeof metadata.thread.status === "string" ? metadata.thread.status : metadata.thread.status?.type;
-        const reader = this.historyReader(endpointId, lease);
-        const suffix = await reader.descendingSuffix(threadId, baselineTurnId ?? undefined, budget);
-        anchorFound = suffix.anchorFound;
-        for (const candidate of suffix.turns) {
-          if (scannedTurnIds.has(candidate.id)) continue;
-          const exact = await reader.exactTurnItems(threadId, candidate.id, { budget });
-          if (isTerminal(candidate.status)) scannedTurnIds.add(candidate.id);
-          if (exact.firstUserMessage?.clientId === clientUserMessageId) {
-            actual = { id: candidate.id, items: exact.items };
-            break;
-          }
-        }
-      } catch (error) {
-        throw new AppError("OPERATION_UNCERTAIN", `turn/start outcome could not be reconciled because thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      if (actual) return actual;
-      if (Date.now() >= deadline) {
-        if (threadStatus === "idle" && anchorFound) throw new StartProvenAbsentError();
-        throw new AppError("OPERATION_UNCERTAIN", "turn/start outcome could not be proven because thread history was incomplete");
-      }
-      await (this.options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(pollMs);
-    } while (true);
   }
 
   private publicClaim(state: TurnCapacityClaim): TurnCapacityClaim {

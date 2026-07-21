@@ -18,7 +18,8 @@ const configValueSchema = z.object({
   SESSION_REGISTRY_PATH: z.string().min(1).optional(),
   CODEX_BINARY: z.string().default("codex"),
   // Claude endpoints (local and remote) are configured in endpoints.json, not via env.
-  MAX_CONCURRENT_TURNS: positiveInt.default(4),
+  // Legacy no-op retained so existing .env files continue to load after removing the global limit.
+  MAX_CONCURRENT_TURNS: positiveInt.optional(),
   MAX_COLLECT_COUNT: positiveInt.max(100).default(20),
   MCP_HOST: z.literal("127.0.0.1").default("127.0.0.1"),
   MCP_PORT: z.coerce.number().int().min(0).max(65_535).default(43_721),
@@ -105,7 +106,6 @@ export interface BotConfig {
   sessionRegistryPath: string;
   endpointCatalogPath: string;
   codexBinary: string;
-  maxConcurrentTurns: number;
   maxCollectCount: number;
   mcpHost: "127.0.0.1";
   mcpPort: number;
@@ -164,7 +164,6 @@ export function loadConfig(env: Record<string, string | undefined>, overrides: C
     sessionRegistryPath: resolve(parsed.SESSION_REGISTRY_PATH ?? join(dataDir, "sessions.json")),
     endpointCatalogPath: resolve(join(defaultRoot, "endpoints.json")),
     codexBinary: parsed.CODEX_BINARY,
-    maxConcurrentTurns: parsed.MAX_CONCURRENT_TURNS,
     maxCollectCount: parsed.MAX_COLLECT_COUNT,
     mcpHost: parsed.MCP_HOST,
     mcpPort: parsed.MCP_PORT,

@@ -158,31 +158,29 @@ export class ThreadHistoryReader {
     };
   }
 
-  async classifyTurnAgainstAnchor(
+  async descendingFrom(
     threadId: string,
-    targetTurnId: string,
-    anchorTurnId: string,
+    firstTurnId: string,
     budget: HistoryScanBudget,
-  ): Promise<"newer" | "anchor" | "older" | "missing"> {
-    if (targetTurnId === anchorTurnId) return "anchor";
-    let anchorSeen = false;
-    let result: "newer" | "older" | undefined;
-    await this.walkTurns(threadId, {
+  ): Promise<{ turns: ThreadHistoryTurn[]; anchorFound: boolean; exhausted: boolean }> {
+    const buffered: ThreadHistoryTurn[] = [];
+    let anchorFound = false;
+    const scan = await this.walkTurns(threadId, {
       sortDirection: "desc",
       itemsView: "notLoaded",
       budget,
       onTurn: (turn) => {
-        if (turn.id === anchorTurnId) {
-          anchorSeen = true;
-          return false;
-        }
-        if (turn.id !== targetTurnId) return false;
-        result = anchorSeen ? "older" : "newer";
+        buffered.push(turn);
+        if (turn.id !== firstTurnId) return false;
+        anchorFound = true;
         return true;
       },
     });
-    if (!anchorSeen && result !== "newer") throw uncertain("thread history anchor is absent");
-    return result ?? "missing";
+    return {
+      turns: anchorFound ? buffered : [],
+      anchorFound,
+      exhausted: scan.exhausted,
+    };
   }
 
   async exactTurnItems(

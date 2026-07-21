@@ -32,6 +32,23 @@ test("native user item replaces the correlated optimistic bubble", () => {
   assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.optimistic]), [["u:turn:u1", "hello", false]]);
 });
 
+test("native user item replaces history that already replaced its optimistic bubble", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "codex", ids.requestId), ids.subscriptionId);
+  state = addOptimisticWorkerMessage(state, "to:web:input", "hello", 1);
+  state = applyWorkerSnapshot(state, {
+    messages: [{
+      id: "u:thread:300", turnId: "turn", body: "hello", completedAt: 2,
+      terminalStatus: "inProgress", role: "you", clientId: "to:web:input", turnOrder: 300, itemOrder: 300,
+    }],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["turn"],
+  });
+  state = receiveWorkerEvent(state, envelope({
+    kind: "item-started", turnId: "turn", atMs: 2,
+    item: { type: "user-message", id: "u1", clientId: "to:web:input", text: "hello" },
+  }));
+  assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.optimistic]), [["u:turn:u1", "hello", false]]);
+});
+
 test("a rejected worker send removes only its optimistic echo", () => {
   let state = beginWorkerSubscription("worker", "codex", ids.requestId);
   state = addOptimisticWorkerMessage(state, "to:web:one", "first", 1);

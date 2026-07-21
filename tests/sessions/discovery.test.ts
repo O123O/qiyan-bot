@@ -37,7 +37,7 @@ test("discovery exhausts both archives and returns stable filtered snapshot page
   endpoint.pages.set("false:n2", { data: [row("a", 20), row("temp", 100, { ephemeral: true })], nextCursor: null });
   endpoint.pages.set("true:first", { data: [row("old", 10)], nextCursor: null });
   const db = createTestDatabase();
-  const discovery = new SessionDiscovery(db, new AppServerPool([endpoint], { maxConcurrentTurns: 2 }), {
+  const discovery = new SessionDiscovery(db, new AppServerPool([endpoint], {}), {
     clock: { now: () => now }, snapshotTtlMs: 100,
   });
 
@@ -72,7 +72,7 @@ test("discovery search filters the combined snapshot by id, cwd, or preview", as
   const endpoint = new DiscoveryEndpoint();
   endpoint.pages.set("false:first", { data: [row("one", 2, { preview: "Payments API" }), row("two", 1, { cwd: "/work/website" })], nextCursor: null });
   endpoint.pages.set("true:first", { data: [], nextCursor: null });
-  const discovery = new SessionDiscovery(createTestDatabase(), new AppServerPool([endpoint], { maxConcurrentTurns: 2 }));
+  const discovery = new SessionDiscovery(createTestDatabase(), new AppServerPool([endpoint], {}));
   assert.deepEqual((await discovery.list({ endpointId: "local", search: "payments" })).sessions.map((item) => item.id), ["one"]);
 });
 
@@ -83,7 +83,6 @@ test("recovery discovery reuses the caller's endpoint lease for every native pag
   const lease: EndpointWorkLease = { endpointId: "local", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "lease-1" };
   const seen: Array<EndpointWorkLease | undefined> = [];
   const pool = new AppServerPool([endpoint], {
-    maxConcurrentTurns: 2,
     workLeaseProvider: async (_endpointId, existing, run) => { seen.push(existing); return run(existing); },
   });
 

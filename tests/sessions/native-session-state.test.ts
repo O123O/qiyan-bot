@@ -105,13 +105,13 @@ test("publishes only applied view changes", () => {
   assert.deepEqual(changes, ["unknown:-", "idle:-"]);
 });
 
-test("id-less active status requests one bounded refresh", () => {
+test("id-less active status stays metadata-only until a live turn event identifies it", () => {
   const state = new NativeSessionState();
   state.register(identity, 20);
   assert.equal(state.observe("prenyx", 20, "thread/status/changed", {
     threadId: "thread-1",
     status: { type: "active" },
-  }), true);
+  }), false);
   assert.equal(state.view(identity)?.status, "active");
   assert.equal(state.view(identity)?.activeTurnId, null);
 
@@ -120,6 +120,20 @@ test("id-less active status requests one bounded refresh", () => {
     threadId: "thread-1",
     status: { type: "active" },
   }), false);
+});
+
+test("a live item notification identifies an active turn after connection recovery", () => {
+  const state = new NativeSessionState();
+  state.register(identity, 25);
+  state.observe("prenyx", 25, "thread/status/changed", {
+    threadId: "thread-1", status: { type: "active" },
+  });
+
+  assert.equal(state.observe("prenyx", 25, "item/agentMessage/delta", {
+    threadId: "thread-1", turnId: "live-turn", itemId: "message", delta: "working",
+  }), false);
+  assert.equal(state.view(identity)?.status, "active");
+  assert.equal(state.view(identity)?.activeTurnId, "live-turn");
 });
 
 test("an older completion cannot turn an id-less active session idle", () => {
@@ -148,4 +162,37 @@ test("a mismatched completion preserves the known active turn and requests refre
   }), true);
   assert.equal(state.view(identity)?.status, "active");
   assert.equal(state.view(identity)?.activeTurnId, "current");
+});
+
+test("a completion for an id-less active session fences an older refresh response", () => {
+  const state = new NativeSessionState();
+  state.register(identity, 24);
+  state.observe("prenyx", 24, "thread/status/changed", {
+    threadId: "thread-1", status: { type: "active" },
+  });
+  const stale = state.captureRefresh(identity, 24);
+
+  assert.equal(state.observe("prenyx", 24, "turn/completed", {
+    threadId: "thread-1", turn: { id: "completed-without-start", status: "completed" },
+  }), true);
+
+  assert.equal(state.applyRefresh(stale, { status: "active" }), false);
+  assert.equal(state.view(identity)?.status, "active");
+  assert.equal(state.view(identity)?.activeTurnId, null);
+  assert.ok((state.view(identity)?.receiveSequence ?? 0) > 0);
+});
+
+test("a completion observed while idle fences an older active refresh response", () => {
+  const state = new NativeSessionState();
+  state.register(identity, 23);
+  const initial = state.captureRefresh(identity, 23);
+  state.applyRefresh(initial, { status: "idle" });
+  const stale = state.captureRefresh(identity, 23);
+
+  assert.equal(state.observe("prenyx", 23, "turn/completed", {
+    threadId: "thread-1", turn: { id: "completed-before-start", status: "completed" },
+  }), false);
+
+  assert.equal(state.applyRefresh(stale, { status: "active" }), false);
+  assert.equal(state.view(identity)?.status, "idle");
 });

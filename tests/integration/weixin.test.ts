@@ -136,7 +136,7 @@ test("all adapters share the real dispatcher while WeChat tools keep the initiat
   const endpoint: AppServerEndpoint = {
     id: "assistant-local", state: "ready", request: async () => { throw new Error("unused"); },
   };
-  const pool = new AppServerPool([endpoint], { maxConcurrentTurns: 1 });
+  const pool = new AppServerPool([endpoint], {});
   const runner = new ImmediateRunner();
   const runtime = new AssistantRuntime(db, operations, deliveries, {
     binding: { adapterId: "weixin", conversationKey: "weixin:generation:owner", destination: { generationId: "generation" } },

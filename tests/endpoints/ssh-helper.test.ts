@@ -222,6 +222,30 @@ test("the helper emits one versioned response frame", async () => {
   assert.match(result.stdout.toString("utf8"), /^\nqiyan-helper-v1:\{.*\}\n$/u);
 });
 
+test("the helper returns a bounded filtered rollout slice", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-helper-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const threadId = "019f0000-0000-7000-8000-000000000001";
+  const path = join(root, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+  await writeFile(path, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<subagent_notification>hidden</subagent_notification>" }] } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "visible prompt", images: [] } }),
+    JSON.stringify({ type: "response_item", payload: { type: "function_call_output", output: "hidden" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible" }] } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "turn-1" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "thread_rolled_back", num_turns: 1 } }),
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const argument = encodeRemoteArgument(JSON.stringify({ path, threadId, maxBytes: 8 * 1024 * 1024 }));
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "read-rollout-slice", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 1024 * 1024,
+  });
+  const slice = parseRemoteHelperResponse<{ rows: Array<{ line: string }> }>(result.stdout, "read-rollout-slice");
+  assert.equal(slice.rows.length, 5);
+  assert.equal(slice.rows.some((item) => item.line.includes("hidden")), false);
+});
+
 test("the helper establishes a frame boundary after output without a trailing newline", async () => {
   const argument = encodeRemoteArgument(JSON.stringify({ action: "home" }));
   const result = await runBoundedProcess("sh", [

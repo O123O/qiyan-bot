@@ -37,7 +37,7 @@ test("the web UI serves live bot state and enforces the token", { skip: !enabled
     chat: { primary: "slack", slack: { appToken: "xapp-x", botToken: "xoxb-x", userToken: "xoxp-x", ownerUserId: "U1" } },
     userHome, assistantWorkdir: join(root, "assistant"), dataDir,
     sessionRegistryPath: join(dataDir, "sessions.json"), endpointCatalogPath: join(root, "qiyan-home", "endpoints.json"),
-    codexBinary: "codex", maxConcurrentTurns: 4, maxCollectCount: 20, mcpHost: "127.0.0.1", mcpPort: 0,
+    codexBinary: "codex", maxCollectCount: 20, mcpHost: "127.0.0.1", mcpPort: 0,
     attachmentMaxBytes: 1024 * 1024, attachmentStoreMaxBytes: 8 * 1024 * 1024, assistantSandboxMode: "read-only",
     webUi: { host: "127.0.0.1", port: 0 },
   };

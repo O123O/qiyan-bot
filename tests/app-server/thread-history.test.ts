@@ -101,17 +101,6 @@ test("exact turn reads locate metadata first and load only the target turn", asy
   ]);
 });
 
-test("turn ordering distinguishes older targets from missing history", async () => {
-  const turns = ["new", "anchor", "old"].map((id) => ({
-    id, status: "completed", itemsView: "notLoaded", items: [],
-  }));
-  const reader = new ThreadHistoryReader(async () => ({ data: turns, nextCursor: null, backwardsCursor: null }));
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "new", "anchor", createHistoryScanBudget()), "newer");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "anchor", "anchor", createHistoryScanBudget()), "anchor");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "old", "anchor", createHistoryScanBudget()), "older");
-  assert.equal(await reader.classifyTurnAgainstAnchor("thread", "absent", "anchor", createHistoryScanBudget()), "missing");
-});
-
 test("multi-page scans terminate with an explicit budget-exhausted outcome", async () => {
   const reader = new ThreadHistoryReader(async (_method, params) => ({
     data: [{ id: String((params as any).cursor ?? "first"), status: "completed", itemsView: "notLoaded", items: [] }],
@@ -122,6 +111,18 @@ test("multi-page scans terminate with an explicit budget-exhausted outcome", asy
     reader.descendingSuffix("thread", "absent", createHistoryScanBudget({ maxPages: 1 })),
     (error: unknown) => error instanceof HistoryScanBudgetExhaustedError,
   );
+});
+
+test("inclusive history recovery starts at the first observed managed turn", async () => {
+  const turns = ["newest", "first-managed", "historical"].map((id) => ({
+    id, status: "completed", itemsView: "notLoaded", items: [],
+  }));
+  const reader = new ThreadHistoryReader(async () => ({ data: turns, nextCursor: null, backwardsCursor: null }));
+
+  const suffix = await reader.descendingFrom("thread", "first-managed", createHistoryScanBudget());
+
+  assert.equal(suffix.anchorFound, true);
+  assert.deepEqual(suffix.turns.map((turn) => turn.id), ["newest", "first-managed"]);
 });
 
 test("single pages reject duplicate rows, empty continuations, and non-advancing cursors", async () => {

@@ -279,11 +279,14 @@ test("an existing QiYan database reopens normally", async () => {
 });
 
 test("the ownership-inference removal migration drops its durable classifier state", () => {
-  const removal = migrations.at(-1);
+  const removalIndex = migrations.findIndex((migration) =>
+    typeof migration === "string" && migration.includes("DROP TABLE IF EXISTS session_rollout_ownership"));
+  assert.ok(removalIndex > 0);
+  const removal = migrations[removalIndex];
   assert.equal(typeof removal, "string");
   assert.match(removal as string, /DROP TABLE IF EXISTS session_rollout_ownership/u);
   const db = new DatabaseSync(":memory:");
-  for (const migration of migrations.slice(0, -1)) {
+  for (const migration of migrations.slice(0, removalIndex)) {
     if (typeof migration === "function") migration(db);
     else db.exec(migration);
   }

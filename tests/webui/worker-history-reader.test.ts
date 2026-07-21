@@ -70,7 +70,7 @@ test("revalidates the complete mapping after the raw read before extracting text
   await assert.rejects(read, (error) => error instanceof WorkerHistoryError && error.code === "stale");
 });
 
-test("ready native reads request complete turns through the existing lease and never activate", async () => {
+test("ready native reads request bounded message summaries through the existing lease and never activate", async () => {
   const lease = { endpointId: "local", endpointGeneration: 3, leaseId: "lease" } as never;
   const requests: unknown[][] = [];
   const read = (cursor?: string) => readReadyWorkerTurns({
@@ -79,15 +79,15 @@ test("ready native reads request complete turns through the existing lease and n
       requests.push(args);
       assert.equal((args[2] as any).limit, 12, "foreground history should use Codex Web UI's bounded native turn page");
       if (args[1] === "thread/turns/list" && (args[2] as any).cursor === "older-page") return {
-        data: [{ ...turn("older"), id: "older-turn", itemsView: "full" }],
+        data: [{ ...turn("older"), id: "older-turn", itemsView: "summary" }],
         nextCursor: null,
         backwardsCursor: null,
       };
       if (args[1] === "thread/turns/list") return {
         data: [{
-          ...turn(), itemsView: "full",
+          ...turn(), itemsView: "summary",
           items: [
-            { type: "agentMessage", id: "a0", text: "checking", phase: "commentary" },
+            { type: "userMessage", id: "u1", content: [{ type: "text", text: "work" }] },
             { type: "agentMessage", id: "a1", text: "done", phase: "final_answer" },
           ],
         }],
@@ -101,7 +101,7 @@ test("ready native reads request complete turns through the existing lease and n
   assert.equal(page.hasOlder, true);
   assert.ok(page.nextCursor);
   const withinTurn = await read(page.nextCursor);
-  assert.deepEqual(withinTurn.messages.map((message) => message.body), ["checking"]);
+  assert.deepEqual(withinTurn.messages.map((message) => message.body), ["work"]);
   assert.equal(withinTurn.hasOlder, true);
   assert.ok(withinTurn.nextCursor);
   const older = await read(withinTurn.nextCursor);
@@ -111,7 +111,7 @@ test("ready native reads request complete turns through the existing lease and n
   assert.equal((requests[0]?.[2] as any).cursor, undefined);
   assert.equal((requests[1]?.[2] as any).cursor, undefined);
   assert.equal((requests[2]?.[2] as any).cursor, "older-page");
-  assert.equal((requests[0]?.[2] as any).itemsView, "full");
+  assert.equal((requests[0]?.[2] as any).itemsView, "summary");
   assert.ok(requests.every((request) => request[0] === "local" && request[4] === lease));
   assert.equal(requests.some((request) => request[1] === "thread/read"), false);
 
@@ -129,11 +129,11 @@ test("native Web UI paging wraps one stable turn cursor without head-relative me
   const request = async (_endpoint: string, method: string, params: unknown) => {
     requests += 1;
     assert.equal(method, "thread/turns/list");
-    assert.equal((params as any).itemsView, "full");
+    assert.equal((params as any).itemsView, "summary");
     assert.equal((params as any).limit, 12, "message count must not expand the bounded native turn page");
     cursors.push((params as any).cursor);
     return {
-      data: [{ id: "turn", status: "completed", itemsView: "full", items: [{ type: "reasoning", id: "tool" }] }],
+      data: [{ id: "turn", status: "completed", itemsView: "summary", items: [] }],
       nextCursor: (params as any).cursor === undefined ? "older" : null,
       backwardsCursor: null,
     };
@@ -151,7 +151,7 @@ test("native Web UI paging wraps one stable turn cursor without head-relative me
   assert.deepEqual(cursors, [undefined, "older"]);
 });
 
-test("native Web UI paging never falls back to lossy summaries", async () => {
+test("native Web UI paging never requests full tool history", async () => {
   const views: string[] = [];
   const page = await readReadyWorkerTurns({
     withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "legacy", endpointGeneration: 1, leaseId: "lease" } as never),
@@ -164,7 +164,7 @@ test("native Web UI paging never falls back to lossy summaries", async () => {
           id: "turn", status: "completed", itemsView: view,
           items: [
             { type: "userMessage", id: "user", clientId: "client", content: [{ type: "text", text: "hello" }] },
-            { type: "agentMessage", id: "progress", text: "working", phase: "commentary" },
+            { type: "agentMessage", id: "final", text: "done", phase: "final_answer" },
           ],
         }],
         nextCursor: null,
@@ -173,8 +173,8 @@ test("native Web UI paging never falls back to lossy summaries", async () => {
     },
   }, "legacy", "thread", 20, undefined, new AbortController().signal);
 
-  assert.deepEqual(views, ["full"]);
-  assert.deepEqual(page.messages.map((message) => message.body), ["hello", "working"]);
+  assert.deepEqual(views, ["summary"]);
+  assert.deepEqual(page.messages.map((message) => message.body), ["hello", "done"]);
 });
 
 test("history pages prove terminal turns and preserve native read failures", async () => {

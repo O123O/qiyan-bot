@@ -9,9 +9,6 @@ import type { EndpointWorkLease } from "../endpoints/types.ts";
 interface RegistryView { snapshot(): RegistryDocument }
 interface ObserverOptions {
   now(): number;
-  readThread(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<{
-    turns: Array<{ id: string; startedAt: number | null; status?: unknown }>;
-  }>;
   readGoal(endpointId: string, threadId: string): Promise<unknown>;
   onChanged(): void;
   onError(error: unknown): void;
@@ -120,16 +117,11 @@ export class SessionObservationProcessor {
     if (settings.valueChanged) this.options.onChanged();
   }
 
-  async observeTerminal(event: TerminalObservation, lease?: EndpointWorkLease): Promise<void> {
+  async observeTerminal(event: TerminalObservation, _lease?: EndpointWorkLease): Promise<void> {
     const target = this.managedTarget(event.endpointId, event.threadId);
     if (!target) return;
     const { identity } = target;
     let ordinal = this.store.turnOrdinal(identity, event.turnId);
-    if (ordinal === undefined) {
-      const history = await this.options.readThread(event.endpointId, event.threadId, lease);
-      this.store.hydrateTurnOrder(identity, history.turns.map((turn) => ({ id: turn.id, startedAt: turn.startedAt })));
-      ordinal = this.store.turnOrdinal(identity, event.turnId);
-    }
     ordinal ??= this.store.observeTurnStarted(identity, { id: event.turnId, startedAt: event.startedAt });
     const completedAt = normalizeProtocolTime(event.completedAt, this.options.now());
     const workerChanged = this.store.observeLastWorkerEvent(identity, {
@@ -229,13 +221,10 @@ export class SessionObservationProcessor {
     if (notification.method === "thread/tokenUsage/updated") {
       const tokenUsage = normalizeTokenUsage(params.tokenUsage, notification.receivedAt);
       let ordinal = this.store.turnOrdinal(identity, params.turnId);
-      if (ordinal === undefined) {
-        const history = await this.options.readThread(notification.endpointId, identity.threadId);
-        if (!this.runIsCurrent(notification.endpointId, epoch)) return "stale";
-        this.store.hydrateTurnOrder(identity, history.turns.map((turn) => ({ id: turn.id, startedAt: turn.startedAt })));
-        ordinal = this.store.turnOrdinal(identity, params.turnId);
-      }
-      if (ordinal === undefined) return "deferred";
+      ordinal ??= this.store.observeTurnStarted(identity, {
+        id: params.turnId,
+        startedAt: notification.receivedAt,
+      });
       return this.store.observeTokenUsage(identity, params.turnId, tokenUsage, ordinal, notification.sequence);
     }
     if (notification.method === "thread/goal/updated") {
