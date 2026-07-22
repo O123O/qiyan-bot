@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
+import { migrations } from "../../src/storage/migrations.ts";
 import {
   isDashboardMetadataRecoveryRequired,
   SessionDashboardStore,
@@ -174,6 +175,20 @@ test("orders sends, terminal events, token usage, and goals monotonically", () =
   assert.equal(store.facts(identity).goal, null);
 });
 
+test("live token telemetry projects atomically with its sequence and turn order", () => {
+  const db = createTestDatabase();
+  const store = new SessionDashboardStore(db);
+  const usage = { total: { total_tokens: 10, input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 }, last_turn: { total_tokens: 2, input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 }, model_context_window: 100, context_remaining: 98, context_used_percent: 2, observed_at: "1970-01-01T00:00:02.000Z" };
+  db.exec(`CREATE TRIGGER fail_token_revision BEFORE UPDATE OF revision ON session_dashboard_meta
+    WHEN NEW.revision > OLD.revision BEGIN SELECT RAISE(ABORT, 'injected'); END;`);
+
+  assert.throws(() => store.observeTokenUsageNotification(identity, "turn-1", usage, 2), /injected/);
+  assert.equal(store.turnOrdinal(identity, "turn-1"), undefined);
+  assert.equal(store.facts(identity).tokenUsage, null);
+  assert.equal(store.renderState().revision, 0);
+  assert.equal((db.prepare("SELECT next_observation_sequence AS value FROM session_dashboard_meta").get() as { value: number }).value, 1);
+});
+
 test("authoritative history atomically remaps provisional turn ordinals and dependent facts", () => {
   const store = new SessionDashboardStore(createTestDatabase());
   const newOrdinal = store.observeTurnStarted(identity, { id: "new", startedAt: 3 });
@@ -206,8 +221,30 @@ test("notification receipt and completion are durable and sequence ordered", () 
   assert.deepEqual(store.pendingNotifications().map((item) => item.sequence), [1, 2]);
   store.completeNotification(first);
   assert.deepEqual(store.pendingNotifications().map((item) => item.sequence), [2]);
+  assert.equal(db.prepare("SELECT 1 FROM session_dashboard_notifications WHERE sequence = ?").get(first), undefined);
   store.failNotification(second, { message: "invalid payload" });
   assert.deepEqual(store.pendingNotifications(), []);
+});
+
+test("dashboard inbox cleanup removes terminal rows but preserves unresolved work", () => {
+  const db = createTestDatabase();
+  const store = new SessionDashboardStore(db);
+  const processed = store.acceptNotification("local", "thread/settings/updated", { threadId: "processed" }, 100);
+  const failed = store.acceptNotification("local", "thread/settings/updated", { threadId: "failed" }, 101);
+  const pending = store.acceptNotification("local", "thread/settings/updated", { threadId: "pending" }, 102);
+  db.prepare("UPDATE session_dashboard_notifications SET state = 'processed' WHERE sequence = ?").run(processed);
+  store.failNotification(failed, { message: "invalid payload" });
+
+  const cleanup = migrations.find((migration) => typeof migration === "string"
+    && migration.includes("DELETE FROM session_dashboard_notifications WHERE state <> 'pending'"));
+  assert.equal(typeof cleanup, "string");
+  db.exec(cleanup as string);
+
+  assert.deepEqual(
+    (db.prepare("SELECT sequence, state FROM session_dashboard_notifications ORDER BY sequence").all() as Array<{ sequence: number; state: string }>)
+      .map((row) => ({ sequence: row.sequence, state: row.state })),
+    [{ sequence: pending, state: "pending" }],
+  );
 });
 
 test("render dirty acknowledgements cannot erase a concurrent revision", () => {

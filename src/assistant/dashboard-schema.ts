@@ -95,9 +95,18 @@ export const ExistingSessionDashboardDocumentSchema = z.union([
   LegacySessionDashboardDocumentSchema,
 ]);
 
+const appServerTokenBreakdown = z.object({
+  totalTokens: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative(),
+  cacheWriteInputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative(),
+  reasoningOutputTokens: z.number().int().nonnegative(),
+}).strict();
+
 const appServerTokenUsage = z.object({
-  total: z.object({ totalTokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative() }).strict(),
-  last: z.object({ totalTokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative() }).strict(),
+  total: appServerTokenBreakdown,
+  last: appServerTokenBreakdown,
   modelContextWindow: z.number().int().nonnegative().nullable(),
 }).strict();
 
@@ -125,8 +134,9 @@ export function normalizeTokenUsage(input: unknown, observedAt: number): Dashboa
     reasoning_output_tokens: value.reasoningOutputTokens,
   });
   const window = parsed.modelContextWindow;
-  const remaining = window === null ? null : Math.max(0, window - parsed.total.totalTokens);
-  const used = window === null ? null : window === 0 ? (parsed.total.totalTokens === 0 ? 0 : 100) : Math.min(100, Math.max(0, parsed.total.totalTokens / window * 100));
+  const contextTokens = parsed.last.totalTokens;
+  const remaining = window === null ? null : Math.max(0, window - contextTokens);
+  const used = window === null ? null : window === 0 ? (contextTokens === 0 ? 0 : 100) : Math.min(100, Math.max(0, contextTokens / window * 100));
   return DashboardTokenUsageSchema.parse({
     total: normalize(parsed.total),
     last_turn: normalize(parsed.last),

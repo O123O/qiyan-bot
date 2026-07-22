@@ -838,4 +838,7 @@ export const migrations: readonly Migration[] = [
         WHERE kind = 'turn_terminal' AND state = 'pending';
     `);
   },
+  // The dashboard notification table is a durable inbox, not an audit log. Projection
+  // watermarks make replay idempotent, so only unresolved rows need to survive restart.
+  `DELETE FROM session_dashboard_notifications WHERE state <> 'pending';`,
 ];

@@ -87,7 +87,7 @@ const usage = {
   modelContextWindow: 100,
 };
 
-test("accepts body-free fact observations durably and ignores lifecycle status", async () => {
+test("projects body-free fact observations and ignores lifecycle status", async () => {
   const value = fixture();
   assert.equal(value.processor.accept("local", "turn/started", { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress", startedAt: 1, items: [{ type: "agentMessage", text: "secret body" }] } }), true);
   assert.equal(value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high", cwd: "/ignored" } }), true);
@@ -104,6 +104,18 @@ test("accepts body-free fact observations durably and ignores lifecycle status",
   assert.equal(facts.tokenUsage?.total.total_tokens, 10);
   assert.equal(facts.goal?.objective, "finish");
   assert.ok(value.changes() >= 1);
+});
+
+test("projects valid token telemetry without writing the durable inbox", async () => {
+  const value = fixture();
+  assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
+    threadId: "thread-1", turnId: "turn-1", tokenUsage: usage,
+  }), true);
+
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS count FROM session_dashboard_notifications").get() as { count: number }).count, 0);
+  assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).tokenUsage?.total.total_tokens, 10);
+  assert.equal(value.changes(), 1);
+  await value.processor.idle();
 });
 
 test("an exact terminal goal notification revokes goal control", async () => {
@@ -172,6 +184,29 @@ test("replays a token notification accepted before a crash", async () => {
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).tokenUsage, null);
   await value.processor.drain();
   assert.equal(value.store.facts({ endpointId: "local", threadId: "thread-1" }).tokenUsage?.total.total_tokens, 10);
+  assert.equal(value.store.pendingNotifications().length, 0);
+});
+
+test("a live token update queues behind older durable observations", async () => {
+  const value = fixture();
+  value.store.acceptNotification("local", "thread/tokenUsage/updated", {
+    threadId: "thread-1", turnId: "old-turn", tokenUsage: usage,
+  }, 900);
+  const newerUsage = {
+    ...usage,
+    total: { ...usage.total, totalTokens: 20 },
+    last: { ...usage.last, totalTokens: 8 },
+  };
+
+  assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
+    threadId: "thread-1", turnId: "new-turn", tokenUsage: newerUsage,
+  }), true);
+  await value.processor.drain();
+
+  const identity = { endpointId: "local", threadId: "thread-1" };
+  assert.equal(value.store.facts(identity).tokenUsage?.total.total_tokens, 20);
+  assert.equal(value.store.turnOrdinal(identity, "old-turn"), 1);
+  assert.equal(value.store.turnOrdinal(identity, "new-turn"), 2);
   assert.equal(value.store.pendingNotifications().length, 0);
 });
 
@@ -478,9 +513,9 @@ test("observation stop cancels timers, awaits tails, and fences stale callbacks"
 test("quarantines an invalid durable observation without starving later rows", async () => {
   const clock = fakeTimers();
   const value = fixture({ timers: clock.api });
-  assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
+  value.store.acceptNotification("local", "thread/tokenUsage/updated", {
     threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: { totalTokens: -1 } },
-  }), true);
+  }, 1_000);
   value.processor.accept("local", "thread/settings/updated", { threadId: "thread-1", threadSettings: { model: "gpt-5", effort: "high" } });
   await value.processor.idle();
 
@@ -491,6 +526,17 @@ test("quarantines an invalid durable observation without starving later rows", a
   const invalid = value.db.prepare("SELECT state, error_json FROM session_dashboard_notifications WHERE sequence = 1").get() as { state: string; error_json: string };
   assert.equal(invalid.state, "failed");
   assert.deepEqual(JSON.parse(invalid.error_json), { message: "invalid thread/tokenUsage/updated notification" });
+});
+
+test("rejects invalid live token usage before writing the durable inbox", async () => {
+  const value = fixture();
+  assert.equal(value.processor.accept("local", "thread/tokenUsage/updated", {
+    threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: { totalTokens: -1 } },
+  }), false);
+  await value.processor.idle();
+
+  assert.equal((value.db.prepare("SELECT COUNT(*) AS count FROM session_dashboard_notifications").get() as { count: number }).count, 0);
+  assert.equal(value.errors.length, 0);
 });
 
 test("a token observation with a missed start event is ordered locally without a history read", async () => {

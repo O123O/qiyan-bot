@@ -1,7 +1,7 @@
 import type { RegistryDocument } from "../registry/session-registry.ts";
 import type { SessionControlStore } from "../storage/session-control-store.ts";
 import { SessionDashboardStore, type DashboardIdentity, type DashboardNotification } from "../storage/session-dashboard-store.ts";
-import { normalizeTokenUsage, toIsoTimestamp, type DashboardGoal } from "./dashboard-schema.ts";
+import { normalizeTokenUsage, toIsoTimestamp, type DashboardGoal, type DashboardTokenUsage } from "./dashboard-schema.ts";
 import type { TerminalObservation } from "../events/relay.ts";
 import { ZodError } from "zod";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
@@ -53,9 +53,33 @@ export class SessionObservationProcessor {
 
   accept(endpointId: string, method: string, params: unknown): boolean {
     if (!supportedMethods.has(method)) return false;
-    const normalized = normalizeNotification(method, params);
+    const receivedAt = this.options.now();
+    const normalized = normalizeNotification(method, params, receivedAt);
     if (!normalized) return false;
-    this.store.acceptNotification(endpointId, method, normalized, this.options.now());
+    if (method === "thread/tokenUsage/updated") {
+      const token = normalized as { threadId: string; turnId: string; tokenUsage: DashboardTokenUsage };
+      const target = this.managedTarget(endpointId, token.threadId);
+      if (!target) return true;
+      if (this.store.hasPendingNotifications(endpointId)) {
+        const rawTokenUsage = (params as { tokenUsage: unknown }).tokenUsage;
+        this.store.acceptNotification(endpointId, method, {
+          threadId: token.threadId,
+          turnId: token.turnId,
+          tokenUsage: structuredClone(rawTokenUsage),
+        }, receivedAt);
+        void this.enqueue(endpointId);
+        return true;
+      }
+      const changed = this.store.observeTokenUsageNotification(
+        target.identity,
+        token.turnId,
+        token.tokenUsage,
+        receivedAt,
+      );
+      if (changed) this.options.onChanged();
+      return true;
+    }
+    this.store.acceptNotification(endpointId, method, normalized, receivedAt);
     void this.enqueue(endpointId);
     return true;
   }
@@ -278,7 +302,7 @@ export class SessionObservationProcessor {
   }
 }
 
-function normalizeNotification(method: string, raw: unknown): Record<string, unknown> | undefined {
+function normalizeNotification(method: string, raw: unknown, receivedAt: number): Record<string, unknown> | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const params = raw as any;
   if (typeof params.threadId !== "string") return undefined;
@@ -294,7 +318,13 @@ function normalizeNotification(method: string, raw: unknown): Record<string, unk
   }
   if (method === "thread/tokenUsage/updated") {
     if (typeof params.turnId !== "string" || !params.tokenUsage) return undefined;
-    return { threadId: params.threadId, turnId: params.turnId, tokenUsage: structuredClone(params.tokenUsage) };
+    let tokenUsage: DashboardTokenUsage;
+    try { tokenUsage = normalizeTokenUsage(params.tokenUsage, receivedAt); }
+    catch (error) {
+      if (error instanceof ZodError) return undefined;
+      throw error;
+    }
+    return { threadId: params.threadId, turnId: params.turnId, tokenUsage };
   }
   if (method === "thread/goal/updated") {
     if (!params.goal || typeof params.goal.objective !== "string" || typeof params.goal.status !== "string"

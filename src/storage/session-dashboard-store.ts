@@ -110,8 +110,13 @@ export class SessionDashboardStore {
     }));
   }
 
+  hasPendingNotifications(endpointId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM session_dashboard_notifications
+      WHERE state = 'pending' AND endpoint_id = ? LIMIT 1`).get(endpointId) !== undefined;
+  }
+
   completeNotification(sequence: number): void {
-    this.db.prepare("UPDATE session_dashboard_notifications SET state = 'processed', error_json = NULL WHERE sequence = ? AND state = 'pending'").run(sequence);
+    this.db.prepare("DELETE FROM session_dashboard_notifications WHERE sequence = ? AND state = 'pending'").run(sequence);
   }
 
   failNotification(sequence: number, safeError: unknown): void {
@@ -170,18 +175,7 @@ export class SessionDashboardStore {
   }
 
   observeTurnStarted(identity: DashboardIdentity, turn: { id: string; startedAt: number | null }): number {
-    return inTransaction(this.db, () => {
-      const existing = this.db.prepare(`SELECT turn_ordinal FROM session_turn_order
-        WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?`).get(identity.endpointId, identity.threadId, turn.id) as { turn_ordinal: number } | undefined;
-      if (existing) return Number(existing.turn_ordinal);
-      const row = this.db.prepare(`SELECT COALESCE(MAX(turn_ordinal), 0) + 1 AS value FROM session_turn_order
-        WHERE endpoint_id = ? AND thread_id = ?`).get(identity.endpointId, identity.threadId) as { value: number };
-      const ordinal = Number(row.value);
-      this.db.prepare(`INSERT INTO session_turn_order(endpoint_id, thread_id, turn_id, started_at, turn_ordinal)
-        VALUES (?, ?, ?, ?, ?)`)
-        .run(identity.endpointId, identity.threadId, turn.id, turn.startedAt, ordinal);
-      return ordinal;
-    });
+    return inTransaction(this.db, () => this.ensureTurnOrdinal(identity, turn));
   }
 
   turnOrdinal(identity: DashboardIdentity, turnId: string): number | undefined {
@@ -247,6 +241,20 @@ export class SessionDashboardStore {
   observeTokenUsage(identity: DashboardIdentity, turnId: string, value: DashboardTokenUsage, turnOrdinal: number, observationSequence: number): boolean {
     this.guardMetadata();
     const parsed = DashboardTokenUsageSchema.parse(value);
+    return this.writeTokenUsage(identity, turnId, parsed, turnOrdinal, observationSequence);
+  }
+
+  observeTokenUsageNotification(identity: DashboardIdentity, turnId: string, value: DashboardTokenUsage, receivedAt: number): boolean {
+    this.guardMetadata();
+    const parsed = DashboardTokenUsageSchema.parse(value);
+    return inTransaction(this.db, () => {
+      const observationSequence = this.nextObservationSequence();
+      const turnOrdinal = this.ensureTurnOrdinal(identity, { id: turnId, startedAt: receivedAt });
+      return this.writeTokenUsage(identity, turnId, parsed, turnOrdinal, observationSequence);
+    });
+  }
+
+  private writeTokenUsage(identity: DashboardIdentity, turnId: string, parsed: DashboardTokenUsage, turnOrdinal: number, observationSequence: number): boolean {
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
     const existingOrdinal = Number(row.token_turn_ordinal ?? 0);
@@ -410,6 +418,19 @@ export class SessionDashboardStore {
   private ensureFacts(identity: DashboardIdentity): void {
     this.db.prepare("INSERT OR IGNORE INTO session_dashboard_facts(endpoint_id, thread_id) VALUES (?, ?)")
       .run(identity.endpointId, identity.threadId);
+  }
+
+  private ensureTurnOrdinal(identity: DashboardIdentity, turn: { id: string; startedAt: number | null }): number {
+    const existing = this.db.prepare(`SELECT turn_ordinal FROM session_turn_order
+      WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?`).get(identity.endpointId, identity.threadId, turn.id) as { turn_ordinal: number } | undefined;
+    if (existing) return Number(existing.turn_ordinal);
+    const row = this.db.prepare(`SELECT COALESCE(MAX(turn_ordinal), 0) + 1 AS value FROM session_turn_order
+      WHERE endpoint_id = ? AND thread_id = ?`).get(identity.endpointId, identity.threadId) as { value: number };
+    const ordinal = Number(row.value);
+    this.db.prepare(`INSERT INTO session_turn_order(endpoint_id, thread_id, turn_id, started_at, turn_ordinal)
+      VALUES (?, ?, ?, ?, ?)`)
+      .run(identity.endpointId, identity.threadId, turn.id, turn.startedAt, ordinal);
+    return ordinal;
   }
 
   private writeNotes(identity: DashboardIdentity, notes: ManagerNotes, updatedAt: number): void {

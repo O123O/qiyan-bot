@@ -51,15 +51,15 @@ test("manager note patches require a field and accept null clearing", () => {
 
 test("normalizes exact token usage and clamps derived context values", () => {
   assert.deepEqual(normalizeTokenUsage({
-    total: { totalTokens: 120, inputTokens: 80, cachedInputTokens: 20, outputTokens: 40, reasoningOutputTokens: 10 },
-    last: { totalTokens: 20, inputTokens: 12, cachedInputTokens: 4, outputTokens: 8, reasoningOutputTokens: 3 },
+    total: { totalTokens: 120, inputTokens: 80, cachedInputTokens: 20, cacheWriteInputTokens: 0, outputTokens: 40, reasoningOutputTokens: 10 },
+    last: { totalTokens: 20, inputTokens: 12, cachedInputTokens: 4, cacheWriteInputTokens: 0, outputTokens: 8, reasoningOutputTokens: 3 },
     modelContextWindow: 100,
   }, 1_751_328_000_000), {
     total: { total_tokens: 120, input_tokens: 80, cached_input_tokens: 20, output_tokens: 40, reasoning_output_tokens: 10 },
     last_turn: { total_tokens: 20, input_tokens: 12, cached_input_tokens: 4, output_tokens: 8, reasoning_output_tokens: 3 },
     model_context_window: 100,
-    context_remaining: 0,
-    context_used_percent: 100,
+    context_remaining: 80,
+    context_used_percent: 20,
     observed_at: "2025-07-01T00:00:00.000Z",
   });
 });
