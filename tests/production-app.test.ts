@@ -1520,6 +1520,7 @@ test("managed retry owner retries only exact endpoint mappings and wakes downstr
   const keyB = managedRetryKey("endpoint-b", "thread-b", "mapping-b");
   const attempts: Array<{ endpointId: string; keys: readonly string[]; lease: EndpointWorkLease }> = [];
   const restored: string[] = [];
+  const recovered: string[] = [];
   let owner!: ReturnType<typeof createManagedSessionRecoveryOwner>;
   owner = createManagedSessionRecoveryOwner({
     endpoints: {
@@ -1534,6 +1535,7 @@ test("managed retry owner retries only exact endpoint mappings and wakes downstr
       return { restored: keys.length > 0, restoredKeys: keys, settledKeys: [], failures: [] };
     },
     wakeShared: async (endpointId) => { restored.push(endpointId); },
+    onRecovered: (endpointId) => { recovered.push(endpointId); },
     onSafetyFailure: () => assert.fail("unexpected managed retry safety failure"),
     onError: () => assert.fail("unexpected managed retry error"),
     timers: {
@@ -1556,11 +1558,13 @@ test("managed retry owner retries only exact endpoint mappings and wakes downstr
   assert.deepEqual(attempts, [{ endpointId: "endpoint-a", keys: [keyA], lease }]);
   assert.equal(attempts[0]!.keys.includes(healthyA), false);
   assert.deepEqual(restored, ["endpoint-a"]);
+  assert.deepEqual(recovered, ["endpoint-a"]);
 
   const leaseB: EndpointWorkLease = { ...lease, endpointId: "endpoint-b", leaseId: "ready-b" };
   await owner.endpointReady("endpoint-b", leaseB);
   assert.deepEqual(attempts[1], { endpointId: "endpoint-b", keys: [keyB], lease: leaseB });
   assert.deepEqual(restored, ["endpoint-a", "endpoint-b"]);
+  assert.deepEqual(recovered, ["endpoint-a", "endpoint-b"]);
   await owner.stop();
 });
 
@@ -1758,6 +1762,7 @@ test("settled managed recovery removes the target without safety isolation or la
   let attempts = 0;
   let safetyFailures = 0;
   let errors = 0;
+  const recovered: string[] = [];
   const owner = createManagedSessionRecoveryOwner({
     endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
     isLeaseCurrent: () => true,
@@ -1766,6 +1771,7 @@ test("settled managed recovery removes the target without safety isolation or la
       return { restored: false, restoredKeys: [], settledKeys: keys, failures: [] };
     },
     wakeShared: async () => assert.fail("settled mappings have no managed shared wake"),
+    onRecovered: (endpointId) => { recovered.push(endpointId); },
     onSafetyFailure: () => { safetyFailures += 1; },
     onError: () => { errors += 1; },
   });
@@ -1776,6 +1782,62 @@ test("settled managed recovery removes the target without safety isolation or la
   assert.equal(attempts, 1);
   assert.equal(safetyFailures, 0);
   assert.equal(errors, 0);
+  assert.deepEqual(recovered, ["endpoint-a"]);
+  await owner.stop();
+});
+
+test("a timer retry that finds its mapping already ready still publishes recovery", async () => {
+  type Timer = { callback: () => void };
+  const timers: Timer[] = [];
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = {
+    endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "settled-timer",
+  };
+  const recovered: string[] = [];
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => ({ restored: false, restoredKeys: [], settledKeys: keys, failures: [] }),
+    wakeShared: async () => assert.fail("an independently settled mapping has no managed shared wake"),
+    onRecovered: (endpointId) => { recovered.push(endpointId); },
+    onSafetyFailure: () => assert.fail("unexpected safety failure"),
+    onError: () => assert.fail("unexpected recovery error"),
+    timers: {
+      setTimeout: (callback) => { const timer = { callback }; timers.push(timer); return timer; },
+      clearTimeout: () => undefined,
+    },
+  });
+
+  owner.recordFailure(key, "retry");
+  timers[0]!.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+  assert.deepEqual(recovered, ["endpoint-a"]);
+  await owner.stop();
+});
+
+test("settled endpoint-ready recovery publishes once after its shared wake", async () => {
+  const key = managedRetryKey("endpoint-a", "thread-a", "mapping-a");
+  const lease: EndpointWorkLease = {
+    endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "settled-ready",
+  };
+  const events: string[] = [];
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId, run) => run(lease) },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => ({ restored: false, restoredKeys: [], settledKeys: keys, failures: [] }),
+    wakeShared: async () => assert.fail("settled mappings use the caller's shared wake"),
+    onRecovered: () => { events.push("recovered"); },
+    onSafetyFailure: () => assert.fail("unexpected safety failure"),
+    onError: () => assert.fail("unexpected recovery error"),
+  });
+  owner.recordFailure(key, "endpoint");
+
+  assert.deepEqual(await owner.endpointReady("endpoint-a", lease, async () => { events.push("shared"); }), {
+    recovery: "none",
+    sharedWake: "completed",
+  });
+  assert.deepEqual(events, ["shared", "recovered"]);
   await owner.stop();
 });
 

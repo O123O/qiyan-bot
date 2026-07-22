@@ -83,6 +83,7 @@ import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification }
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
+import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { openDatabase, type Database } from "./storage/database.ts";
@@ -1572,6 +1573,7 @@ export function createManagedSessionRecoveryOwner(options: {
     isCurrent: () => boolean,
   ): Promise<ManagedSessionRecoveryBatchResult>;
   wakeShared(endpointId: string, lease: EndpointWorkLease, isCurrent: () => boolean): Promise<void>;
+  onRecovered?(endpointId: string): void;
   onSafetyFailure(error: unknown): void;
   onError(error: unknown): void;
   timers?: ManagedRecoveryTimers;
@@ -1646,7 +1648,13 @@ export function createManagedSessionRecoveryOwner(options: {
   const runIsCurrent = (endpointId: string, epoch: number, lease: EndpointWorkLease): boolean => generationIsCurrent(endpointId, epoch, lease)
     && !unavailableEndpoints.has(endpointId);
   let schedule!: (endpointId: string) => void;
-  const run = async (endpointId: string, selection: "retry" | "all", epoch: number, existingLease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
+  const run = async (
+    endpointId: string,
+    selection: "retry" | "all",
+    epoch: number,
+    existingLease?: EndpointWorkLease,
+    deferSettledPublication = false,
+  ): Promise<ManagedEndpointReadyOutcome> => {
     if (stopped) return { recovery: "pending", sharedWake: "stale" };
     const fallbackWake = fallbackWakes.get(endpointId);
     if (fallbackWake) await fallbackWake.barrier;
@@ -1716,8 +1724,10 @@ export function createManagedSessionRecoveryOwner(options: {
         if (!isCurrent()) return { recovery: "pending", sharedWake: "stale" };
         for (const key of sharedKeys) pending.delete(key);
         safetyReported.delete(endpointId);
+        options.onRecovered?.(endpointId);
         return { recovery: recovery(true), sharedWake: "completed" };
       }
+      if (batch.settledKeys.length > 0 && !deferSettledPublication) options.onRecovered?.(endpointId);
       return { recovery: recovery(), sharedWake: "needed" };
     };
     let result: ManagedEndpointReadyOutcome;
@@ -1740,11 +1750,20 @@ export function createManagedSessionRecoveryOwner(options: {
     if (!stopped && !unavailableEndpoints.has(endpointId) && targetsFor(endpointId, "retry").length > 0) schedule(endpointId);
     return result;
   };
-  const enqueue = (endpointId: string, selection: "retry" | "all", epoch: number, lease?: EndpointWorkLease): Promise<ManagedEndpointReadyOutcome> => {
+  const enqueue = (
+    endpointId: string,
+    selection: "retry" | "all",
+    epoch: number,
+    lease?: EndpointWorkLease,
+    deferSettledPublication = false,
+  ): Promise<ManagedEndpointReadyOutcome> => {
     if (stopped) return Promise.resolve({ recovery: "pending", sharedWake: "stale" });
     const previous = tails.get(endpointId) ?? Promise.resolve();
     let result: ManagedEndpointReadyOutcome = { recovery: "pending", sharedWake: "stale" };
-    const scheduled = previous.then(async () => { result = await run(endpointId, selection, epoch, lease); }, async () => { result = await run(endpointId, selection, epoch, lease); });
+    const scheduled = previous.then(
+      async () => { result = await run(endpointId, selection, epoch, lease, deferSettledPublication); },
+      async () => { result = await run(endpointId, selection, epoch, lease, deferSettledPublication); },
+    );
     const contained = scheduled.catch(report);
     tails.set(endpointId, contained);
     void contained.finally(() => { if (tails.get(endpointId) === contained) tails.delete(endpointId); });
@@ -1780,6 +1799,7 @@ export function createManagedSessionRecoveryOwner(options: {
     try {
       await wakeShared();
       if (!generationIsCurrent(endpointId, epoch, lease)) return { ...result, sharedWake: "stale" };
+      options.onRecovered?.(endpointId);
       return { ...result, sharedWake: "completed" };
     } finally {
       releaseBarrier();
@@ -1804,7 +1824,7 @@ export function createManagedSessionRecoveryOwner(options: {
       const epoch = advanceEndpointEpoch(endpointId);
       unavailableEndpoints.delete(endpointId);
       clearTimer(endpointId);
-      const result = await enqueue(endpointId, "all", epoch, lease);
+      const result = await enqueue(endpointId, "all", epoch, lease, wakeShared !== undefined);
       if (!wakeShared || result.sharedWake !== "needed") return result;
       return completeIndependentSharedWake(endpointId, lease, epoch, wakeShared, result);
     },
@@ -2042,6 +2062,7 @@ export async function buildProductionApp(
   let endpointsCommitted = false;
   let operationReconciler: OperationReconciliationLoop | undefined;
   let managedRecoveryOwner: ManagedSessionRecoveryOwner | undefined;
+  let runtimeRestartRecovery!: RuntimeRestartRecovery;
   let recoveryOwnersStop: Promise<void> | undefined;
   const report = options.onOperationalEvent ?? (() => undefined);
   const eventWakeBoundary = createDurableEventWakeBoundary({
@@ -2589,7 +2610,19 @@ export async function buildProductionApp(
           mcpConfigDir: join(dataDir, "claude-worker-mcp"),
           // Fire drives a turn via the durable send_to_session (singleFireKey ==
           // clientUserMessageId for idempotent delivery).
-          send: (nickname, message, key) => sessions.send(nickname, message, { mode: "auto", clientUserMessageId: key }).then(() => undefined),
+          send: (nickname, message, key, mode = "auto", expected) => sessions.send(nickname, message, {
+            mode,
+            clientUserMessageId: key,
+            ...(expected ? { onBeforeNativeDispatch: ({ session }) => {
+              if (session.endpoint !== expected.endpointId || session.thread_id !== expected.threadId
+                || session.mapping_id !== expected.mappingId) {
+                throw new AppError("SESSION_DETACHED", "runtime recovery mapping changed before dispatch");
+              }
+              if (claudeGoalOwnsWorkerRecovery(session)) {
+                throw new AppError("SESSION_BUSY", "active goal owns worker recovery");
+              }
+            } } : {}),
+          }).then(() => undefined),
           // A monitor check MUST run on the session's own host. If no runner is registered for
           // the endpoint (its runner is only registered once the endpoint is active — so a
           // durable monitor whose endpoint is unavailable/unrecovered has none), treat the
@@ -2602,6 +2635,14 @@ export async function buildProductionApp(
           // local worker (checked here) and every remote worker (checked over ssh). Both
           // register a runner in monitorCheckRunners.
           supportsMonitor: (session) => monitorCheckRunners.has(session.endpointId),
+          resolveRuntimeRecovery: (row, mappingId) => {
+            const current = registry.getByIdentity(row.endpointId, row.threadId);
+            if (!current || current.session.lifecycle_state !== "managed" || current.session.mapping_id !== mappingId) return undefined;
+            const live = nativeSessions.view({ endpointId: row.endpointId, threadId: row.threadId, mappingId });
+            if (live?.availability === "ready" && live.status === "active") return undefined;
+            if (claudeGoalOwnsWorkerRecovery(current.session)) return undefined;
+            return current.nickname;
+          },
         });
         // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
         // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
@@ -2904,6 +2945,28 @@ export async function buildProductionApp(
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turnId);
           },
         );
+        runtimeRestartRecovery = new RuntimeRestartRecovery({
+          listManaged: (endpointId) => Object.entries(registry.managedSnapshot().sessions)
+            .filter(([, session]) => session.endpoint === endpointId)
+            .map(([nickname, session]) => ({ nickname, session })),
+          resolve: (endpointId, threadId) => registry.getByIdentity(endpointId, threadId),
+          native: (session) => nativeSessions.view({
+            endpointId: session.endpoint,
+            threadId: session.thread_id,
+            mappingId: session.mapping_id,
+          }),
+          enqueueResume: ({ nickname, session }) => scheduling!.enqueueRuntimeRecovery({
+            nickname,
+            endpointId: session.endpoint,
+            threadId: session.thread_id,
+            mappingId: session.mapping_id,
+          }, RUNTIME_RESTART_RESUME_MESSAGE),
+          resumeActiveGoal: ({ nickname, session }) => {
+            if (!claudeGoalOwnsWorkerRecovery(session)) return false;
+            claudeGoalDriver!.resumeActive([{ nickname, endpointId: session.endpoint, threadId: session.thread_id }]);
+            return true;
+          },
+        });
         observations = new SessionObservationProcessor(dashboardStore, registry, sessionControls, {
           now: () => Date.now(),
           readGoal: (endpointId, threadId) => pool.request(endpointId, "thread/goal/get", { threadId }),
@@ -2934,6 +2997,7 @@ export async function buildProductionApp(
             unavailableOnly: true, keys, lease, isCurrent,
           }),
           wakeShared: wakeRestoredEndpoint,
+          onRecovered: (endpointId) => runtimeRestartRecovery.endpointReady(endpointId),
           onSafetyFailure: () => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "managed_session_recovery_isolated",
           }),
@@ -3813,6 +3877,11 @@ export async function buildProductionApp(
     sessionControls.setGoalControlled(identity.endpointId, identity.threadId, identity.mappingId, controlled);
   }
 
+  function claudeGoalOwnsWorkerRecovery(session: RegistrySession): boolean {
+    return sessionProvider(session.endpoint) === "claude"
+      && claudeGoals?.get(session.endpoint, session.thread_id)?.status === "active";
+  }
+
   function armGoalControl(nickname: string): void {
     const identity = dashboardIdentity(nickname);
     sessionControls.setGoalControlled(
@@ -4017,6 +4086,7 @@ export async function buildProductionApp(
       target.onUnavailable((kind, reason) => {
         if (!current()) return;
         offerWorkerDiscontinuity(webWorkerStream, target.id);
+        runtimeRestartRecovery.endpointUnavailable(target.id, kind);
         nativeSessions.invalidateEndpoint(target.id, generation);
         runBackground(() => handleEndpointUnavailable(target, kind, reason), () => recordBackgroundFailure("project unavailable handling"));
       }),

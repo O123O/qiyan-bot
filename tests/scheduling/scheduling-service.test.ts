@@ -48,6 +48,57 @@ test("a clean success fires once and advances", async () => {
   assert.equal(calls, 1);
 });
 
+test("runtime restart recovery is deduplicated, starts a new turn, and rechecks its mapping", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-sched-runtime-recovery-"));
+  const db = createTestDatabase();
+  const sends: Array<{ nickname: string; message: string; mode: string | undefined; mappingId: string | undefined }> = [];
+  let allowed = true;
+  const svc = new SchedulingService({
+    db,
+    now: () => 1_000_000,
+    mcpConfigDir: dir,
+    send: async (nickname, message, _key, mode, expected) => {
+      sends.push({ nickname, message, mode, mappingId: expected?.mappingId });
+    },
+    runCheck: async () => false,
+    resolveRuntimeRecovery: (_row, mappingId) => allowed && mappingId === "mapping-1" ? "renamed-s1" : undefined,
+  });
+  const session = { nickname: "s1", endpointId: "local", threadId: "t1", mappingId: "mapping-1" };
+
+  svc.enqueueRuntimeRecovery(session, "resume safely");
+  svc.enqueueRuntimeRecovery(session, "resume safely");
+  assert.equal(svc.store.listForSession("local", "t1").length, 1);
+  await svc.runDueOnce();
+  assert.deepEqual(sends, [{ nickname: "renamed-s1", message: "resume safely", mode: "start", mappingId: "mapping-1" }]);
+
+  svc.enqueueRuntimeRecovery(session, "stale mapping");
+  allowed = false;
+  await svc.runDueOnce();
+  assert.equal(sends.length, 1, "a replaced mapping or newly-active goal drops the stale recovery");
+  assert.equal(svc.store.listForSession("local", "t1").length, 0);
+});
+
+test("runtime recovery is consumed if a newer turn wins the dispatch race", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-sched-runtime-race-"));
+  const db = createTestDatabase();
+  let calls = 0;
+  const svc = new SchedulingService({
+    db,
+    now: () => 1_000_000,
+    mcpConfigDir: dir,
+    send: async () => { calls += 1; throw new AppError("SESSION_BUSY", "newer turn is active"); },
+    runCheck: async () => false,
+    resolveRuntimeRecovery: () => "s1",
+  });
+  svc.enqueueRuntimeRecovery({ nickname: "s1", endpointId: "local", threadId: "t1", mappingId: "mapping-1" }, "resume safely");
+
+  await svc.runDueOnce();
+  await svc.runDueOnce();
+
+  assert.equal(calls, 1);
+  assert.equal(svc.store.listForSession("local", "t1").length, 0);
+});
+
 // A goal auto-drive is enqueued when a pursuit turn completes and fires GOAL_DRIVE_DELAY_MS
 // later. If the goal stops being active in that window (cancel deletes it; pause/complete/blocked
 // change its status), the pending drive MUST NOT send — otherwise a stopped goal drives one more

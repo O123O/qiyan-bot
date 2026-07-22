@@ -17,7 +17,13 @@ export interface SchedulingServiceDeps {
   db: Database;
   // Drive a turn on the target session (production-app wires this to the durable
   // send_to_session, passing singleFireKey as the clientUserMessageId).
-  send(nickname: string, message: string, singleFireKey: string): Promise<void>;
+  send(
+    nickname: string,
+    message: string,
+    singleFireKey: string,
+    mode?: "auto" | "start",
+    expected?: { endpointId: string; threadId: string; mappingId: string },
+  ): Promise<void>;
   // Run a monitor's shell predicate on the session's endpoint; true iff exit 0.
   runCheck(row: ScheduleRow): Promise<boolean>;
   now(): number;
@@ -33,11 +39,15 @@ export interface SchedulingServiceDeps {
   // Whether the `monitor` tool is available to a session — false for a remote worker, whose
   // check would run on the QiYan host, not the worker's (see remote-worker-scheduling §3.5).
   supportsMonitor?(session: WorkerScheduleSession): boolean;
+  // Runtime-restart wakeups carry the captured mapping id in their private spec. Resolve the
+  // mapping's current nickname immediately before dispatch; undefined drops a stale wakeup.
+  resolveRuntimeRecovery?(row: ScheduleRow, mappingId: string): string | undefined;
 }
 
 // Inter-drive pacing for goal auto-drive turns (F3/F6): bounds a failing goal to one
 // claude turn per this interval rather than at poll speed.
 const GOAL_DRIVE_DELAY_MS = 5_000;
+const RUNTIME_RECOVERY_SPEC = "runtime-recovery:";
 
 export class SchedulingService {
   readonly store: ScheduleStore;
@@ -107,13 +117,25 @@ export class SchedulingService {
     // check string could also be "goal" (that row is kind "monitor").
     if (row.kind === "wakeup" && row.spec === "goal" && this.deps.goals
       && this.deps.goals.get(row.endpointId, row.threadId)?.status !== "active") return;
+    const recoveryMappingId = row.kind === "wakeup" && row.spec.startsWith(RUNTIME_RECOVERY_SPEC)
+      ? row.spec.slice(RUNTIME_RECOVERY_SPEC.length)
+      : undefined;
+    const targetNickname = recoveryMappingId === undefined
+      ? row.nickname
+      : this.deps.resolveRuntimeRecovery?.(row, recoveryMappingId);
+    if (!targetNickname) return;
     const outcome = this.outbox.claim(singleFireKey, row.nickname, row.message, this.deps.now());
     if (outcome === "delivered") return;
     if (outcome === "in-flight") throw new AppError("OPERATION_UNCERTAIN", `schedule send in-flight: ${singleFireKey}`);
     try {
-      await this.deps.send(row.nickname, row.message, singleFireKey);
+      await this.deps.send(targetNickname, row.message, singleFireKey, recoveryMappingId === undefined ? "auto" : "start",
+        recoveryMappingId === undefined ? undefined : { endpointId: row.endpointId, threadId: row.threadId, mappingId: recoveryMappingId });
       this.outbox.markSent(singleFireKey);
     } catch (error) {
+      if (recoveryMappingId !== undefined && error instanceof AppError && error.code === "SESSION_BUSY") {
+        this.outbox.markSent(singleFireKey);
+        return;
+      }
       if (isProvenNotDispatched(error)) { this.outbox.release(singleFireKey); throw error; }
       // Ambiguous: the turn may already be running/done. Do NOT re-send (avoid the
       // duplicate-delivery class this deployment is sensitive to); accept it.
@@ -131,6 +153,12 @@ export class SchedulingService {
   // failing/looping goal can't spawn back-to-back claude turns at poll speed.
   enqueueGoalDrive(session: WorkerScheduleSession, message: string): void {
     this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "goal", message, nextFireAt: this.deps.now() + GOAL_DRIVE_DELAY_MS }, this.deps.now());
+  }
+
+  enqueueRuntimeRecovery(session: WorkerScheduleSession & { mappingId: string }, message: string): void {
+    const spec = `${RUNTIME_RECOVERY_SPEC}${session.mappingId}`;
+    if (this.store.hasArmedSpec(session.endpointId, session.threadId, spec)) return;
+    this.enqueueImmediate(session, spec, message);
   }
 
   // Is a goal drive already pending for this session? (dedup — one drive lane.)
