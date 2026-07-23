@@ -200,7 +200,7 @@ export class SessionLifecycle {
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transition_intent"));
       await this.registry.transition(nickname, session, "archiving");
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "transitioned"));
-      if (native) await this.pool.request(session.endpoint, "thread/archive", { threadId: session.thread_id }, undefined, lease);
+      if (native) await this.archiveOrConfirmAbsent(session.endpoint, session.thread_id, lease);
       checkpoint?.(this.checkpoint(nickname, session, "archiving", "native_archived"));
       this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
       this.native.unregister(this.nativeIdentity(session));
@@ -416,7 +416,7 @@ export class SessionLifecycle {
           await this.unsubscribeOrConfirmAbsent(current.endpoint, current.thread_id, lease);
         }
       } else {
-        await this.pool.request(current.endpoint, "thread/archive", { threadId: current.thread_id }, undefined, lease);
+        await this.archiveOrConfirmAbsent(current.endpoint, current.thread_id, lease);
       }
       this.epochs.end(current.endpoint, current.thread_id, current.mapping_id, this.clock.now());
       this.native.unregister(this.nativeIdentity(current));
@@ -453,6 +453,33 @@ export class SessionLifecycle {
     // includeTurns:false does not return turns; normalize to [] (as the `read` fallback does) so callers
     // treat it as an unmaterialized view and never mistake it for "has turns".
     return { ...response, thread: { ...response.thread, turns: [] } };
+  }
+
+  private async archiveOrConfirmAbsent(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<void> {
+    const archive = (): Promise<unknown> =>
+      this.pool.request(endpointId, "thread/archive", { threadId }, undefined, lease);
+    try {
+      await archive();
+      return;
+    } catch (error) {
+      if (isExactThreadNoRollout(error, threadId)) return;
+      if (!isExactThreadNotLoaded(error, threadId)) throw error;
+    }
+
+    let resumed: ThreadResponse;
+    try {
+      resumed = await this.pool.request<ThreadResponse>(endpointId, "thread/resume", this.resumeParams(threadId), undefined, lease);
+    } catch (error) {
+      if (isExactThreadNoRollout(error, threadId)) return;
+      throw error;
+    }
+    this.requireThreadIdentity(resumed.thread, threadId);
+    this.requireIdle(resumed.thread);
+    try {
+      await archive();
+    } catch (error) {
+      if (!isExactThreadNoRollout(error, threadId)) throw error;
+    }
   }
 
   private async readListedMetadata(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadResponse> {

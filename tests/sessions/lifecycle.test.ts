@@ -1143,6 +1143,21 @@ test("archive clears a never-materialized (no rollout) thread without a native a
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), false);
 });
 
+test("archive completes when a loaded empty thread reports no rollout during the native archive", async () => {
+  const { registry, endpoint, lifecycle } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  endpoint.status = "idle";
+  endpoint.calls.length = 0;
+  endpoint.archiveError = new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1");
+  const checkpoints: string[] = [];
+
+  await lifecycle.archive("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
+
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(checkpoints, ["transition_intent", "transitioned", "native_archived", "removed"]);
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/read", "thread/archive"]);
+});
+
 test("unadopt clears a never-materialized (no rollout) thread without unsubscribing", async () => {
   const { registry, endpoint, lifecycle } = await fixture();
   await lifecycle.adopt("payments", "local", "thread-1");
@@ -1154,7 +1169,7 @@ test("unadopt clears a never-materialized (no rollout) thread without unsubscrib
   assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false);
 });
 
-test("removal reconciliation accepts exact absence only for unadoption", async () => {
+test("removal reconciliation confirms absence or reloads before archiving", async () => {
   const unadopting = await fixture();
   await unadopting.registry.createManaged("payments", {
     endpoint: "local", thread_id: "thread-1", project_dir: unadopting.dir, mapping_id: "mapping-unadopt",
@@ -1175,9 +1190,33 @@ test("removal reconciliation accepts exact absence only for unadoption", async (
   const archiveManaged = required(archiving.registry);
   await archiving.registry.transition("payments", archiveManaged, "archiving");
   archiving.endpoint.archiveError = new JsonRpcResponseError(-32600, "thread not loaded: thread-1");
-  const archiveError = archiving.endpoint.archiveError;
-  await assert.rejects(archiving.lifecycle.reconcileRemoval("payments", required(archiving.registry)), (error: unknown) => error === archiveError);
-  assert.equal(required(archiving.registry).lifecycle_state, "archiving");
+  archiving.endpoint.onResume = () => { archiving.endpoint.archiveError = undefined; };
+  await archiving.lifecycle.reconcileRemoval("payments", required(archiving.registry));
+  assert.equal(archiving.registry.get("payments"), undefined);
+  assert.deepEqual(archiving.endpoint.calls.map((call) => call.method), ["thread/archive", "thread/resume", "thread/archive"]);
+
+  const absent = await fixture();
+  await absent.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: absent.dir, mapping_id: "mapping-archive-absent",
+  });
+  const absentManaged = required(absent.registry);
+  await absent.registry.transition("payments", absentManaged, "archiving");
+  absent.endpoint.archiveError = new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1");
+  await absent.lifecycle.reconcileRemoval("payments", required(absent.registry));
+  assert.equal(absent.registry.get("payments"), undefined);
+  assert.deepEqual(absent.endpoint.calls.map((call) => call.method), ["thread/archive"]);
+
+  const coldAbsent = await fixture();
+  await coldAbsent.registry.createManaged("payments", {
+    endpoint: "local", thread_id: "thread-1", project_dir: coldAbsent.dir, mapping_id: "mapping-archive-cold-absent",
+  });
+  const coldAbsentManaged = required(coldAbsent.registry);
+  await coldAbsent.registry.transition("payments", coldAbsentManaged, "archiving");
+  coldAbsent.endpoint.archiveError = new JsonRpcResponseError(-32600, "thread not loaded: thread-1");
+  coldAbsent.endpoint.resumeError = new JsonRpcResponseError(-32600, "no rollout found for thread id thread-1");
+  await coldAbsent.lifecycle.reconcileRemoval("payments", required(coldAbsent.registry));
+  assert.equal(coldAbsent.registry.get("payments"), undefined);
+  assert.deepEqual(coldAbsent.endpoint.calls.map((call) => call.method), ["thread/archive", "thread/resume"]);
 });
 
 test("startup completes exact unadopting and archiving mappings before managed resume", async () => {
