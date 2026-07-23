@@ -163,11 +163,16 @@ export async function readLocalRolloutSlice(
   before: number | undefined,
   maxBytes: number,
   signal: AbortSignal,
+  allowMissing = false,
 ): Promise<RolloutSlice> {
   if (!isAbsolute(path) || !basename(path).startsWith("rollout-") || !basename(path).endsWith(`-${threadId}.jsonl`)
     || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > SLICE_BYTES) throw new Error("invalid rollout history read");
   if (signal.aborted) throw signal.reason ?? new Error("worker history read cancelled");
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
+    if (allowMissing && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!file) return { device: "unmaterialized", inode: threadId, size: 0, start: 0, end: 0, rows: [] };
   try {
     const state = await file.stat({ bigint: true });
     const uid = process.getuid?.();

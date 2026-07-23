@@ -101,6 +101,22 @@ test("local rollout slices transfer only conversational and turn-boundary rows",
   assert.ok(slice.rows.every((item) => !item.line.includes("function_call_output")));
 });
 
+test("a never-materialized rollout is empty only when the caller permits it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-rollout-"));
+  const threadId = "019f0000-0000-7000-8000-000000000002";
+  const path = join(dir, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+  const signal = new AbortController().signal;
+
+  await assert.rejects(
+    readLocalRolloutSlice(path, threadId, undefined, 8 * 1024 * 1024, signal),
+    (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+  );
+  assert.deepEqual(
+    await readLocalRolloutSlice(path, threadId, undefined, 8 * 1024 * 1024, signal, true),
+    { device: "unmaterialized", inode: threadId, size: 0, start: 0, end: 0, rows: [] },
+  );
+});
+
 test("carries terminal status across message-page boundaries and exposes only the authoritative active turn", async () => {
   const rows = [
     row(100, message("2026-01-01T00:00:01Z", "assistant", "old-one", "commentary", "old")),

@@ -246,6 +246,22 @@ test("the helper returns a bounded filtered rollout slice", async (t) => {
   assert.equal(slice.rows.some((item) => item.line.includes("hidden")), false);
 });
 
+test("the helper reports a permitted never-materialized rollout as empty", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-rollout-helper-"));
+  const threadId = "019f0000-0000-7000-8000-000000000003";
+  const path = join(root, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+  const argument = encodeRemoteArgument(JSON.stringify({
+    path, threadId, maxBytes: 8 * 1024 * 1024, allowMissing: true,
+  }));
+
+  const result = await runBoundedProcess(process.execPath, [helperPath.pathname, "read-rollout-slice", argument], {
+    timeoutMs: 5_000, maxOutputBytes: 1024 * 1024,
+  });
+  assert.deepEqual(parseRemoteHelperResponse(result.stdout, "read-rollout-slice"), {
+    device: "unmaterialized", inode: threadId, size: 0, start: 0, end: 0, rows: [],
+  });
+});
+
 test("the helper establishes a frame boundary after output without a trailing newline", async () => {
   const argument = encodeRemoteArgument(JSON.stringify({ action: "home" }));
   const result = await runBoundedProcess("sh", [

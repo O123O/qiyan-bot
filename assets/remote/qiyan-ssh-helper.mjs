@@ -263,12 +263,18 @@ async function readRolloutSlice(value) {
   const threadId = value?.threadId;
   const before = value?.before;
   const maxBytes = value?.maxBytes;
+  const allowMissing = value?.allowMissing;
   if (typeof path !== "string" || !isAbsolute(path) || !SAFE_PATH.test(path)
     || typeof threadId !== "string" || !/^[A-Za-z0-9-]{1,128}$/u.test(threadId)
     || !basename(path).startsWith("rollout-") || !basename(path).endsWith(`-${threadId}.jsonl`)
     || (before !== undefined && (!Number.isSafeInteger(before) || before < 0))
+    || (allowMissing !== undefined && typeof allowMissing !== "boolean")
     || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) throw new Error("invalid rollout read request");
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error) => {
+    if (allowMissing === true && error?.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!file) return { device: "unmaterialized", inode: threadId, size: 0, start: 0, end: 0, rows: [] };
   try {
     const state = await file.stat({ bigint: true });
     const uid = process.getuid?.();

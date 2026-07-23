@@ -2184,6 +2184,10 @@ export async function buildProductionApp(
       const response = await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false }, signal, lease);
       const path = typeof response?.thread?.path === "string" ? response.thread.path : undefined;
       if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
+      // `thread/start` reserves a rollout path before Codex materializes the JSONL on its first
+      // turn. Keep an actually missing established history visible as an error: only a native
+      // thread with no preview, and no pagination cursor from an earlier file, permits ENOENT.
+      const allowMissing = response.thread.preview === "" && cursor === undefined;
       const native = nativeSessions.view({ endpointId, threadId, mappingId: _mappingId });
       const status = native?.availability === "ready"
         ? native.status
@@ -2191,9 +2195,9 @@ export async function buildProductionApp(
       const context = remoteContexts.get(endpointId);
       return readCodexRolloutHistoryPage({
         readSlice: async (rolloutPath, rolloutThreadId, before, maxBytes, requestSignal) => {
-          if (!context) return readLocalRolloutSlice(rolloutPath, rolloutThreadId, before, maxBytes, requestSignal);
+          if (!context) return readLocalRolloutSlice(rolloutPath, rolloutThreadId, before, maxBytes, requestSignal, allowMissing);
           const value = await context.remote.invokeTransfer<unknown>("read-rollout-slice", [JSON.stringify({
-            path: rolloutPath, threadId: rolloutThreadId, ...(before === undefined ? {} : { before }), maxBytes,
+            path: rolloutPath, threadId: rolloutThreadId, ...(before === undefined ? {} : { before }), maxBytes, allowMissing,
           })], { maxOutputBytes: 24 * 1024 * 1024, signal: requestSignal }, context.host.remoteHelperPath);
           return parseRolloutSlice(value);
         },
