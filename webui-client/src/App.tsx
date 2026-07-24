@@ -50,6 +50,7 @@ import {
   type WorkerStreamState,
 } from "./worker-chat-stream";
 
+const QIYAN_LOGO = new URL("./favicon.png", import.meta.url).href;
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
 const IMG_EXT = /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i; // shown inline in the preview panel
@@ -927,7 +928,7 @@ export function App() {
     <div className="app">
       <style>{STYLES}</style>
       <header className="topbar">
-        <div className="brand">QiYan</div>
+        <img className="brand" src={QIYAN_LOGO} alt="QiYan" width={32} height={32} />
         <nav className="tabs" onWheel={(e) => { if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY; }}>
           {(() => {
             const status = assistantSession ? workerStatus(assistantSession) : { label: "unavailable" as const, tone: "unavailable" as const };
