@@ -169,18 +169,36 @@ export class ConversationStore {
     });
   }
 
-  recordInternalLog(input: InternalSource): string {
+  recordInternalLog(input: InternalSource, ownerEcho?: CanonicalChatSource): string {
     return inTransaction(this.db, () => {
       const existing = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id IS NULL AND kind = ? AND source_id = ?")
         .get(input.kind, input.sourceId) as { id: string } | undefined;
-      if (existing) return existing.id;
-      const arrival = this.takeArrivalSequence();
-      this.db.prepare(`INSERT INTO source_contexts
-        (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
-          destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
-        VALUES (?, ?, ?, ?, ?, 'completed', ?, NULL, NULL, NULL, NULL, ?, 'internal', 0)`)
-        .run(input.id, input.kind, input.sourceId, input.rawText, JSON.stringify(input.attachmentIds), input.receivedAt, arrival);
-      return input.id;
+      if (!existing) {
+        const arrival = this.takeArrivalSequence();
+        this.db.prepare(`INSERT INTO source_contexts
+          (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
+            destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required)
+          VALUES (?, ?, ?, ?, ?, 'completed', ?, NULL, NULL, NULL, NULL, ?, 'internal', 0)`)
+          .run(input.id, input.kind, input.sourceId, input.rawText, JSON.stringify(input.attachmentIds), input.receivedAt, arrival);
+      }
+      if (ownerEcho) {
+        if (!/^[a-z][a-z0-9_-]{0,31}$/u.test(ownerEcho.binding.adapterId)) this.conflict("chat adapter identifier is invalid");
+        const duplicate = this.db.prepare("SELECT id FROM source_contexts WHERE adapter_id = ? AND source_id = ?")
+          .get(ownerEcho.binding.adapterId, ownerEcho.nativeSourceId);
+        if (!duplicate) {
+          const arrival = this.takeArrivalSequence();
+          this.db.prepare(`INSERT INTO source_contexts
+            (id, kind, source_id, raw_text, attachment_ids_json, state, created_at, adapter_id, conversation_key,
+              destination_json, native_reply_json, arrival_sequence, source_class, queue_notice_required, failed_attachments_json)
+            VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, 'chat', 0, ?)`)
+            .run(ownerEcho.id, ownerEcho.binding.adapterId, ownerEcho.nativeSourceId, ownerEcho.rawText,
+              JSON.stringify(ownerEcho.attachmentIds), ownerEcho.receivedAt, ownerEcho.binding.adapterId,
+              ownerEcho.binding.conversationKey, JSON.stringify(ownerEcho.binding.destination),
+              ownerEcho.binding.reply === undefined ? null : JSON.stringify(ownerEcho.binding.reply),
+              arrival, JSON.stringify(ownerEcho.failedAttachments ?? []));
+        }
+      }
+      return existing?.id ?? input.id;
     });
   }
 

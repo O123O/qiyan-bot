@@ -144,6 +144,39 @@ test("an internal audit log is durable but never eligible for an assistant turn"
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'audit-1'").get()!.state, "completed");
 });
 
+test("an owner-visible direct log persists in the QiYan transcript without becoming runnable", () => {
+  const { store } = fixture();
+  const ownerEcho = {
+    ...message("web-direct", binding("web", "web:owner")),
+    rawText: "→ @payments  fix the flaky test",
+  };
+
+  store.recordInternalLog({
+    id: "audit-visible",
+    kind: "direct_to",
+    sourceId: "direct_to:native:web-direct",
+    rawText: "[direct message delivered to worker \"payments\"]\nfix the flaky test",
+    attachmentIds: [],
+    receivedAt: 100,
+  }, ownerEcho);
+  store.recordInternalLog({
+    id: "audit-hidden",
+    kind: "direct_to",
+    sourceId: "direct_to:native:worker-panel",
+    rawText: "[direct message delivered to worker \"other\"]\nworker-panel message",
+    attachmentIds: [],
+    receivedAt: 101,
+  });
+
+  assert.equal(store.nextPendingCandidate(), undefined);
+  assert.deepEqual(store.listOwnerConversation(undefined, 20), [{
+    id: "web-direct",
+    role: "you",
+    body: "→ @payments  fix the flaky test",
+    at: 100_000,
+  }]);
+});
+
 test("a route-bound recovery turn queues chat input and never reserves it as a steer", () => {
   const { db, deliveries, store } = fixture();
   const route = binding("telegram", "chat-1");

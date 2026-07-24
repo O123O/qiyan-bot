@@ -47,7 +47,7 @@ const reads: WebReadsDeps = {
 };
 
 interface ServerCalls {
-  inputs: Array<{ text: string; target?: string; clientInputId?: string }>;
+  inputs: Array<{ text: string; target?: string; clientInputId?: string; echoInAssistant?: boolean }>;
   goals: WebGoalControlInput[];
 }
 
@@ -69,7 +69,10 @@ async function withServer(
       maxFileBytes: 1024,
     },
     uploads: { dir: uploadsDir, maxBytes: 1024, ttlMs: 1e9 },
-    submitInput: async (text, target, clientInputId) => { calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}) }); return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) }; },
+    submitInput: async (text, target, clientInputId, echoInAssistant) => {
+      calls.inputs.push({ text, ...(target ? { target } : {}), ...(clientInputId ? { clientInputId } : {}), ...(echoInAssistant ? { echoInAssistant } : {}) });
+      return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) };
+    },
     controlGoal: async (input) => { calls.goals.push(input); return { ok: true }; },
     openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {},
     report: () => {},
@@ -242,12 +245,13 @@ test("paginates older messages with an inclusive before cursor (no same-ms skip)
 test("POST /api/input forwards text and target to submitInput", async () => {
   await withServer(async (base, calls) => {
     const clientInputId = crypto.randomUUID();
-    const sent = await (await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hello", target: "payments", clientInputId }) })).json();
+    const sent = await (await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hello", target: "payments", clientInputId, echoInAssistant: true }) })).json();
     await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "hi assistant" }) });
     assert.deepEqual(sent, { ok: true, clientUserMessageId: `to:web:${clientInputId}` });
-    assert.deepEqual(calls.inputs, [{ text: "hello", target: "payments", clientInputId }, { text: "hi assistant" }]);
+    assert.deepEqual(calls.inputs, [{ text: "hello", target: "payments", clientInputId, echoInAssistant: true }, { text: "hi assistant" }]);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "missing id", target: "payments" }) })).status, 400);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "bad id", target: "payments", clientInputId: "not-a-uuid" }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "bad echo", echoInAssistant: true }) })).status, 400);
     assert.equal((await fetch(`${base}/api/input?token=${TOKEN}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 400);
   });
 });

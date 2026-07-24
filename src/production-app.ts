@@ -2122,17 +2122,21 @@ export async function buildProductionApp(
   const openStateDatabase = options.storage?.openDatabase ?? openDatabase;
   const closeStateDatabase = options.storage?.closeDatabase ?? ((database: Database) => { database.close(); });
 
-  const acceptChat = async (source: CanonicalChatSource, effects: ChatAcceptanceEffects): Promise<void> => {
+  const acceptChat = async (
+    source: CanonicalChatSource,
+    effects: ChatAcceptanceEffects,
+    presentation?: { ownerDisplayText?: string },
+  ): Promise<void> => {
     const directive = parseDirective(source.rawText, source.attachmentIds, config.maxCollectCount);
     if (directive.kind === "to") {
       // `/to <worker> <text>` uses the shared worker send transport but never wakes QiYan.
       const result = await deliverDirectTo({
         alreadyDelivered: (sourceId) => conversations.hasInternalSource("direct_to", sourceId),
         send: (nickname, text, sendOptions) => sessions.send(nickname, text, sendOptions),
-        recordAudit: (input) => { conversations.recordInternalLog(input); },
+        recordAudit: (input, ownerEcho) => { conversations.recordInternalLog(input, ownerEcho); },
         commitCheckpoint: () => effects.commitNativeCheckpoint?.(),
         report,
-      }, source, directive.target, directive.payload);
+      }, source, directive.target, directive.payload, presentation?.ownerDisplayText);
       // The Web worker panel needs an HTTP failure so it does not present an unadmitted optimistic
       // message as accepted native history.
       if (!result.delivered && source.binding.adapterId === WEB_ADAPTER_ID) {

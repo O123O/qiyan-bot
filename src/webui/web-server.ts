@@ -104,7 +104,7 @@ export interface WebServerOptions {
   // ssh access for remote-worker files (reuses the user's ControlMaster). A PROVIDER, not a value: the
   // ssh runtime root is only known after startup, so it must be resolved per request, not at wiring time.
   remote?: () => RemoteDeps | undefined;
-  submitInput(text: string, target: string | undefined, clientInputId?: string): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }>;
+  submitInput(text: string, target: string | undefined, clientInputId?: string, echoInAssistant?: boolean): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }>;
   controlGoal(input: WebGoalControlInput): Promise<WebGoalControlResult>;
   openGoalAdmission(): void;
   closeGoalAdmission(): void;
@@ -457,14 +457,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
     if (request.method === "POST" && url.pathname === "/api/input") {
       let raw = "";
       for await (const chunk of request) { raw += chunk; if (raw.length > 256 * 1024) { json(response, 413, { error: "too large" }); return; } }
-      let parsed: { text?: unknown; target?: unknown; clientInputId?: unknown };
+      let parsed: { text?: unknown; target?: unknown; clientInputId?: unknown; echoInAssistant?: unknown };
       try { parsed = JSON.parse(raw || "{}"); } catch { json(response, 400, { error: "invalid json" }); return; }
       const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
       const target = typeof parsed.target === "string" && parsed.target ? parsed.target : undefined;
       const clientInputId = typeof parsed.clientInputId === "string" ? parsed.clientInputId : undefined;
+      const echoInAssistant = parsed.echoInAssistant === true;
       if (!text) { json(response, 400, { error: "text is required" }); return; }
       if (target && (!clientInputId || !UUID.test(clientInputId))) { json(response, 400, { error: "valid clientInputId is required for worker input" }); return; }
-      const result = await options.submitInput(text, target, clientInputId);
+      if (echoInAssistant && !target) { json(response, 400, { error: "assistant echo requires a worker target" }); return; }
+      const result = await options.submitInput(text, target, clientInputId, echoInAssistant);
       json(response, result.ok ? 200 : 400, result);
       return;
     }

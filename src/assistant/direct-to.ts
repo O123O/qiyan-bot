@@ -8,7 +8,7 @@ export interface DirectToDeps {
   // Deliver verbatim text to a named worker (SessionService.send).
   send(nickname: string, text: string, options: { mode: "auto"; clientUserMessageId: string }): Promise<unknown>;
   // Record a completed audit row. It is never eligible for an assistant turn.
-  recordAudit(input: InternalSource): void;
+  recordAudit(input: InternalSource, ownerEcho?: CanonicalChatSource): void;
   // Ack the native ingress checkpoint so the surface does not redeliver this message.
   commitCheckpoint(): void;
   report(event: OperationalEvent): void;
@@ -22,9 +22,12 @@ export async function deliverDirectTo(
   source: CanonicalChatSource,
   target: string,
   payload: string,
+  ownerDisplayText?: string,
 ): Promise<{ delivered: boolean; error?: string }> {
   const sourceId = `direct_to:${source.nativeSourceId}`;
   // Idempotency: on redelivery (the marker exists) do nothing but re-ack the ingress checkpoint.
+  // Legacy markers predate the panel-origin discriminator, so they cannot safely be backfilled into
+  // the QiYan transcript: some came from worker panels. New audit + owner-echo rows commit atomically.
   if (deps.alreadyDelivered(sourceId)) { deps.commitCheckpoint(); return { delivered: true }; }
 
   let failure: string | undefined;
@@ -38,7 +41,10 @@ export async function deliverDirectTo(
   const note = failure
     ? `[direct message could NOT be delivered to worker "${target}" (${failure})]${dropped}\n${payload}`
     : `[direct message delivered to worker "${target}"]${dropped}\n${payload}`;
-  deps.recordAudit({ id: `direct-to-note:${source.id}`, kind: "direct_to", sourceId, rawText: note, attachmentIds: [], receivedAt: source.receivedAt });
+  deps.recordAudit(
+    { id: `direct-to-note:${source.id}`, kind: "direct_to", sourceId, rawText: note, attachmentIds: [], receivedAt: source.receivedAt },
+    !failure && ownerDisplayText ? { ...source, rawText: ownerDisplayText, attachmentIds: [] } : undefined,
+  );
   deps.commitCheckpoint();
   deps.report({
     level: failure ? "warn" : "info",

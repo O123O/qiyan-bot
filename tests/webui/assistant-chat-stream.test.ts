@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { mergeAssistantConversation } from "../../webui-client/src/assistant-chat-stream.ts";
 
@@ -30,4 +31,13 @@ test("the same durable WebSocket and history message is rendered once", () => {
   const socket = message("assistant:turn-1", "done", 3);
 
   assert.deepEqual(mergeAssistantConversation([history, socket], []), [socket]);
+});
+
+test("a targeted optimistic echo and its durable history row share one identity", async () => {
+  const history = message("web:input-1", "→ @payments  ship it", 2);
+  const optimistic = message("web:input-1", "→ @payments  ship it", 1);
+  assert.equal(mergeAssistantConversation([history, optimistic], []).length, 1);
+
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /selected === null && redirect && clientInputId \? \{ id: `web:\$\{clientInputId\}` \} : \{\}/u);
 });
