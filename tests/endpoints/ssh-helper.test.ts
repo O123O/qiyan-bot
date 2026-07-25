@@ -553,6 +553,17 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     "if (result.error) throw result.error;",
     "process.exit(result.status ?? 1);",
   ].join("\n"), { mode: 0o700 });
+  const capabilityClaude = join(wrapperDir, "claude");
+  await writeFile(capabilityClaude, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+  const capabilityShell = join(wrapperDir, "shell");
+  await writeFile(capabilityShell, [
+    "#!/bin/sh",
+    'if [ "$1" = "-lc" ]; then',
+    "  shift",
+    '  exec /bin/bash -c "$1"',
+    "fi",
+    'exec /bin/bash "$@"',
+  ].join("\n"), { mode: 0o700 });
   const installed = join(runtimeDir, "qiyan-ssh-helper.mjs");
   const base = { runtimeDir, session, tmuxMode: "explicit" as const };
   const invoke = async <T>(operation: string, value: unknown, input?: Buffer, timeoutMs = 10_000): Promise<T> => {
@@ -577,14 +588,10 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   });
   const started = await invoke<{ identity: unknown; claudePath: string }>("start-claude-runtime", {
     ...base,
-    shell: "/bin/bash",
+    shell: capabilityShell,
     token: randomBytes(16).toString("hex"),
   });
-  const expectedClaude = (await runBoundedProcess("/bin/bash", ["-lc", "command -v claude"], {
-    timeoutMs: 5_000,
-    maxOutputBytes: 64 * 1024,
-  })).stdout.toString("utf8").trim();
-  assert.equal(started.claudePath, expectedClaude, "fresh runtime startup returns the Claude binary");
+  assert.equal(started.claudePath, capabilityClaude, "fresh runtime startup returns the discovered Claude binary");
   identity = started.identity;
 
   const fakeClaude = join(cwd, "fake-claude.mjs");
@@ -676,7 +683,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   }
   await invoke("start-claude-runtime", {
     ...base,
-    shell: "/bin/bash",
+    shell: capabilityShell,
     token: randomBytes(16).toString("hex"),
   });
   const panesAfterUpgrade = await runBoundedProcess("tmux", [
@@ -763,7 +770,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
 
   const replacement = await invoke<{ identity: any }>("start-claude-runtime", {
     ...base,
-    shell: "/bin/bash",
+    shell: capabilityShell,
     token: randomBytes(16).toString("hex"),
   });
   assert.notEqual(replacement.identity.token, (started.identity as any).token);
@@ -784,7 +791,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   assert.equal(afterCrash.status, "absent");
   const recovered = await invoke<{ identity: any }>("start-claude-runtime", {
     ...base,
-    shell: "/bin/bash",
+    shell: capabilityShell,
     token: randomBytes(16).toString("hex"),
   });
   assert.notEqual(recovered.identity.token, replacement.identity.token);
