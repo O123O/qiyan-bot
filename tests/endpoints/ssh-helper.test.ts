@@ -540,12 +540,26 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     helperPath.pathname,
     "bootstrap",
   ], { input: bootstrap, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
+  const wrapperDir = join(xdg, "bin");
+  await mkdir(wrapperDir);
+  const realTmux = (await runBoundedProcess("/bin/bash", ["-lc", "command -v tmux"], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  })).stdout.toString("utf8").trim();
+  await writeFile(join(wrapperDir, "tmux"), [
+    "#!/usr/bin/env node",
+    'import { spawnSync } from "node:child_process";',
+    `const result = spawnSync(${JSON.stringify(realTmux)}, process.argv.slice(2).map((arg) => arg.replaceAll("\\t", "_")), { stdio: "inherit" });`,
+    "if (result.error) throw result.error;",
+    "process.exit(result.status ?? 1);",
+  ].join("\n"), { mode: 0o700 });
   const installed = join(runtimeDir, "qiyan-ssh-helper.mjs");
   const base = { runtimeDir, session, tmuxMode: "explicit" as const };
   const invoke = async <T>(operation: string, value: unknown, input?: Buffer, timeoutMs = 10_000): Promise<T> => {
     try {
       const result = await runBoundedProcess("env", [
         `XDG_RUNTIME_DIR=${xdg}`,
+        `PATH=${wrapperDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
         process.execPath,
         installed,
         operation,
@@ -644,6 +658,37 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     },
   });
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
+
+  const duplicateResult = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "new-window", "-d", "-P", "-F", "#{pane_id}",
+    "-t", session, "-n", "legacy-duplicate", "/bin/bash", "-l",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const duplicatePane = duplicateResult.stdout.toString("utf8").trim();
+  for (const [option, optionValue] of [
+    ["@qiyan_thread", threadId],
+    ["@qiyan_runtime", (started.identity as any).token],
+  ]) {
+    await runBoundedProcess("tmux", [
+      "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+      "set-option", "-p", "-t", duplicatePane, option, optionValue,
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  }
+  await invoke("start-claude-runtime", {
+    ...base,
+    shell: "/bin/bash",
+    token: randomBytes(16).toString("hex"),
+  });
+  const panesAfterUpgrade = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "list-panes", "-a", "-F", "#{pane_id}|#{@qiyan_thread}",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  assert.deepEqual(
+    panesAfterUpgrade.stdout.toString("utf8").trim().split("\n")
+      .filter((line) => line.endsWith(`|${threadId}`)),
+    [`${first.paneId}|${threadId}`],
+    "reattaching repairs idle duplicate panes left by the incompatible tmux parser",
+  );
 
   const second = await dispatch("turn-two", true);
   assert.equal(second.paneId, first.paneId, "the thread reuses its persistent pane");

@@ -227,6 +227,7 @@ async function startClaudeRuntime(value) {
   }
   const before = await inspectClaudeRuntime(value);
   if (before.status === "healthy") {
+    await reconcileClaudePanes(paths, before.identity.token);
     await sweepClaudeBuffers(paths);
     await sweepReleasedClaudePanes(paths, before.identity.token);
     return { identity: before.identity, claudePath: capabilityPaths.at(-5) };
@@ -234,6 +235,7 @@ async function startClaudeRuntime(value) {
   if (before.status === "unhealthy") {
     const repaired = await repairClaudeAnchor(paths, value.shell, before.identity);
     if (!repaired) throw new Error("existing Claude runtime is unhealthy");
+    await reconcileClaudePanes(paths, repaired.token);
     await sweepClaudeBuffers(paths);
     await sweepReleasedClaudePanes(paths, repaired.token);
     return { identity: repaired, claudePath: capabilityPaths.at(-5) };
@@ -272,12 +274,12 @@ async function repairClaudeAnchor(paths, shell, candidate) {
   const listed = await run("tmux", [
     ...tmuxArgs(paths),
     "list-panes", "-s", "-t", paths.session, "-F",
-    "#{pane_id}\t#{@qiyan_thread}\t#{@qiyan_runtime}",
+    "#{pane_id}|#{@qiyan_thread}|#{@qiyan_runtime}",
   ]);
   let paneCount = 0;
   for (const line of listed.stdout.toString("utf8").split(/\r?\n/u)) {
     if (!line) continue;
-    const [pane, threadId, runtimeToken, extra] = line.split("\t");
+    const [pane, threadId, runtimeToken, extra] = line.split("|");
     if (extra !== undefined || !/^%[0-9]+$/u.test(pane ?? "")
       || runtimeToken !== identity.token) throw new Error("Claude pane ownership cannot be proven");
     requireClaudeId(threadId);
@@ -851,12 +853,12 @@ async function findClaudePane(paths, threadId, runtimeToken) {
   const listed = await run("tmux", [
     ...tmuxArgs(paths),
     "list-panes", "-a", "-F",
-    "#{session_name}\t#{pane_id}\t#{@qiyan_thread}\t#{@qiyan_runtime}",
+    "#{session_name}|#{pane_id}|#{@qiyan_thread}|#{@qiyan_runtime}",
   ], true);
   if (listed.code !== 0) return undefined;
   let found;
   for (const line of listed.stdout.toString("utf8").split(/\r?\n/u)) {
-    const [session, pane, foundThread, foundRuntime, extra] = line.split("\t");
+    const [session, pane, foundThread, foundRuntime, extra] = line.split("|");
     if (extra !== undefined || session !== paths.session || foundThread !== threadId) continue;
     if (!/^%[0-9]+$/u.test(pane ?? "") || foundRuntime !== runtimeToken || found !== undefined) {
       throw new Error("Claude pane ownership cannot be proven");
@@ -953,15 +955,55 @@ async function sweepClaudeBuffers(paths) {
   }
 }
 
+async function reconcileClaudePanes(paths, runtimeToken) {
+  const listed = await run("tmux", [
+    ...tmuxArgs(paths),
+    "list-panes", "-a", "-F",
+    "#{session_name}|#{pane_id}|#{@qiyan_thread}|#{@qiyan_runtime}|#{@qiyan_release}",
+  ]);
+  const groups = new Map();
+  for (const line of listed.stdout.toString("utf8").split(/\r?\n/u)) {
+    if (!line) continue;
+    const [session, pane, threadId, owner, release, extra] = line.split("|");
+    if (extra !== undefined || session !== paths.session) continue;
+    if (!threadId && !owner && !release) continue;
+    if (!/^%[0-9]+$/u.test(pane ?? "") || !/^[A-Za-z0-9:_.-]{1,256}$/u.test(threadId ?? "")
+      || owner !== runtimeToken || (release !== "" && release !== runtimeToken)) {
+      throw new Error("Claude pane ownership cannot be proven");
+    }
+    const rows = groups.get(threadId) ?? [];
+    rows.push({ pane, release });
+    groups.set(threadId, rows);
+  }
+  for (const rows of groups.values()) {
+    if (rows.length < 2) continue;
+    if (rows.some((row) => row.release === runtimeToken)) {
+      throw new Error("duplicate Claude pane release cannot be reconciled");
+    }
+    const inspected = [];
+    for (const row of rows) {
+      inspected.push({ ...row, state: await inspectClaudePane(paths, row.pane, runtimeToken) });
+    }
+    const running = inspected.filter((row) => row.state.status === "running");
+    if (running.length > 1) throw new Error("multiple Claude turns are active for one thread");
+    const keep = running[0] ?? inspected[0];
+    for (const row of inspected) {
+      if (row.pane !== keep.pane) {
+        await run("tmux", [...tmuxArgs(paths), "kill-pane", "-t", row.pane]);
+      }
+    }
+  }
+}
+
 async function sweepReleasedClaudePanes(paths, runtimeToken) {
   const listed = await run("tmux", [
     ...tmuxArgs(paths),
     "list-panes", "-a", "-F",
-    "#{session_name}\t#{pane_id}\t#{@qiyan_thread}\t#{@qiyan_runtime}\t#{@qiyan_release}",
+    "#{session_name}|#{pane_id}|#{@qiyan_thread}|#{@qiyan_runtime}|#{@qiyan_release}",
   ], true);
   if (listed.code !== 0) return;
   for (const line of listed.stdout.toString("utf8").split(/\r?\n/u)) {
-    const [session, pane, threadId, owner, release, extra] = line.split("\t");
+    const [session, pane, threadId, owner, release, extra] = line.split("|");
     if (extra !== undefined || session !== paths.session || !/^%[0-9]+$/u.test(pane ?? "")
       || owner !== runtimeToken || release !== runtimeToken) continue;
     const inspected = await inspectClaudePane(paths, pane, runtimeToken);

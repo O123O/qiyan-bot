@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "3ce46a57c24be3fa7e6ebe850e3d7f1e1fa8bd105926e40570a326a967dd07e9";
+export const REMOTE_HELPER_SHA256 = "e4452ad4be1125d22f542840964dfa9c907284caa1e50c7f75e0ed31382c91bb";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_CLAUDE_LAUNCHER_SHA256 = "c0732dda212dc114e4f42cf0dad26857c3a006efe5df23364e97d842f8c689f1";
 export const REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256 = "4f52c4e08a8122e2accb8b407916a07659aa86006e020d22b6511f3b49850e6a";
