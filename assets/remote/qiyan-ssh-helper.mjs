@@ -412,8 +412,12 @@ async function dispatchClaudeTurn(value) {
     const sameRunning = after.status === "running"
       && after.turnId === turnId
       && after.dispatchToken === dispatchToken;
-    if (acknowledged && sameRunning) {
-      return { status: "running", paneId: pane, turnId, dispatchToken, identity: after.identity };
+    if (acknowledged) {
+      if (sameRunning) {
+        return { status: "running", paneId: pane, turnId, dispatchToken, identity: after.identity };
+      }
+      if (after.status === "idle") return { status: "settled", paneId: pane, turnId, dispatchToken };
+      throw new Error("Claude turn changed after materialization");
     }
     if (await scanClaudeTranscriptBytes(transcriptCursor, home, thread.threadId, `qiyan-cid:${turnId}`)) {
       if (sameRunning) {

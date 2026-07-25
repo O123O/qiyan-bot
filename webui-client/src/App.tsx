@@ -10,7 +10,7 @@ import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-pr
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
 import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
-import { mergeAssistantConversation, reconcileAssistantHistory } from "./assistant-chat-stream";
+import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
@@ -208,6 +208,7 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const workerSubscriptionTargetRef = useRef<WorkerSubscriptionTarget | null>(null);
   const workerPageLoaderRef = useRef<((nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest?: boolean) => Promise<boolean>) | null>(null);
+  const assistantHistoryAbortRef = useRef<AbortController | null>(null);
   const workerHistoryAbortRef = useRef<AbortController | null>(null);
   const recoveryRetriesRef = useRef(new Map<string, { attempt: number; timer: number }>());
   const completionReloadsRef = useRef(new Map<string, number[]>());
@@ -291,12 +292,19 @@ export function App() {
     } catch { /* transient */ }
   }, []);
   const loadHistory = useCallback(async () => {
+    assistantHistoryAbortRef.current?.abort();
+    const abort = new AbortController();
+    assistantHistoryAbortRef.current = abort;
     try {
-      const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`);
-      setHistory((current) => reconcileAssistantHistory(current, p.messages));
-      setHasOlder((current) => Object.hasOwn(current, ASSIST) ? current : { ...current, [ASSIST]: p.hasOlder });
+      const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`, { signal: abort.signal });
+      if (assistantHistoryAbortRef.current !== abort) return;
+      setHistory(replaceAssistantHistoryPage(p.messages));
+      setHasOlder((current) => ({ ...current, [ASSIST]: p.hasOlder }));
     }
     catch { /* transient */ }
+    finally {
+      if (assistantHistoryAbortRef.current === abort) assistantHistoryAbortRef.current = null;
+    }
   }, []);
   const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false): Promise<boolean> => {
     const current = workerRef.current;
@@ -437,6 +445,7 @@ export function App() {
   }, [clearRecoveryRetries, replaceWorker]);
 
   useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
+  useEffect(() => () => assistantHistoryAbortRef.current?.abort(), []);
   useEffect(() => () => workerHistoryAbortRef.current?.abort(), []);
   useEffect(() => () => {
     if (workerTailScrollFrameRef.current !== null) window.cancelAnimationFrame(workerTailScrollFrameRef.current);
@@ -564,13 +573,14 @@ export function App() {
   }, [rendered.length, tailRevision, selected, loadingOlder, goal?.objective, goal?.status]);
 
   const loadOlder = useCallback(async () => {
-    if (loadingOlder) return;
+    if (loadingOlder || (selected === null && assistantHistoryAbortRef.current)) return;
     const el = logRef.current;
     const assistantCursor = selected === null ? history[0]?.at : undefined;
     const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
     if (assistantCursor === undefined && workerCursor === undefined) return;
     setLoadingOlder(true);
     if (el) preserveRef.current = { height: el.scrollHeight, pending: true };
+    let assistantAbort: AbortController | null = null;
     try {
       if (selected !== null) {
         const active = workerRef.current;
@@ -581,7 +591,11 @@ export function App() {
         return;
       }
       const path = `/api/assistant/messages?limit=${PAGE}&before=${assistantCursor}`;
-      const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path);
+      const abort = new AbortController();
+      assistantAbort = abort;
+      assistantHistoryAbortRef.current = abort;
+      const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path, { signal: abort.signal });
+      if (assistantHistoryAbortRef.current !== abort) return;
       // The `before` cursor is INCLUSIVE, so dedup the boundary rows we already have (by id).
       const existing = new Set(history.map((m) => m.id).filter(Boolean));
       const fresh = p.messages.filter((m) => !m.id || !existing.has(m.id));
@@ -593,6 +607,7 @@ export function App() {
       // same boundary page forever when >limit rows share one millisecond).
       setHasOlder((h) => ({ ...h, [key]: p.hasOlder && fresh.length > 0 }));
     } catch { preserveRef.current = null; } finally {
+      if (assistantAbort && assistantHistoryAbortRef.current === assistantAbort) assistantHistoryAbortRef.current = null;
       preserveRef.current = settleWorkerScrollPreservation(preserveRef.current);
       setLoadingOlder(false);
     }

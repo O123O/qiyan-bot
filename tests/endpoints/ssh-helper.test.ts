@@ -604,7 +604,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     'const displaced=prompt.includes("turn-displaced");',
     'const large=displaced?`${JSON.stringify({type:"assistant",message:{role:"assistant",stop_reason:"tool_use",content:[{type:"text",text:"x".repeat(300*1024)}]}})}\\n`:"";',
     "await appendFile(path,user+large);",
-    "await new Promise((resolve)=>setTimeout(resolve,500));",
+    'if(!prompt.includes("turn-fast")) await new Promise((resolve)=>setTimeout(resolve,500));',
     'await appendFile(path,`${JSON.stringify({type:"assistant",cwd:process.cwd(),message:{role:"assistant",stop_reason:"end_turn",content:[{type:"text",text:"done"}]}})}\\n`);',
   ].join("\n"), { mode: 0o700 });
   const threadId = "fixture-thread";
@@ -703,11 +703,25 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   assert.equal(displaced.status, "running", "ack scans every byte appended after dispatch, not only the file tail");
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
+
+  // Simulate a fast remote completion whose launcher has already acknowledged native
+  // materialization, while a redundant helper-side transcript scan cannot yet observe it.
+  const installedSource = await readFile(installed, "utf8");
+  const scanSignature = "async function scanClaudeTranscriptBytes(cursor, home, threadId, markerText) {";
+  assert.ok(installedSource.includes(scanSignature));
+  await writeFile(installed, installedSource.replace(
+    scanSignature,
+    `${scanSignature}\n  if (markerText.includes("turn-fast")) return false;`,
+  ), { mode: 0o700 });
+  const fast = await dispatch("turn-fast", true);
+  assert.equal(fast.status, "settled", "an acknowledged turn remains accepted after it becomes idle");
+  assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
   await invoke("release-claude-thread", { ...base, threadId });
 
   const transcript = await readFile(join(home, ".claude", "projects", "fixture", `${threadId}.jsonl`), "utf8");
   assert.match(transcript, /qiyan-cid:turn-one/u);
   assert.match(transcript, /qiyan-cid:turn-two/u);
+  assert.match(transcript, /qiyan-cid:turn-fast/u);
   assert.match(transcript, /qiyan-cid:turn-displaced/u);
 
   const orphanThread = "orphan-config";

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { mergeAssistantConversation, reconcileAssistantHistory } from "../../webui-client/src/assistant-chat-stream.ts";
+import { mergeAssistantConversation, replaceAssistantHistoryPage } from "../../webui-client/src/assistant-chat-stream.ts";
 
 const message = (id: string, body: string, at: number, extra = {}) => ({ id, body, at, ...extra });
 
@@ -33,13 +33,15 @@ test("the same durable WebSocket and history message is rendered once", () => {
   assert.deepEqual(mergeAssistantConversation([history, socket], []), [socket]);
 });
 
-test("a reconnect reconciles the latest durable page without discarding loaded history", () => {
+test("a reconnect replaces old durable pages so pagination cannot retain a gap", () => {
   const older = message("you:old", "old", 1);
   const current = message("assistant:turn-1", "first", 2);
   const refreshed = message("assistant:turn-1", "first, durable", 3);
   const missed = message("worker:turn-2", "missed while offline", 4);
 
-  assert.deepEqual(reconcileAssistantHistory([older, current], [refreshed, missed]), [older, refreshed, missed]);
+  assert.deepEqual(replaceAssistantHistoryPage([refreshed, missed]), [refreshed, missed]);
+  assert.ok(!replaceAssistantHistoryPage([refreshed, missed]).includes(older));
+  assert.ok(!replaceAssistantHistoryPage([refreshed, missed]).includes(current));
 });
 
 test("a targeted optimistic echo and its durable history row share one identity", async () => {
@@ -49,4 +51,12 @@ test("a targeted optimistic echo and its durable history row share one identity"
 
   const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /selected === null && redirect && clientInputId \? \{ id: `web:\$\{clientInputId\}` \} : \{\}/u);
+});
+
+test("assistant history refresh adopts the latest server pagination state", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /setHasOlder\(\(current\) => \(\{ \.\.\.current, \[ASSIST\]: p\.hasOlder \}\)\)/u);
+  assert.match(source, /assistantHistoryAbortRef\.current\?\.abort\(\)/u);
+  assert.match(source, /if \(assistantHistoryAbortRef\.current !== abort\) return/u);
+  assert.match(source, /selected === null && assistantHistoryAbortRef\.current/u);
 });
