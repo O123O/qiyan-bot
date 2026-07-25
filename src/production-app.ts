@@ -1896,7 +1896,7 @@ export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: st
   if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
   if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
   try {
-    // A daemonless endpoint (Claude) checkpoints with no runtime identity, so `identity` is
+    // A daemonless endpoint (local Claude) checkpoints with no runtime identity, so `identity` is
     // absent from the persisted receipt — accept that instead of failing the parse (which
     // would strand the recovery and permanently lock out the endpoint's lifecycle ops).
     return {
@@ -2832,12 +2832,16 @@ export async function buildProductionApp(
                   return undefined;
                 }
               };
-              const claudeRemoteRunner = new SshClaudeCommandRunner({ plan: generation.plan });
+              const claudeRemoteRunner = new SshClaudeCommandRunner({
+                plan: generation.plan,
+                host: { ...host, remote },
+              });
               // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
               monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
                 runner: claudeRemoteRunner,
+                persistentRuntime: claudeRemoteRunner,
                 launchFlags: claudeLaunchPolicy(definition.model, definition.effort),
                 // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
                 // over the reverse tunnel (Tier B).
@@ -5036,7 +5040,7 @@ export async function buildProductionApp(
       }
       try {
         // Every replacement generation resumes each managed thread with turns excluded. This
-        // re-subscribes Codex notifications and recreates an empty daemonless Claude thread.
+        // re-subscribes Codex notifications and recreates an empty Claude thread when needed.
         const response = await lifecycle.reconcileManaged(
           nickname,
           session,

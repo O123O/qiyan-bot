@@ -176,7 +176,13 @@ test("bootstrap streams packaged assets instead of placing them in SSH argv", as
     },
   });
 
-  await remote.bootstrap({ runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01", helper: helperSource, launcher: Buffer.from("launcher") });
+  await remote.bootstrap({
+    runtimeDir: "/tmp/qiyan-1000/abcdef0123456789abcdef01",
+    helper: helperSource,
+    launcher: Buffer.from("launcher"),
+    claudeLauncher: Buffer.from("claude-launcher"),
+    claudeRuntimeLauncher: Buffer.from("claude-runtime-launcher"),
+  });
   assert.ok(observedArgs.every((argument) => argument.length < 64 * 1024));
   assert.ok(observedInput instanceof Uint8Array);
   const payload = JSON.parse(Buffer.from(observedInput as Uint8Array).toString("utf8")) as { helperBase64: string };

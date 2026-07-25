@@ -26,9 +26,9 @@ export interface EndpointWorkLease {
 }
 
 export interface ManagedAppServerEndpoint extends AppServerEndpoint {
-  // True when the endpoint has no persistent daemon to restart/shut down (a Claude
-  // endpoint drives ephemeral `claude -p` subprocesses), so it never has a runtime
-  // identity to prove. The manager skips the identity-based drain/shutdown dance for it.
+  // True when the endpoint has no persistent runtime to restart/shut down (currently
+  // local Claude). Remote Claude owns a detached tmux runtime and therefore participates
+  // in the same identity-based drain/shutdown lifecycle as remote Codex.
   readonly daemonless?: boolean;
   start(): Promise<void>;
   closeConnection(): Promise<void>;

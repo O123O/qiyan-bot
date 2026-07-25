@@ -57,6 +57,8 @@ jobs:
           package/assets/brand/qiyan-overview.svg
           package/assets/endpoints.example.jsonc
           package/assets/remote/qiyan-app-server-launcher.sh
+          package/assets/remote/qiyan-claude-runtime-launcher.sh
+          package/assets/remote/qiyan-claude.mjs
           package/assets/remote/qiyan-ssh-helper.mjs
           package/assets/slack/manifest.yaml
           package/assets/webui/index.html

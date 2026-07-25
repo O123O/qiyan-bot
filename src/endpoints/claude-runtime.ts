@@ -1,6 +1,6 @@
-// ClaudeCodeRuntime (Phase 1.3) — a ManagedAppServerEndpoint-shaped adapter that
-// makes the existing pool/lifecycle/relay drive a headless `claude -p` session
-// unchanged, WITHOUT the Codex initialize/account handshake (there is no daemon).
+// ManagedAppServerEndpoint-shaped adapter for headless `claude -p` sessions.
+// Local Claude is daemonless; remote Claude composes this adapter with a persistent
+// tmux controller so turns survive SSH and QiYan reconnects.
 //
 // Model: one endpoint per host, multiplexing many sessions; threadId === Claude
 // session id. `thread/start` pre-reserves a session id (claude's --session-id) and
@@ -24,31 +24,45 @@ import {
 } from "./claude-models.ts";
 import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
 import { ClaudeTranscriptHistory } from "./claude-history.ts";
-import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
+import type { EndpointLossKind, EndpointLossReason, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
 interface ThreadState {
   cwd: string;
   threadSource?: string;
   materialized: boolean;                 // has at least one turn been run (transcript exists)?
+  recoveryChecked: boolean;
+  recovery?: Promise<void>;
+  startingTurnId?: string;
   running?: { turnId: string; handle: ClaudeTurnHandle };
   terminalTurns: Set<string>;            // turn ids known interrupted/failed (no transcript end_turn)
 }
 
+export interface ClaudePersistentRuntime {
+  start(): Promise<void>;
+  closeConnection(): Promise<void>;
+  shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
+  runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
+  onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
+  recoverTurn(threadId: string, cwd: string): Promise<{ turnId: string; handle: ClaudeTurnHandle } | undefined>;
+  releaseThread(threadId: string): Promise<void>;
+}
+
 export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   readonly id: string;
-  // No persistent daemon: turns are ephemeral `claude -p` subprocesses, so there is no
-  // runtime identity and no drain/shutdown to prove. The endpoint manager treats
-  // restart/disconnect as "reset the adapter", not the Codex identity dance.
-  readonly daemonless = true;
+  readonly daemonless: boolean;
   private endpointState: "starting" | "ready" | "unavailable" | "stopped" = "starting";
   private readonly emitter = new EventEmitter();
   private readonly threads = new Map<string, ThreadState>();
+  private readonly stateLoads = new Map<string, Promise<ThreadState>>();
   private readonly history: ClaudeTranscriptHistory;
+  private persistentUnavailableSubscription?: () => void;
+  private lifecycleGeneration = 0;
 
   constructor(private readonly options: {
     id: string;
     runner: ClaudeCommandRunner;
     launchFlags: ClaudeLaunchFlags;
+    persistentRuntime?: ClaudePersistentRuntime;
     goals?: ClaudeGoalStore;
     // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
@@ -62,6 +76,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     steer?: (threadId: string, message: string) => Promise<void>;
   }) {
     this.id = options.id;
+    this.daemonless = options.persistentRuntime === undefined;
     this.history = new ClaudeTranscriptHistory(options.runner);
     this.emitter.setMaxListeners(100);
   }
@@ -69,23 +84,59 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   get state(): "starting" | "ready" | "unavailable" | "stopped" { return this.endpointState; }
 
   async start(): Promise<void> {
-    // No daemon to connect: the endpoint is ready as soon as it exists.
+    const generation = ++this.lifecycleGeneration;
+    this.endpointState = "starting";
+    if (this.options.persistentRuntime) {
+      this.persistentUnavailableSubscription ??= this.options.persistentRuntime.onUnavailable((kind, reason) => {
+        if (this.endpointState === "stopped") return;
+        this.endpointState = "unavailable";
+        this.emitter.emit("unavailable", kind, reason);
+      });
+      try {
+        await this.options.persistentRuntime.start();
+      } catch (error) {
+        if (this.lifecycleGeneration === generation) this.endpointState = "unavailable";
+        throw error;
+      }
+    }
+    if (this.lifecycleGeneration !== generation) {
+      await this.options.persistentRuntime?.closeConnection();
+      return;
+    }
     this.endpointState = "ready";
     this.emitter.emit("ready");
   }
 
   async closeConnection(): Promise<void> {
-    for (const state of this.threads.values()) state.running?.handle.interrupt();
+    this.lifecycleGeneration += 1;
     this.endpointState = "stopped";
+    this.persistentUnavailableSubscription?.();
+    delete this.persistentUnavailableSubscription;
+    if (this.options.persistentRuntime) {
+      await this.options.persistentRuntime.closeConnection();
+      return;
+    }
+    for (const state of this.threads.values()) state.running?.handle.interrupt();
   }
 
-  async shutdownRuntime(_expected: RuntimeIdentity): Promise<void> {
-    await this.closeConnection();
+  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+    this.lifecycleGeneration += 1;
+    if (!this.options.persistentRuntime) {
+      this.endpointState = "stopped";
+      this.persistentUnavailableSubscription?.();
+      delete this.persistentUnavailableSubscription;
+      for (const state of this.threads.values()) await state.running?.handle.interrupt();
+      return;
+    }
+    this.endpointState = "stopped";
+    this.persistentUnavailableSubscription?.();
+    delete this.persistentUnavailableSubscription;
+    await this.options.persistentRuntime.shutdownRuntime(expected);
   }
 
-  // A host endpoint has no persistent daemon process; there is no single runtime
-  // identity to fence. Individual turn subprocesses are ephemeral.
-  async runtimeIdentity(): Promise<RuntimeIdentity | undefined> { return undefined; }
+  async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
+    return this.options.persistentRuntime?.runtimeIdentity();
+  }
 
   onNotification(listener: (method: string, params: unknown) => void): () => void {
     this.emitter.on("notification", listener);
@@ -113,17 +164,29 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/resume": return this.threadResume(args) as unknown as T;
       case "thread/turns/list": return await this.threadTurnsList(args) as T;
       case "turn/start": return await this.turnStart(args) as T;
-      case "turn/interrupt": return this.turnInterrupt(args) as T;
+      case "turn/interrupt": return await this.turnInterrupt(args) as T;
       case "thread/list": return await this.threadList(args) as T;
       case "thread/archive": {
         const id = typeof args.threadId === "string" ? args.threadId : "";
-        this.threads.get(id)?.running?.handle.interrupt();
+        const state = this.threads.get(id);
+        if (id && this.options.persistentRuntime) {
+          await this.options.persistentRuntime.releaseThread(id);
+        } else {
+          state?.running?.handle.interrupt();
+        }
         this.threads.delete(id);
         // Claude has no native archive: tombstone the thread so discover hides it (Codex parity).
         if (id) this.options.archives?.add(this.id, id, this.options.now?.());
         return {} as T;
       }
-      case "thread/unsubscribe": return { status: "unsubscribed" } as T;
+      case "thread/unsubscribe": {
+        const id = requireString(args.threadId, "threadId");
+        if (this.options.persistentRuntime) {
+          await this.options.persistentRuntime.releaseThread(id);
+          this.threads.delete(id);
+        }
+        return { status: "unsubscribed" } as T;
+      }
       case "thread/name/set": return {} as T;
       // Claude has no model-list API; return the curated catalog (Codex `{data,nextCursor}` shape)
       // so set_session_model / the model picker have real entries to validate against.
@@ -147,7 +210,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadSource = typeof params.threadSource === "string" ? params.threadSource : undefined;
     const id = randomUUID();
     this.threads.set(id, {
-      cwd, materialized: false, terminalTurns: new Set(),
+      cwd, materialized: false, recoveryChecked: true, terminalTurns: new Set(),
       ...(threadSource === undefined ? {} : { threadSource }),
     });
     return this.withCurrentSettings({
@@ -193,16 +256,48 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // as an empty idle thread. A truly unknown thread with no transcript reproduces
     // the exact Codex `no rollout` error so recovery paths behave.
     if (!state) {
-      const cwd = await this.history.sessionCwd(threadId, "");
-      if (cwd === undefined && recoveryCwd === undefined) throw noRollout(threadId);
-      state = {
-        cwd: cwd ?? recoveryCwd!,
-        materialized: cwd !== undefined,
-        terminalTurns: new Set(),
-      };
-      this.threads.set(threadId, state);
+      let loading = this.stateLoads.get(threadId);
+      if (!loading) {
+        loading = this.loadState(threadId, recoveryCwd);
+        this.stateLoads.set(threadId, loading);
+      }
+      try {
+        state = await loading;
+      } finally {
+        if (this.stateLoads.get(threadId) === loading) this.stateLoads.delete(threadId);
+      }
+    }
+    if (!state.recoveryChecked) {
+      state.recovery ??= this.recoverState(threadId, state);
+      await state.recovery;
     }
     return state;
+  }
+
+  private async loadState(threadId: string, recoveryCwd?: string): Promise<ThreadState> {
+    const cwd = await this.history.sessionCwd(threadId, "");
+    if (cwd === undefined && recoveryCwd === undefined) throw noRollout(threadId);
+    const state: ThreadState = {
+      cwd: cwd ?? recoveryCwd!,
+      materialized: cwd !== undefined,
+      recoveryChecked: false,
+      terminalTurns: new Set(),
+    };
+    this.threads.set(threadId, state);
+    return state;
+  }
+
+  private async recoverState(threadId: string, state: ThreadState): Promise<void> {
+    try {
+      const recovered = await this.options.persistentRuntime?.recoverTurn(threadId, state.cwd);
+      state.recoveryChecked = true;
+      if (recovered) {
+        state.running = recovered;
+        this.observeTurnHandle(threadId, state, recovered.turnId, recovered.handle);
+      }
+    } finally {
+      delete state.recovery;
+    }
   }
 
   private withCurrentSettings(thread: ClaudeThreadView): {
@@ -279,34 +374,71 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   }
 
   private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
+    const lifecycleGeneration = this.lifecycleGeneration;
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
     // Defense-in-depth: the pool/lifecycle serialize turns per thread, but never let
     // a second turn/start silently orphan a running child (losing interrupt control).
-    if (state.running) throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
+    if (state.running || state.startingTurnId) {
+      throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
+    }
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
     // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
     this.options.archives?.remove(this.id, threadId);
+    state.startingTurnId = clientId;
+    try {
+      // Per-session model/effort: `service.send` spreads the sticky settings into these params;
+      // prefer them over the endpoint-wide launch defaults (Claude applies them as `--model`/
+      // `--effort` per invocation). Attach the worker scheduling tools (stable per session).
+      const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
+      const flags: ClaudeLaunchFlags = {
+        ...this.options.launchFlags,
+        ...(typeof params.model === "string" ? { model: params.model } : {}),
+        ...(typeof params.effort === "string" ? { effort: params.effort } : {}),
+        ...(workerConfig === undefined ? {} : { mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] }),
+      };
+      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, clientId)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
+      }
 
-    // Per-session model/effort: `service.send` spreads the sticky settings into these params;
-    // prefer them over the endpoint-wide launch defaults (Claude applies them as `--model`/
-    // `--effort` per invocation). Attach the worker scheduling tools (stable per session).
-    const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
-    const flags: ClaudeLaunchFlags = {
-      ...this.options.launchFlags,
-      ...(typeof params.model === "string" ? { model: params.model } : {}),
-      ...(typeof params.effort === "string" ? { effort: params.effort } : {}),
-      ...(workerConfig === undefined ? {} : { mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] }),
-    };
+      const handle = await this.options.runner.startTurn({
+        threadId, cwd: state.cwd, message, resume: state.materialized, flags,
+      });
+      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, clientId)) {
+        if (this.options.persistentRuntime) await this.options.persistentRuntime.closeConnection();
+        else await handle.interrupt();
+        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
+      }
+      state.running = { turnId: clientId, handle };
+      this.observeTurnHandle(threadId, state, clientId, handle);
+      return { turn: { id: clientId, status: "inProgress" } };
+    } finally {
+      if (state.startingTurnId === clientId) delete state.startingTurnId;
+    }
+  }
 
-    const handle = this.options.runner.startTurn({
-      threadId, cwd: state.cwd, message, resume: state.materialized, flags,
-    });
-    state.running = { turnId: clientId, handle };
+  private turnGenerationIsCurrent(
+    generation: number,
+    threadId: string,
+    state: ThreadState,
+    clientId: string,
+  ): boolean {
+    return this.endpointState === "ready"
+      && this.lifecycleGeneration === generation
+      && this.threads.get(threadId) === state
+      && state.startingTurnId === clientId;
+  }
 
+  private observeTurnHandle(
+    threadId: string,
+    state: ThreadState,
+    clientId: string,
+    handle: ClaudeTurnHandle,
+  ): void {
     void handle.done.then((status) => {
+      if (state.running?.turnId !== clientId || state.running.handle !== handle) return;
       state.materialized = true;
       delete state.running;
       // A failed turn is marked terminal so reconstruct synthesizes a findable
@@ -321,6 +453,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
           : { id: clientId },
       });
     }).catch(() => {
+      if (state.running?.turnId !== clientId || state.running.handle !== handle) return;
       delete state.running;
       state.terminalTurns.add(clientId);
       this.emitter.emit("notification", "turn/completed", {
@@ -328,8 +461,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         turn: { id: clientId, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${clientId}:user`, clientId }] },
       });
     });
-
-    return { turn: { id: clientId, status: "inProgress" } };
   }
 
   private goals(): ClaudeGoalStore {
@@ -366,11 +497,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { turnId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID() };
   }
 
-  private turnInterrupt(params: Record<string, unknown>): Record<string, never> {
+  private async turnInterrupt(params: Record<string, unknown>): Promise<Record<string, never>> {
     const threadId = requireString(params.threadId, "threadId");
     const turnId = requireString(params.turnId, "turnId");
     const state = this.threads.get(threadId);
-    if (state?.running?.turnId === turnId) state.running.handle.interrupt();
+    if (state?.running?.turnId === turnId) await state.running.handle.interrupt();
     state?.terminalTurns.add(turnId);
     return {};
   }

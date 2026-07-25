@@ -22,7 +22,7 @@ QiYan keeps the assistant and project workers distinct. The assistant has its ow
 
 A worker can run either coding agent, chosen per endpoint. Codex workers run `codex app-server`; Claude workers run headless `claude -p`. Both are managed through the same lifecycle, nickname, and chat tools — create, adopt, send, steer, collect, unadopt, archive — so you pick a provider without learning a second workflow.
 
-Endpoints are declared in `<QIYAN_HOME>/endpoints.json`, each with a `provider` (`codex` or `claude`) and a `transport` (`local` or `ssh`); Claude entries may pin a `model` and `effort`. See the [worker endpoints guide](docs/ssh-workers.md) for the format.
+Endpoints are declared in `<QIYAN_HOME>/endpoints.json`, each with a `provider` (`codex` or `claude`) and a `transport` (`local` or `ssh`); Claude entries may pin a `model` and `effort`. Remote Claude runs each one-shot `claude -p` turn inside a persistent per-endpoint tmux runtime, so an SSH or QiYan service reconnect does not terminate the worker. See the [worker endpoints guide](docs/ssh-workers.md) for the format.
 
 Claude has no built-in goal or scheduling engine, so QiYan supplies them: it drives a Claude worker toward a set goal turn by turn until the worker marks it complete or blocked, and gives the worker MCP tools to schedule its own wakeups, recurring runs, and condition monitors (locally, or over an SSH reverse tunnel for a remote worker). Because `claude -p` runs one turn at a time, a mid-turn "steer" is delivered as the worker's next turn rather than interrupting the running one, and archiving a Claude session tombstones it in QiYan while leaving its transcript on disk.
 
@@ -44,7 +44,7 @@ Read this before installing or launching:
 - Node.js 24 or newer
 - `codex-cli 0.144.4` or newer (the assistant and Codex workers)
 - The Claude Code CLI (`claude`) — only if you configure Claude workers
-- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+ and, per endpoint provider, either Codex 0.144.4+ and tmux (Codex) or the `claude` CLI (Claude), plus its own authenticated CLI profile
+- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+, tmux, and, per endpoint provider, either Codex 0.144.4+ or the `claude` CLI, plus its own authenticated CLI profile
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install

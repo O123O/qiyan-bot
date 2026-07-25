@@ -1,7 +1,6 @@
-// Command runner for a Claude session (Phase 1.3) — the seam that makes "local vs
-// remote" a spawn parameter, not a subsystem. `LocalClaudeCommandRunner` runs
-// `claude -p` directly; a future ssh runner will run `ssh <host> claude -p` over the
-// existing ControlMaster (1.4). The runtime above depends only on this interface.
+// Command runner for a Claude session. Local Claude spawns `claude -p` directly;
+// remote Claude dispatches the same one-shot process inside a persistent tmux pane.
+// The runtime above depends only on this interface.
 import { spawn } from "node:child_process";
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -42,7 +41,7 @@ export type ClaudeTurnStatus = "completed" | "failed";
 
 export interface ClaudeTurnHandle {
   readonly done: Promise<ClaudeTurnStatus>;
-  interrupt(): void;
+  interrupt(): void | Promise<void>;
 }
 
 export interface ClaudeTranscriptSnapshot {
@@ -64,7 +63,7 @@ export interface ClaudeTranscriptChunkRequest {
 }
 
 export interface ClaudeCommandRunner {
-  startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle;
+  startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle | Promise<ClaudeTurnHandle>;
   // Reads at most `length` transcript bytes from the worker host. Snapshot pinning makes
   // pagination fail closed if the JSONL is replaced, truncated, or appended between pages.
   readTranscriptChunk(threadId: string, cwd: string, request: ClaudeTranscriptChunkRequest): Promise<ClaudeTranscriptChunk | undefined>;

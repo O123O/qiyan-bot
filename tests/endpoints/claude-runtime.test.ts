@@ -70,6 +70,284 @@ function makeRuntime(runner: ClaudeCommandRunner) {
   return new ClaudeCodeRuntime({ id: "claude-local", runner, launchFlags: { model: "claude-opus-4-8" } });
 }
 
+test("a persistent Claude backend owns endpoint lifecycle without killing an in-flight turn on detach", async () => {
+  const runner = new FakeRunner();
+  const identity = {
+    kind: "ssh" as const,
+    token: "0123456789abcdef0123456789abcdef",
+    pid: 123,
+    linuxStartTime: "456",
+    processGroupId: 123,
+  };
+  const listeners = new Set<(kind: "connection-lost" | "runtime-lost") => void>();
+  const persistent = {
+    starts: 0,
+    closes: 0,
+    stops: [] as unknown[],
+    async start() { this.starts += 1; },
+    async closeConnection() { this.closes += 1; },
+    async shutdownRuntime(expected: unknown) { this.stops.push(expected); },
+    async runtimeIdentity() { return identity; },
+    onUnavailable(listener: (kind: "connection-lost" | "runtime-lost") => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    async recoverTurn() { return undefined; },
+    async releaseThread() {},
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    runner,
+    launchFlags: {},
+    persistentRuntime: persistent,
+  } as any);
+
+  assert.equal(rt.daemonless, false);
+  await rt.start();
+  assert.equal(persistent.starts, 1);
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:persist",
+    input: [{ type: "text", text: "keep running" }],
+  });
+
+  await rt.closeConnection();
+  assert.equal(persistent.closes, 1);
+  assert.equal((runner as any).pending[0]?.settled, false, "detach must not interrupt the remote process");
+  assert.deepEqual(await rt.runtimeIdentity(), identity);
+  await rt.shutdownRuntime(identity);
+  assert.deepEqual(persistent.stops, [identity]);
+});
+
+test("cold resume restores an active remote Claude turn from the persistent pane", async () => {
+  const runner = new FakeRunner();
+  runner.seed("remote-live", [
+    {
+      type: "user",
+      cwd: "/remote/work",
+      promptSource: "sdk",
+      promptId: "prompt-live",
+      uuid: "user-live",
+      message: { role: "user", content: "work\n\n<!-- qiyan-cid:ctx:live -->" },
+    },
+  ]);
+  let settle!: (status: ClaudeTurnStatus) => void;
+  const recoveredHandle = {
+    done: new Promise<ClaudeTurnStatus>((resolve) => { settle = resolve; }),
+    interrupt() {},
+  };
+  const persistent = {
+    async start() {},
+    async closeConnection() {},
+    async shutdownRuntime() {},
+    async runtimeIdentity() { return undefined; },
+    onUnavailable() { return () => undefined; },
+    async recoverTurn(threadId: string) {
+      return threadId === "remote-live"
+        ? { turnId: "ctx:live", handle: recoveredHandle }
+        : undefined;
+    },
+    async releaseThread() {},
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    runner,
+    launchFlags: {},
+    persistentRuntime: persistent,
+  } as any);
+  await rt.start();
+
+  const resumed = await rt.request<{ thread: any }>("thread/resume", {
+    threadId: "remote-live",
+    cwd: "/remote/work",
+    excludeTurns: true,
+  });
+  assert.deepEqual(resumed.thread.status, { type: "active" });
+  await assert.rejects(
+    rt.request("turn/start", {
+      threadId: "remote-live",
+      clientUserMessageId: "ctx:duplicate",
+      input: [{ type: "text", text: "duplicate" }],
+    }),
+    /already running/u,
+  );
+  settle("failed");
+});
+
+test("concurrent cold resumes share one state load and one persistent turn recovery", async () => {
+  const runner = new FakeRunner();
+  runner.seed("remote-shared", [{
+    type: "user",
+    cwd: "/remote/work",
+    promptSource: "sdk",
+    promptId: "prompt-shared",
+    uuid: "user-shared",
+    message: { role: "user", content: "work\n\n<!-- qiyan-cid:ctx:shared -->" },
+  }]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let recoveries = 0;
+  const recoveredHandle = { done: new Promise<ClaudeTurnStatus>(() => undefined), interrupt() {} };
+  const persistent = {
+    async start() {},
+    async closeConnection() {},
+    async shutdownRuntime() {},
+    async runtimeIdentity() { return undefined; },
+    onUnavailable() { return () => undefined; },
+    async recoverTurn() {
+      recoveries += 1;
+      await gate;
+      return { turnId: "ctx:shared", handle: recoveredHandle };
+    },
+    async releaseThread() {},
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    runner,
+    launchFlags: {},
+    persistentRuntime: persistent,
+  } as any);
+  await rt.start();
+
+  const first = rt.request("thread/resume", {
+    threadId: "remote-shared",
+    cwd: "/remote/work",
+    excludeTurns: true,
+  });
+  const second = rt.request("thread/resume", {
+    threadId: "remote-shared",
+    cwd: "/remote/work",
+    excludeTurns: true,
+  });
+  await delay(0);
+  assert.equal(recoveries, 1);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(recoveries, 1);
+});
+
+test("cold archive and unsubscribe always release persistent remote materialization", async () => {
+  const released: string[] = [];
+  const persistent = {
+    async start() {},
+    async closeConnection() {},
+    async shutdownRuntime() {},
+    async runtimeIdentity() { return undefined; },
+    onUnavailable() { return () => undefined; },
+    async recoverTurn() { return undefined; },
+    async releaseThread(threadId: string) { released.push(threadId); },
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    runner: new FakeRunner(),
+    launchFlags: {},
+    persistentRuntime: persistent,
+  } as any);
+  await rt.start();
+
+  await rt.request("thread/archive", { threadId: "cold-archive" });
+  await rt.request("thread/unsubscribe", { threadId: "cold-unsubscribe" });
+  assert.deepEqual(released, ["cold-archive", "cold-unsubscribe"]);
+});
+
+test("a Claude thread reserves its start before asynchronous turn preparation", async () => {
+  const delegate = new FakeRunner();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let starts = 0;
+  const runner: ClaudeCommandRunner = {
+    async startTurn(request) {
+      starts += 1;
+      await gate;
+      return delegate.startTurn(request);
+    },
+    readTranscriptChunk: (...args) => delegate.readTranscriptChunk(...args),
+    transcriptPath: (threadId) => delegate.transcriptPath(threadId),
+    listThreads: (...args) => delegate.listThreads(...args),
+  };
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const first = rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:first",
+    input: [{ type: "text", text: "first" }],
+  });
+  await delay(0);
+  const second = rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:second",
+    input: [{ type: "text", text: "second" }],
+  }).then(
+    () => ({ status: "fulfilled" as const }),
+    (reason: unknown) => ({ status: "rejected" as const, reason }),
+  );
+  await delay(0);
+  release();
+  const [firstOutcome, secondOutcome] = await Promise.all([Promise.allSettled([first]).then((items) => items[0]!), second]);
+
+  assert.equal(starts, 1);
+  assert.equal(firstOutcome.status, "fulfilled");
+  assert.equal(secondOutcome.status, "rejected");
+  assert.match(String(secondOutcome.status === "rejected" ? secondOutcome.reason : ""), /already running/u);
+});
+
+test("shutdown fences a local turn before an asynchronous preparation can spawn it", async () => {
+  const runner = new FakeRunner();
+  let release!: () => void;
+  const gate = new Promise<string | undefined>((resolve) => { release = () => resolve(undefined); });
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local",
+    runner,
+    launchFlags: {},
+    workerMcpConfigPath: () => gate,
+  });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const pending = rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:late",
+    input: [{ type: "text", text: "late" }],
+  });
+  await delay(0);
+  await rt.closeConnection();
+  release();
+
+  await assert.rejects(pending, /endpoint changed while its turn was starting/u);
+  assert.equal(runner.requests.length, 0);
+  assert.equal(rt.state, "stopped");
+});
+
+test("a close racing persistent startup cannot republish the endpoint as ready", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let closes = 0;
+  const persistent = {
+    async start() { await gate; },
+    async closeConnection() { closes += 1; },
+    async shutdownRuntime() {},
+    async runtimeIdentity() { return undefined; },
+    onUnavailable() { return () => undefined; },
+    async recoverTurn() { return undefined; },
+    async releaseThread() {},
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    runner: new FakeRunner(),
+    launchFlags: {},
+    persistentRuntime: persistent,
+  } as any);
+  const starting = rt.start();
+  await delay(0);
+  await rt.closeConnection();
+  release();
+  await starting;
+
+  assert.equal(rt.state, "stopped");
+  assert.ok(closes >= 1);
+});
+
 test("thread/start reserves an idle empty thread without spawning", async () => {
   const runner = new FakeRunner();
   const rt = makeRuntime(runner);

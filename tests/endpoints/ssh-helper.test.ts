@@ -12,9 +12,11 @@ import test from "node:test";
 import {
   REMOTE_HELPER_SHA256,
   REMOTE_LAUNCHER_SHA256,
+  REMOTE_CLAUDE_LAUNCHER_SHA256,
+  REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
   REMOTE_APP_SERVER_PROXY_READY,
+  REMOTE_CLAUDE_RUNTIME_WATCH_READY,
   SshRemoteClient,
-  encodeRemoteBootstrapArgument,
   encodeRemoteArgument,
   parseRemoteHelperResponse,
   validateInstalledHelperPath,
@@ -23,11 +25,28 @@ import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/s
 
 const helperPath = new URL("../../assets/remote/qiyan-ssh-helper.mjs", import.meta.url);
 const launcherPath = new URL("../../assets/remote/qiyan-app-server-launcher.sh", import.meta.url);
+const claudeLauncherPath = new URL("../../assets/remote/qiyan-claude.mjs", import.meta.url);
+const claudeRuntimeLauncherPath = new URL("../../assets/remote/qiyan-claude-runtime-launcher.sh", import.meta.url);
 
 test("packaged remote assets match their pinned digests", async () => {
   const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
   assert.equal(digest(await readFile(helperPath)), REMOTE_HELPER_SHA256);
   assert.equal(digest(await readFile(launcherPath)), REMOTE_LAUNCHER_SHA256);
+  assert.equal(digest(await readFile(claudeLauncherPath)), REMOTE_CLAUDE_LAUNCHER_SHA256);
+  assert.equal(digest(await readFile(claudeRuntimeLauncherPath)), REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256);
+});
+
+test("the packaged remote Claude launcher is one-shot, stdin-driven, and leaves completion to native JSONL", async () => {
+  const source = await readFile(claudeLauncherPath, "utf8");
+  assert.match(source, /for await \(const .* of process\.stdin\)/u);
+  assert.match(source, /spawn\(config\.command, config\.args/u);
+  assert.match(source, /qiyan-cid/u);
+  assert.doesNotMatch(source, /status(?:File|Path)|exitCodeFile|turn-status/iu);
+  const runtimeSource = await readFile(claudeRuntimeLauncherPath, "utf8");
+  assert.match(runtimeSource, /exec 3<>"\$watch_path"/u);
+  const helper = await readFile(helperPath, "utf8");
+  assert.match(helper, /claude-watch\.fifo/u);
+  assert.doesNotMatch(helper, /while \(identityMatches\(expected\)/u);
 });
 
 test("installed helper locators accept normalized fallback and shared paths", () => {
@@ -77,15 +96,21 @@ test("every shared runtime operation re-attests its XDG root", async (t) => {
   const runtimeDir = `${xdg}/qiyan-bot/${randomBytes(12).toString("hex")}`;
   const helper = await readFile(helperPath);
   const launcher = await readFile(launcherPath);
-  const bootstrap = encodeRemoteBootstrapArgument(JSON.stringify({
+  const claudeLauncher = await readFile(claudeLauncherPath);
+  const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const bootstrap = Buffer.from(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
     helperSha256: REMOTE_HELPER_SHA256,
     launcherBase64: launcher.toString("base64url"),
     launcherSha256: REMOTE_LAUNCHER_SHA256,
-  }));
-  await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "bootstrap", bootstrap], {
-    timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
+    claudeLauncherBase64: claudeLauncher.toString("base64url"),
+    claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
+    claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
+    claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+  }), "utf8");
+  await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "bootstrap"], {
+    input: bootstrap, timeoutMs: 15_000, maxOutputBytes: 64 * 1024,
   });
   await chmod(xdg, 0o755);
   const inspect = encodeRemoteArgument(JSON.stringify({ runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit" }));
@@ -124,7 +149,13 @@ test("an unsafe XDG replacement cannot execute cached helper bytes", async (t) =
       ], options);
     },
   });
-  await remote.bootstrap({ runtimeDir, helper, launcher });
+  await remote.bootstrap({
+    runtimeDir,
+    helper,
+    launcher,
+    claudeLauncher: await readFile(claudeLauncherPath),
+    claudeRuntimeLauncher: await readFile(claudeRuntimeLauncherPath),
+  });
   const upload = Buffer.from("trusted-program-upload");
   const uploadSha = createHash("sha256").update(upload).digest("hex");
   const uploaded = await remote.invokeTransfer<{ path: string }>("write-file", [JSON.stringify({
@@ -401,17 +432,29 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   t.after(() => rm(runtimeDir, { recursive: true, force: true }));
   const helper = await readFile(helperPath);
   const launcher = await readFile(launcherPath);
-  const bootstrap = encodeRemoteBootstrapArgument(JSON.stringify({
+  const claudeLauncher = await readFile(claudeLauncherPath);
+  const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const bootstrap = Buffer.from(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
     helperSha256: REMOTE_HELPER_SHA256,
     launcherBase64: launcher.toString("base64url"),
     launcherSha256: REMOTE_LAUNCHER_SHA256,
-  }));
-  await runBoundedProcess(process.execPath, [helperPath.pathname, "bootstrap", bootstrap], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+    claudeLauncherBase64: claudeLauncher.toString("base64url"),
+    claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
+    claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
+    claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+  }), "utf8");
+  await runBoundedProcess(process.execPath, [helperPath.pathname, "bootstrap"], {
+    input: bootstrap,
+    timeoutMs: 15_000,
+    maxOutputBytes: 64 * 1024,
+  });
   assert.equal((await stat(runtimeDir)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-ssh-helper.mjs`)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-app-server-launcher.sh`)).mode & 0o777, 0o700);
+  assert.equal((await stat(`${runtimeDir}/qiyan-claude.mjs`)).mode & 0o777, 0o700);
+  assert.equal((await stat(`${runtimeDir}/qiyan-claude-runtime-launcher.sh`)).mode & 0o777, 0o700);
   const inspectArg = encodeRemoteArgument(JSON.stringify({
     runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
   }));
@@ -464,10 +507,389 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   assert.equal((await stat(uploaded.path)).mode & 0o777, 0o600);
 });
 
-test("published packages include both remote runtime assets", async () => {
+test("the remote Claude helper reuses one tmux pane and derives settlement from native JSONL", async (t) => {
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-claude-tmux-"));
+  const home = await mkdtemp(join(tmpdir(), "qiyan-claude-home-"));
+  const cwd = await mkdtemp(join(tmpdir(), "qiyan-claude-work-"));
+  t.after(() => Promise.all([
+    rm(xdg, { recursive: true, force: true }),
+    rm(home, { recursive: true, force: true }),
+    rm(cwd, { recursive: true, force: true }),
+  ]));
+  await chmod(xdg, 0o700);
+  const runtimeDir = `${xdg}/qiyan-bot/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const helper = await readFile(helperPath);
+  const launcher = await readFile(launcherPath);
+  const claudeLauncher = await readFile(claudeLauncherPath);
+  const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const bootstrap = Buffer.from(JSON.stringify({
+    runtimeDir,
+    helperBase64: helper.toString("base64url"),
+    helperSha256: REMOTE_HELPER_SHA256,
+    launcherBase64: launcher.toString("base64url"),
+    launcherSha256: REMOTE_LAUNCHER_SHA256,
+    claudeLauncherBase64: claudeLauncher.toString("base64url"),
+    claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
+    claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
+    claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+  }), "utf8");
+  await runBoundedProcess("env", [
+    `XDG_RUNTIME_DIR=${xdg}`,
+    process.execPath,
+    helperPath.pathname,
+    "bootstrap",
+  ], { input: bootstrap, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
+  const installed = join(runtimeDir, "qiyan-ssh-helper.mjs");
+  const base = { runtimeDir, session, tmuxMode: "explicit" as const };
+  const invoke = async <T>(operation: string, value: unknown, input?: Buffer, timeoutMs = 10_000): Promise<T> => {
+    try {
+      const result = await runBoundedProcess("env", [
+        `XDG_RUNTIME_DIR=${xdg}`,
+        process.execPath,
+        installed,
+        operation,
+        encodeRemoteArgument(JSON.stringify(value)),
+      ], { ...(input ? { input } : {}), timeoutMs, maxOutputBytes: 64 * 1024 });
+      return parseRemoteHelperResponse<T>(result.stdout, operation);
+    } catch (error) {
+      throw new Error(`${operation} failed`, { cause: error });
+    }
+  };
+  let identity: unknown;
+  t.after(async () => {
+    if (!identity) return;
+    await invoke("stop-claude-runtime", { ...base, expected: identity }, undefined, 10_000).catch(() => undefined);
+  });
+  const started = await invoke<{ identity: unknown; claudePath: string }>("start-claude-runtime", {
+    ...base,
+    shell: "/bin/bash",
+    token: randomBytes(16).toString("hex"),
+  });
+  const expectedClaude = (await runBoundedProcess("/bin/bash", ["-lc", "command -v claude"], {
+    timeoutMs: 5_000,
+    maxOutputBytes: 64 * 1024,
+  })).stdout.toString("utf8").trim();
+  assert.equal(started.claudePath, expectedClaude, "fresh runtime startup returns the Claude binary");
+  identity = started.identity;
+
+  const fakeClaude = join(cwd, "fake-claude.mjs");
+  await writeFile(fakeClaude, [
+    "#!/usr/bin/env node",
+    'import { mkdir, appendFile } from "node:fs/promises";',
+    'import { join } from "node:path";',
+    "const chunks=[];",
+    "for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));",
+    'const prompt=Buffer.concat(chunks).toString("utf8");',
+    'const at=process.argv.findIndex((value)=>value==="--session-id"||value==="--resume");',
+    "const threadId=process.argv[at+1];",
+    'const dir=join(process.env.HOME,".claude","projects","fixture");',
+    "await mkdir(dir,{recursive:true});",
+    'const path=join(dir,`${threadId}.jsonl`);',
+    'const user=`${JSON.stringify({type:"user",cwd:process.cwd(),promptSource:"sdk",message:{role:"user",content:prompt}})}\\n`;',
+    'const displaced=prompt.includes("turn-displaced");',
+    'const large=displaced?`${JSON.stringify({type:"assistant",message:{role:"assistant",stop_reason:"tool_use",content:[{type:"text",text:"x".repeat(300*1024)}]}})}\\n`:"";',
+    "await appendFile(path,user+large);",
+    "await new Promise((resolve)=>setTimeout(resolve,500));",
+    'await appendFile(path,`${JSON.stringify({type:"assistant",cwd:process.cwd(),message:{role:"assistant",stop_reason:"end_turn",content:[{type:"text",text:"done"}]}})}\\n`);',
+  ].join("\n"), { mode: 0o700 });
+  const threadId = "fixture-thread";
+  const configure = async (resume: boolean) => {
+    const config = Buffer.from(JSON.stringify({
+      version: 1,
+      threadId,
+      cwd,
+      home,
+      command: fakeClaude,
+      args: [resume ? "--resume" : "--session-id", threadId],
+    }), "utf8");
+    return invoke<{ path: string }>("configure-claude-thread", {
+      ...base,
+      threadId,
+      size: config.byteLength,
+      sha256: createHash("sha256").update(config).digest("hex"),
+    }, config);
+  };
+  const dispatch = async (turnId: string, resume: boolean) => {
+    const configured = await configure(resume);
+    const prompt = Buffer.from(`work ${turnId}\n\n<!-- qiyan-cid:${turnId} -->`, "utf8");
+    const result = await invoke<any>("dispatch-claude-turn", {
+      ...base,
+      threadId,
+      turnId,
+      dispatchToken: randomBytes(16).toString("hex"),
+      configPath: configured.path,
+      shell: "/bin/bash",
+      home,
+      size: prompt.byteLength,
+      sha256: createHash("sha256").update(prompt).digest("hex"),
+    }, prompt, 40_000);
+    return { ...result, configPath: configured.path };
+  };
+
+  const first = await dispatch("turn-one", false);
+  assert.equal(first.status, "running");
+  assert.match(first.paneId, /^%[0-9]+$/u);
+  await invoke("interrupt-claude-turn", {
+    ...base,
+    threadId,
+    paneId: first.paneId,
+    expected: {
+      runtimeToken: first.identity.token,
+      turnId: first.turnId,
+      dispatchToken: first.dispatchToken,
+      pid: first.identity.pid,
+      linuxStartTime: first.identity.linuxStartTime,
+      processGroupId: first.identity.processGroupId,
+    },
+  });
+  assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
+
+  const second = await dispatch("turn-two", true);
+  assert.equal(second.paneId, first.paneId, "the thread reuses its persistent pane");
+  const configText = await readFile(second.configPath, "utf8");
+  assert.doesNotMatch(configText, /work turn-/u, "per-turn user messages are never written to config");
+  assert.deepEqual(await invoke("release-claude-thread", { ...base, threadId }), { status: "deferred" });
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
+  await assert.rejects(readFile(second.configPath), /ENOENT/u);
+
+  const displaced = await dispatch("turn-displaced", true);
+  assert.equal(displaced.status, "running", "ack scans every byte appended after dispatch, not only the file tail");
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
+  await invoke("release-claude-thread", { ...base, threadId });
+
+  const transcript = await readFile(join(home, ".claude", "projects", "fixture", `${threadId}.jsonl`), "utf8");
+  assert.match(transcript, /qiyan-cid:turn-one/u);
+  assert.match(transcript, /qiyan-cid:turn-two/u);
+  assert.match(transcript, /qiyan-cid:turn-displaced/u);
+
+  const orphanThread = "orphan-config";
+  const orphanConfig = Buffer.from(JSON.stringify({
+    version: 1,
+    threadId: orphanThread,
+    cwd,
+    home,
+    command: fakeClaude,
+    args: ["--session-id", orphanThread],
+  }), "utf8");
+  const orphan = await invoke<{ path: string }>("configure-claude-thread", {
+    ...base,
+    threadId: orphanThread,
+    size: orphanConfig.byteLength,
+    sha256: createHash("sha256").update(orphanConfig).digest("hex"),
+  }, orphanConfig);
+
+  const watch = await openReadyProcessStream("env", [
+    `XDG_RUNTIME_DIR=${xdg}`,
+    process.execPath,
+    installed,
+    "watch-claude-runtime",
+    encodeRemoteArgument(JSON.stringify({ ...base, expected: identity })),
+  ], {
+    readyMarker: REMOTE_CLAUDE_RUNTIME_WATCH_READY,
+    timeoutMs: 5_000,
+    maxPreludeBytes: 64 * 1024,
+  });
+  const watchClosed = new Promise<void>((resolve) => watch.onClose(() => resolve()));
+  await invoke("stop-claude-runtime", { ...base, expected: identity });
+  identity = undefined;
+  await Promise.race([
+    watchClosed,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Claude runtime watch did not close")), 3_000)),
+  ]);
+  assert.deepEqual(await invoke("release-claude-thread", { ...base, threadId: orphanThread }), { status: "absent" });
+  await assert.rejects(readFile(orphan.path), /ENOENT/u);
+
+  const replacement = await invoke<{ identity: any }>("start-claude-runtime", {
+    ...base,
+    shell: "/bin/bash",
+    token: randomBytes(16).toString("hex"),
+  });
+  assert.notEqual(replacement.identity.token, (started.identity as any).token);
+  identity = replacement.identity;
+
+  // An unexpected tmux exit leaves a stale identity file. It must still converge
+  // to absent and permit exactly one fresh runtime generation.
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"),
+    "-f", "/dev/null",
+    "kill-session", "-t", session,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  let afterCrash: { status: string } = { status: "unhealthy" };
+  for (let attempt = 0; attempt < 100 && afterCrash.status !== "absent"; attempt += 1) {
+    afterCrash = await invoke("inspect-claude-runtime", base);
+    if (afterCrash.status !== "absent") await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(afterCrash.status, "absent");
+  const recovered = await invoke<{ identity: any }>("start-claude-runtime", {
+    ...base,
+    shell: "/bin/bash",
+    token: randomBytes(16).toString("hex"),
+  });
+  assert.notEqual(recovered.identity.token, replacement.identity.token);
+  identity = recovered.identity;
+
+  // A matching thread option in another session on the same private tmux server
+  // is not part of this endpoint and must never be reused or released.
+  const foreignSession = "foreign-claude";
+  const foreignCreated = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "new-session", "-d", "-P", "-F", "#{pane_id}",
+    "-s", foreignSession, "/bin/bash", "-l",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const foreignPane = foreignCreated.stdout.toString("utf8").trim();
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "set-option", "-p", "-t", foreignPane, "@qiyan_thread", "foreign-thread",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "set-option", "-p", "-t", foreignPane, "@qiyan_runtime", recovered.identity.token,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  assert.deepEqual(await invoke("release-claude-thread", { ...base, threadId: "foreign-thread" }), { status: "released" });
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "has-session", "-t", foreignSession,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+
+  const staleCreated = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "new-window", "-d", "-P", "-F", "#{pane_id}",
+    "-t", session, "-n", "stale-pane", "/bin/bash", "-l",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const stalePane = staleCreated.stdout.toString("utf8").trim();
+  for (const [option, optionValue] of [
+    ["@qiyan_thread", "stale-thread"],
+    ["@qiyan_runtime", randomBytes(16).toString("hex")],
+  ] as const) {
+    await runBoundedProcess("tmux", [
+      "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+      "set-option", "-p", "-t", stalePane, option, optionValue,
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  }
+  await assert.rejects(
+    invoke("release-claude-thread", { ...base, threadId: "stale-thread" }),
+    /release-claude-thread failed/u,
+  );
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "kill-pane", "-t", stalePane,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+
+  // If only the anchor dies, a surviving managed pane keeps tmux alive. Startup
+  // repairs the anchor with the same generation token and preserves that pane.
+  const managedPaneResult = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "new-window", "-d", "-P", "-F", "#{pane_id}",
+    "-t", session, "-n", "anchor-repair", "/bin/bash", "-l",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const managedPane = managedPaneResult.stdout.toString("utf8").trim();
+  for (const [option, optionValue] of [
+    ["@qiyan_thread", "anchor-repair-thread"],
+    ["@qiyan_runtime", recovered.identity.token],
+  ]) {
+    await runBoundedProcess("tmux", [
+      "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+      "set-option", "-p", "-t", managedPane, option, optionValue,
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  }
+  const secondManagedResult = await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "new-window", "-d", "-P", "-F", "#{pane_id}",
+    "-t", session, "-n", "anchor-repair-second", "/bin/bash", "-l",
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const secondManagedPane = secondManagedResult.stdout.toString("utf8").trim();
+  for (const [option, optionValue] of [
+    ["@qiyan_thread", "anchor-repair-second"],
+    ["@qiyan_runtime", randomBytes(16).toString("hex")],
+  ] as const) {
+    await runBoundedProcess("tmux", [
+      "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+      "set-option", "-p", "-t", secondManagedPane, option, optionValue,
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  }
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "select-window", "-t", managedPane,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  process.kill(recovered.identity.pid, "SIGKILL");
+  let anchorLost: { status: string } = { status: "healthy" };
+  for (let attempt = 0; attempt < 100 && anchorLost.status === "healthy"; attempt += 1) {
+    anchorLost = await invoke("inspect-claude-runtime", base);
+    if (anchorLost.status === "healthy") await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(anchorLost.status, "unhealthy");
+  const reusedPid = spawn("setsid", [
+    "env",
+    `QIYAN_RUNTIME_TOKEN=${recovered.identity.token}`,
+    "tail",
+    "-f",
+    "/dev/null",
+  ], { stdio: "ignore" });
+  assert.ok(reusedPid.pid);
+  t.after(async () => {
+    if (reusedPid.exitCode === null && reusedPid.signalCode === null) {
+      try { process.kill(reusedPid.pid!, "SIGKILL"); } catch { /* already stopped */ }
+      await once(reusedPid, "exit").catch(() => undefined);
+    }
+  });
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const environment = await readFile(`/proc/${reusedPid.pid}/environ`).catch(() => Buffer.alloc(0));
+    if (environment.toString("utf8").split("\0").includes(`QIYAN_RUNTIME_TOKEN=${recovered.identity.token}`)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await writeFile(join(runtimeDir, "claude-identity.json"), `${JSON.stringify({
+    ...recovered.identity,
+    pid: reusedPid.pid,
+  })}\n`, { mode: 0o600 });
+  await assert.rejects(
+    invoke("start-claude-runtime", {
+      ...base,
+      shell: "/bin/bash",
+      token: randomBytes(16).toString("hex"),
+    }),
+    /start-claude-runtime failed/u,
+    "anchor repair must attest every window, not only the current one",
+  );
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "set-option", "-p", "-t", secondManagedPane, "@qiyan_runtime", recovered.identity.token,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  const repaired = await invoke<{ identity: any }>("start-claude-runtime", {
+    ...base,
+    shell: "/bin/bash",
+    token: randomBytes(16).toString("hex"),
+  });
+  assert.equal(repaired.identity.token, recovered.identity.token);
+  assert.notEqual(repaired.identity.pid, recovered.identity.pid);
+  process.kill(reusedPid.pid, "SIGKILL");
+  await once(reusedPid, "exit");
+  identity = repaired.identity;
+  assert.equal((await invoke<any>("inspect-claude-turn", {
+    ...base,
+    threadId: "anchor-repair-thread",
+  })).paneId, managedPane);
+  assert.equal((await invoke<any>("inspect-claude-turn", {
+    ...base,
+    threadId: "anchor-repair-second",
+  })).paneId, secondManagedPane);
+
+  await invoke("release-claude-thread", { ...base, threadId: "anchor-repair-thread" });
+  await invoke("release-claude-thread", { ...base, threadId: "anchor-repair-second" });
+  await runBoundedProcess("tmux", [
+    "-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null",
+    "kill-session", "-t", foreignSession,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+});
+
+test("published packages include every remote runtime asset", async () => {
   const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { files: string[] };
   assert.ok(manifest.files.includes("assets/remote/qiyan-ssh-helper.mjs"));
   assert.ok(manifest.files.includes("assets/remote/qiyan-app-server-launcher.sh"));
+  assert.ok(manifest.files.includes("assets/remote/qiyan-claude.mjs"));
+  assert.ok(manifest.files.includes("assets/remote/qiyan-claude-runtime-launcher.sh"));
 });
 
 test("the remote workspace helper returns a structured missing-path error", async (t) => {
