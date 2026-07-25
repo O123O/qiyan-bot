@@ -9,7 +9,15 @@ interface AssistantEndpoint {
 }
 
 interface ThreadResponse {
-  thread: { id: string; cwd: string; threadSource?: string | null; name?: string | null; status?: { type?: string } };
+  thread: {
+    id: string;
+    cwd: string;
+    path?: string | null;
+    preview?: string;
+    threadSource?: string | null;
+    name?: string | null;
+    status?: { type?: string };
+  };
   model?: string;
   reasoningEffort?: string | null;
 }
@@ -24,7 +32,14 @@ export async function resumeAssistantIdentity(input: {
   pendingThreadId?: string | null;
   recordPendingThread?(threadId: string): Promise<void>;
   clearPendingThread?(threadId: string): Promise<void>;
-}): Promise<{ threadId: string; nativeStatus: string; model?: string; effort?: string | null }> {
+}): Promise<{
+  threadId: string;
+  nativeStatus: string;
+  rolloutPath?: string;
+  preview?: string;
+  model?: string;
+  effort?: string | null;
+}> {
   const { identity, configuredDir } = await validateRegistration(input.registry, input.endpoint.id, input.assistantDir);
   let response: ThreadResponse;
   if (identity.thread_id === "pending") {
@@ -57,6 +72,8 @@ export async function resumeAssistantIdentity(input: {
   return {
     threadId,
     nativeStatus: response.thread.status?.type ?? "idle",
+    ...(typeof response.thread.path === "string" ? { rolloutPath: response.thread.path } : {}),
+    ...(typeof response.thread.preview === "string" ? { preview: response.thread.preview } : {}),
     ...(typeof response.model === "string" ? { model: response.model } : {}),
     ...(typeof response.reasoningEffort === "string" || response.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
   };

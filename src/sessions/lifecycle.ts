@@ -14,7 +14,15 @@ import type { NativeRefreshToken, NativeSessionIdentity } from "./native-session
 import { NativeSessionState } from "./native-session-state.ts";
 import { DISCOVERY_SOURCE_KINDS } from "./discovery.ts";
 
-interface ThreadView { id: string; cwd: string; threadSource?: string | null; status: { type: string }; turns: Array<{ id: string; status?: unknown }> }
+interface ThreadView {
+  id: string;
+  cwd: string;
+  path?: string | null;
+  preview?: string;
+  threadSource?: string | null;
+  status: { type: string };
+  turns: Array<{ id: string; status?: unknown }>;
+}
 interface ThreadResponse { thread: ThreadView; cwd?: string; model?: string; reasoningEffort?: string | null }
 export interface CurrentSessionSettings { model?: string; effort?: string | null }
 export interface LifecycleCheckpoint extends MappingIdentity {
@@ -121,6 +129,9 @@ export class SessionLifecycle {
         }
         this.requireThreadIdentity(after.thread, threadId);
         this.requireAdoptionOutcome(after.thread, resumed);
+        if (after.thread.path !== before.thread.path || after.thread.preview !== before.thread.preview) {
+          onThreadRead?.(after.thread);
+        }
         await this.assertDispatchable(endpointId, project, lease);
         await this.verifyCwd(endpointId, after.thread.cwd, project.path, lease);
         await this.registry.promote(nickname, reserved);

@@ -78,6 +78,7 @@ import { SessionRegistry, type RegistrySession } from "./registry/session-regist
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import { SessionLifecycle } from "./sessions/lifecycle.ts";
+import { CodexRolloutLocations, createCodexWorkerHistoryRead } from "./webui/codex-worker-history.ts";
 import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
 import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
@@ -2153,6 +2154,7 @@ export async function buildProductionApp(
   // always built; the web server listens only when the persisted state says enabled (off by default,
   // toggled by `qiyan-bot web-ui start|stop`).
   const webBus = new WebBus();
+  const codexRolloutLocations = new CodexRolloutLocations();
   const webWorkerStream = createWorkerStream({
     bus: webBus,
     resolveSession: (nickname) => {
@@ -2170,10 +2172,48 @@ export async function buildProductionApp(
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
+  const readCodexWorkerTurns = createCodexWorkerHistoryRead({
+    locations: codexRolloutLocations,
+    nativeSession: (endpointId, threadId, mappingId) =>
+      nativeSessions.view({ endpointId, threadId, mappingId }),
+    readPage: async ({ endpointId, allowMissing, ...input }, signal) => {
+      const context = remoteContexts.get(endpointId);
+      return readCodexRolloutHistoryPage({
+        readSlice: async (rolloutPath, rolloutThreadId, before, maxBytes, requestSignal) => {
+          if (!context) {
+            const slice = await readLocalRolloutSlice(
+              rolloutPath,
+              rolloutThreadId,
+              before,
+              maxBytes,
+              requestSignal,
+              allowMissing,
+            );
+            if (slice.device !== "unmaterialized") {
+              codexRolloutLocations.markMaterialized(endpointId, rolloutThreadId);
+            }
+            return slice;
+          }
+          const value = await context.remote.invokeTransfer<unknown>("read-rollout-slice", [JSON.stringify({
+            path: rolloutPath,
+            threadId: rolloutThreadId,
+            ...(before === undefined ? {} : { before }),
+            maxBytes,
+            allowMissing,
+          })], { maxOutputBytes: 24 * 1024 * 1024, signal: requestSignal }, context.host.remoteHelperPath);
+          const slice = parseRolloutSlice(value);
+          if (slice.device !== "unmaterialized") {
+            codexRolloutLocations.markMaterialized(endpointId, rolloutThreadId);
+          }
+          return slice;
+        },
+      }, input, signal);
+    },
+  });
   const readWorkerTurns = (
     endpointId: string,
     threadId: string,
-    _mappingId: string,
+    mappingId: string,
     limit: number,
     cursor: string | undefined,
     signal: AbortSignal,
@@ -2184,33 +2224,10 @@ export async function buildProductionApp(
         request: (id, method, params, requestSignal, lease) => pool.request(id, method, params, requestSignal, lease),
       }, endpointId, threadId, limit, cursor, signal);
     }
-    return endpointManager.withReadyWorkLease(endpointId, async (lease) => {
-      const response = await pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false }, signal, lease);
-      const path = typeof response?.thread?.path === "string" ? response.thread.path : undefined;
-      if (!path) return { messages: [], hasOlder: false, openTurnIds: [], terminalTurnIds: [] };
-      // `thread/start` reserves a rollout path before Codex materializes the JSONL on its first
-      // turn. Keep an actually missing established history visible as an error: only a native
-      // thread with no preview, and no pagination cursor from an earlier file, permits ENOENT.
-      const allowMissing = response.thread.preview === "" && cursor === undefined;
-      const native = nativeSessions.view({ endpointId, threadId, mappingId: _mappingId });
-      const status = native?.availability === "ready"
-        ? native.status
-        : typeof response?.thread?.status?.type === "string" ? response.thread.status.type : "unknown";
-      const context = remoteContexts.get(endpointId);
-      return readCodexRolloutHistoryPage({
-        readSlice: async (rolloutPath, rolloutThreadId, before, maxBytes, requestSignal) => {
-          if (!context) return readLocalRolloutSlice(rolloutPath, rolloutThreadId, before, maxBytes, requestSignal, allowMissing);
-          const value = await context.remote.invokeTransfer<unknown>("read-rollout-slice", [JSON.stringify({
-            path: rolloutPath, threadId: rolloutThreadId, ...(before === undefined ? {} : { before }), maxBytes, allowMissing,
-          })], { maxOutputBytes: 24 * 1024 * 1024, signal: requestSignal }, context.host.remoteHelperPath);
-          return parseRolloutSlice(value);
-        },
-      }, {
-        path, threadId, nativeStatus: status,
-        activeTurnId: native?.availability === "ready" ? native.activeTurnId : null,
-        limit, ...(cursor ? { cursor } : {}),
-      }, signal);
-    });
+    return endpointManager.withReadyWorkLease(
+      endpointId,
+      () => readCodexWorkerTurns(endpointId, threadId, mappingId, limit, cursor, signal),
+    );
   };
   const phases: AppPhase[] = [
     {
@@ -3037,6 +3054,7 @@ export async function buildProductionApp(
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
         unsubscribers.push(assistantEndpoint.onNotification((method, params) => {
+          markRolloutMaterializedFromNotification(assistantEndpoint.id, method, params);
           const generation = pool.endpointGeneration(assistantEndpoint.id).generation;
           const refreshRequired = nativeSessions.observe(assistantEndpoint.id, generation, method, params);
           if (refreshRequired) {
@@ -3922,7 +3940,13 @@ export async function buildProductionApp(
     );
   }
 
-  function hydrateThreadOrder(endpointId: string, thread: { id: string; turns?: Array<{ id: string; startedAt?: number | null }> }): void {
+  function hydrateThreadOrder(endpointId: string, thread: {
+    id: string;
+    path?: unknown;
+    preview?: unknown;
+    turns?: Array<{ id: string; startedAt?: number | null }>;
+  }): void {
+    codexRolloutLocations.observe(endpointId, thread);
     dashboardStore.hydrateTurnOrder({ endpointId, threadId: thread.id }, (thread.turns ?? []).map((turn) => ({
       id: turn.id,
       startedAt: typeof turn.startedAt === "number" && Number.isFinite(turn.startedAt) ? turn.startedAt : null,
@@ -4085,6 +4109,7 @@ export async function buildProductionApp(
           ? (params as { turnId: string }).turnId
           : undefined;
         const turnId = nestedTurnId ?? directTurnId;
+        markRolloutMaterializedFromNotification(target.id, method, params);
         if (mapping && turnId) {
           managedEpochs.recordFirstTurn(target.id, threadId!, mapping.session.mapping_id, turnId);
         }
@@ -4220,6 +4245,14 @@ export async function buildProductionApp(
     return new Set(["completed", "failed", "interrupted"]).has(value);
   }
 
+  function markRolloutMaterializedFromNotification(endpointId: string, method: string, params: unknown): void {
+    if (method !== "turn/started" && method !== "turn/completed" && !method.startsWith("item/")) return;
+    const threadId = typeof (params as { threadId?: unknown })?.threadId === "string"
+      ? (params as { threadId: string }).threadId
+      : undefined;
+    if (threadId) codexRolloutLocations.markMaterialized(endpointId, threadId);
+  }
+
   async function readBoundedThread(
     endpointId: string,
     threadId: string,
@@ -4317,6 +4350,11 @@ export async function buildProductionApp(
       pendingThreadId: assistantProfile.pendingThreadId,
       recordPendingThread: (threadId) => assistantProfile.recordPendingThread(threadId),
       clearPendingThread: (threadId) => assistantProfile.clearPendingThread(threadId),
+    });
+    codexRolloutLocations.observe(assistantEndpoint.id, {
+      id: resumed.threadId,
+      path: resumed.rolloutPath,
+      preview: resumed.preview,
     });
     await refreshAssistantNativeState();
     assistantCurrentSettings = {
