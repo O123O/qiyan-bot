@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { mergeAssistantConversation } from "../../webui-client/src/assistant-chat-stream.ts";
+import { mergeAssistantConversation, reconcileAssistantHistory } from "../../webui-client/src/assistant-chat-stream.ts";
 
 const message = (id: string, body: string, at: number, extra = {}) => ({ id, body, at, ...extra });
 
@@ -31,6 +31,15 @@ test("the same durable WebSocket and history message is rendered once", () => {
   const socket = message("assistant:turn-1", "done", 3);
 
   assert.deepEqual(mergeAssistantConversation([history, socket], []), [socket]);
+});
+
+test("a reconnect reconciles the latest durable page without discarding loaded history", () => {
+  const older = message("you:old", "old", 1);
+  const current = message("assistant:turn-1", "first", 2);
+  const refreshed = message("assistant:turn-1", "first, durable", 3);
+  const missed = message("worker:turn-2", "missed while offline", 4);
+
+  assert.deepEqual(reconcileAssistantHistory([older, current], [refreshed, missed]), [older, refreshed, missed]);
 });
 
 test("a targeted optimistic echo and its durable history row share one identity", async () => {

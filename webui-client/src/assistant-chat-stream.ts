@@ -26,6 +26,27 @@ function deduplicate<T extends AssistantConversationMessage>(messages: readonly 
 
 const timestamp = (message: AssistantConversationMessage): number => message.completedAt ?? message.at ?? 0;
 
+export function reconcileAssistantHistory<T extends AssistantConversationMessage>(
+  current: readonly T[],
+  latestPage: readonly T[],
+): T[] {
+  const merged = [...current];
+  const positions = new Map<string, number>();
+  for (const [index, message] of merged.entries()) {
+    if (message.id) positions.set(message.id, index);
+  }
+  for (const message of latestPage) {
+    const existing = message.id ? positions.get(message.id) : undefined;
+    if (existing === undefined) {
+      if (message.id) positions.set(message.id, merged.length);
+      merged.push(message);
+    } else if (timestamp(message) >= timestamp(merged[existing]!)) {
+      merged[existing] = message;
+    }
+  }
+  return merged.sort((left, right) => timestamp(left) - timestamp(right));
+}
+
 export function mergeAssistantConversation<T extends AssistantConversationMessage>(
   durableInput: readonly T[],
   liveInput: readonly T[],

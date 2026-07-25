@@ -10,7 +10,7 @@ import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-pr
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation } from "./chat-provenance";
 import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
-import { mergeAssistantConversation } from "./assistant-chat-stream";
+import { mergeAssistantConversation, reconcileAssistantHistory } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
@@ -291,7 +291,11 @@ export function App() {
     } catch { /* transient */ }
   }, []);
   const loadHistory = useCallback(async () => {
-    try { const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`); setHistory(p.messages); setHasOlder((h) => ({ ...h, [ASSIST]: p.hasOlder })); }
+    try {
+      const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`);
+      setHistory((current) => reconcileAssistantHistory(current, p.messages));
+      setHasOlder((current) => Object.hasOwn(current, ASSIST) ? current : { ...current, [ASSIST]: p.hasOlder });
+    }
     catch { /* transient */ }
   }, []);
   const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false): Promise<boolean> => {
@@ -444,7 +448,13 @@ export function App() {
     const connect = () => {
       ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
       wsRef.current = ws;
-      ws.onopen = () => { setLive(true); subscribeWorker(ws, selectedRef.current); };
+      ws.onopen = () => {
+        setLive(true);
+        // Close the gap between the last durable fetch and this socket generation. Worker finals
+        // delivered while the browser was disconnected remain in the owner transcript.
+        void loadHistory();
+        subscribeWorker(ws, selectedRef.current);
+      };
       ws.onclose = () => {
         if (wsRef.current === ws) wsRef.current = null;
         if (workerSubscriptionTargetRef.current?.socket === ws) workerSubscriptionTargetRef.current = null;
@@ -494,7 +504,7 @@ export function App() {
     };
     connect();
     return () => { stop = true; try { ws.close(); } catch { /* closing */ } };
-  }, [replaceWorker, scheduleCompletionReloads, subscribeWorker]);
+  }, [loadHistory, replaceWorker, scheduleCompletionReloads, subscribeWorker]);
 
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => {
