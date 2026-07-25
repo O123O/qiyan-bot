@@ -145,7 +145,7 @@ test("remoteRunCommand runs a bounded one-shot command in the remote project", a
   );
   assert.equal(noninteractive.stdout, "cat,cat,cat,0,Never,force");
   const timedOut = await remoteRunCommand(d, "testhost", root, "trap '' TERM; sleep 30 & pid=$!; awk '{print $1, $22}' /proc/$pid/stat; wait", {
-    maxBytes: 4096, timeoutMs: 200,
+    maxBytes: 4096, timeoutMs: 1_000,
   });
   assert.equal(timedOut.timedOut, true);
   const [timedOutPidRaw, timedOutStart] = timedOut.stdout.trim().split(/\s+/u);

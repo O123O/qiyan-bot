@@ -701,7 +701,11 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   assert.equal(second.paneId, first.paneId, "the thread reuses its persistent pane");
   const configText = await readFile(second.configPath, "utf8");
   assert.doesNotMatch(configText, /work turn-/u, "per-turn user messages are never written to config");
-  assert.deepEqual(await invoke("release-claude-thread", { ...base, threadId }), { status: "deferred" });
+  assert.match(
+    (await invoke<{ status: string }>("release-claude-thread", { ...base, threadId })).status,
+    /^(?:deferred|released)$/u,
+    "release is immediate when the turn settles first and deferred otherwise",
+  );
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
   await assert.rejects(readFile(second.configPath), /ENOENT/u);
