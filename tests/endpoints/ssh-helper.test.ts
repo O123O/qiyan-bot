@@ -719,11 +719,13 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   // materialization, while a redundant helper-side transcript scan cannot yet observe it.
   const installedSource = await readFile(installed, "utf8");
   const scanSignature = "async function scanClaudeTranscriptBytes(cursor, home, threadId, markerText) {";
+  const acknowledgementSignature = "const acknowledged = await waitForTmuxSignal(paths, acknowledgement, 30_000);";
   assert.ok(installedSource.includes(scanSignature));
-  await writeFile(installed, installedSource.replace(
-    scanSignature,
-    `${scanSignature}\n  if (markerText.includes("turn-fast")) return false;`,
-  ), { mode: 0o700 });
+  assert.ok(installedSource.includes(acknowledgementSignature));
+  await writeFile(installed, installedSource
+    .replace(scanSignature, `${scanSignature}\n  if (markerText.includes("turn-fast")) return false;`)
+    .replace(acknowledgementSignature, `${acknowledgementSignature}
+    if (turnId === "turn-fast") await new Promise((resolve) => setTimeout(resolve, 1_000));`), { mode: 0o700 });
   const fast = await dispatch("turn-fast", true);
   assert.equal(fast.status, "settled", "an acknowledged turn remains accepted after it becomes idle");
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
