@@ -622,7 +622,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
       threadId,
       size: config.byteLength,
       sha256: createHash("sha256").update(config).digest("hex"),
-    }, config);
+    }, config, 20_000);
   };
   const dispatch = async (turnId: string, resume: boolean) => {
     const configured = await configure(resume);
