@@ -670,12 +670,13 @@ test("turn/steer durably enqueues the message (never aborts the running turn)", 
 test("buildClaudeArgs emits stable, byte-identical flags", () => {
   const base: ClaudeTurnRequest = {
     threadId: "sid-1", cwd: "/w", message: "hi", resume: false,
-    flags: { appendSystemPrompt: "SP", disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8", effort: "high" },
+    flags: { appendSystemPrompt: "SP", allowedTools: ["WebFetch", "WebSearch"], disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8", effort: "high" },
   };
   assert.deepEqual(buildClaudeArgs(base), [
     "-p", "--output-format", "stream-json", "--verbose",
     "--session-id", "sid-1",
     "--append-system-prompt", "SP",
+    "--allowedTools", "WebFetch WebSearch",
     "--disallowedTools", "Monitor ScheduleWakeup",
     "--mcp-config", "/tmp/m.json", "--strict-mcp-config",
     "--model", "claude-opus-4-8",

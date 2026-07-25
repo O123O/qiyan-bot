@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { loadConfig, loadAssistantLoginConfig, claudeLaunchPolicy, CLAUDE_DISABLED_TOOLS, CLAUDE_REDIRECT_PROMPT } from "../src/config.ts";
+import { loadConfig, loadAssistantLoginConfig, claudeLaunchPolicy, CLAUDE_ALLOWED_TOOLS, CLAUDE_DISABLED_TOOLS, CLAUDE_REDIRECT_PROMPT } from "../src/config.ts";
 
 function baseEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
@@ -192,7 +192,11 @@ test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the r
   // apply it, so a remote worker never keeps the native Monitor/ScheduleWakeup/cron tools.
   for (const model of [undefined, "haiku"] as const) {
     const policy = claudeLaunchPolicy(model);
+    assert.deepEqual([...policy.allowedTools], [...CLAUDE_ALLOWED_TOOLS]);
     assert.deepEqual([...policy.disallowedTools], [...CLAUDE_DISABLED_TOOLS]);
+    for (const tool of ["WebFetch", "WebSearch"]) {
+      assert.ok(policy.allowedTools.includes(tool), `${tool} must be pre-approved`);
+    }
     for (const tool of ["Monitor", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete"]) {
       assert.ok(policy.disallowedTools.includes(tool), `${tool} must be disabled`);
     }

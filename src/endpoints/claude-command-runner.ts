@@ -11,6 +11,7 @@ import { AppError } from "../core/errors.ts";
 // runtime MUST pass byte-identical values every turn of a session (design §5).
 export interface ClaudeLaunchFlags {
   appendSystemPrompt?: string;
+  allowedTools?: readonly string[];
   disallowedTools?: readonly string[];
   mcpConfig?: readonly string[];
   model?: string;
@@ -83,6 +84,7 @@ export function buildClaudeArgs(request: ClaudeTurnRequest): string[] {
   args.push(request.resume ? "--resume" : "--session-id", request.threadId);
   const { flags } = request;
   if (flags.appendSystemPrompt !== undefined) args.push("--append-system-prompt", flags.appendSystemPrompt);
+  if (flags.allowedTools && flags.allowedTools.length > 0) args.push("--allowedTools", flags.allowedTools.join(" "));
   if (flags.disallowedTools && flags.disallowedTools.length > 0) args.push("--disallowedTools", flags.disallowedTools.join(" "));
   for (const config of flags.mcpConfig ?? []) args.push("--mcp-config", config);
   if (flags.mcpConfig && flags.mcpConfig.length > 0) args.push("--strict-mcp-config");

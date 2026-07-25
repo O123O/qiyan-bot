@@ -82,6 +82,7 @@ export interface ChatConfig {
 // Fixed enforcement defaults for a managed Claude session (design §5): the native
 // schedulers are disabled and the model is redirected to QiYan's tools.
 export const CLAUDE_DISABLED_TOOLS = ["Monitor", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete"] as const;
+export const CLAUDE_ALLOWED_TOOLS = ["WebFetch", "WebSearch"] as const;
 export const CLAUDE_REDIRECT_PROMPT =
   "You have NO built-in scheduling ability. For any scheduled, recurring, or condition-watching work you MUST use the QiYan MCP tools (schedule_wakeup, schedule_cron, monitor). Never use built-in Monitor/ScheduleWakeup/cron tools, the /loop skill, background tasks, or hooks.";
 
@@ -90,9 +91,9 @@ export const CLAUDE_REDIRECT_PROMPT =
 // redirect. It is NOT conditional on a local endpoint being configured: a remote-only deployment
 // (a remote-only deployment) must apply it too. `model`/`effort` are the per-endpoint overrides,
 // sourced from the endpoint's endpoints.json entry.
-export function claudeLaunchPolicy(model?: string, effort?: string): { disallowedTools: readonly string[]; appendSystemPrompt: string; model?: string; effort?: string } {
+export function claudeLaunchPolicy(model?: string, effort?: string): { allowedTools: readonly string[]; disallowedTools: readonly string[]; appendSystemPrompt: string; model?: string; effort?: string } {
   return {
-    disallowedTools: CLAUDE_DISABLED_TOOLS, appendSystemPrompt: CLAUDE_REDIRECT_PROMPT,
+    allowedTools: CLAUDE_ALLOWED_TOOLS, disallowedTools: CLAUDE_DISABLED_TOOLS, appendSystemPrompt: CLAUDE_REDIRECT_PROMPT,
     ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }),
   };
 }
