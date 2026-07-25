@@ -63,15 +63,23 @@ test("a known-interrupted turn id is reported interrupted (terminal)", () => {
 
 test("userMessage carries the QiYan clientId marker; phases split final vs commentary", () => {
   const recs = [
-    { type: "user", promptSource: "sdk", promptId: "p1", uuid: "u1", message: { role: "user", content: "hello <!-- qiyan-cid:ctx:7 -->" } },
+    { type: "user", promptSource: "sdk", promptId: "p1", uuid: "u1", timestamp: "2026-07-25T03:25:02.550Z", message: { role: "user", content: "hello <!-- qiyan-cid:ctx:7 -->" } },
     { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "let me check" }] } },
     { type: "user", promptSource: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x" }] } },
-    { type: "assistant", uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "the answer" }] } },
+    { type: "assistant", uuid: "a2", timestamp: "2026-07-25T03:25:23.621Z", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "the answer" }] } },
   ];
   const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
   assert.equal(v.turns.length, 1);
-  const items = v.turns[0]!.items;
-  assert.deepEqual(items[0], { type: "userMessage", id: "u1", clientId: "ctx:7" });
+  const turn = v.turns[0]!;
+  const items = turn.items;
+  assert.deepEqual(items[0], {
+    type: "userMessage",
+    id: "u1",
+    clientId: "ctx:7",
+    content: [{ type: "text", text: "hello", text_elements: [] }],
+  });
+  assert.equal(turn.startedAt, Date.parse("2026-07-25T03:25:02.550Z"));
+  assert.equal(turn.completedAt, Date.parse("2026-07-25T03:25:23.621Z"));
   assert.deepEqual(items.filter((i) => i.type === "agentMessage").map((i) => i.phase), ["commentary", "final_answer"]);
   assert.equal(items.find((i) => i.phase === "final_answer")?.text, "the answer");
 });

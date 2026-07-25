@@ -13,7 +13,7 @@
 // a `user` row with non-empty `promptSource`; a null-`promptSource` user row is a
 // tool_result (mid-turn); a turn ends on an assistant row whose `stop_reason` is a
 // concrete value other than `tool_use`.
-import { extractClaudeClientMarker } from "./claude-client-marker.ts";
+import { extractClaudeClientMarker, visibleClaudeUserText } from "./claude-client-marker.ts";
 
 export type ClaudeTurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 export type ClaudeMessagePhase = "final_answer" | "commentary";
@@ -22,6 +22,7 @@ export interface ClaudeThreadItem {
   type: "userMessage" | "agentMessage";
   id: string;
   clientId?: string | null;
+  content?: Array<{ type: "text"; text: string; text_elements: unknown[] }>;
   text?: string;
   phase?: ClaudeMessagePhase | null;
 }
@@ -31,6 +32,8 @@ export interface ClaudeThreadTurn {
   status: ClaudeTurnStatus;
   itemsView: "full" | "summary" | "notLoaded";
   items: ClaudeThreadItem[];
+  startedAt?: number | null;
+  completedAt?: number | null;
 }
 
 export interface ClaudeThreadView {
@@ -92,12 +95,24 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       // For a QiYan-dispatched turn, turn.id is its clientUserMessageId marker. It
       // therefore matches the id returned by `turn/start` and pushed by
       // `turn/completed`; an unmarked transcript turn uses Claude's promptId.
+      const text = visibleClaudeUserText(record.message);
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
         id: idOf(record) ?? `${promptId}:user`,
         clientId: marker ?? null,
+        ...(text ? { content: [{ type: "text", text, text_elements: [] }] } : {}),
       };
-      current = { turn: { id: turnId, status: "completed", itemsView: "full", items: [userItem] }, terminal: false };
+      current = {
+        turn: {
+          id: turnId,
+          status: "completed",
+          itemsView: "full",
+          items: [userItem],
+          startedAt: timestampOf(record) ?? null,
+          completedAt: null,
+        },
+        terminal: false,
+      };
       assistantRecordSeq = 0;
       continue;
     }
@@ -114,7 +129,11 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
           phase: terminal ? "final_answer" : "commentary",
         });
       }
-      if (terminal) { current.terminal = true; current.turn.status = "completed"; }
+      if (terminal) {
+        current.terminal = true;
+        current.turn.status = "completed";
+        current.turn.completedAt = timestampOf(record) ?? current.turn.startedAt ?? null;
+      }
     }
   }
   finalize(current);
@@ -168,6 +187,15 @@ function turnIdOf(record: Record<string, unknown>): string | undefined {
 
 function idOf(record: Record<string, unknown>): string | undefined {
   return typeof record.uuid === "string" && record.uuid.length > 0 ? record.uuid : undefined;
+}
+
+function timestampOf(record: Record<string, unknown>): number | undefined {
+  if (typeof record.timestamp === "number" && Number.isFinite(record.timestamp) && record.timestamp > 0) {
+    return record.timestamp;
+  }
+  if (typeof record.timestamp !== "string") return undefined;
+  const parsed = Date.parse(record.timestamp);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function isTurnEnd(record: Record<string, unknown>): boolean {

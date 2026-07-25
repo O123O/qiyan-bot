@@ -6,17 +6,22 @@ export function encodeClaudeClientMarker(clientId: string): string {
   return `<!-- qiyan-cid:${clientId} -->`;
 }
 
-export function extractClaudeClientMarker(message: unknown): string | undefined {
-  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+function messageText(message: unknown): string {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return "";
   const content = (message as Record<string, unknown>).content;
-  let text = "";
-  if (typeof content === "string") text = content;
-  else if (Array.isArray(content)) {
-    for (const block of content) {
-      if (block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string") {
-        text += `${(block as Record<string, unknown>).text as string}\n`;
-      }
-    }
-  }
-  return clientMarkerPattern.exec(text)?.[1];
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((block) => (
+    block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string"
+      ? [(block as Record<string, unknown>).text as string]
+      : []
+  )).join("\n");
+}
+
+export function extractClaudeClientMarker(message: unknown): string | undefined {
+  return clientMarkerPattern.exec(messageText(message))?.[1];
+}
+
+export function visibleClaudeUserText(message: unknown): string {
+  return messageText(message).replace(clientMarkerPattern, "").trim();
 }

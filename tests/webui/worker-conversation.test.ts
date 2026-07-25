@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { reconstructClaudeThread } from "../../src/sessions/claude-thread.ts";
 import { openWorkerTurnIds, pageWorkerConversation, terminalWorkerTurnIds } from "../../src/webui/worker-conversation.ts";
 
 const userMsg = (id: string, text: string) => ({ type: "userMessage", id, clientId: `client-${id}`, content: [{ type: "text", text, text_elements: [] }] });
@@ -59,4 +60,31 @@ test("paginates terminal and open rows with a bounded exclusive compound cursor"
 test("Claude-style userMessage without content yields agent rows only", () => {
   const turns = [{ id: "t1", status: "completed", startedAt: 1, completedAt: 2, items: [{ type: "userMessage", id: "u", clientId: "u" }, agentMsg("a", "reply")] }];
   assert.deepEqual(pageWorkerConversation(turns, 20).messages.map((row) => [row.role, row.body]), [["worker", "reply"]]);
+});
+
+test("Claude transcript history places the response after its correlated user message", () => {
+  const started = "2026-07-25T03:25:02.550Z";
+  const completed = "2026-07-25T03:25:23.621Z";
+  const thread = reconstructClaudeThread({
+    threadId: "claude",
+    cwd: "/work",
+    records: [
+      {
+        type: "user", promptSource: "sdk", promptId: "prompt", uuid: "user", timestamp: started,
+        message: { role: "user", content: "do the work\n\n<!-- qiyan-cid:to:web:input -->" },
+      },
+      {
+        type: "assistant", uuid: "agent", timestamp: completed,
+        message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] },
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    pageWorkerConversation(thread.turns, 20).messages.map((row) => [row.role, row.body, row.completedAt, row.clientId]),
+    [
+      ["you", "do the work", Date.parse(started), "to:web:input"],
+      ["worker", "done", Date.parse(completed), undefined],
+    ],
+  );
 });
