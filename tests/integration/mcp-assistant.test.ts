@@ -36,7 +36,12 @@ async function writeSkill(root: string, name: string): Promise<void> {
 async function assertShellEnvironment(
   endpoint: ManagedAppServerEndpoint,
   threadId: string,
-  expected: { userHome: string; codexHome: string },
+  expected: {
+    userHome: string;
+    codexHome: string;
+    inherited?: Record<string, string>;
+    absent?: readonly string[];
+  },
 ): Promise<void> {
   let unsubscribe: () => void = () => undefined;
   const completed = new Promise<any>((resolve, reject) => {
@@ -50,7 +55,7 @@ async function assertShellEnvironment(
   });
   await endpoint.request("thread/shellCommand", {
     threadId,
-    command: `node -e 'const ok = process.env.HOME === ${JSON.stringify(expected.userHome)} && process.env.CODEX_HOME === ${JSON.stringify(expected.codexHome)} && process.env.QIYAN_BOT_MCP_TOKEN === undefined; process.stdout.write(ok ? "QIYAN_ENV_OK" : "QIYAN_ENV_BAD")'`,
+    command: `node -e 'const inherited=${JSON.stringify(expected.inherited ?? {})}; const absent=${JSON.stringify(expected.absent ?? ["QIYAN_BOT_MCP_TOKEN"])}; const ok = process.env.HOME === ${JSON.stringify(expected.userHome)} && process.env.CODEX_HOME === ${JSON.stringify(expected.codexHome)} && Object.entries(inherited).every(([key, value]) => process.env[key] === value) && absent.every((key) => process.env[key] === undefined); process.stdout.write(ok ? "QIYAN_ENV_OK" : "QIYAN_ENV_BAD")'`,
   });
   assert.equal((await completed).aggregatedOutput, "QIYAN_ENV_OK");
 }
@@ -75,7 +80,13 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
   const endpoint = localEndpoint({
     id: "assistant-local",
     env: buildAssistantChildEnvironment(
-      { ...process.env, HOME: normalHome },
+      {
+        ...process.env,
+        HOME: normalHome,
+        XDG_RUNTIME_DIR: "/run/user/qiyan-integration",
+        QIYAN_USER_TOOL_CREDENTIAL: "user-tool-value",
+        TELEGRAM_BOT_TOKEN: "must-not-reach-assistant",
+      },
       { home: assistantHome, codexHome: assistantCodexHome },
       "must-not-reach-shell",
     ),
@@ -100,7 +111,15 @@ test("isolated app-server persists thread provenance and excludes normal-home sk
     ephemeral: true,
     threadSource: crypto.randomUUID(),
   });
-  await assertShellEnvironment(endpoint, shellThread.thread.id, { userHome: normalHome, codexHome: assistantCodexHome });
+  await assertShellEnvironment(endpoint, shellThread.thread.id, {
+    userHome: normalHome,
+    codexHome: assistantCodexHome,
+    inherited: {
+      XDG_RUNTIME_DIR: "/run/user/qiyan-integration",
+      QIYAN_USER_TOOL_CREDENTIAL: "user-tool-value",
+    },
+    absent: ["QIYAN_BOT_MCP_TOKEN", "TELEGRAM_BOT_TOKEN"],
+  });
 
   const volatile = await endpoint.request<any>("thread/start", {
     cwd: workdir,

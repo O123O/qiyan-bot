@@ -260,13 +260,6 @@ async function readJson(request: AsyncIterable<Uint8Array>): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-const inheritedEnvironmentKeys = new Set([
-  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "CODEX_HOME",
-  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-  "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
-]);
-
 export function buildWorkerChildEnvironment(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(host)) {
@@ -276,10 +269,7 @@ export function buildWorkerChildEnvironment(host: NodeJS.ProcessEnv): NodeJS.Pro
 }
 
 export function buildAssistantBaseEnvironment(host: NodeJS.ProcessEnv, mcpToken?: string): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(host)) {
-    if (value !== undefined && (inheritedEnvironmentKeys.has(key) || key.startsWith("LC_"))) result[key] = value;
-  }
+  const result = buildWorkerChildEnvironment(host);
   if (mcpToken) result.QIYAN_BOT_MCP_TOKEN = mcpToken;
   return result;
 }
@@ -305,7 +295,7 @@ export function assistantTurnConfig(
 export function secureShellConfig(shellEnvironment: { userHome: string; codexHome: string }): Record<string, unknown> {
   return {
     allow_login_shell: false,
-    "shell_environment_policy.inherit": "core",
+    "shell_environment_policy.inherit": "all",
     "shell_environment_policy.exclude": [...BOT_SECRET_ENV_NAMES],
     "shell_environment_policy.set": {
       HOME: shellEnvironment.userHome,

@@ -357,17 +357,20 @@ test("worker environment preserves user configuration while removing only exact 
     HOME: "/home/user",
     CODEX_HOME: "/private/manager-codex",
   });
+  assert.equal(config["shell_environment_policy.inherit"], "all");
   assert.equal(config.allow_login_shell, false);
   assert.equal(JSON.stringify(config).includes("mcp-secret"), false);
 });
 
-test("assistant child is allowlisted while the worker retains the complete user environment", () => {
+test("assistant and worker children inherit user environment while excluding exact bot configuration", () => {
   const host = {
     PATH: "/bin", HOME: "/home/user", CODEX_HOME: "/home/user/.codex", OPENAI_API_KEY: "auth",
     USER_MCP_TOKEN: "worker-only", TELEGRAM_THEME: "dark", TELEGRAM_BOT_TOKEN: "secret",
     SLACK_APP_TOKEN: "xapp-secret", SLACK_BOT_TOKEN: "xoxb-secret", SLACK_USER_TOKEN: "xoxp-secret",
     SLACK_TEAM_ID: "T123", SLACK_OWNER_USER_ID: "U123", PRIMARY_CHAT_APP: "slack",
     SSL_CERT_FILE: "/custom/ca.pem", SSL_CERT_DIR: "/custom/ca", NODE_EXTRA_CA_CERTS: "/custom/node-ca.pem",
+    XDG_RUNTIME_DIR: "/run/user/1000", SSH_AUTH_SOCK: "/run/user/1000/ssh-agent",
+    KRB5CCNAME: "FILE:/run/user/1000/krb5cc", AWS_SECRET_ACCESS_KEY: "user-tool-credential",
   };
   const worker = buildWorkerChildEnvironment(host);
   const assistant = buildAssistantChildEnvironment(host, { home: "/private/manager-home", codexHome: "/private/manager-codex" }, "manager-token");
@@ -383,8 +386,12 @@ test("assistant child is allowlisted while the worker retains the complete user 
   assert.equal(assistant.SSL_CERT_FILE, "/custom/ca.pem");
   assert.equal(assistant.SSL_CERT_DIR, "/custom/ca");
   assert.equal(assistant.NODE_EXTRA_CA_CERTS, "/custom/node-ca.pem");
-  assert.equal(assistant.USER_MCP_TOKEN, undefined);
-  assert.equal(assistant.TELEGRAM_THEME, undefined);
+  assert.equal(assistant.USER_MCP_TOKEN, "worker-only");
+  assert.equal(assistant.TELEGRAM_THEME, "dark");
+  assert.equal(assistant.XDG_RUNTIME_DIR, "/run/user/1000");
+  assert.equal(assistant.SSH_AUTH_SOCK, "/run/user/1000/ssh-agent");
+  assert.equal(assistant.KRB5CCNAME, "FILE:/run/user/1000/krb5cc");
+  assert.equal(assistant.AWS_SECRET_ACCESS_KEY, "user-tool-credential");
   assert.equal(assistant.TELEGRAM_BOT_TOKEN, undefined);
   for (const key of ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TEAM_ID", "SLACK_OWNER_USER_ID", "PRIMARY_CHAT_APP"]) {
     assert.equal(worker[key], undefined);
