@@ -10,8 +10,9 @@ import type { ThreadGate } from "./thread-gate.ts";
 import { WorkspaceRouter } from "../endpoints/workspace-router.ts";
 import type { EndpointManager } from "../endpoints/manager.ts";
 import type { EndpointWorkLease } from "../endpoints/types.ts";
-import type { NativeRefreshToken, NativeSessionIdentity, NativeSessionView } from "./native-session-state.ts";
+import type { NativeSessionIdentity, NativeSessionView } from "./native-session-state.ts";
 import { NativeSessionState } from "./native-session-state.ts";
+import { repairActiveTurnIdentity } from "./native-session-probe.ts";
 import { createHistoryScanBudget } from "../app-server/thread-history.ts";
 import { waitForCompactionEvidence } from "./compaction.ts";
 
@@ -31,6 +32,11 @@ export class SessionService {
     // in SessionControlStore and re-apply every turn, so this returns false and consume is skipped.
     private readonly settingsPersistNatively: (endpointId: string) => boolean = () => true,
     private readonly onTurnAccepted: (session: RegistrySession, turnId: string) => void = () => undefined,
+    private readonly observedSettings: (
+      endpointId: string,
+      threadId: string,
+      mappingId: string,
+    ) => { model?: string | null; effort?: string | null } = () => ({}),
   ) {}
 
   async send(nickname: string, text: string, options: {
@@ -106,7 +112,7 @@ export class SessionService {
           turn: response.turn,
         });
       } else if (this.native.applyStartResponse(startToken, response.turn.id) === "refresh-required") {
-        await this.refreshNative(session, lease);
+        await this.repairNative(session, lease);
       }
       return { mode: "start" as const, turnId: response.turn.id, terminal, appliedSettings: settings };
     });
@@ -120,8 +126,7 @@ export class SessionService {
     const expected = this.registeredControl(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactRegisteredControl(nickname, expected.mapping_id);
-      let current = await this.currentNative(session, lease);
-      if (options.recoverExactTurn && current.status !== "active") current = await this.refreshNative(session, lease);
+      const current = await this.currentNative(session, lease);
       let active = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
       if (!active && current.status === "active" && options.recoverExactTurn && turnId) active = turnId;
       if (current.status === "active" && !active) {
@@ -244,9 +249,11 @@ export class SessionService {
   } = {}): Promise<unknown> {
     const session = this.required(nickname);
     const read = async (lease?: EndpointWorkLease): Promise<unknown> => {
-      const current = await this.refreshNative(session, lease);
-      const nativeStatus = current.status;
-      const activeTurnId = current.activeTurnId;
+      const current = this.native.view(this.nativeIdentity(session));
+      const generation = lease?.endpointGeneration ?? this.safeEndpointGeneration(session.endpoint);
+      const ready = current?.availability === "ready" && current.endpointGeneration === generation;
+      const nativeStatus = ready ? current.status : "unknown";
+      const activeTurnId = ready ? current.activeTurnId : null;
       options.observeNative?.({ nativeStatus, activeTurnId });
       const goal = await this.getGoal(nickname, lease);
       return {
@@ -263,8 +270,12 @@ export class SessionService {
       : read();
   }
 
-  async refreshNativeState(nickname: string): Promise<void> {
-    await this.refreshNative(this.required(nickname));
+  async refreshNativeState(nickname: string, expectedLifecycleRevision?: number): Promise<void> {
+    const session = this.required(nickname);
+    await this.withMutationLease(
+      session.endpoint,
+      (lease) => this.repairNative(session, lease, expectedLifecycleRevision),
+    );
   }
 
   async models(endpointId: string): Promise<unknown> { return { data: await this.listModels(endpointId), nextCursor: null }; }
@@ -288,9 +299,15 @@ export class SessionService {
   async setEffortForIdentity(endpointId: string, threadId: string, mappingId: string, effort: string): Promise<void> {
     const available = await this.listModels(endpointId);
     const pendingModel = this.controls.settings(endpointId, threadId, mappingId).model;
-    const native = await this.pool.request<any>(endpointId, "thread/read", { threadId, includeTurns: false });
-    const configuredModel = pendingModel ?? native.thread.model;
-    const model = available.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? available.find((candidate) => candidate.isDefault) ?? available[0];
+    const configuredModel = pendingModel ?? this.observedSettings(endpointId, threadId, mappingId).model;
+    if (!configuredModel) {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `current model is unavailable for ${endpointId}/${threadId}; set a model first`);
+    }
+    const model = available.find((candidate) =>
+      candidate.id === configuredModel || candidate.model === configuredModel);
+    if (!model) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", `current model is unavailable on ${endpointId}: ${configuredModel}`);
+    }
     if (model?.supportedReasoningEfforts && !model.supportedReasoningEfforts.some((candidate: any) => candidate.reasoningEffort === effort || candidate === effort)) {
       throw new AppError("UNSUPPORTED_CAPABILITY", `reasoning effort ${effort} is not supported by ${model.id ?? model.model}`);
     }
@@ -377,11 +394,9 @@ export class SessionService {
     const expected = this.managed(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactManaged(nickname, expected.mapping_id);
-      const refreshToken = this.beginNativeRefresh(session, lease);
-      const native = await this.pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
-      this.assertMutationNativeState(nickname, native.thread?.status);
-      this.applyNativeRead(native, refreshToken);
-      const project = await this.prepareExisting(session.endpoint, String(native.thread.cwd), lease);
+      const native = await this.currentNative(session, lease);
+      this.assertMutationNativeState(nickname, native.status);
+      const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
       await this.assertDispatchable(session.endpoint, project, lease);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed thread cwd changed");
       this.assertExactManaged(nickname, expected.mapping_id);
@@ -447,12 +462,19 @@ export class SessionService {
   }
 
   private async readWithTurns(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<any> {
-    const response = await this.pool.request<any>(
-      endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
-    );
+    const found = this.registry.getByIdentity(endpointId, threadId);
+    if (!found) throw new AppError("UNKNOWN_SESSION", `unknown managed thread: ${endpointId}/${threadId}`);
+    const current = await this.currentNative(found.session, lease);
     const latest = await this.pool.historyReader(endpointId, lease).latestTurn(threadId);
     const turns = latest ? [latest] : [];
-    return { ...response, thread: { ...response.thread, turns } };
+    return {
+      thread: {
+        id: threadId,
+        cwd: found.session.project_dir,
+        status: { type: current.status },
+        turns,
+      },
+    };
   }
 
   private required(nickname: string) {
@@ -483,20 +505,32 @@ export class SessionService {
   private async currentNative(session: RegistrySession, lease?: EndpointWorkLease): Promise<NativeSessionView> {
     const generation = this.endpointGeneration(session.endpoint, lease);
     const current = this.native.view(this.nativeIdentity(session));
-    if (current?.availability === "ready" && current.endpointGeneration === generation
-      && current.status !== "unknown" && (current.status !== "active" || current.activeTurnId !== null)) return current;
-    return this.refreshNative(session, lease);
+    if (!current || current.availability !== "ready" || current.endpointGeneration !== generation) {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `native session generation is unavailable: ${session.endpoint}/${session.thread_id}`);
+    }
+    const repaired = current.status === "active" && current.activeTurnId === null
+      ? await this.repairNative(session, lease)
+      : current;
+    if (repaired.status === "unknown") {
+      throw new AppError("ENDPOINT_UNAVAILABLE", `native session state is unknown: ${session.endpoint}/${session.thread_id}`);
+    }
+    return repaired;
   }
 
-  private async refreshNative(session: RegistrySession, lease?: EndpointWorkLease): Promise<NativeSessionView> {
-    const token = this.beginNativeRefresh(session, lease);
-    const response = await this.pool.request<any>(session.endpoint, "thread/read", {
-      threadId: session.thread_id,
-      includeTurns: false,
-    }, undefined, lease);
-    this.applyNativeRead(response, token);
+  private async repairNative(
+    session: RegistrySession,
+    lease?: EndpointWorkLease,
+    expectedLifecycleRevision?: number,
+  ): Promise<NativeSessionView> {
     const identity = this.nativeIdentity(session);
-    const generation = token.endpointGeneration;
+    const generation = this.endpointGeneration(session.endpoint, lease);
+    await repairActiveTurnIdentity({
+      native: this.native,
+      identity,
+      endpointGeneration: generation,
+      latestTurn: () => this.pool.historyReader(session.endpoint, lease).latestTurn(session.thread_id),
+      ...(expectedLifecycleRevision === undefined ? {} : { expectedLifecycleRevision }),
+    });
     const current = this.native.view(identity);
     if (!current || current.endpointGeneration !== generation || current.availability !== "ready") {
       throw new AppError("ENDPOINT_UNAVAILABLE", `native session generation changed: ${session.endpoint}/${session.thread_id}`);
@@ -504,22 +538,9 @@ export class SessionService {
     return current;
   }
 
-  private beginNativeRefresh(session: RegistrySession, lease?: EndpointWorkLease): NativeRefreshToken {
-    const identity = this.nativeIdentity(session);
-    const generation = this.endpointGeneration(session.endpoint, lease);
-    const existing = this.native.view(identity);
-    if (!existing || existing.endpointGeneration !== generation || existing.availability !== "ready") {
-      this.native.register(identity, generation);
-    }
-    return this.native.captureRefresh(identity, generation);
-  }
-
-  private applyNativeRead(
-    response: any,
-    token: NativeRefreshToken,
-  ): void {
-    const status = response.thread?.status?.type ?? response.thread?.status ?? "unknown";
-    this.native.applyRefresh(token, { status });
+  private safeEndpointGeneration(endpointId: string): number {
+    try { return this.pool.endpointGeneration(endpointId).generation; }
+    catch { return -1; }
   }
 }
 

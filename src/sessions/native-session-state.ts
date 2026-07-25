@@ -192,6 +192,7 @@ export class NativeSessionState {
       }
       if (method === "thread/status/changed") {
         const status = nativeStatus(values?.status);
+        if (status === "active" && current.activeTurnId === null) refreshRequired = true;
         this.apply(current, {
           status,
           activeTurnId: status === "active" ? current.activeTurnId : null,

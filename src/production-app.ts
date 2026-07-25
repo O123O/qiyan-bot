@@ -77,13 +77,18 @@ import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, To
 import { SessionRegistry, type RegistrySession } from "./registry/session-registry.ts";
 import { SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
-import { SessionLifecycle } from "./sessions/lifecycle.ts";
-import { CodexRolloutLocations, createCodexWorkerHistoryRead } from "./webui/codex-worker-history.ts";
+import {
+  currentSessionSettings,
+  hasCurrentSessionSettings,
+  SessionLifecycle,
+} from "./sessions/lifecycle.ts";
+import { CodexRolloutLocations, createCodexConversationHistoryRead } from "./sessions/codex-conversation-history.ts";
 import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
 import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
 import { SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
+import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
@@ -1321,10 +1326,6 @@ export function managedSessionNeedsRecovery(
   return unavailableOnly ? state?.managementState === "unavailable" : true;
 }
 
-export function managedRecoveryRequiresConnectionResume(provider: string, remote: boolean): boolean {
-  return provider === "codex" && remote;
-}
-
 export type ManagedRecoveryDisposition = "retry" | "endpoint" | "permanent";
 
 export function managedRecoveryDisposition(error: unknown, currentReadyLease = false): ManagedRecoveryDisposition {
@@ -1340,37 +1341,46 @@ export function managedRetryKey(endpointId: string, threadId: string, mappingId:
 }
 
 type WorkerNativeRefreshMapping = { nickname: string; session: RegistrySession };
+interface WorkerNativeRefreshRequest {
+  nickname: string;
+  expectedLifecycleRevision: number;
+}
 
 export function routeWorkerNativeRefresh(
-  pending: Map<ManagedRetryKey, string>,
+  pending: Map<ManagedRetryKey, WorkerNativeRefreshRequest>,
   mapping: WorkerNativeRefreshMapping | undefined,
   refreshRequired: boolean,
-  refresh: (nickname: string) => void,
+  expectedLifecycleRevision: number | undefined,
+  refresh: (nickname: string, expectedLifecycleRevision: number) => void,
 ): void {
-  if (!refreshRequired || !mapping) return;
+  if (!refreshRequired || !mapping || expectedLifecycleRevision === undefined) return;
   const key = managedRetryKey(mapping.session.endpoint, mapping.session.thread_id, mapping.session.mapping_id);
   if (mapping.session.lifecycle_state === "adopting") {
-    pending.set(key, mapping.nickname);
+    pending.set(key, { nickname: mapping.nickname, expectedLifecycleRevision });
     return;
   }
   pending.delete(key);
-  if (mapping.session.lifecycle_state === "managed") refresh(mapping.nickname);
+  if (mapping.session.lifecycle_state === "managed") {
+    refresh(mapping.nickname, expectedLifecycleRevision);
+  }
 }
 
 export function settleDeferredWorkerNativeRefreshes(
-  pending: Map<ManagedRetryKey, string>,
+  pending: Map<ManagedRetryKey, WorkerNativeRefreshRequest>,
   resolveSession: (nickname: string) => RegistrySession | undefined,
-  refresh: (nickname: string) => void,
+  refresh: (nickname: string, expectedLifecycleRevision: number) => void,
   onlyNickname?: string,
 ): void {
-  for (const [key, nickname] of pending) {
-    if (onlyNickname !== undefined && nickname !== onlyNickname) continue;
-    const current = resolveSession(nickname);
+  for (const [key, request] of pending) {
+    if (onlyNickname !== undefined && request.nickname !== onlyNickname) continue;
+    const current = resolveSession(request.nickname);
     const matches = current !== undefined
       && key === managedRetryKey(current.endpoint, current.thread_id, current.mapping_id);
     if (matches && current.lifecycle_state === "adopting") continue;
     pending.delete(key);
-    if (matches && current.lifecycle_state === "managed") refresh(nickname);
+    if (matches && current.lifecycle_state === "managed") {
+      refresh(request.nickname, request.expectedLifecycleRevision);
+    }
   }
 }
 
@@ -2067,7 +2077,7 @@ export async function buildProductionApp(
   const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const reconnectAttempts = new Map<string, number>();
   const terminalProcessing = new Map<string, Promise<void>>();
-  const deferredWorkerNativeRefreshes = new Map<ManagedRetryKey, string>();
+  const deferredWorkerNativeRefreshes = new Map<ManagedRetryKey, WorkerNativeRefreshRequest>();
   const assistantLifecycleBuffer = new AssistantLifecycleBuffer();
   const assistantToolReadiness = new ToolReadinessGate();
   const endpointRecoveryIncidents = new EndpointRecoveryIncidents();
@@ -2172,7 +2182,7 @@ export async function buildProductionApp(
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
-  const readCodexWorkerTurns = createCodexWorkerHistoryRead({
+  const readCodexWorkerTurns = createCodexConversationHistoryRead({
     locations: codexRolloutLocations,
     nativeSession: (endpointId, threadId, mappingId) =>
       nativeSessions.view({ endpointId, threadId, mappingId }),
@@ -2853,6 +2863,16 @@ export async function buildProductionApp(
           hasIdentityReferences: (id) => hasEndpointIdentityReferences(id),
           commitBinding: (binding, references) => endpointBindings.commitAfterActivation(binding.endpointId, binding.destination, references),
           managedThreadIds: (id) => Object.values(registry.snapshot().sessions).filter((session) => session.endpoint === id).map((session) => session.thread_id),
+          managedThreadState: (id, threadId, generation) => {
+            const found = registry.getByIdentity(id, threadId);
+            if (!found) return undefined;
+            const current = nativeSessions.view({
+              endpointId: id,
+              threadId,
+              mappingId: found.session.mapping_id,
+            });
+            return current?.endpointGeneration === generation ? current : undefined;
+          },
           onReconnectGaveUp: (id, attempts) => reportOperationalSafely(report, {
             level: "warn", code: "endpoint_reconnect_gave_up", component: "endpoint_manager", consecutiveFailures: attempts,
             reason: `endpoint ${id} unreachable after sustained reconnect attempts (~48h); pausing automatic recovery until restart or next use`,
@@ -2966,6 +2986,7 @@ export async function buildProductionApp(
             observeGoal(registered.nickname, currentGoal);
             if ((control.controlled || hasGoal) && !active) setGoalControlled(registered.nickname, false);
           },
+          sessionProvider,
         );
         sessions = new SessionService(
           pool,
@@ -2981,6 +3002,9 @@ export async function buildProductionApp(
           (session, turnId) => {
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turnId);
           },
+          (endpointId, threadId, mappingId) => mappingId === assistantMappingId
+            ? assistantCurrentSettings
+            : dashboardStore.facts({ endpointId, threadId }).currentSettings,
         );
         runtimeRestartRecovery = new RuntimeRestartRecovery({
           listManaged: (endpointId) => Object.entries(registry.managedSnapshot().sessions)
@@ -3058,7 +3082,17 @@ export async function buildProductionApp(
           const generation = pool.endpointGeneration(assistantEndpoint.id).generation;
           const refreshRequired = nativeSessions.observe(assistantEndpoint.id, generation, method, params);
           if (refreshRequired) {
-            runBackground(() => refreshAssistantNativeState(), () => recordBackgroundFailure("assistant native status refresh"));
+            const expectedLifecycleRevision = nativeSessions.view({
+              endpointId: assistantEndpoint.id,
+              threadId: registry.snapshot().assistant.thread_id,
+              mappingId: assistantMappingId,
+            })?.lifecycleRevision;
+            if (expectedLifecycleRevision !== undefined) {
+              runBackground(
+                () => refreshAssistantNativeState(expectedLifecycleRevision),
+                () => recordBackgroundFailure("assistant native status refresh"),
+              );
+            }
           }
           offerWorkerNotification(webWorkerStream, assistantEndpoint.id, method, params);
           runBackground(
@@ -3436,11 +3470,44 @@ export async function buildProductionApp(
         const endpointId = projectEndpoint(args.endpoint);
         assertSessionCreationOrder(context.operationSequence, args.nickname, endpointId, args.thread_id);
         const mappingId = `mapping_${randomUUID()}`;
-        context.checkpoint({ endpoint: endpointId, threadId: args.thread_id, mappingId });
+        const settingsObservationSequence = dashboardStore.allocateObservationSequence();
+        context.checkpoint({
+          endpoint: endpointId,
+          threadId: args.thread_id,
+          mappingId,
+          settingsObservationSequence,
+        });
+        let observedSettings: ReturnType<typeof currentSessionSettings> | undefined;
         try {
-          await lifecycle.adopt(args.nickname, endpointId, args.thread_id, (thread) => hydrateThreadOrder(endpointId, thread), mappingId);
+          const adoptedSettings = await lifecycle.adopt(
+            args.nickname,
+            endpointId,
+            args.thread_id,
+            (thread, settings) => {
+              hydrateThreadOrder(endpointId, thread);
+              if (hasCurrentSessionSettings(settings)) {
+                context.checkpoint({
+                  endpoint: endpointId,
+                  threadId: args.thread_id,
+                  mappingId,
+                  currentSettings: settings,
+                  settingsObservationSequence,
+                });
+              }
+            },
+            mappingId,
+          );
+          if (hasCurrentSessionSettings(adoptedSettings)) observedSettings = adoptedSettings;
         } finally {
           flushDeferredWorkerNativeRefreshes(args.nickname);
+        }
+        if (observedSettings) {
+          observeCurrentSettings(
+            args.nickname,
+            observedSettings,
+            Date.now(),
+            settingsObservationSequence,
+          );
         }
         dashboardStore.markDirty();
         await renderDashboardSafely();
@@ -3828,21 +3895,21 @@ export async function buildProductionApp(
     };
   }
 
-  async function refreshAssistantNativeState(): Promise<void> {
+  async function refreshAssistantNativeState(expectedLifecycleRevision?: number): Promise<void> {
     const identity = registry.snapshot().assistant;
     const generation = pool.endpointGeneration(identity.endpoint).generation;
     const nativeIdentity = { endpointId: identity.endpoint, threadId: identity.thread_id, mappingId: assistantMappingId };
     const existing = nativeSessions.view(nativeIdentity);
     if (!existing || existing.endpointGeneration !== generation || existing.availability !== "ready") {
-      nativeSessions.register(nativeIdentity, generation);
+      throw new AppError("ENDPOINT_UNAVAILABLE", "assistant native session state is unavailable");
     }
-    const token = nativeSessions.captureRefresh(nativeIdentity, generation);
-    const response = await pool.request<any>(identity.endpoint, "thread/read", {
-      threadId: identity.thread_id,
-      includeTurns: false,
+    await repairActiveTurnIdentity({
+      native: nativeSessions,
+      identity: nativeIdentity,
+      endpointGeneration: generation,
+      latestTurn: () => pool.historyReader(identity.endpoint).latestTurn(identity.thread_id),
+      ...(expectedLifecycleRevision === undefined ? {} : { expectedLifecycleRevision }),
     });
-    const status = response.thread?.status?.type ?? response.thread?.status ?? "unknown";
-    nativeSessions.applyRefresh(token, { status });
   }
 
   async function assistantSessionStatus(observeNative: boolean): Promise<unknown> {
@@ -4117,7 +4184,20 @@ export async function buildProductionApp(
           ? nativeSessions.view({ endpointId: target.id, threadId: threadId!, mappingId: mapping.session.mapping_id })
           : undefined;
         const refreshRequired = nativeSessions.observe(target.id, generation, method, params);
-        routeWorkerNativeRefresh(deferredWorkerNativeRefreshes, mapping, refreshRequired, requestWorkerNativeRefresh);
+        const expectedLifecycleRevision = mapping
+          ? nativeSessions.view({
+            endpointId: target.id,
+            threadId: threadId!,
+            mappingId: mapping.session.mapping_id,
+          })?.lifecycleRevision
+          : undefined;
+        routeWorkerNativeRefresh(
+          deferredWorkerNativeRefreshes,
+          mapping,
+          refreshRequired,
+          expectedLifecycleRevision,
+          requestWorkerNativeRefresh,
+        );
         offerWorkerNotification(webWorkerStream, target.id, method, params);
         if (method === "thread/status/changed" && (params as any)?.status?.type === "idle"
           && threadId && before?.availability === "ready" && before.status === "active" && before.activeTurnId) {
@@ -4266,9 +4346,6 @@ export async function buildProductionApp(
     threadId: string,
     lease?: EndpointWorkLease,
   ) {
-    const response = await pool.request<any>(
-      endpointId, "thread/read", { threadId, includeTurns: false }, undefined, lease,
-    );
     const reader = pool.historyReader(endpointId, lease);
     const page = await reader.turnsPage(threadId, {
       limit: recoveryTurnWindowLimit,
@@ -4278,11 +4355,46 @@ export async function buildProductionApp(
     const turns = [...page.data].reverse();
     return {
       thread: {
-        ...response.thread,
+        ...registeredThreadMetadata(endpointId, threadId),
         turns,
         historyWindow: { exhausted: page.nextCursor === null, anchorTurnIds: [] as string[] },
       },
       reader,
+    };
+  }
+
+  function registeredThreadMetadata(endpointId: string, threadId: string): {
+    id: string;
+    cwd: string;
+    status: { type: string };
+    turns: [];
+  } {
+    const assistantIdentity = registry.snapshot().assistant;
+    if (assistantIdentity.endpoint === endpointId && assistantIdentity.thread_id === threadId) {
+      const current = nativeSessions.view({
+        endpointId,
+        threadId,
+        mappingId: assistantMappingId,
+      });
+      return {
+        id: threadId,
+        cwd: assistantIdentity.project_dir,
+        status: { type: current?.availability === "ready" ? current.status : "unknown" },
+        turns: [],
+      };
+    }
+    const found = registry.getByIdentity(endpointId, threadId);
+    if (!found) throw new AppError("UNKNOWN_SESSION", `unknown managed thread: ${endpointId}/${threadId}`);
+    const current = nativeSessions.view({
+      endpointId,
+      threadId,
+      mappingId: found.session.mapping_id,
+    });
+    return {
+      id: threadId,
+      cwd: found.session.project_dir,
+      status: { type: current?.availability === "ready" ? current.status : "unknown" },
+      turns: [],
     };
   }
 
@@ -4356,6 +4468,17 @@ export async function buildProductionApp(
       path: resumed.rolloutPath,
       preview: resumed.preview,
     });
+    const generation = pool.endpointGeneration(assistantEndpoint.id).generation;
+    const nativeIdentity = {
+      endpointId: assistantEndpoint.id,
+      threadId: resumed.threadId,
+      mappingId: assistantMappingId,
+    };
+    nativeSessions.register(nativeIdentity, generation);
+    nativeSessions.applyRefresh(
+      nativeSessions.captureRefresh(nativeIdentity, generation),
+      { status: resumed.nativeStatus },
+    );
     await refreshAssistantNativeState();
     assistantCurrentSettings = {
       ...(resumed.model ? { model: resumed.model } : {}),
@@ -4654,9 +4777,14 @@ export async function buildProductionApp(
             if (!checkpoint.mappingId) return;
             try {
               try {
-                await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread) => {
+                await lifecycle.adopt(args.nickname, recoveryEndpointId, checkpoint.threadId, (thread, settings) => {
                   if (thread.threadSource !== operation.id) throw new AppError("OPERATION_UNCERTAIN", "recovered worker thread has the wrong creation source");
                   hydrateThreadOrder(recoveryEndpointId, thread);
+                  if (hasCurrentSessionSettings(settings)) {
+                    checkpoint.currentSettings = settings;
+                    checkpoint.settingsObservationSequence ??= dashboardStore.allocateObservationSequence();
+                    operations.checkpoint(operation.id, checkpoint);
+                  }
                 }, checkpoint.mappingId, lease);
               } finally {
                 flushDeferredWorkerNativeRefreshes(args.nickname);
@@ -4680,7 +4808,8 @@ export async function buildProductionApp(
             && (!expectedThread || session.thread_id === expectedThread) && (!expectedDir || session.project_dir === expectedDir)) {
             const live = nativeSessions.view({ endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id });
             const needsReconcile = !managedEpochs.current(session.endpoint, session.thread_id, session.mapping_id)
-              || !live || live.availability !== "ready" || live.status === "unknown";
+              || !live || live.availability !== "ready" || live.status === "unknown"
+              || !hasCurrentSessionSettings((checkpoint as any)?.currentSettings);
             let native: any;
             if (needsReconcile) {
               try {
@@ -4688,8 +4817,6 @@ export async function buildProductionApp(
                   args.nickname,
                   session,
                   lease,
-                  undefined,
-                  operation.kind === "create_session" ? { requireRestorable: true } : undefined,
                 );
               } catch (error) {
                 if (operation.kind === "create_session" && isRecoveredThreadNotDurable(error)) {
@@ -4699,14 +4826,23 @@ export async function buildProductionApp(
                 throw error;
               }
             } else {
-              native = await pool.request<any>(session.endpoint, "thread/read", { threadId: session.thread_id, includeTurns: false }, undefined, lease);
+              native = { thread: registeredThreadMetadata(session.endpoint, session.thread_id) };
             }
             await verifySessionCwd(session.endpoint, native.thread.cwd, session.project_dir, lease);
             hydrateThreadOrder(session.endpoint, native.thread);
+            const recoveredSettings = currentSessionSettings(native);
+            if (!hasCurrentSessionSettings((checkpoint as any)?.currentSettings)
+              && hasCurrentSessionSettings(recoveredSettings)) {
+              checkpoint!.currentSettings = recoveredSettings;
+              checkpoint!.settingsObservationSequence ??= dashboardStore.allocateObservationSequence();
+              operations.checkpoint(operation.id, checkpoint);
+            }
             await succeedRecovered(operation, { nickname: args.nickname, mapping_id: session.mapping_id }, () => {
               dashboardStore.markDirty();
               const currentSettings = (checkpoint as any)?.currentSettings;
-              if (currentSettings) observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+              if (hasCurrentSessionSettings(currentSettings)) {
+                observeCurrentSettings(args.nickname, currentSettings, operation.createdAt, (checkpoint as any)?.settingsObservationSequence);
+              }
             });
           } else if (!session && operation.kind !== "create_session") {
             failRecoveredNoEffect(operation.id, "atomic session registry mapping was not committed");
@@ -4899,19 +5035,13 @@ export async function buildProductionApp(
         continue;
       }
       try {
-        // SSH Codex keeps a detached App Server across QiYan connection generations. Rejoin each
-        // managed thread so this WebSocket receives lifecycle/item notifications; local Codex gets
-        // a fresh process and Claude's daemonless runtime has no connection subscription.
-        const resumeForConnection = managedRecoveryRequiresConnectionResume(
-          sessionProvider(session.endpoint),
-          remoteContexts.has(session.endpoint),
-        );
+        // Every replacement generation resumes each managed thread with turns excluded. This
+        // re-subscribes Codex notifications and recreates an empty daemonless Claude thread.
         const response = await lifecycle.reconcileManaged(
           nickname,
           session,
           options.lease,
           options.isCurrent,
-          resumeForConnection ? { resumeForConnection: true } : undefined,
         );
         if ((options.isCurrent && !options.isCurrent())
           || (options.lease && !isManagedRecoveryLeaseCurrent(session.endpoint, options.lease))) {
@@ -5172,9 +5302,9 @@ export async function buildProductionApp(
     backgroundFailureReporter.report(label);
   }
 
-  function requestWorkerNativeRefresh(nickname: string): void {
+  function requestWorkerNativeRefresh(nickname: string, expectedLifecycleRevision: number): void {
     runBackground(
-      () => sessions.refreshNativeState(nickname),
+      () => sessions.refreshNativeState(nickname, expectedLifecycleRevision),
       () => recordBackgroundFailure("worker native status refresh"),
     );
   }

@@ -18,7 +18,10 @@ import { encodeClaudeClientMarker } from "../sessions/claude-client-marker.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
-import { claudeModelCatalog } from "./claude-models.ts";
+import {
+  CLAUDE_DEFAULT_REASONING_EFFORT,
+  claudeModelCatalog,
+} from "./claude-models.ts";
 import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
 import { ClaudeTranscriptHistory } from "./claude-history.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
@@ -135,7 +138,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     }
   }
 
-  private threadStart(params: Record<string, unknown>): { thread: ClaudeThreadView } {
+  private threadStart(params: Record<string, unknown>): {
+    thread: ClaudeThreadView;
+    model?: string;
+    reasoningEffort?: string;
+  } {
     const cwd = requireString(params.cwd, "cwd");
     const threadSource = typeof params.threadSource === "string" ? params.threadSource : undefined;
     const id = randomUUID();
@@ -143,13 +150,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       cwd, materialized: false, terminalTurns: new Set(),
       ...(threadSource === undefined ? {} : { threadSource }),
     });
-    return {
-      thread: {
-        id, cwd, itemsView: "full", status: { type: "idle" }, turns: [],
-        ...(threadSource === undefined ? {} : { threadSource }),
-        ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
-      },
-    };
+    return this.withCurrentSettings({
+      id, cwd, itemsView: "full", status: { type: "idle" }, turns: [],
+      ...(threadSource === undefined ? {} : { threadSource }),
+      ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
+    });
   }
 
   private async threadRead(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
@@ -161,18 +166,25 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { thread: params.includeTurns === true ? projected : { ...projected, turns: [] } };
   }
 
-  private async threadResume(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
+  private async threadResume(params: Record<string, unknown>): Promise<{
+    thread: ClaudeThreadView;
+    model?: string;
+    reasoningEffort?: string;
+  }> {
     const threadId = requireString(params.threadId, "threadId");
+    const recoveryCwd = params.cwd === undefined ? undefined : requireString(params.cwd, "cwd");
     // Re-adopting a thread un-tombstones it (Codex parity: resuming an archived thread revives it).
     this.options.archives?.remove(this.id, threadId);
-    const state = await this.ensureState(threadId);
+    const state = await this.ensureState(threadId, recoveryCwd);
     const projected = params.excludeTurns === true
       ? this.stateOnlyThread(threadId, state)
       : await this.reconstruct(threadId, state);
-    return { thread: params.excludeTurns === true ? { ...projected, turns: [] } : projected };
+    return this.withCurrentSettings(
+      params.excludeTurns === true ? { ...projected, turns: [] } : projected,
+    );
   }
 
-  private async ensureState(threadId: string): Promise<ThreadState> {
+  private async ensureState(threadId: string, recoveryCwd?: string): Promise<ThreadState> {
     let state = this.threads.get(threadId);
     // Cold-start recovery: after a QiYan restart the in-memory map is empty, but the
     // Claude transcript is durable on disk. Rehydrate an unknown-but-on-disk session
@@ -182,11 +194,27 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // the exact Codex `no rollout` error so recovery paths behave.
     if (!state) {
       const cwd = await this.history.sessionCwd(threadId, "");
-      if (cwd === undefined) throw noRollout(threadId);
-      state = { cwd, materialized: true, terminalTurns: new Set() };
+      if (cwd === undefined && recoveryCwd === undefined) throw noRollout(threadId);
+      state = {
+        cwd: cwd ?? recoveryCwd!,
+        materialized: cwd !== undefined,
+        terminalTurns: new Set(),
+      };
       this.threads.set(threadId, state);
     }
     return state;
+  }
+
+  private withCurrentSettings(thread: ClaudeThreadView): {
+    thread: ClaudeThreadView;
+    model: string;
+    reasoningEffort: string;
+  } {
+    return {
+      thread,
+      model: this.options.launchFlags.model ?? "default",
+      reasoningEffort: this.options.launchFlags.effort ?? CLAUDE_DEFAULT_REASONING_EFFORT,
+    };
   }
 
   private async reconstruct(threadId: string, knownState?: ThreadState): Promise<ClaudeThreadView> {

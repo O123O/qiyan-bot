@@ -24,6 +24,7 @@
 // these levels (verified via `claude --help`).
 
 export const CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export const CLAUDE_DEFAULT_REASONING_EFFORT = "high";
 
 export interface ClaudeCatalogModel {
   id: string;
@@ -50,7 +51,7 @@ function entry(id: string, displayName: string, isDefault: boolean): ClaudeCatal
     displayName,
     hidden: false,
     supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS.map((reasoningEffort) => ({ reasoningEffort })),
-    defaultReasoningEffort: "high",
+    defaultReasoningEffort: CLAUDE_DEFAULT_REASONING_EFFORT,
     isDefault,
   };
 }

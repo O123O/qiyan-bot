@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
+import { isExactThreadNoRollout, isExactThreadNotLoaded } from "../app-server/thread-errors.ts";
 import { AppError } from "../core/errors.ts";
 import type { SessionRegistry } from "../registry/session-registry.ts";
 
@@ -122,15 +122,7 @@ async function createOrRecoverPendingThread(
   creation: { nonce: string; name: string; record(threadId: string): Promise<void>; clear(threadId: string): Promise<void> },
 ): Promise<ThreadResponse> {
   if (input.pendingThreadId) {
-    let read: ThreadResponse | undefined;
     try {
-      read = await input.endpoint.request<ThreadResponse>("thread/read", { threadId: input.pendingThreadId, includeTurns: false });
-    } catch (error) {
-      if (!isExactThreadNotLoaded(error, input.pendingThreadId)) throw error;
-      await creation.clear(input.pendingThreadId);
-    }
-    if (read) {
-      await verifyThread(read.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
       const resumed = await input.endpoint.request<ThreadResponse>("thread/resume", {
         threadId: input.pendingThreadId,
         cwd: input.assistantDir,
@@ -139,8 +131,17 @@ async function createOrRecoverPendingThread(
         config: input.config,
         excludeTurns: true,
       });
-      await verifyThread(resumed.thread, { id: input.pendingThreadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
+      await verifyThread(resumed.thread, {
+        id: input.pendingThreadId,
+        cwd: configuredDir,
+        nonce: creation.nonce,
+        name: creation.name,
+      });
       return resumed;
+    } catch (error) {
+      if (!isExactThreadNotLoaded(error, input.pendingThreadId)
+        && !isExactThreadNoRollout(error, input.pendingThreadId)) throw error;
+      await creation.clear(input.pendingThreadId);
     }
   }
 
@@ -151,7 +152,14 @@ async function createOrRecoverPendingThread(
   const threadId = String(started.thread.id);
   await creation.record(threadId);
   await input.endpoint.request("thread/name/set", { threadId, name: creation.name });
-  const materialized = await input.endpoint.request<ThreadResponse>("thread/read", { threadId, includeTurns: false });
+  const materialized = await input.endpoint.request<ThreadResponse>("thread/resume", {
+    threadId,
+    cwd: input.assistantDir,
+    approvalPolicy: "never",
+    sandbox: input.sandboxMode,
+    config: input.config,
+    excludeTurns: true,
+  });
   await verifyThread(materialized.thread, { id: threadId, cwd: configuredDir, nonce: creation.nonce, name: creation.name });
   return materialized;
 }

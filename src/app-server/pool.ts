@@ -25,16 +25,6 @@ export class TurnIdentityConflictError extends AppError {
   }
 }
 
-export interface ThreadHistory {
-  status?: string | { type?: string };
-  turns: Array<{
-    id: string;
-    status: string;
-    itemsView?: "full" | "summary" | "notLoaded";
-    items: Array<{ type: string; clientId?: string | null }>;
-  }>;
-}
-
 interface TurnStartResponse { turn: { id: string } }
 interface ClaimState extends TurnCapacityClaim {
   phase: "provisional" | "active";
@@ -237,23 +227,6 @@ export class AppServerPool {
       }
       throw error;
     }
-  }
-
-  async readFullThread(endpointId: string, threadId: string, lease?: EndpointWorkLease): Promise<ThreadHistory> {
-    return this.withWorkLease(endpointId, lease, (admitted) => this.readFullThreadAdmitted(endpointId, threadId, admitted));
-  }
-
-  private async readFullThreadAdmitted(endpointId: string, threadId: string, lease: EndpointWorkLease | undefined): Promise<ThreadHistory> {
-    let response: { thread: ThreadHistory };
-    try {
-      response = await this.request(endpointId, "thread/read", { threadId, includeTurns: true }, undefined, lease);
-    } catch (error) {
-      throw new AppError("OPERATION_UNCERTAIN", `full thread history was unavailable: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (response.thread.turns.some((turn) => turn.itemsView !== "full")) {
-      throw new AppError("OPERATION_UNCERTAIN", "thread history is not a full item view");
-    }
-    return response.thread;
   }
 
   async interrupt(endpointId: string, threadId: string, turnId: string, lease?: EndpointWorkLease): Promise<void> {

@@ -231,23 +231,6 @@ test("a caller-owned uncertain start remains claimed until its owner settles it"
   pool.releaseTurnCapacityClaim(claim);
 });
 
-test("only full item views can prove a client message absent", async () => {
-  for (const itemsView of ["summary", "notLoaded"] as const) {
-    const endpoint: AppServerEndpoint = {
-      id: "local", state: "ready",
-      request: async <T>() => ({ thread: { turns: [{ id: "turn", status: "completed", itemsView, items: [] }] } }) as T,
-    };
-    const pool = new AppServerPool([endpoint], {});
-    await assert.rejects(pool.readFullThread("local", "assistant"), (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
-  }
-  const endpoint: AppServerEndpoint = {
-    id: "local", state: "ready",
-    request: async <T>() => ({ thread: { turns: [{ id: "turn", status: "completed", itemsView: "full", items: [] }] } }) as T,
-  };
-  const pool = new AppServerPool([endpoint], {});
-  assert.equal((await pool.readFullThread("local", "assistant")).turns[0]?.itemsView, "full");
-});
-
 test("lazily resolves and starts one endpoint generation", async () => {
   class Remote extends FakeEndpoint implements ManagedAppServerEndpoint {
     override readonly id = "devbox";

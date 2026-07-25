@@ -1,6 +1,6 @@
 import { basename, isAbsolute } from "node:path";
-import type { NativeSessionView } from "../sessions/native-session-state.ts";
-import type { WorkerNativeHistoryPage } from "./worker-history-reader.ts";
+import type { WorkerNativeHistoryPage } from "../webui/worker-history-reader.ts";
+import type { NativeSessionView } from "./native-session-state.ts";
 
 interface RolloutLocation {
   path: string;
@@ -48,7 +48,7 @@ export class CodexRolloutLocations {
   }
 }
 
-export function createCodexWorkerHistoryRead(deps: {
+export function createCodexConversationHistoryRead(deps: {
   locations: CodexRolloutLocations;
   nativeSession(endpointId: string, threadId: string, mappingId: string): NativeSessionView | undefined;
   readPage(

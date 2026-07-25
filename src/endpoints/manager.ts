@@ -1,5 +1,4 @@
 import { AppError } from "../core/errors.ts";
-import { RpcRequestTimeoutError } from "../app-server/rpc-client.ts";
 import type { EndpointDefinition } from "./catalog.ts";
 import { EndpointAdmissionGate, type EndpointDesiredState } from "./admission-gate.ts";
 import type { PendingDestinationBinding } from "./ssh-config.ts";
@@ -74,6 +73,11 @@ export class EndpointManager {
     hasIdentityReferences(endpointId: string): boolean | Promise<boolean>;
     commitBinding?(binding: PendingDestinationBinding, hasReferences: boolean): void | Promise<void>;
     managedThreadIds(endpointId: string): readonly string[] | Promise<readonly string[]>;
+    managedThreadState?(
+      endpointId: string,
+      threadId: string,
+      endpointGeneration: number,
+    ): { availability: "ready" | "unavailable"; status: "unknown" | "idle" | "active" | "error"; endpointGeneration: number } | undefined;
     schedule?(delayMs: number, run: () => void): ScheduledWork;
     // Called once (latched until the next completed ready recovery) when the automatic reconnect loop
     // gives up on a persistently-unreachable endpoint (~48h of failed retries, e.g. a cluster in
@@ -535,18 +539,17 @@ export class EndpointManager {
     for (const listener of this.endpointListeners) listener(endpoint, generation);
   }
 
-  private async requireManagedThreadsIdle(endpointId: string, endpoint: ManagedAppServerEndpoint): Promise<void> {
+  private async requireManagedThreadsIdle(endpointId: string, _endpoint: ManagedAppServerEndpoint): Promise<void> {
+    const generation = this.record(endpointId).generation;
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
-      let response: { thread?: { status?: string | { type?: string } } };
-      try { response = await endpoint.request("thread/read", { threadId, includeTurns: false }); }
-      catch (error) {
-        if (error instanceof RpcRequestTimeoutError) throw error;
-        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`, { cause: error });
+      const state = this.options.managedThreadState?.(endpointId, threadId, generation);
+      if (!state || state.availability !== "ready" || state.endpointGeneration !== generation
+        || state.status === "unknown" || state.status === "error") {
+        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`);
       }
-      const status = typeof response.thread?.status === "string" ? response.thread.status : response.thread?.status?.type;
-      // Codex reports persisted threads that are not resident in app-server memory as notLoaded.
-      // Such a thread cannot have an active turn, so it is as safe to stop as an idle loaded thread.
-      if (status !== "idle" && status !== "notLoaded") throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
+      if (state.status !== "idle") {
+        throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
+      }
     }
   }
 

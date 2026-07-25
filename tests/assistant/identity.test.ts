@@ -146,7 +146,10 @@ test("fresh pending identity records, materializes, commits, and clears in order
         assert.equal(registry.snapshot().assistant.thread_id, "pending");
         return {} as T;
       }
-      if (method === "thread/read") return { thread: { id: "created", cwd: dir, threadSource: "bot-nonce", name: "qiyan-bot-assistant:bot-nonce", status: { type: "idle" } } } as T;
+      if (method === "thread/resume") {
+        assert.equal(params.excludeTurns, true);
+        return { thread: { id: "created", cwd: dir, threadSource: "bot-nonce", name: "qiyan-bot-assistant:bot-nonce", status: { type: "idle" } } } as T;
+      }
       throw new Error(`unexpected ${method}`);
     },
   };
@@ -157,7 +160,7 @@ test("fresh pending identity records, materializes, commits, and clears in order
     clearPendingThread: async (id) => { order.push(`clear:${id}`); assert.equal(registry.snapshot().assistant.thread_id, id); },
   });
   assert.equal(result.threadId, "created");
-  assert.deepEqual(order, ["thread/start", "record:created", "thread/name/set", "thread/read", "clear:created"]);
+  assert.deepEqual(order, ["thread/start", "record:created", "thread/name/set", "thread/resume", "clear:created"]);
 });
 
 test("pending receipt resumes only exact durable provenance", async () => {
@@ -180,31 +183,20 @@ test("pending receipt resumes only exact durable provenance", async () => {
     creationNonce: "bot-nonce", pendingThreadId: "receipt-thread",
     recordPendingThread: async () => { throw new Error("must not record"); }, clearPendingThread: async (id) => { cleared = id; },
   });
-  assert.deepEqual(calls, ["thread/read", "thread/resume"]);
+  assert.deepEqual(calls, ["thread/resume"]);
   assert.equal(result.threadId, "receipt-thread");
   assert.equal(cleared, "receipt-thread");
 });
 
-test("a resume failure preserves an already-proven durable pending receipt", async () => {
+test("a non-absence resume failure preserves a pending receipt", async () => {
   const dir = await mkdtemp(join(tmpdir(), "assistant-receipt-resume-failure-"));
   const registry = await SessionRegistry.open(join(dir, "sessions.json"), {
     version: 3, assistant: { endpoint: "assistant-local", thread_id: "pending", project_dir: dir }, sessions: {},
   });
-  const failure = new JsonRpcResponseError(-32600, "thread not loaded: receipt-thread");
+  const failure = new Error("resume transport failed");
   const endpoint = {
     id: "assistant-local",
     request: async <T>(method: string) => {
-      if (method === "thread/read") {
-        return {
-          thread: {
-            id: "receipt-thread",
-            cwd: dir,
-            threadSource: "bot-nonce",
-            name: "qiyan-bot-assistant:bot-nonce",
-            status: { type: "idle" },
-          },
-        } as T;
-      }
       if (method === "thread/resume") throw failure;
       throw new Error(`unexpected ${method}`);
     },
@@ -312,10 +304,10 @@ test("only exact thread-not-loaded clears a pending receipt", async () => {
     const endpoint = {
       id: "assistant-local",
       request: async <T>(method: string, params: any) => {
-        if (method === "thread/read" && params.threadId === "lost") throw failure;
+        if (method === "thread/resume" && params.threadId === "lost") throw failure;
         if (method === "thread/start") return { thread: { id: "replacement", cwd: dir, threadSource: "bot-nonce", name: null, status: { type: "idle" } } } as T;
         if (method === "thread/name/set") return {} as T;
-        if (method === "thread/read") return { thread: { id: "replacement", cwd: dir, threadSource: "bot-nonce", name: "qiyan-bot-assistant:bot-nonce", status: { type: "idle" } } } as T;
+        if (method === "thread/resume") return { thread: { id: "replacement", cwd: dir, threadSource: "bot-nonce", name: "qiyan-bot-assistant:bot-nonce", status: { type: "idle" } } } as T;
         throw new Error(`unexpected ${method}`);
       },
     };
@@ -335,7 +327,7 @@ test("only exact thread-not-loaded clears a pending receipt", async () => {
   for (const failure of [
     new JsonRpcResponseError(-32600, "invalid request"),
     new JsonRpcResponseError(-32000, "thread not loaded: lost"),
-    new Error("app-server request timed out: thread/read"),
+    new Error("app-server request timed out: thread/resume"),
   ]) {
     const unsafe = await run(failure);
     await assert.rejects(unsafe.action, (error: unknown) => error === failure);

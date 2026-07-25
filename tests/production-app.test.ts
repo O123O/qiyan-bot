@@ -17,7 +17,6 @@ import {
   isMissingUnmaterializedThread,
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
-  managedRecoveryRequiresConnectionResume,
   managedRetryKey,
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
@@ -101,23 +100,38 @@ test("an adopting completion defers native refresh until the mapping is managed"
   const refreshRequired = native.observe("local", 7, "turn/completed", {
     threadId: "thread-1", turn: { id: "completed-without-start" },
   });
+  const expectedLifecycleRevision = native.view(identity)!.lifecycleRevision;
   const pending = new Map();
   const refreshes: string[] = [];
   const adopting = {
     endpoint: "local", thread_id: "thread-1", project_dir: "/project", mapping_id: "mapping-1", lifecycle_state: "adopting" as const,
   };
 
-  routeWorkerNativeRefresh(pending, { nickname: "worker", session: adopting }, refreshRequired, (nickname) => refreshes.push(nickname));
+  routeWorkerNativeRefresh(
+    pending,
+    { nickname: "worker", session: adopting },
+    refreshRequired,
+    expectedLifecycleRevision,
+    (nickname, revision) => refreshes.push(`${nickname}:${revision}`),
+  );
   assert.equal(refreshes.length, 0, "adoption must not indirectly issue a native read");
   assert.equal(pending.size, 1);
 
-  settleDeferredWorkerNativeRefreshes(pending, () => adopting, (nickname) => refreshes.push(nickname));
+  settleDeferredWorkerNativeRefreshes(
+    pending,
+    () => adopting,
+    (nickname, revision) => refreshes.push(`${nickname}:${revision}`),
+  );
   assert.equal(refreshes.length, 0);
   assert.equal(pending.size, 1);
 
   const managed = { ...adopting, lifecycle_state: "managed" as const };
-  settleDeferredWorkerNativeRefreshes(pending, () => managed, (nickname) => refreshes.push(nickname));
-  assert.deepEqual(refreshes, ["worker"]);
+  settleDeferredWorkerNativeRefreshes(
+    pending,
+    () => managed,
+    (nickname, revision) => refreshes.push(`${nickname}:${revision}`),
+  );
+  assert.deepEqual(refreshes, [`worker:${expectedLifecycleRevision}`]);
   assert.equal(pending.size, 0);
 });
 
@@ -190,12 +204,6 @@ test("startup capacity bootstrap settles every referenced endpoint before ingres
   releaseB();
   assert.deepEqual([...await bootstrap].sort(), ["a", "b"]);
   assert.deepEqual(failures, ["b"]);
-});
-
-test("only remote Codex recovery rejoins threads on the replacement connection", () => {
-  assert.equal(managedRecoveryRequiresConnectionResume("codex", true), true);
-  assert.equal(managedRecoveryRequiresConnectionResume("codex", false), false);
-  assert.equal(managedRecoveryRequiresConnectionResume("claude", true), false);
 });
 
 test("completed cutover does not drain assistant post-turn actions while the resumed thread is active", () => {

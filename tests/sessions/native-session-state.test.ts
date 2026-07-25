@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
+import { repairActiveTurnIdentity } from "../../src/sessions/native-session-probe.ts";
 
 const identity = { endpointId: "prenyx", threadId: "thread-1", mappingId: "mapping-1" };
 
@@ -38,6 +39,94 @@ test("current-generation events are the only live lifecycle authority", () => {
     receiveSequence: 2,
     observedAt: 100,
   });
+});
+
+test("a one-turn probe repairs only an exact current active turn identity", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.applyRefresh(native.captureRefresh(identity, 3), { status: "active" });
+
+  await repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    latestTurn: async () => ({ id: "running", status: "inProgress", itemsView: "notLoaded", items: [] }),
+  });
+
+  assert.equal(native.view(identity)?.status, "active");
+  assert.equal(native.view(identity)?.activeTurnId, "running");
+});
+
+test("an inconclusive active-turn probe fails closed as unknown", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.applyRefresh(native.captureRefresh(identity, 3), { status: "active" });
+
+  await repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    latestTurn: async () => ({ id: "done", status: "completed", itemsView: "notLoaded", items: [] }),
+  });
+
+  assert.equal(native.view(identity)?.status, "unknown");
+  assert.equal(native.view(identity)?.activeTurnId, null);
+});
+
+test("a probe response cannot overwrite a newer native notification", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.applyRefresh(native.captureRefresh(identity, 3), { status: "active" });
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const probing = repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    latestTurn: async () => {
+      await barrier;
+      return { id: "stale", status: "inProgress", itemsView: "notLoaded", items: [] };
+    },
+  });
+  native.observe("remote", 3, "turn/started", { threadId: "thread", turn: { id: "newer" } });
+  release();
+  await probing;
+
+  assert.equal(native.view(identity)?.status, "active");
+  assert.equal(native.view(identity)?.activeTurnId, "newer");
+});
+
+test("a queued forced probe cannot start after a newer notification resolves the state", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.applyRefresh(native.captureRefresh(identity, 3), {
+    status: "active",
+    activeTurnId: "older",
+  });
+  const expectedLifecycleRevision = native.view(identity)!.lifecycleRevision;
+  native.observe("remote", 3, "turn/started", {
+    threadId: "thread",
+    turn: { id: "newer" },
+  });
+  let probes = 0;
+
+  await repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    expectedLifecycleRevision,
+    latestTurn: async () => {
+      probes += 1;
+      return { id: "stale", status: "inProgress", itemsView: "notLoaded", items: [] };
+    },
+  });
+
+  assert.equal(probes, 0);
+  assert.equal(native.view(identity)?.activeTurnId, "newer");
 });
 
 test("a late refresh response cannot overwrite lifecycle events received after dispatch", () => {
@@ -105,13 +194,13 @@ test("publishes only applied view changes", () => {
   assert.deepEqual(changes, ["unknown:-", "idle:-"]);
 });
 
-test("id-less active status stays metadata-only until a live turn event identifies it", () => {
+test("id-less active status requests identity repair until a live turn event identifies it", () => {
   const state = new NativeSessionState();
   state.register(identity, 20);
   assert.equal(state.observe("prenyx", 20, "thread/status/changed", {
     threadId: "thread-1",
     status: { type: "active" },
-  }), false);
+  }), true);
   assert.equal(state.view(identity)?.status, "active");
   assert.equal(state.view(identity)?.activeTurnId, null);
 

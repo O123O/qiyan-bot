@@ -75,13 +75,63 @@ test("thread/start reserves an idle empty thread without spawning", async () => 
   const rt = makeRuntime(runner);
   await rt.start();
   assert.equal(rt.state, "ready");
-  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w", threadSource: "worker-thread" });
+  const started = await rt.request<{ thread: any; model?: string }>(
+    "thread/start",
+    { cwd: "/w", threadSource: "worker-thread" },
+  );
+  const { thread } = started;
   assert.equal(typeof thread.id, "string");
   assert.equal(thread.cwd, "/w");
   assert.equal(thread.threadSource, "worker-thread");
   assert.deepEqual(thread.status, { type: "idle" });
   assert.deepEqual(thread.turns, []);
+  assert.equal(started.model, "claude-opus-4-8");
   assert.equal(runner.requests.length, 0); // no subprocess yet
+});
+
+test("an unpinned Claude endpoint reports its catalog model and effort defaults", async () => {
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-default",
+    runner: new FakeRunner(),
+    launchFlags: {},
+  });
+  await rt.start();
+
+  const started = await rt.request<{ model?: string; reasoningEffort?: string }>(
+    "thread/start",
+    { cwd: "/w" },
+  );
+
+  assert.deepEqual(
+    { model: started.model, effort: started.reasoningEffort },
+    { model: "default", effort: "high" },
+  );
+});
+
+test("managed cold resume recreates an unmaterialized thread and accepts its first turn", async () => {
+  const runner = new FakeRunner();
+  const original = makeRuntime(runner);
+  await original.start();
+  const { thread } = await original.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  const recovered = makeRuntime(runner);
+  await recovered.start();
+  const resumed = await recovered.request<{ thread: any; model?: string }>("thread/resume", {
+    threadId: thread.id,
+    cwd: "/w",
+    excludeTurns: true,
+  });
+  assert.equal(resumed.thread.id, thread.id);
+  assert.equal(resumed.thread.cwd, "/w");
+  assert.equal(resumed.model, "claude-opus-4-8");
+
+  await recovered.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:recovered",
+    input: [{ type: "text", text: "continue" }],
+  });
+  assert.equal(runner.requests.at(-1)?.threadId, thread.id);
+  assert.equal(runner.requests.at(-1)?.resume, false);
 });
 
 test("first turn uses --session-id, resumes after; turn/completed fires; thread/read is authoritative", async () => {

@@ -4,7 +4,6 @@ import test from "node:test";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
 import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
-import { RpcRequestTimeoutError } from "../../src/app-server/rpc-client.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { createOperationReconciliationLoop, operationRecoveryFailureDisposition } from "../../src/production-app.ts";
 
@@ -65,6 +64,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
 
 function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly string[] = []) {
   const local = new FakeEndpoint("local");
+  const endpoints = new Map<string, FakeEndpoint>([["local", local]]);
   let index = 0;
   const manager = new EndpointManager({
     localEndpoint: local,
@@ -75,10 +75,21 @@ function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly st
     createRemote: async () => {
       const endpoint = candidates[index++];
       assert.ok(endpoint, "unexpected remote candidate request");
+      endpoints.set(endpoint.id, endpoint);
       return { endpoint };
     },
     hasIdentityReferences: () => true,
     managedThreadIds: () => managedThreadIds,
+    managedThreadState: (id, _threadId, generation) => {
+      const status = endpoints.get(id)?.threadStatus;
+      return {
+        availability: "ready",
+        status: status === "notLoaded" ? "idle"
+          : status === "systemError" ? "error"
+            : status ?? "unknown",
+        endpointGeneration: generation,
+      };
+    },
   });
   return { manager, local, candidateCount: () => index };
 }
@@ -102,6 +113,17 @@ function fixture(options: { onRecoveryPaused?(id: string, recovery: { reason: "s
     hasIdentityReferences: () => true,
     commitBinding: (binding) => { commits.push(binding.endpointId); },
     managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    managedThreadState: (id, _threadId, generation) => {
+      const endpoint = id === "local" ? local : remotes.get(id);
+      if (!endpoint) return undefined;
+      return {
+        availability: "ready",
+        status: endpoint.threadStatus === "notLoaded" ? "idle"
+          : endpoint.threadStatus === "systemError" ? "error"
+            : endpoint.threadStatus,
+        endpointGeneration: generation,
+      };
+    },
     ...(options.onRecoveryPaused ? { onRecoveryPaused: options.onRecoveryPaused } : {}),
   });
   return { manager, local, remotes, commits, reloads: () => reloads };
@@ -660,20 +682,23 @@ test("runtime-stopped remote restart recovery starts and validates only its repl
   assert.equal(replacement.runtimeStops, 0);
 });
 
-test("lifecycle idle proof preserves the typed RPC timeout source", async () => {
+test("lifecycle idle proof fails closed on an error native state", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
-  remote.requestError = new RpcRequestTimeoutError("thread/read");
-  await assert.rejects(value.manager.disconnect("devbox"), (error: unknown) => error instanceof RpcRequestTimeoutError);
+  remote.threadStatus = "systemError";
+  await assert.rejects(
+    value.manager.disconnect("devbox"),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+  );
 });
 
-test("lifecycle idle proof does not require materialized turn history", async () => {
+test("lifecycle idle proof does not request native history", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
 
   await value.manager.disconnect("devbox");
 
-  assert.deepEqual(remote.requests, [{ method: "thread/read", params: { threadId: "thread-1", includeTurns: false } }]);
+  assert.deepEqual(remote.requests, []);
 });
 
 test("lifecycle cold activation retries on its capped timer without a ready event", async () => {
@@ -771,12 +796,12 @@ test("fresh-channel lifecycle recovery pauses and waits for an explicit endpoint
   await loop.stop();
 });
 
-test("lifecycle idle-proof timeout retries through the same operation timer", async () => {
+test("an uncertain lifecycle idle proof is retained without a blind retry", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
   const identity = await remote.runtimeIdentity();
   assert.ok(identity?.kind === "ssh");
-  remote.requestError = new RpcRequestTimeoutError("thread/read");
+  remote.threadStatus = "systemError";
   const scheduled: Array<{ callback: () => void; delay: number }> = [];
   let attempts = 0;
   const target = { policy: "endpoint_lifecycle", endpointId: "devbox" } as const;
@@ -801,12 +826,9 @@ test("lifecycle idle-proof timeout retries through the same operation timer", as
     },
   });
   await loop.request();
-  assert.equal(scheduled[0]!.delay, 1_000);
-  remote.requestError = undefined;
-  scheduled[0]!.callback();
-  await new Promise<void>((resolve) => { setImmediate(resolve); });
-  assert.equal(attempts, 2);
-  assert.equal(remote.runtimeStops, 1);
+  assert.deepEqual(scheduled, []);
+  assert.equal(attempts, 1);
+  assert.equal(remote.runtimeStops, 0);
   await loop.stop();
 });
 
@@ -1093,7 +1115,7 @@ test("active history prevents disconnect and reopens admission without stopping"
   await value.manager.withWorkLease("devbox", "rpc", async () => undefined);
 });
 
-test("unloaded managed history permits a guarded local restart", async () => {
+test("an idle native view permits a guarded local restart without reading history", async () => {
   const { manager, local } = queuedFixture([], ["thread-1"]);
   local.rotateIdentityOnStop = true;
   await manager.ensureReady("local");
@@ -1103,10 +1125,7 @@ test("unloaded managed history permits a guarded local restart", async () => {
 
   assert.equal(local.runtimeStops, 1);
   assert.equal(local.state, "ready");
-  assert.deepEqual(local.requests, [{
-    method: "thread/read",
-    params: { threadId: "thread-1", includeTurns: false },
-  }]);
+  assert.deepEqual(local.requests, []);
 });
 
 test("leases reject foreign generations and old endpoint callbacks cannot replace a newer generation", async () => {

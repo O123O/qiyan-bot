@@ -3,8 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   CodexRolloutLocations,
-  createCodexWorkerHistoryRead,
-} from "../../src/webui/codex-worker-history.ts";
+  createCodexConversationHistoryRead,
+} from "../../src/sessions/codex-conversation-history.ts";
 
 const threadId = "019f949a-51be-7a72-ae4b-ce8ce38095db";
 const path = `/home/user/.codex/sessions/2026/07/24/rollout-2026-07-24T14-49-29-${threadId}.jsonl`;
@@ -14,7 +14,7 @@ test("Codex worker history reuses a bounded page until a native event changes th
   locations.observe("remote", { id: threadId, path, preview: "" });
   let receiveSequence = 1;
   let reads = 0;
-  const read = createCodexWorkerHistoryRead({
+  const read = createCodexConversationHistoryRead({
     locations,
     nativeSession: () => ({
       availability: "ready",
@@ -78,7 +78,7 @@ test("Codex rollout locations accept only the exact thread rollout path", () => 
 test("only an initial latest-page read may tolerate an unmaterialized rollout", async () => {
   const locations = new CodexRolloutLocations();
   locations.observe("remote", { id: threadId, path, preview: "" });
-  const read = createCodexWorkerHistoryRead({
+  const read = createCodexConversationHistoryRead({
     locations,
     nativeSession: () => undefined,
     readPage: async (input) => {

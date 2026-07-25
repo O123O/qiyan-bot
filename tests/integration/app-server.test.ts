@@ -154,8 +154,12 @@ test("active turn steering persists its client correlation ID", { skip: !steerEn
     assert.ok(repeat === "accepted" || repeat === "rejected");
     const completed = await terminal.completed;
     pool.markTurnTerminal(endpoint.id, threadId, completed.id);
-    const history = await pool.readFullThread(endpoint.id, threadId);
-    const user = history.turns.flatMap((candidate) => candidate.items)
+    const history = await pool.historyReader(endpoint.id).exactTurnItems(
+      threadId,
+      completed.id,
+      { budget: createHistoryScanBudget() },
+    );
+    const user = history.items
       .find((item) => item.type === "userMessage" && item.clientId === steerId);
     assert.ok(user, "turn/steer clientUserMessageId is persisted in full history");
     return;
