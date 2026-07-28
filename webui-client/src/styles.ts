@@ -64,6 +64,8 @@ body { margin:0; }
 .msg.qiyan { border-color:var(--qiyan-border); }
 .msg.worker-relay { border-color:var(--worker-relay-border); }
 .msg .when { color:var(--muted); font-size:11px; margin-bottom:4px; }
+.worker-mention { padding:0; border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.worker-mention:hover, .worker-mention:focus-visible { color:var(--accent); text-decoration:underline; }
 .md { word-break:break-word; } .md > *:first-child { margin-top:0; } .md > *:last-child { margin-bottom:0; }
 .md p { margin:.4em 0; } .md pre { margin:.4em 0; border:1px solid var(--line); border-radius:8px; overflow:auto; }
 .md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */

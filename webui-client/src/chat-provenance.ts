@@ -17,3 +17,8 @@ export function assistantMessagePresentation(message: AssistantMessageLike): Ass
     ? { className: "worker-relay", label: `Worker · ${message.worker}` }
     : { className: "qiyan", label: "QiYan" };
 }
+
+export function workerMentionDraft(draft: string, worker: string): string {
+  const body = draft.trimStart().replace(/^@[a-z0-9][a-z0-9_-]*(?:\s+|$)/iu, "");
+  return `@${worker} ${body}`;
+}

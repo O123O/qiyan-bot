@@ -8,7 +8,7 @@ import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
 import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
-import { assistantMessagePresentation } from "./chat-provenance";
+import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
@@ -190,6 +190,7 @@ export function App() {
   const [slashSuggestionsOpen, setSlashSuggestionsOpen] = useState(true);
   const [sugIdx, setSugIdx] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const preserveRef = useRef<WorkerScrollPreservation | null>(null); // scroll-height baseline across a prepend read
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
@@ -681,6 +682,16 @@ export function App() {
   const pickCommandSuggestion = (suggestion: CommandSuggestion) => {
     setText(suggestion.insert); setSlashSuggestionsOpen(false); setMentionSuggestions([]);
   };
+  const targetWorkerFromRelay = (nickname: string) => {
+    setText((draft) => workerMentionDraft(draft, nickname));
+    setMentionSuggestions([]); setSlashSuggestionsOpen(false);
+    window.requestAnimationFrame(() => {
+      const input = composerInputRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+  };
 
   // `!cmd` in a worker tab runs a one-shot shell command in that worker's project dir; the output is an
   // ephemeral card (not persisted).
@@ -1010,8 +1021,14 @@ export function App() {
             {shown.length === 0 && <div className="empty">{selected === null ? "Message QiYan — replies appear here." : `Message ${selected} — its replies appear here.`}</div>}
             {rendered.map((m, i) => {
               const presentation = selected === null ? assistantMessagePresentation(m) : null;
-              return <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : presentation?.className ?? ""}`}>
-                <div className="when">{m.role === "you" ? "you" : m.role === "assistant" ? presentation?.label ?? "QiYan" : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
+              const relayWorker = presentation?.className === "worker-relay" ? m.worker : undefined;
+              return <div key={m.id ?? `${m.at ?? m.completedAt}-${i}`} className={`msg ${m.role === "you" ? "you" : presentation?.className ?? ""}`}
+                onDoubleClick={relayWorker ? () => targetWorkerFromRelay(relayWorker) : undefined}>
+                <div className="when">{m.role === "you" ? "you" : m.role === "assistant"
+                  ? relayWorker
+                    ? <button type="button" className="worker-mention" title={`Message @${relayWorker}`} onClick={() => targetWorkerFromRelay(relayWorker)} onDoubleClick={(event) => event.stopPropagation()}>{presentation?.label ?? `Worker · ${relayWorker}`}</button>
+                    : presentation?.label ?? "QiYan"
+                  : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
                 <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected ?? m.origin ?? null)}>{normalizeMath(m.body)}</Markdown></div>
               </div>;
             })}
@@ -1029,7 +1046,7 @@ export function App() {
             {slashSuggestions.length === 0 && mentionSuggestions.length > 0 && <div className="suggest" role="listbox" aria-label="Worker suggestions">{mentionSuggestions.map((n, i) => <div key={n} role="option" aria-selected={i === sugIdx % suggestionCount} className={`srow ${i === sugIdx % suggestionCount ? "on" : ""}`} onMouseDown={(e) => { e.preventDefault(); pickMentionSuggestion(n); }}>@{n}</div>)}</div>}
             <input ref={fileInput} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadFile(f); e.target.value = ""; }} />
             <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
-            <textarea value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
+            <textarea ref={composerInputRef} value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
               placeholder={selected === null ? "Message QiYan… (type / for commands; @worker to direct-message)" : `Message ${selected}… (type / for commands)`} />
             <button onClick={() => void send()}>Send</button>
           </div>
