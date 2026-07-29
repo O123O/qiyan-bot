@@ -730,6 +730,67 @@ export function hasEarlierEndpointOperation(
   });
 }
 
+type EndpointLifecycleOperationKind = "disconnect_endpoint" | "restart_endpoint";
+
+export async function settleEarlierEndpointOperations(options: {
+  operations: Pick<OperationStore, "listRecoverable" | "get">;
+  currentSequence: number;
+  endpointId: string;
+  currentKind: EndpointLifecycleOperationKind;
+  resolver: OperationRecoveryTargetResolver;
+  reconcile(): Promise<void>;
+  isEndpointReady(endpointId: string): boolean;
+  waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
+  waitTimeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<"proceed" | "satisfied"> {
+  const earlier = (): RecoverableOperation[] => options.operations.listRecoverable()
+    .filter((operation) => operation.sequence < options.currentSequence)
+    .filter((operation) => {
+      const target = recoverableOperationTarget(operation, options.resolver);
+      return (target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle")
+        && target.endpointId === options.endpointId;
+    })
+    .sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
+  const captured = earlier();
+  if (captured.length === 0) return "proceed";
+  const conflict = (): AppError =>
+    new AppError("OPERATION_CONFLICT", `endpoint ${options.endpointId} has an earlier unresolved operation`);
+
+  try {
+    await options.reconcile();
+    let unresolved = earlier();
+    while (unresolved.length > 0) {
+      const oldest = unresolved[0]!;
+      if (!options.isEndpointReady(options.endpointId) || oldest.state !== "uncertain") throw conflict();
+      const controller = new AbortController();
+      const abort = (): void => controller.abort(options.signal?.reason);
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+      const timeout = setTimeout(
+        () => controller.abort(new Error("endpoint operation join timed out")),
+        options.waitTimeoutMs ?? 10_000,
+      );
+      timeout.unref?.();
+      try { await options.waitForTerminal(oldest.id, controller.signal); }
+      finally {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", abort);
+      }
+      unresolved = earlier();
+    }
+  } catch (error) {
+    if (error instanceof AppError && error.code === "OPERATION_CONFLICT") throw error;
+    throw conflict();
+  }
+
+  const lastEarlier = captured.at(-1);
+  return lastEarlier?.kind === options.currentKind
+    && options.operations.get(lastEarlier.id)?.state === "succeeded"
+    ? "satisfied"
+    : "proceed";
+}
+
 export function hasEarlierSessionCreation(
   operations: readonly SequencedRecoverableOperation[],
   currentSequence: number,
@@ -3677,7 +3738,9 @@ export async function buildProductionApp(
       list_models: async (args) => sessions.models(args.endpoint === assistantEndpoint.id ? assistantEndpoint.id : projectEndpoint(args.endpoint)),
       disconnect_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
-        assertEndpointLifecycleOrder(context.operationSequence, endpointId);
+        if (await settleEndpointLifecycleOrder(
+          context.operationSequence, endpointId, "disconnect_endpoint", context.signal,
+        ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
         await endpointManager.disconnect(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         return { endpoint: endpointId, state: "disconnected" };
       },
@@ -3694,7 +3757,9 @@ export async function buildProductionApp(
           return { scheduled: true, actionId: context.operationId, endpoint: assistantEndpoint.id };
         }
         const endpointId = projectEndpoint(args.endpoint);
-        assertEndpointLifecycleOrder(context.operationSequence, endpointId);
+        if (await settleEndpointLifecycleOrder(
+          context.operationSequence, endpointId, "restart_endpoint", context.signal,
+        ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
         await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
@@ -4069,9 +4134,26 @@ export async function buildProductionApp(
     return { defaultProjectEndpointId: "local", assistantEndpointId: assistantEndpoint.id, session: (nickname) => registry.get(nickname) };
   }
 
-  function assertEndpointLifecycleOrder(operationSequence: number, endpointId: string): void {
-    if (!hasEarlierEndpointOperation(operations.listRecoverable(), operationSequence, endpointId, operationTargetResolver())) return;
-    throw new AppError("OPERATION_CONFLICT", `endpoint ${endpointId} has an earlier unresolved operation`);
+  function settleEndpointLifecycleOrder(
+    operationSequence: number,
+    endpointId: string,
+    currentKind: EndpointLifecycleOperationKind,
+    signal?: AbortSignal,
+  ): Promise<"proceed" | "satisfied"> {
+    return settleEarlierEndpointOperations({
+      operations,
+      currentSequence: operationSequence,
+      endpointId,
+      currentKind,
+      resolver: operationTargetResolver(),
+      reconcile: reconcileOperations,
+      isEndpointReady: isRecoveryEndpointReady,
+      waitForTerminal: (operationId, operationSignal) => {
+        if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
+        return operationReconciler.waitForTerminal(operationId, operationSignal);
+      },
+      ...(signal ? { signal } : {}),
+    });
   }
 
   function assertSessionCreationOrder(

@@ -20,6 +20,7 @@ import {
   managedRetryKey,
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
+  settleEarlierEndpointOperations,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
   operationRecoveryAction,
@@ -1256,6 +1257,177 @@ test("durable overlap fences are endpoint-sequenced and nickname/thread exact", 
   assert.equal(hasEarlierSessionCreation(operations, 3, {
     nickname: "third", endpointId: "endpoint-b", threadId: "thread-c",
   }, resolver), false);
+});
+
+test("an explicit restart joins an earlier uncertain restart after reconnect", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    receipt: { endpoint: "lyris", phase: "draining" },
+    state: "uncertain" as const,
+  };
+  let recoverable = [earlier];
+  let ready = false;
+  let waitedFor: string | undefined;
+  const states = new Map([[earlier.id, earlier.state as string]]);
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => recoverable as any,
+      get: (id) => id === earlier.id ? { ...earlier, state: states.get(id) } as any : undefined,
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => { ready = true; },
+    isEndpointReady: () => ready,
+    waitForTerminal: async (id) => {
+      waitedFor = id;
+      states.set(id, "succeeded");
+      recoverable = [];
+    },
+  });
+
+  assert.equal(waitedFor, earlier.id);
+  assert.equal(result, "satisfied");
+});
+
+test("a recovered different lifecycle operation does not absorb a restart", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "disconnect-earlier",
+    sequence: 1,
+    kind: "disconnect_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+  let recoverable = [earlier];
+  const states = new Map([[earlier.id, earlier.state as string]]);
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => recoverable as any,
+      get: (id) => id === earlier.id ? { ...earlier, state: states.get(id) } as any : undefined,
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => {
+      states.set(earlier.id, "succeeded");
+      recoverable = [];
+    },
+    isEndpointReady: () => false,
+    waitForTerminal: async () => undefined,
+  });
+
+  assert.equal(result, "proceed");
+});
+
+test("an intervening endpoint operation prevents an older restart from absorbing the current restart", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const restart = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+  const send = {
+    id: "send-after-restart",
+    sequence: 2,
+    kind: "send_to_session",
+    args: { nickname: "worker" },
+    state: "uncertain" as const,
+  };
+  let recoverable = [restart, send];
+  const states = new Map([[restart.id, restart.state as string], [send.id, send.state as string]]);
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => recoverable as any,
+      get: (id) => ({ ...recoverable.find((operation) => operation.id === id), state: states.get(id) }) as any,
+    },
+    currentSequence: 3,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: {
+      ...resolver,
+      session: (nickname) => nickname === "worker"
+        ? { endpoint: "lyris" } as any
+        : undefined,
+    },
+    reconcile: async () => {
+      states.set(restart.id, "succeeded");
+      states.set(send.id, "succeeded");
+      recoverable = [];
+    },
+    isEndpointReady: () => true,
+    waitForTerminal: async () => undefined,
+  });
+
+  assert.equal(result, "proceed");
+});
+
+test("joining a ready but permanently uncertain restart has a bounded wait", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+
+  await assert.rejects(settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => undefined,
+    isEndpointReady: () => true,
+    waitTimeoutMs: 1,
+    waitForTerminal: async (_id, signal) => new Promise((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+  }), (error: unknown) => error instanceof AppError
+    && error.code === "OPERATION_CONFLICT"
+    && error.message === "endpoint lyris has an earlier unresolved operation");
+});
+
+test("an explicit restart fails without creating another uncertain action when recovery still needs authentication", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+
+  await assert.rejects(settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    waitForTerminal: async () => assert.fail("an unavailable endpoint must not wait indefinitely"),
+  }), (error: unknown) => error instanceof AppError
+    && error.code === "OPERATION_CONFLICT"
+    && error.message === "endpoint lyris has an earlier unresolved operation");
 });
 
 test("reconnection incidents compare-delete per endpoint and preserve a newer loss", () => {
