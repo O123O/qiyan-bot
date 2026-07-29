@@ -22,12 +22,14 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   threadStatus: "notLoaded" | "idle" | "active" | "systemError" = "idle";
   requestError: Error | undefined;
   startGate: Promise<void> | undefined;
+  onStart: (() => void) | undefined;
   readonly requests: Array<{ method: string; params: unknown }> = [];
   onRuntimeIdentity: (() => void) | undefined;
   private readonly events = new EventEmitter();
   constructor(readonly id: string) {}
   async start() {
     this.starts += 1;
+    this.onStart?.();
     await this.startGate;
     if (this.failStart) throw this.startError ?? new Error("offline");
     this.state = "ready";
@@ -844,6 +846,63 @@ test("restart recovery accepts the checkpointed replacement without restarting i
   remote.identityToken = "b".repeat(32);
   await assert.rejects(value.manager.recoverRestart("devbox", "runtime_started", identity), /identity changed/u);
   assert.equal(remote.runtimeStops, 0);
+});
+
+test("draining restart recovery accepts an already-running replacement identity", async () => {
+  const stale = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  const value = queuedFixture([stale, replacement]);
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const stopped = await stale.runtimeIdentity();
+  assert.ok(stopped?.kind === "ssh");
+  stale.identityToken = "b".repeat(32);
+  replacement.identityToken = "b".repeat(32);
+  replacement.onStart = () => {
+    assert.equal(stale.connectionCloses, 1, "stale transport must close before the replacement connects");
+  };
+  const checkpoints: unknown[] = [];
+  let publications = 0;
+  value.manager.onEndpoint(() => { publications += 1; });
+
+  await value.manager.recoverRestart(
+    "devbox",
+    "draining",
+    stopped,
+    (checkpoint) => checkpoints.push(checkpoint),
+  );
+
+  assert.deepEqual(checkpoints, [{
+    phase: "runtime_started",
+    identity: { ...stopped, token: "b".repeat(32) },
+  }]);
+  assert.equal(stale.runtimeStops, 0, "the replacement must not be stopped as though it were the old runtime");
+  assert.equal(stale.connectionCloses, 1, "the stale RPC connection must be closed");
+  assert.equal(replacement.starts, 1, "the replacement identity must be attested by a fresh RPC connection");
+  assert.equal(publications, 1);
+  assert.equal(value.manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
+test("replacement recovery cleans an unpublished connection when its checkpoint fails", async () => {
+  const stale = new FakeEndpoint("devbox");
+  const replacement = new FakeEndpoint("devbox");
+  const value = queuedFixture([stale, replacement]);
+  await value.manager.ensureReady("devbox");
+  const stopped = await stale.runtimeIdentity();
+  assert.ok(stopped?.kind === "ssh");
+  stale.identityToken = "b".repeat(32);
+  replacement.identityToken = "b".repeat(32);
+  let publications = 0;
+  value.manager.onEndpoint(() => { publications += 1; });
+
+  await assert.rejects(
+    value.manager.recoverRestart("devbox", "draining", stopped, () => { throw new Error("checkpoint failed"); }),
+    /checkpoint failed/u,
+  );
+
+  assert.equal(stale.connectionCloses, 1);
+  assert.equal(replacement.connectionCloses, 1, "an uncheckpointed replacement must not remain connected");
+  assert.equal(publications, 0);
+  assert.equal(value.manager.endpointGeneration("devbox").endpoint, stale);
 });
 
 test("restart recovery durably checkpoints the stopped and replacement runtime identities", async () => {

@@ -360,7 +360,22 @@ export class EndpointManager {
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        if (!sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        if (!sameRuntimeIdentity(actual, expectedIdentity!)) {
+          // A reconnect can create and publish the replacement after the old runtime exits but
+          // before the restart operation checkpoints runtime_stopped. A different attested
+          // identity is the restart's desired postcondition, not an ownership conflict.
+          runtimeStopped = true;
+          await target.endpoint.closeConnection();
+          const endpoint = await this.startCandidate(replacement);
+          replacementEndpoint = endpoint;
+          const replacementIdentity = await this.requireRuntimeIdentity(endpoint);
+          if (!sameRuntimeIdentity(replacementIdentity, actual)) {
+            throw new AppError("OPERATION_UNCERTAIN", `replacement runtime identity changed during recovery: ${id}`);
+          }
+          checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
+          this.publishAfterReopen(record, drain, endpoint);
+          return;
+        }
         let endpoint = target.endpoint;
         if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(target);
