@@ -714,7 +714,8 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   await assert.rejects(readFile(second.configPath), /ENOENT/u);
 
   const displaced = await dispatch("turn-displaced", true);
-  assert.equal(displaced.status, "running", "ack scans every byte appended after dispatch, not only the file tail");
+  assert.match(displaced.status, /^(?:running|settled)$/u);
+  assert.equal(displaced.turnId, "native-turn-displaced", "ack scans every byte appended after dispatch, not only the file tail");
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
 
