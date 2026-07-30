@@ -84,7 +84,7 @@ export interface ChatConfig {
 export const CLAUDE_DISABLED_TOOLS = ["Monitor", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete"] as const;
 export const CLAUDE_ALLOWED_TOOLS = ["WebFetch", "WebSearch"] as const;
 export const CLAUDE_REDIRECT_PROMPT =
-  "You have NO built-in scheduling ability. For any scheduled, recurring, or condition-watching work you MUST use the QiYan MCP tools (schedule_wakeup, schedule_cron, monitor). Never use built-in Monitor/ScheduleWakeup/cron tools, the /loop skill, background tasks, or hooks.";
+  "You have NO built-in scheduling ability. For any scheduled, recurring, or condition-watching work you MUST use the QiYan MCP tools (schedule_wakeup, schedule_cron, monitor). Never use built-in Monitor/ScheduleWakeup/cron tools, the /loop skill, background tasks, or hooks. In headless mode, never launch agents with run_in_background=true: they are not awaited, and the Claude CLI exits before they can reliably finish. Run agents in the foreground.";
 
 // The launch policy applied to EVERY managed Claude session — local AND remote — so a worker
 // never keeps Claude's native scheduling tools (which QiYan can't observe) and always gets the

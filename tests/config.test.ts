@@ -201,6 +201,7 @@ test("claudeLaunchPolicy disables Claude's built-in scheduling and appends the r
       assert.ok(policy.disallowedTools.includes(tool), `${tool} must be disabled`);
     }
     assert.equal(policy.appendSystemPrompt, CLAUDE_REDIRECT_PROMPT);
+    assert.match(policy.appendSystemPrompt, /never launch.*run_in_background.*not awaited.*CLI exits/iu);
   }
   assert.equal(claudeLaunchPolicy().model, undefined);
   assert.equal(claudeLaunchPolicy("haiku").model, "haiku");
