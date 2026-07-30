@@ -51,6 +51,7 @@ class FakeRemote {
     status: "running";
     paneId: string;
     turnId: string;
+    userItemId: string;
     dispatchToken: string;
     identity: typeof turnIdentity;
   } | undefined;
@@ -95,7 +96,8 @@ class FakeRemote {
     this.turn = {
       status: "running",
       paneId: "%7",
-      turnId: value.turnId,
+      turnId: "native-prompt",
+      userItemId: "native-user",
       dispatchToken: value.dispatchToken,
       identity: turnIdentity,
     };
@@ -138,10 +140,12 @@ test("detaching a remote Claude runner closes observers but neither interrupts n
   const handle = await first.startTurn({
     threadId: "thread-one",
     cwd: "/work",
-    message: "continue\n\n<!-- qiyan-cid:ctx:one -->",
+    message: "continue",
     resume: true,
     flags: { model: "claude-opus-4-8", effort: "high" },
   });
+  assert.equal(remote.transfers.find((item) => item.operation === "dispatch-claude-turn")?.input, "continue");
+  assert.deepEqual(await handle.materialization, { turnId: "native-prompt", userItemId: "native-user" });
   await delay(0);
   assert.equal(remote.streams.some((item) => item.operation === "watch-claude-runtime"), true);
   assert.equal(remote.streams.some((item) => item.operation === "watch-claude-turn"), true);
@@ -153,7 +157,7 @@ test("detaching a remote Claude runner closes observers but neither interrupts n
   const replacement = runner(remote);
   await replacement.start();
   const recovered = await replacement.recoverTurn("thread-one", "/work");
-  assert.equal(recovered?.turnId, "ctx:one");
+  assert.equal(recovered?.turnId, "native-prompt");
   await replacement.closeConnection();
 });
 
@@ -179,7 +183,7 @@ test("persistent turn-observer failures back off and enter endpoint recovery", a
   await value.startTurn({
     threadId: "thread-one",
     cwd: "/work",
-    message: "continue\n\n<!-- qiyan-cid:ctx:one -->",
+    message: "continue",
     resume: true,
     flags: {},
   });
@@ -199,7 +203,7 @@ test("runtime-unavailable leaves the turn unsettled and enters endpoint recovery
   const handle = await value.startTurn({
     threadId: "thread-one",
     cwd: "/work",
-    message: "continue\n\n<!-- qiyan-cid:ctx:one -->",
+    message: "continue",
     resume: true,
     flags: {},
   });

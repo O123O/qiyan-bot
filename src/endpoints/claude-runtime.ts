@@ -14,7 +14,6 @@ import { EventEmitter } from "node:events";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { encodeClaudeClientMarker } from "../sessions/claude-client-marker.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
@@ -32,7 +31,7 @@ interface ThreadState {
   materialized: boolean;                 // has at least one turn been run (transcript exists)?
   recoveryChecked: boolean;
   recovery?: Promise<void>;
-  startingTurnId?: string;
+  starting?: { clientId: string; handle?: ClaudeTurnHandle };
   running?: { turnId: string; handle: ClaudeTurnHandle };
   terminalTurns: Set<string>;            // turn ids known interrupted/failed (no transcript end_turn)
 }
@@ -116,7 +115,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       await this.options.persistentRuntime.closeConnection();
       return;
     }
-    for (const state of this.threads.values()) state.running?.handle.interrupt();
+    for (const state of this.threads.values()) {
+      state.starting?.handle?.interrupt();
+      state.running?.handle.interrupt();
+    }
   }
 
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
@@ -125,7 +127,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       this.endpointState = "stopped";
       this.persistentUnavailableSubscription?.();
       delete this.persistentUnavailableSubscription;
-      for (const state of this.threads.values()) await state.running?.handle.interrupt();
+      for (const state of this.threads.values()) {
+        await state.starting?.handle?.interrupt();
+        await state.running?.handle.interrupt();
+      }
       return;
     }
     this.endpointState = "stopped";
@@ -172,6 +177,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         if (id && this.options.persistentRuntime) {
           await this.options.persistentRuntime.releaseThread(id);
         } else {
+          state?.starting?.handle?.interrupt();
           state?.running?.handle.interrupt();
         }
         this.threads.delete(id);
@@ -351,7 +357,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return {
       id: threadId,
       cwd: state.cwd,
-      status: { type: state.running ? "active" : "idle" },
+      status: { type: state.running || state.starting ? "active" : "idle" },
       itemsView: "full",
       turns: [],
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
@@ -380,14 +386,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (!state) throw noRollout(threadId);
     // Defense-in-depth: the pool/lifecycle serialize turns per thread, but never let
     // a second turn/start silently orphan a running child (losing interrupt control).
-    if (state.running || state.startingTurnId) {
+    if (state.running || state.starting) {
       throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
     }
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
-    const message = `${inputToText(params.input)}\n\n${encodeClaudeClientMarker(clientId)}`;
+    const message = inputToText(params.input);
     // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
     this.options.archives?.remove(this.id, threadId);
-    state.startingTurnId = clientId;
+    const starting: NonNullable<ThreadState["starting"]> = { clientId };
+    state.starting = starting;
     try {
       // Per-session model/effort: `service.send` spreads the sticky settings into these params;
       // prefer them over the endpoint-wide launch defaults (Claude applies them as `--model`/
@@ -399,23 +406,50 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         ...(typeof params.effort === "string" ? { effort: params.effort } : {}),
         ...(workerConfig === undefined ? {} : { mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] }),
       };
-      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, clientId)) {
+      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
       }
 
       const handle = await this.options.runner.startTurn({
         threadId, cwd: state.cwd, message, resume: state.materialized, flags,
       });
-      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, clientId)) {
+      starting.handle = handle;
+      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
         if (this.options.persistentRuntime) await this.options.persistentRuntime.closeConnection();
         else await handle.interrupt();
         throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
       }
-      state.running = { turnId: clientId, handle };
-      this.observeTurnHandle(threadId, state, clientId, handle);
-      return { turn: { id: clientId, status: "inProgress" } };
+      const materialization = await handle.materialization;
+      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
+        if (this.options.persistentRuntime) await this.options.persistentRuntime.closeConnection();
+        else await handle.interrupt();
+        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
+      }
+      if (materialization === undefined) {
+        await handle.interrupt();
+        state.terminalTurns.add(clientId);
+        return { turn: { id: clientId, status: "interrupted" } };
+      }
+      const { turnId: nativeTurnId, userItemId } = materialization;
+      state.running = { turnId: nativeTurnId, handle };
+      this.observeTurnHandle(threadId, state, nativeTurnId, handle);
+      this.emitter.emit("notification", "turn/started", {
+        threadId,
+        turn: { id: nativeTurnId, status: "inProgress" },
+      });
+      this.emitter.emit("notification", "item/started", {
+        threadId,
+        turnId: nativeTurnId,
+        item: {
+          type: "userMessage",
+          id: userItemId,
+          clientId: null,
+          content: [{ type: "text", text: message, text_elements: [] }],
+        },
+      });
+      return { turn: { id: nativeTurnId, status: "inProgress" } };
     } finally {
-      if (state.startingTurnId === clientId) delete state.startingTurnId;
+      if (state.starting === starting) delete state.starting;
     }
   }
 
@@ -423,42 +457,42 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     generation: number,
     threadId: string,
     state: ThreadState,
-    clientId: string,
+    starting: NonNullable<ThreadState["starting"]>,
   ): boolean {
     return this.endpointState === "ready"
       && this.lifecycleGeneration === generation
       && this.threads.get(threadId) === state
-      && state.startingTurnId === clientId;
+      && state.starting === starting;
   }
 
   private observeTurnHandle(
     threadId: string,
     state: ThreadState,
-    clientId: string,
+    turnId: string,
     handle: ClaudeTurnHandle,
   ): void {
     void handle.done.then((status) => {
-      if (state.running?.turnId !== clientId || state.running.handle !== handle) return;
+      if (state.running?.turnId !== turnId || state.running.handle !== handle) return;
       state.materialized = true;
       delete state.running;
       // A failed turn is marked terminal so reconstruct synthesizes a findable
       // terminal turn even if `claude` never wrote its user row (relay would else hang).
-      if (status === "failed") state.terminalTurns.add(clientId);
+      if (status === "failed") state.terminalTurns.add(turnId);
       // Successful turns use the minimal trigger and are hydrated through bounded native
       // paging. A failure may have no JSONL user row, so emit its complete synthetic terminal.
       this.emitter.emit("notification", "turn/completed", {
         threadId,
         turn: status === "failed"
-          ? { id: clientId, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${clientId}:user`, clientId }] }
-          : { id: clientId },
+          ? { id: turnId, status: "interrupted" }
+          : { id: turnId },
       });
     }).catch(() => {
-      if (state.running?.turnId !== clientId || state.running.handle !== handle) return;
+      if (state.running?.turnId !== turnId || state.running.handle !== handle) return;
       delete state.running;
-      state.terminalTurns.add(clientId);
+      state.terminalTurns.add(turnId);
       this.emitter.emit("notification", "turn/completed", {
         threadId,
-        turn: { id: clientId, status: "interrupted", itemsView: "full", items: [{ type: "userMessage", id: `${clientId}:user`, clientId }] },
+        turn: { id: turnId, status: "interrupted" },
       });
     });
   }
@@ -502,6 +536,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const turnId = requireString(params.turnId, "turnId");
     const state = this.threads.get(threadId);
     if (state?.running?.turnId === turnId) await state.running.handle.interrupt();
+    if (state?.starting?.clientId === turnId) await state.starting.handle?.interrupt();
     state?.terminalTurns.add(turnId);
     return {};
   }

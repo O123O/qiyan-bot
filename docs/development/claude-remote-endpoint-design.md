@@ -14,9 +14,9 @@ turn / duplicate-driver detection). This is the deferred remote half of the Clau
   drive it over the **QiYan-managed ControlMaster** instead (see §3.3).
 - **Provider awareness** (merged, PR #12): `sessionProvider(endpointId)` + `list_managed_sessions.provider` +
   AGENTS.md. `sessionProvider` already reads a catalog `type:"claude-code"` (once the schema allows it, §3.1).
-- **Ownership model** (merged): a Claude turn QiYan drove carries a `<!-- qiyan-cid:ctx:call -->` marker in the
-  `user` row's message content (Claude has no Codex `client_id` field); the scanner reads it back and
-  `ownsWorkerTurn` classifies owned-vs-external. This is what the remote scan must reproduce on the remote host.
+- **Native turn identity** (merged): QiYan sends the exact user prompt unchanged. After `claude -p`
+  materializes it, the runner reads the newly appended top-level JSONL user row and uses Claude's native
+  `promptId`/UUID as the turn id. Legacy embedded markers are read only for old-transcript compatibility.
 
 ## 2. The impedance: SSH infra is Codex-coupled
 
@@ -141,8 +141,7 @@ parsers differ in ways that would silently diverge ownership if the Codex one is
   a user message) and reports the open turn (`claude-transcript.ts:152-157`). Copy the Claude behavior.
 - **Turn-end:** ends on ANY concrete `stop_reason` except `tool_use` (`claude-transcript.ts:209-213`) — broader
   than `end_turn` (match the code, not any stale comment), else `max_tokens`/`refusal` turns stay open forever.
-- **Marker:** extract the `<!-- qiyan-cid:…-->` clientId from the `user` row's message CONTENT (Claude has no
-  Codex `client_id` field); `hasUserMessage:true` always.
+- **Identity:** use the top-level user row's native `promptId`/UUID; never add backend metadata to message content.
 - **Owner uid check:** the remote helper SHOULD verify the transcript file's `state.uid` (as the Codex helper
   does, `qiyan-ssh-helper.mjs:182`) even though the local scanner omits it — defense on a shared remote host.
 - Byte-offset cursor with the shared append/truncation/mtime detection; throw the shared literal

@@ -10,15 +10,14 @@ const SAFE_TMUX_NAME = /^[A-Za-z0-9_.-]{1,128}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const MAX_PROMPT_BYTES = 16 * 1024 * 1024;
 const MAX_CONFIG_BYTES = 256 * 1024;
-const MAX_MARKER_SCAN_BYTES = 128 * 1024 * 1024;
-const MARKER_SCAN_CHUNK_BYTES = 256 * 1024;
+const MAX_MATERIALIZATION_SCAN_BYTES = 128 * 1024 * 1024;
+const MATERIALIZATION_SCAN_CHUNK_BYTES = 256 * 1024;
 
 const configPath = requiredPath(process.env.QIYAN_CLAUDE_CONFIG);
 const tmuxSocket = requiredPath(process.env.QIYAN_CLAUDE_TMUX_SOCKET);
 const pane = requiredPane(process.env.QIYAN_CLAUDE_PANE);
 const buffer = requiredTmuxName(process.env.QIYAN_CLAUDE_BUFFER, "qiyan-");
 const acknowledgement = requiredTmuxName(process.env.QIYAN_CLAUDE_ACK, "qiyan-");
-const turnId = requiredId(process.env.QIYAN_CLAUDE_TURN_ID);
 const dispatchToken = requiredHex(process.env.QIYAN_CLAUDE_DISPATCH_TOKEN);
 const runtimeToken = requiredHex(process.env.QIYAN_RUNTIME_TOKEN);
 
@@ -37,11 +36,11 @@ try {
   if (!self || self.processGroupId !== process.pid) throw new Error("qiyan-claude requires its own process group");
   const live = {
     runtimeToken,
-    turnId,
     dispatchToken,
     pid: process.pid,
     linuxStartTime: self.startTime,
     processGroupId: self.processGroupId,
+    materialized: false,
   };
   setPaneOption("@qiyan_live", Buffer.from(JSON.stringify(live), "utf8").toString("base64url"));
   liveInstalled = true;
@@ -61,19 +60,24 @@ try {
     child.once("close", (code, signal) => resolve({ code: code ?? (signal ? 1 : 0) }));
   });
 
-  let materialized = false;
-  let markerUncertain = false;
+  let materialization;
+  let materializationUncertain = false;
   try {
-    materialized = await waitForClientMarker(config.home, config.threadId, turnId, transcriptCursor, outcome);
+    materialization = await waitForNativeMaterialization(config.home, config.threadId, transcriptCursor, outcome);
   } catch {
-    markerUncertain = true;
+    materializationUncertain = true;
   }
-  if (materialized) signalTmux(acknowledgement);
-  else if (!markerUncertain) {
+  if (materialization) {
+    const materialized = { ...live, ...materialization, materialized: true };
+    const encoded = Buffer.from(JSON.stringify(materialized), "utf8").toString("base64url");
+    setPaneOption("@qiyan_live", encoded);
+    setPaneOption("@qiyan_last", encoded);
+    signalTmux(acknowledgement);
+  } else if (!materializationUncertain) {
     try { child.kill("SIGKILL"); } catch { /* already gone */ }
   }
   const result = await outcome;
-  process.exitCode = materialized ? result.code : 1;
+  process.exitCode = materialization ? result.code : 1;
 } catch {
   process.exitCode = 1;
 } finally {
@@ -122,17 +126,17 @@ async function readConfig(path) {
   }
 }
 
-async function waitForClientMarker(home, threadId, clientId, cursor, childOutcome) {
-  const marker = `qiyan-cid:${clientId}`;
+async function waitForNativeMaterialization(home, threadId, cursor, childOutcome) {
   const deadline = Date.now() + 30_000;
   let childSettled = false;
   void childOutcome.then(() => { childSettled = true; });
   do {
-    if (scanNewTranscriptBytes(cursor, home, threadId, marker)) return true;
-    if (childSettled) return scanNewTranscriptBytes(cursor, home, threadId, marker);
+    const materialization = scanNewTranscriptTurn(cursor, home, threadId);
+    if (materialization) return materialization;
+    if (childSettled) return scanNewTranscriptTurn(cursor, home, threadId);
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   } while (Date.now() < deadline);
-  return false;
+  return undefined;
 }
 
 function createTranscriptCursor(home, threadId) {
@@ -175,7 +179,7 @@ function transcriptSnapshot(path) {
   }
 }
 
-function scanNewTranscriptBytes(cursor, home, threadId, markerText) {
+function scanNewTranscriptTurn(cursor, home, threadId) {
   if (!cursor.path) {
     const path = findTranscript(home, threadId);
     if (!path) return false;
@@ -193,24 +197,42 @@ function scanNewTranscriptBytes(cursor, home, threadId, markerText) {
     if (!state.isFile() || state.uid !== process.getuid?.()
       || String(state.dev) !== cursor.device || String(state.ino) !== cursor.inode
       || state.size < cursor.offset) throw new Error("Claude transcript changed during dispatch");
-    const marker = Buffer.from(markerText, "utf8");
     while (cursor.offset < state.size) {
-      const remainingBudget = MAX_MARKER_SCAN_BYTES - cursor.scanned;
-      if (remainingBudget <= 0) throw new Error("Claude marker scan exceeded its bound");
-      const length = Math.min(MARKER_SCAN_CHUNK_BYTES, remainingBudget, state.size - cursor.offset);
+      const remainingBudget = MAX_MATERIALIZATION_SCAN_BYTES - cursor.scanned;
+      if (remainingBudget <= 0) throw new Error("Claude materialization scan exceeded its bound");
+      const length = Math.min(MATERIALIZATION_SCAN_CHUNK_BYTES, remainingBudget, state.size - cursor.offset);
       const bytes = Buffer.alloc(length);
       const read = readSync(fd, bytes, 0, length, cursor.offset);
       if (read <= 0) break;
       cursor.offset += read;
       cursor.scanned += read;
       const combined = Buffer.concat([cursor.carry, bytes.subarray(0, read)]);
-      if (combined.includes(marker)) return true;
-      cursor.carry = Buffer.from(combined.subarray(Math.max(0, combined.length - marker.length + 1)));
+      let start = 0;
+      for (let index = combined.indexOf(0x0a); index >= 0; index = combined.indexOf(0x0a, start)) {
+        const materialization = nativeMaterializationFromLine(combined.subarray(start, index));
+        if (materialization) return materialization;
+        start = index + 1;
+      }
+      cursor.carry = Buffer.from(combined.subarray(start));
     }
-    return false;
+    return undefined;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+}
+
+function nativeMaterializationFromLine(line) {
+  if (line.byteLength === 0) return undefined;
+  let value;
+  try { value = JSON.parse(line.toString("utf8")); } catch { return undefined; }
+  if (!value || typeof value !== "object" || value.type !== "user"
+    || typeof value.promptSource !== "string" || value.promptSource.length === 0) return undefined;
+  const turnId = typeof value.promptId === "string" && value.promptId.length > 0
+    ? value.promptId
+    : typeof value.uuid === "string" && value.uuid.length > 0 ? value.uuid : undefined;
+  if (!turnId || !SAFE_ID.test(turnId)) return undefined;
+  const userItemId = typeof value.uuid === "string" && SAFE_ID.test(value.uuid) ? value.uuid : `${turnId}:user`;
+  return { turnId, userItemId };
 }
 
 function processState(pid) {
@@ -274,11 +296,6 @@ function requiredTmuxName(value, prefix) {
 
 function requiredPane(value) {
   if (typeof value !== "string" || !/^%[0-9]+$/u.test(value)) throw new Error("invalid tmux pane");
-  return value;
-}
-
-function requiredId(value) {
-  if (typeof value !== "string" || !SAFE_ID.test(value)) throw new Error("invalid Claude identifier");
   return value;
 }
 

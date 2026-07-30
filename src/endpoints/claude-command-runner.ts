@@ -29,6 +29,43 @@ export interface ClaudeThreadMeta {
 }
 
 export const CLAUDE_PREVIEW_MAX = 200;
+const CLAUDE_MATERIALIZATION_SCAN_BYTES = 128 * 1024 * 1024;
+
+interface ClaudeMaterializationCursor {
+  path?: string;
+  device?: string;
+  inode?: string;
+  offset: number;
+  scanned: number;
+  carry: Buffer;
+}
+
+export interface ClaudeTurnMaterialization {
+  turnId: string;
+  userItemId: string;
+}
+
+function nativeClaudeMaterializationFromLine(line: Uint8Array): ClaudeTurnMaterialization | undefined {
+  if (line.byteLength === 0) return undefined;
+  let raw: unknown;
+  try { raw = JSON.parse(Buffer.from(line).toString("utf8")); }
+  catch { return undefined; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) {
+    return undefined;
+  }
+  const turnId = typeof record.promptId === "string" && record.promptId.length > 0
+    ? record.promptId
+    : typeof record.uuid === "string" && record.uuid.length > 0
+      ? record.uuid
+      : undefined;
+  if (!turnId || !/^[A-Za-z0-9:_.-]{1,256}$/u.test(turnId)) return undefined;
+  const userItemId = typeof record.uuid === "string" && /^[A-Za-z0-9:_.-]{1,256}$/u.test(record.uuid)
+    ? record.uuid
+    : `${turnId}:user`;
+  return { turnId, userItemId };
+}
 
 export interface ClaudeTurnRequest {
   threadId: string;   // Claude session id
@@ -41,6 +78,9 @@ export interface ClaudeTurnRequest {
 export type ClaudeTurnStatus = "completed" | "failed";
 
 export interface ClaudeTurnHandle {
+  // Claude's own top-level user-row identities, learned from the transcript
+  // after the one-shot process accepts the exact prompt.
+  readonly materialization: Promise<ClaudeTurnMaterialization | undefined>;
   readonly done: Promise<ClaudeTurnStatus>;
   interrupt(): void | Promise<void>;
 }
@@ -116,7 +156,8 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
   private readonly pathCache = new Map<string, string>();
   constructor(private readonly options: { command?: string; home?: string } = {}) {}
 
-  startTurn(request: ClaudeTurnRequest): ClaudeTurnHandle {
+  async startTurn(request: ClaudeTurnRequest): Promise<ClaudeTurnHandle> {
+    const cursor = await this.createMaterializationCursor(request.threadId, request.cwd);
     // stdin: prompt; stdout: stream-json; stderr IGNORED so a chatty child can never
     // block on a full stderr pipe (which would deadlock and never emit `close`).
     const child = spawn(this.options.command ?? "claude", buildClaudeArgs(request), {
@@ -151,7 +192,109 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       child.once("error", () => resolve("failed"));
       child.once("close", (code) => { consume(buffer); resolve(code === 0 && !isError ? "completed" : "failed"); });
     });
-    return { done, interrupt: () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } } };
+    const interrupt = (): void => { try { child.kill("SIGKILL"); } catch { /* already gone */ } };
+    const materialization = this.waitForNativeMaterialization(request.threadId, request.cwd, cursor, done)
+      .then((native) => {
+        if (native === undefined) interrupt();
+        return native;
+      }, (error: unknown) => {
+        interrupt();
+        throw error;
+      });
+    return { materialization, done, interrupt };
+  }
+
+  private async createMaterializationCursor(threadId: string, cwd: string): Promise<ClaudeMaterializationCursor> {
+    const path = await this.transcriptPath(threadId, cwd);
+    if (!path) return { offset: 0, scanned: 0, carry: Buffer.alloc(0) };
+    let handle;
+    try { handle = await open(path, "r"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { offset: 0, scanned: 0, carry: Buffer.alloc(0) };
+      throw error;
+    }
+    try {
+      const state = await handle.stat();
+      if (!state.isFile()) throw new AppError("OPERATION_UNCERTAIN", "Claude transcript is not a regular file");
+      return {
+        path,
+        device: String(state.dev),
+        inode: String(state.ino),
+        offset: state.size,
+        scanned: 0,
+        carry: Buffer.alloc(0),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async waitForNativeMaterialization(
+    threadId: string,
+    cwd: string,
+    cursor: ClaudeMaterializationCursor,
+    childOutcome: Promise<ClaudeTurnStatus>,
+  ): Promise<ClaudeTurnMaterialization | undefined> {
+    const deadline = Date.now() + 30_000;
+    let settled = false;
+    void childOutcome.then(() => { settled = true; });
+    do {
+      const materialization = await this.scanNativeMaterialization(threadId, cwd, cursor);
+      if (materialization !== undefined) return materialization;
+      if (settled) return await this.scanNativeMaterialization(threadId, cwd, cursor);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    } while (Date.now() < deadline);
+    return undefined;
+  }
+
+  private async scanNativeMaterialization(
+    threadId: string,
+    cwd: string,
+    cursor: ClaudeMaterializationCursor,
+  ): Promise<ClaudeTurnMaterialization | undefined> {
+    if (!cursor.path) {
+      const path = await this.transcriptPath(threadId, cwd);
+      if (!path) return undefined;
+      const handle = await open(path, "r");
+      try {
+        const state = await handle.stat();
+        if (!state.isFile()) throw new AppError("OPERATION_UNCERTAIN", "Claude transcript is not a regular file");
+        cursor.path = path;
+        cursor.device = String(state.dev);
+        cursor.inode = String(state.ino);
+        cursor.offset = 0;
+      } finally {
+        await handle.close();
+      }
+    }
+    const handle = await open(cursor.path, "r");
+    try {
+      const state = await handle.stat();
+      if (!state.isFile() || String(state.dev) !== cursor.device || String(state.ino) !== cursor.inode
+        || state.size < cursor.offset) {
+        throw new AppError("OPERATION_UNCERTAIN", "Claude transcript changed during dispatch");
+      }
+      while (cursor.offset < state.size) {
+        const remaining = CLAUDE_MATERIALIZATION_SCAN_BYTES - cursor.scanned;
+        if (remaining <= 0) throw new AppError("OPERATION_UNCERTAIN", "Claude materialization scan exceeded its bound");
+        const bytes = Buffer.alloc(Math.min(256 * 1024, remaining, state.size - cursor.offset));
+        const { bytesRead } = await handle.read(bytes, 0, bytes.length, cursor.offset);
+        if (bytesRead <= 0) break;
+        cursor.offset += bytesRead;
+        cursor.scanned += bytesRead;
+        const combined = Buffer.concat([cursor.carry, bytes.subarray(0, bytesRead)]);
+        let start = 0;
+        for (let index = combined.indexOf(0x0a); index >= 0; index = combined.indexOf(0x0a, start)) {
+          const materialization = nativeClaudeMaterializationFromLine(combined.subarray(start, index));
+          if (materialization !== undefined) return materialization;
+          start = index + 1;
+        }
+        cursor.carry = Buffer.from(combined.subarray(start));
+      }
+      return undefined;
+    } finally {
+      await handle.close();
+    }
   }
 
   async readTranscriptChunk(

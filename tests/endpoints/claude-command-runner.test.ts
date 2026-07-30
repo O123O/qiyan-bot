@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -65,4 +65,38 @@ test("transcript reads are positional, byte-bounded, and snapshot-pinned", async
     runner.readTranscriptChunk("large", "/work", { offset: 0, length: 128, expected: tail.snapshot }),
     /changed during bounded history paging/u,
   );
+});
+
+test("local turns preserve exact prompt bytes and take their identity from native JSONL", async () => {
+  const home = await mkdtemp(join(tmpdir(), "claude-home-"));
+  const threadId = "native-local";
+  const transcriptDir = join(home, ".claude", "projects", "fixture");
+  const transcript = join(transcriptDir, `${threadId}.jsonl`);
+  await mkdir(transcriptDir, { recursive: true });
+  const command = join(home, "fake-claude.mjs");
+  await writeFile(command, [
+    "#!/usr/bin/env node",
+    'import { appendFile } from "node:fs/promises";',
+    "const chunks=[];",
+    "for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));",
+    'const prompt=Buffer.concat(chunks).toString("utf8");',
+    `const path=${JSON.stringify(transcript)};`,
+    `await appendFile(path,JSON.stringify({type:"user",cwd:${JSON.stringify(home)},promptSource:"sdk",promptId:"native-prompt",uuid:"native-user",message:{role:"user",content:prompt}})+"\\n");`,
+    'await appendFile(path,JSON.stringify({type:"assistant",message:{role:"assistant",stop_reason:"end_turn",content:[{type:"text",text:"done"}]}})+"\\n");',
+  ].join("\n"), { mode: 0o700 });
+  const runner = new LocalClaudeCommandRunner({ home, command });
+
+  const handle = await runner.startTurn({
+    threadId,
+    cwd: home,
+    message: "exact user prompt",
+    resume: true,
+    flags: {},
+  });
+
+  assert.deepEqual(await handle.materialization, { turnId: "native-prompt", userItemId: "native-user" });
+  assert.equal(await handle.done, "completed");
+  const user = JSON.parse((await readFile(transcript, "utf8")).split("\n")[0]!) as any;
+  assert.equal(user.message.content, "exact user prompt");
+  assert.doesNotMatch(user.message.content, /qiyan-cid/u);
 });

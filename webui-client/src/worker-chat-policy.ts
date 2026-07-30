@@ -16,6 +16,16 @@ export interface WorkerSubscriptionTarget {
   mappingId: string;
 }
 
+export function workerInputDisplayMode(
+  provider: string | undefined,
+  targetsSelectedWorker: boolean,
+): "optimistic" | "authoritative" | "ephemeral" {
+  if (!targetsSelectedWorker) return "ephemeral";
+  // Claude's one-shot runtime learns the native user-row ids only after the exact
+  // prompt is appended to JSONL. Let that authoritative row render the message.
+  return provider === "claude" ? "authoritative" : "optimistic";
+}
+
 export function sameWorkerSubscriptionTarget(
   current: WorkerSubscriptionTarget | null,
   next: WorkerSubscriptionTarget,

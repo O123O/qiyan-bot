@@ -37,6 +37,7 @@ interface RemoteTurn {
   status: "running";
   paneId: string;
   turnId: string;
+  userItemId: string;
   dispatchToken: string;
   identity: Extract<RuntimeIdentity, { kind: "ssh" }>;
 }
@@ -132,8 +133,6 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
     if (!this.expectedRuntime || !this.claudeCommand) {
       throw new AppError("ENDPOINT_UNAVAILABLE", "remote Claude runtime is not connected");
     }
-    const turnId = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u.exec(request.message)?.[1];
-    if (!turnId) throw new AppError("CONFIGURATION_ERROR", "remote Claude turn is missing its client marker");
     const config = Buffer.from(JSON.stringify({
       version: 1,
       threadId: request.threadId,
@@ -161,13 +160,13 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
       status: "settled";
       paneId: string;
       turnId: string;
+      userItemId: string;
       dispatchToken: string;
     }>(
       "dispatch-claude-turn",
       [JSON.stringify({
         ...this.runtimeRequest(),
         threadId: request.threadId,
-        turnId,
         dispatchToken,
         configPath: configured.path,
         shell: this.options.host.shell,
@@ -178,11 +177,17 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
       { input: Readable.from([prompt]), maxOutputBytes: 64 * 1024, timeoutMs: 45_000 },
       this.options.host.remoteHelperPath,
     );
-    if (!dispatched || dispatched.turnId !== turnId || dispatched.dispatchToken !== dispatchToken) {
+    if (!dispatched || typeof dispatched.turnId !== "string" || dispatched.turnId.length === 0
+      || typeof dispatched.userItemId !== "string" || dispatched.userItemId.length === 0
+      || dispatched.dispatchToken !== dispatchToken) {
       throw new AppError("OPERATION_UNCERTAIN", "remote Claude dispatch returned invalid acknowledgement");
     }
     if (dispatched.status === "settled") {
-      return { done: Promise.resolve("completed"), interrupt: () => undefined };
+      return {
+        materialization: Promise.resolve({ turnId: dispatched.turnId, userItemId: dispatched.userItemId }),
+        done: Promise.resolve("completed"),
+        interrupt: () => undefined,
+      };
     }
     const identity = parseRuntimeIdentity(dispatched.identity);
     if (identity.kind !== "ssh") throw new AppError("OPERATION_UNCERTAIN", "remote Claude turn returned invalid identity");
@@ -191,6 +196,9 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
 
   async recoverTurn(threadId: string, _cwd: string): Promise<{ turnId: string; handle: ClaudeTurnHandle } | undefined> {
     const inspected = await this.inspectTurn(threadId);
+    if (inspected.status === "starting") {
+      throw new AppError("OPERATION_UNCERTAIN", "remote Claude turn has not materialized in native history");
+    }
     if (inspected.status !== "running") return undefined;
     return { turnId: inspected.turnId, handle: this.turnHandle(threadId, inspected) };
   }
@@ -237,7 +245,10 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
   }
 
   private async inspectTurn(threadId: string): Promise<
-    RemoteTurn | { status: "idle"; paneId?: string } | { status: "runtime-unavailable" }
+    RemoteTurn
+    | { status: "starting"; paneId: string; dispatchToken: string; identity: Extract<RuntimeIdentity, { kind: "ssh" }> }
+    | { status: "idle"; paneId?: string }
+    | { status: "runtime-unavailable" }
   > {
     const raw = await this.options.host.remote.invoke<any>(
       "inspect-claude-turn",
@@ -248,13 +259,20 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
     if (raw?.status === "idle") {
       return { status: "idle", ...(typeof raw.paneId === "string" ? { paneId: raw.paneId } : {}) };
     }
-    if (raw?.status !== "running" || typeof raw.paneId !== "string"
-      || typeof raw.turnId !== "string" || typeof raw.dispatchToken !== "string") {
+    if ((raw?.status !== "running" && raw?.status !== "starting") || typeof raw.paneId !== "string"
+      || (raw.status === "running" && typeof raw.turnId !== "string")
+      || typeof raw.dispatchToken !== "string") {
       throw new AppError("ENDPOINT_UNAVAILABLE", "invalid remote Claude turn inspection");
     }
     const identity = parseRuntimeIdentity(raw.identity);
     if (identity.kind !== "ssh") throw new AppError("ENDPOINT_UNAVAILABLE", "invalid remote Claude turn identity");
-    return { ...raw, identity } as RemoteTurn;
+    return {
+      ...raw,
+      ...(raw.status === "running"
+        ? { userItemId: typeof raw.userItemId === "string" ? raw.userItemId : `${raw.turnId}:user` }
+        : {}),
+      identity,
+    } as Awaited<ReturnType<SshClaudeCommandRunner["inspectTurn"]>>;
   }
 
   private turnHandle(threadId: string, turn: RemoteTurn): ClaudeTurnHandle {
@@ -264,6 +282,7 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner, ClaudePersis
       this.turnObservers.delete(observer);
     });
     return {
+      materialization: Promise.resolve({ turnId: turn.turnId, userItemId: turn.userItemId }),
       done,
       interrupt: async () => {
         await this.options.host.remote.invoke("interrupt-claude-turn", [JSON.stringify({

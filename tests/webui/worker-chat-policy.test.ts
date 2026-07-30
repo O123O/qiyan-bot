@@ -9,8 +9,16 @@ import {
   sameWorkerSubscriptionTarget,
   settleWorkerScrollPreservation,
   shouldFollowWorkerTail,
+  workerInputDisplayMode,
   workerViewportRevision,
 } from "../../webui-client/src/worker-chat-policy.ts";
+
+test("Claude waits for its native JSONL user row instead of creating an uncorrelatable optimistic copy", () => {
+  assert.equal(workerInputDisplayMode("claude", true), "authoritative");
+  assert.equal(workerInputDisplayMode("codex", true), "optimistic");
+  assert.equal(workerInputDisplayMode(undefined, true), "optimistic");
+  assert.equal(workerInputDisplayMode("claude", false), "ephemeral");
+});
 
 test("a sparse worker history page follows its cursor only while the viewport is underfilled", () => {
   const common = { hasOlder: true, historyInFlight: false, loadingOlder: false, cursor: "older", attempts: 0, recentBoundaryPending: false };

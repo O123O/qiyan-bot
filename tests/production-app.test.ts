@@ -57,6 +57,7 @@ import {
   assistantStartupCanDrainPostTurnActions,
   finalizeAssistantStartup,
   recoveryTurnSuffix,
+  selectRecoveredSendTurn,
   commitAssistantTerminalFinals,
   resolveAssistantTerminalTurn,
   settleAssistantTerminalTools,
@@ -702,6 +703,22 @@ test("bounded start recovery proves absence from a nonempty baseline suffix and 
   assert.equal(reconcileAbsentRecoveredSendStart(store, store.listRecoverable()[0]!, {
     thread: { status: { type: "idle" }, turns: recoveryTurnSuffix(turns, "old"), historyWindow: { exhausted: true } },
   }, () => undefined), true);
+});
+
+test("Claude start recovery uses the sole native turn appended after its durable baseline", () => {
+  const native = { id: "native-prompt", status: "completed", items: [{ type: "userMessage", clientId: null }] };
+  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
+    provider: "claude", mode: "start", baselineRecorded: true,
+  }), native);
+  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
+    provider: "claude", mode: "start", baselineRecorded: false,
+  }), undefined);
+  assert.equal(selectRecoveredSendTurn([native, { ...native, id: "other" }], "ctx:call", {
+    provider: "claude", mode: "start", baselineRecorded: true,
+  }), undefined);
+  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
+    provider: "codex", mode: "start", baselineRecorded: true,
+  }), undefined);
 });
 
 test("start recovery never proves absence from a non-exhausted bounded window", () => {

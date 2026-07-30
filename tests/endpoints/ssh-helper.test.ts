@@ -40,7 +40,8 @@ test("the packaged remote Claude launcher is one-shot, stdin-driven, and leaves 
   const source = await readFile(claudeLauncherPath, "utf8");
   assert.match(source, /for await \(const .* of process\.stdin\)/u);
   assert.match(source, /spawn\(config\.command, config\.args/u);
-  assert.match(source, /qiyan-cid/u);
+  assert.doesNotMatch(source, /qiyan-cid/u);
+  assert.match(source, /promptId/u);
   assert.doesNotMatch(source, /status(?:File|Path)|exitCodeFile|turn-status/iu);
   const runtimeSource = await readFile(claudeRuntimeLauncherPath, "utf8");
   assert.match(runtimeSource, /exec 3<>"\$watch_path"/u);
@@ -607,11 +608,13 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     'const dir=join(process.env.HOME,".claude","projects","fixture");',
     "await mkdir(dir,{recursive:true});",
     'const path=join(dir,`${threadId}.jsonl`);',
-    'const user=`${JSON.stringify({type:"user",cwd:process.cwd(),promptSource:"sdk",message:{role:"user",content:prompt}})}\\n`;',
+    'const nativeTurnId=`native-${prompt.slice("work ".length)}`;',
+    'const user=`${JSON.stringify({type:"user",cwd:process.cwd(),promptSource:"sdk",promptId:nativeTurnId,message:{role:"user",content:prompt}})}\\n`;',
     'const displaced=prompt.includes("turn-displaced");',
     'const large=displaced?`${JSON.stringify({type:"assistant",message:{role:"assistant",stop_reason:"tool_use",content:[{type:"text",text:"x".repeat(300*1024)}]}})}\\n`:"";',
     "await appendFile(path,user+large);",
-    'if(!prompt.includes("turn-fast")) await new Promise((resolve)=>setTimeout(resolve,500));',
+    'if(prompt.includes("turn-one")) await new Promise((resolve)=>setTimeout(resolve,5000));',
+    'else if(!prompt.includes("turn-fast")) await new Promise((resolve)=>setTimeout(resolve,500));',
     'await appendFile(path,`${JSON.stringify({type:"assistant",cwd:process.cwd(),message:{role:"assistant",stop_reason:"end_turn",content:[{type:"text",text:"done"}]}})}\\n`);',
   ].join("\n"), { mode: 0o700 });
   const threadId = "fixture-thread";
@@ -633,11 +636,10 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   };
   const dispatch = async (turnId: string, resume: boolean) => {
     const configured = await configure(resume);
-    const prompt = Buffer.from(`work ${turnId}\n\n<!-- qiyan-cid:${turnId} -->`, "utf8");
+    const prompt = Buffer.from(`work ${turnId}`, "utf8");
     const result = await invoke<any>("dispatch-claude-turn", {
       ...base,
       threadId,
-      turnId,
       dispatchToken: randomBytes(16).toString("hex"),
       configPath: configured.path,
       shell: "/bin/bash",
@@ -650,6 +652,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
 
   const first = await dispatch("turn-one", false);
   assert.equal(first.status, "running");
+  assert.equal(first.turnId, "native-turn-one");
   assert.match(first.paneId, /^%[0-9]+$/u);
   await invoke("interrupt-claude-turn", {
     ...base,
@@ -715,27 +718,18 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
 
-  // Simulate a fast remote completion whose launcher has already acknowledged native
-  // materialization, while a redundant helper-side transcript scan cannot yet observe it.
-  const installedSource = await readFile(installed, "utf8");
-  const scanSignature = "async function scanClaudeTranscriptBytes(cursor, home, threadId, markerText) {";
-  const acknowledgementSignature = "const acknowledged = await waitForTmuxSignal(paths, acknowledgement, 30_000);";
-  assert.ok(installedSource.includes(scanSignature));
-  assert.ok(installedSource.includes(acknowledgementSignature));
-  await writeFile(installed, installedSource
-    .replace(scanSignature, `${scanSignature}\n  if (markerText.includes("turn-fast")) return false;`)
-    .replace(acknowledgementSignature, `${acknowledgementSignature}
-    if (turnId === "turn-fast") await new Promise((resolve) => setTimeout(resolve, 1_000));`), { mode: 0o700 });
+  // A fast completion can clear the live pane option before the dispatch helper
+  // observes it; the native materialization record still makes the result definite.
   const fast = await dispatch("turn-fast", true);
   assert.equal(fast.status, "settled", "an acknowledged turn remains accepted after it becomes idle");
   assert.equal((await invoke<any>("inspect-claude-turn", { ...base, threadId })).status, "idle");
   await invoke("release-claude-thread", { ...base, threadId });
 
   const transcript = await readFile(join(home, ".claude", "projects", "fixture", `${threadId}.jsonl`), "utf8");
-  assert.match(transcript, /qiyan-cid:turn-one/u);
-  assert.match(transcript, /qiyan-cid:turn-two/u);
-  assert.match(transcript, /qiyan-cid:turn-fast/u);
-  assert.match(transcript, /qiyan-cid:turn-displaced/u);
+  assert.doesNotMatch(transcript, /qiyan-cid/u);
+  for (const turnId of ["turn-one", "turn-two", "turn-fast", "turn-displaced"]) {
+    assert.match(transcript, new RegExp(`"content":"work ${turnId}"`, "u"));
+  }
 
   const orphanThread = "orphan-config";
   const orphanConfig = Buffer.from(JSON.stringify({

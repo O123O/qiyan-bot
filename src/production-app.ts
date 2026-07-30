@@ -701,6 +701,27 @@ export function recoveryTurnSuffix<T extends { id: string }>(turns: readonly T[]
   return turns.slice(index + 1);
 }
 
+export function selectRecoveredSendTurn<T extends {
+  id: string;
+  status: string;
+  items: ReadonlyArray<{ type?: unknown; clientId?: unknown }>;
+}>(
+  turns: readonly T[],
+  clientId: string,
+  options: { provider: string; mode: string; baselineRecorded: boolean },
+): T | undefined {
+  const correlated = turns.find((candidate) => candidate.items.some(
+    (item) => item.type === "userMessage" && item.clientId === clientId,
+  ));
+  if (correlated) return correlated;
+  // Claude runs one serialized `claude -p` process per turn. Once the pre-dispatch
+  // native baseline is durable, one appended native turn is the exact outcome.
+  return options.provider === "claude" && options.mode === "start"
+    && options.baselineRecorded && turns.length === 1
+    ? turns[0]
+    : undefined;
+}
+
 export function recoverableOperationEndpointReferences(
   operations: readonly Pick<RecoverableOperation, "kind" | "args" | "receipt">[],
   resolver: OperationRecoveryTargetResolver,
@@ -3647,6 +3668,7 @@ export async function buildProductionApp(
           result = await sessions.send(args.nickname, args.content, {
             mode: args.mode,
             clientUserMessageId: `${context.effectiveSourceContextId}:${context.callId}`,
+            captureBaselineTurn: args.mode === "start" && sessionProvider(worker.endpoint) === "claude",
             prepareInput: async ({ session, projectRoot, lease }) => {
               if (!lease) throw new AppError("ENDPOINT_UNAVAILABLE", "worker endpoint lease is unavailable");
               const files = await Promise.all(resolvedAttachments.map((attachment) => workerFiles.toWorkerInput({
@@ -4753,7 +4775,11 @@ export async function buildProductionApp(
             },
           ) };
           const clientId = `${operation.contextId}:${operation.callId}`;
-          const turn = history.thread.turns.find((candidate: any) => candidate.items.some((item: any) => item.type === "userMessage" && item.clientId === clientId));
+          const turn = selectRecoveredSendTurn(history.thread.turns, clientId, {
+            provider: sessionProvider(session.endpoint),
+            mode: args.mode,
+            baselineRecorded: hasBaseline,
+          });
           const holds = (args.attachment_ids as string[]).map((id, index) => {
             const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
             return { ...attachment, id: `${workerAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId)}:${index}` };

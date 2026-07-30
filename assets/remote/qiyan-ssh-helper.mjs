@@ -17,8 +17,8 @@ const RESPONSE_PREFIX = "qiyan-helper-v1:";
 const APP_SERVER_PROXY_READY = "qiyan-app-server-proxy-v1-ready\n";
 const CLAUDE_RUNTIME_WATCH_READY = "qiyan-claude-runtime-watch-v1-ready\n";
 const CLAUDE_TURN_WATCH_READY = "qiyan-claude-turn-watch-v1-ready\n";
-const MAX_CLAUDE_MARKER_SCAN_BYTES = 128 * 1024 * 1024;
-const CLAUDE_MARKER_SCAN_CHUNK_BYTES = 256 * 1024;
+const MAX_CLAUDE_MATERIALIZATION_SCAN_BYTES = 128 * 1024 * 1024;
+const CLAUDE_MATERIALIZATION_SCAN_CHUNK_BYTES = 256 * 1024;
 
 const operation = process.argv[2];
 const encoded = process.argv.slice(3);
@@ -368,7 +368,6 @@ async function configureClaudeThread(value) {
 async function dispatchClaudeTurn(value) {
   const paths = claudeRuntimePaths(value);
   const thread = claudeThreadPaths(paths, value?.threadId);
-  const turnId = requireClaudeId(value?.turnId);
   const dispatchToken = value?.dispatchToken;
   const expectedSize = value?.size;
   const expectedSha256 = value?.sha256;
@@ -388,7 +387,8 @@ async function dispatchClaudeTurn(value) {
   const transcriptCursor = await createClaudeTranscriptCursor(home, thread.threadId);
   const pane = await ensureClaudePane(paths, thread, shell, runtime.identity.token);
   const before = await inspectClaudePane(paths, pane, runtime.identity.token);
-  if (before.status === "running") throw new Error("Claude thread is already active");
+  if (before.status !== "idle") throw new Error("Claude thread is already active");
+  await run("tmux", [...tmuxArgs(paths), "set-option", "-pu", "-t", pane, "@qiyan_last"], true);
   const buffer = `qiyan-${randomUUID().replaceAll("-", "")}`;
   const acknowledgement = `qiyan-${randomUUID().replaceAll("-", "")}`;
   try {
@@ -399,7 +399,6 @@ async function dispatchClaudeTurn(value) {
       `QIYAN_CLAUDE_PANE=${shellQuote(pane)}`,
       `QIYAN_CLAUDE_BUFFER=${shellQuote(buffer)}`,
       `QIYAN_CLAUDE_ACK=${shellQuote(acknowledgement)}`,
-      `QIYAN_CLAUDE_TURN_ID=${shellQuote(turnId)}`,
       `QIYAN_CLAUDE_THREAD_ID=${shellQuote(thread.threadId)}`,
       `QIYAN_CLAUDE_DISPATCH_TOKEN=${shellQuote(dispatchToken)}`,
       `QIYAN_RUNTIME_TOKEN=${shellQuote(runtime.identity.token)}`,
@@ -409,24 +408,27 @@ async function dispatchClaudeTurn(value) {
     await run("tmux", [...tmuxArgs(paths), "send-keys", "-t", pane, "Enter"]);
     const acknowledged = await waitForTmuxSignal(paths, acknowledgement, 30_000);
     const after = await inspectClaudePane(paths, pane, runtime.identity.token);
+    const last = await inspectClaudeLast(paths, pane, runtime.identity.token);
+    const scannedMaterialization = acknowledged && last?.userItemId
+      ? undefined
+      : await scanClaudeTranscriptTurn(transcriptCursor, home, thread.threadId);
+    const materialization = last?.dispatchToken === dispatchToken && last.userItemId
+      ? { turnId: last.turnId, userItemId: last.userItemId }
+      : scannedMaterialization;
     const sameRunning = after.status === "running"
-      && after.turnId === turnId
-      && after.dispatchToken === dispatchToken;
-    if (acknowledged) {
+      && after.turnId === materialization?.turnId
+      && after.dispatchToken === dispatchToken
+      && materialization !== undefined;
+    if (materialization !== undefined) {
       if (sameRunning) {
-        return { status: "running", paneId: pane, turnId, dispatchToken, identity: after.identity };
+        return { status: "running", paneId: pane, ...materialization, dispatchToken, identity: after.identity };
       }
-      if (after.status === "idle") return { status: "settled", paneId: pane, turnId, dispatchToken };
+      if (after.status === "idle" && last?.turnId === materialization.turnId) {
+        return { status: "settled", paneId: pane, ...materialization, dispatchToken };
+      }
       throw new Error("Claude turn changed after materialization");
     }
-    if (await scanClaudeTranscriptBytes(transcriptCursor, home, thread.threadId, `qiyan-cid:${turnId}`)) {
-      if (sameRunning) {
-        return { status: "running", paneId: pane, turnId, dispatchToken, identity: after.identity };
-      }
-      if (after.status === "idle") return { status: "settled", paneId: pane, turnId, dispatchToken };
-      throw new Error("Claude turn changed after materialization");
-    }
-    if (sameRunning) {
+    if (after.status === "running" || after.status === "starting") {
       await stopOwnedGroup(after.identity);
       await clearClaudeLiveOption(paths, pane);
     }
@@ -909,8 +911,11 @@ async function inspectClaudePane(paths, pane, runtimeToken) {
     processGroupId: live.processGroupId,
   });
   return {
-    status: "running",
-    turnId: live.turnId,
+    status: live.materialized ? "running" : "starting",
+    ...(live.materialized ? {
+      turnId: live.turnId,
+      ...(live.userItemId === undefined ? {} : { userItemId: live.userItemId }),
+    } : {}),
     dispatchToken: live.dispatchToken,
     identity: {
       kind: "ssh",
@@ -924,10 +929,31 @@ async function inspectClaudePane(paths, pane, runtimeToken) {
 
 function validClaudeLive(value) {
   if (!value || typeof value !== "object" || !HEX_128.test(value.runtimeToken ?? "")
-    || !HEX_128.test(value.dispatchToken ?? "") || !/^[A-Za-z0-9:_.-]{1,256}$/u.test(value.turnId ?? "")
+    || !HEX_128.test(value.dispatchToken ?? "")
     || !Number.isSafeInteger(value.pid) || value.pid < 2 || !DECIMAL.test(value.linuxStartTime ?? "")
     || !Number.isSafeInteger(value.processGroupId) || value.processGroupId < 2) return undefined;
-  return value;
+  const materialized = value.materialized === undefined ? value.turnId !== undefined : value.materialized;
+  if (typeof materialized !== "boolean") return undefined;
+  if (materialized && !/^[A-Za-z0-9:_.-]{1,256}$/u.test(value.turnId ?? "")) return undefined;
+  if (value.userItemId !== undefined && !/^[A-Za-z0-9:_.-]{1,256}$/u.test(value.userItemId)) return undefined;
+  if (!materialized && value.turnId !== undefined) return undefined;
+  if (!materialized && value.userItemId !== undefined) return undefined;
+  return { ...value, materialized };
+}
+
+async function inspectClaudeLast(paths, pane, runtimeToken) {
+  const option = await run("tmux", [...tmuxArgs(paths), "show-options", "-pqv", "-t", pane, "@qiyan_last"], true);
+  const encoded = option.stdout.toString("utf8").trim();
+  if (!encoded) return undefined;
+  let value;
+  try { value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")); } catch {
+    throw new Error("invalid Claude materialization record");
+  }
+  const live = validClaudeLive(value);
+  if (!live?.materialized || live.runtimeToken !== runtimeToken) {
+    throw new Error("invalid Claude materialization record");
+  }
+  return live;
 }
 
 function sameClaudeLive(actual, expected) {
@@ -1116,7 +1142,7 @@ async function findClaudeTranscript(home, threadId) {
   return undefined;
 }
 
-async function scanClaudeTranscriptBytes(cursor, home, threadId, markerText) {
+async function scanClaudeTranscriptTurn(cursor, home, threadId) {
   if (!cursor.path) {
     const found = await findClaudeTranscript(home, threadId);
     if (!found) return false;
@@ -1131,24 +1157,44 @@ async function scanClaudeTranscriptBytes(cursor, home, threadId, markerText) {
     if (!state.isFile() || state.uid !== process.getuid?.()
       || String(state.dev) !== cursor.device || String(state.ino) !== cursor.inode
       || state.size < cursor.offset) throw new Error("Claude transcript changed during dispatch");
-    const marker = Buffer.from(markerText, "utf8");
     while (cursor.offset < state.size) {
-      const remainingBudget = MAX_CLAUDE_MARKER_SCAN_BYTES - cursor.scanned;
-      if (remainingBudget <= 0) throw new Error("Claude marker scan exceeded its bound");
-      const length = Math.min(CLAUDE_MARKER_SCAN_CHUNK_BYTES, remainingBudget, state.size - cursor.offset);
+      const remainingBudget = MAX_CLAUDE_MATERIALIZATION_SCAN_BYTES - cursor.scanned;
+      if (remainingBudget <= 0) throw new Error("Claude materialization scan exceeded its bound");
+      const length = Math.min(CLAUDE_MATERIALIZATION_SCAN_CHUNK_BYTES, remainingBudget, state.size - cursor.offset);
       const bytes = Buffer.alloc(length);
       const { bytesRead } = await file.read(bytes, 0, length, cursor.offset);
       if (bytesRead <= 0) break;
       cursor.offset += bytesRead;
       cursor.scanned += bytesRead;
       const combined = Buffer.concat([cursor.carry, bytes.subarray(0, bytesRead)]);
-      if (combined.includes(marker)) return true;
-      cursor.carry = Buffer.from(combined.subarray(Math.max(0, combined.length - marker.length + 1)));
+      let start = 0;
+      for (let index = combined.indexOf(0x0a); index >= 0; index = combined.indexOf(0x0a, start)) {
+        const materialization = nativeClaudeMaterializationFromLine(combined.subarray(start, index));
+        if (materialization) return materialization;
+        start = index + 1;
+      }
+      cursor.carry = Buffer.from(combined.subarray(start));
     }
-    return false;
+    return undefined;
   } finally {
     await file.close();
   }
+}
+
+function nativeClaudeMaterializationFromLine(line) {
+  if (line.byteLength === 0) return undefined;
+  let value;
+  try { value = JSON.parse(line.toString("utf8")); } catch { return undefined; }
+  if (!value || typeof value !== "object" || value.type !== "user"
+    || typeof value.promptSource !== "string" || value.promptSource.length === 0) return undefined;
+  const turnId = typeof value.promptId === "string" && value.promptId.length > 0
+    ? value.promptId
+    : typeof value.uuid === "string" && value.uuid.length > 0 ? value.uuid : undefined;
+  if (!turnId || !/^[A-Za-z0-9:_.-]{1,256}$/u.test(turnId)) return undefined;
+  const userItemId = typeof value.uuid === "string" && /^[A-Za-z0-9:_.-]{1,256}$/u.test(value.uuid)
+    ? value.uuid
+    : `${turnId}:user`;
+  return { turnId, userItemId };
 }
 
 function shellQuote(value) {

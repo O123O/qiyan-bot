@@ -92,9 +92,8 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       if (!promptId || !turnId) continue; // tool_result or malformed user row
       finalize(current);
       const marker = extractClaudeClientMarker(record.message);
-      // For a QiYan-dispatched turn, turn.id is its clientUserMessageId marker. It
-      // therefore matches the id returned by `turn/start` and pushed by
-      // `turn/completed`; an unmarked transcript turn uses Claude's promptId.
+      // New turns use Claude's native promptId. Older QiYan transcripts may still
+      // carry a legacy client marker, which preserves their historical turn ids.
       const text = visibleClaudeUserText(record.message);
       const userItem: ClaudeThreadItem = {
         type: "userMessage",

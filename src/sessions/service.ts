@@ -44,6 +44,7 @@ export class SessionService {
     clientUserMessageId?: string;
     input?: unknown[];
     settings?: { model?: string; effort?: string };
+    captureBaselineTurn?: boolean;
     prepareInput?(context: { session: RegistrySession; projectRoot: string; lease?: EndpointWorkLease }): Promise<unknown[]>;
     onBeforeNativeDispatch?(context: {
       session: RegistrySession;
@@ -95,7 +96,15 @@ export class SessionService {
       }
       const settings = options.settings ?? this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);
       this.assertExactManaged(nickname, session.mapping_id);
-      await options.onBeforeNativeDispatch?.({ session, mode: "start", ...(lease ? { lease } : {}) });
+      const baselineTurnId = options.onBeforeNativeDispatch && options.captureBaselineTurn === true
+        ? (await this.pool.historyReader(session.endpoint, lease).latestTurn(session.thread_id))?.id ?? null
+        : undefined;
+      await options.onBeforeNativeDispatch?.({
+        session,
+        mode: "start",
+        ...(baselineTurnId === undefined ? {} : { baselineTurnId }),
+        ...(lease ? { lease } : {}),
+      });
       this.assertExactManaged(nickname, session.mapping_id);
       const generation = this.endpointGeneration(session.endpoint, lease);
       const startToken = this.native.captureStart(this.nativeIdentity(session), generation);

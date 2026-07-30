@@ -122,6 +122,7 @@ class ServiceEndpoint implements AppServerEndpoint {
 async function fixture(options: {
   coldEndpoint?: boolean;
   observedModel?: string;
+  settingsPersistNatively?: boolean;
   onTurnAccepted?(turnId: string): void;
 } = {}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "qiyan-bot-service-")));
@@ -181,7 +182,7 @@ async function fixture(options: {
     workspaces,
     gate,
     endpoints,
-    undefined,
+    () => options.settingsPersistNatively ?? true,
     (_session, turnId) => options.onTurnAccepted?.(turnId),
     () => options.observedModel ? { model: options.observedModel } : {},
   );
@@ -324,6 +325,30 @@ test("an authoritative native send response records the adopted epoch's first ma
   await service.send("payments", "start");
 
   assert.deepEqual(accepted, ["started-1"]);
+});
+
+test("a durable Claude start explicitly checkpoints the latest native turn before dispatch", async () => {
+  const { endpoint, service } = await fixture({ settingsPersistNatively: false });
+  endpoint.threadTurns = [{ id: "native-before", status: "completed", items: [] }];
+  let baseline: string | null | undefined;
+
+  await service.send("payments", "start", {
+    captureBaselineTurn: true,
+    onBeforeNativeDispatch: (evidence) => { baseline = evidence.baselineTurnId; },
+  });
+
+  assert.equal(baseline, "native-before");
+  assert.deepEqual(endpoint.calls.slice(0, 2).map((call) => call.method), ["thread/turns/list", "turn/start"]);
+});
+
+test("a dispatch guard does not read native history unless recovery requests a baseline", async () => {
+  const { endpoint, service } = await fixture({ settingsPersistNatively: false });
+
+  await service.send("payments", "start", {
+    onBeforeNativeDispatch: () => undefined,
+  });
+
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["turn/start"]);
 });
 
 test("per-send acceptance is recorded before terminal notification work can enter the thread gate", async () => {

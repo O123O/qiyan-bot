@@ -21,6 +21,7 @@ import {
   releaseWorkerHistoryAutoFill,
   sameWorkerSubscriptionTarget,
   settleWorkerScrollPreservation,
+  workerInputDisplayMode,
   workerViewportRevision,
   type WorkerHistoryAutoFillState,
   type WorkerScrollPreservation,
@@ -730,14 +731,18 @@ export function App() {
     setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); stickRef.current = true;
     const clientInputId = target ? createBrowserUuid() : undefined;
     const active = workerRef.current;
-    if (target && target === selected && clientInputId) {
+    const inputDisplayMode = workerInputDisplayMode(
+      sessions.find((candidate) => candidate.nickname === target)?.provider,
+      Boolean(target && target === selected && clientInputId),
+    );
+    if (inputDisplayMode === "optimistic" && target && clientInputId) {
       const session = sessions.find((candidate) => candidate.nickname === target);
       const mappingId = session?.mappingId ?? "";
       const timeline = active?.nickname === target && active.mappingId === mappingId
         ? active
         : beginWorkerSubscription(target, session?.provider ?? "codex", createBrowserUuid(), [], mappingId);
       replaceWorker(addOptimisticWorkerMessage(timeline, `to:web:${clientInputId}`, body, Date.now()));
-    } else {
+    } else if (inputDisplayMode === "ephemeral") {
       push(key, {
         ...(selected === null && redirect && clientInputId ? { id: `web:${clientInputId}` } : {}),
         role: "you", body: redirect && redirect !== selected ? `→ @${redirect}  ${body}` : body, at: Date.now(),

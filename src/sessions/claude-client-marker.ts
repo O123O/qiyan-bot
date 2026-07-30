@@ -1,10 +1,7 @@
 const clientMarkerPattern = /<!--\s*qiyan-cid:([A-Za-z0-9:_.-]{1,256})\s*-->/u;
 
-// Claude does not expose Codex-style item ids. QiYan includes its client id in the
-// submitted prompt so the native transcript reader can correlate the echoed user row.
-export function encodeClaudeClientMarker(clientId: string): string {
-  return `<!-- qiyan-cid:${clientId} -->`;
-}
+// Read-only compatibility for transcripts written by QiYan versions that appended
+// correlation metadata to Claude prompts. New turns always preserve exact user input.
 
 function messageText(message: unknown): string {
   if (!message || typeof message !== "object" || Array.isArray(message)) return "";

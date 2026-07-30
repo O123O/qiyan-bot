@@ -24,19 +24,24 @@ class FakeRunner implements ClaudeCommandRunner {
   transcriptReadCount = 0;
   readonly transcriptChunkLengths: number[] = [];
   private readonly transcripts = new Map<string, unknown[]>();
-  private readonly pending: Array<{ threadId: string; marker: string; settle: (s: ClaudeTurnStatus) => void; settled: boolean }> = [];
+  private readonly pending: Array<{ threadId: string; turnId: string; settle: (s: ClaudeTurnStatus) => void; settled: boolean }> = [];
 
   startTurn(request: ClaudeTurnRequest) {
     this.requests.push(request);
-    const marker = /<!-- qiyan-cid:([^\s]+) -->/u.exec(request.message)?.[1] ?? "none";
     const recs = this.transcripts.get(request.threadId) ?? [];
-    recs.push({ type: "user", cwd: request.cwd, promptSource: "sdk", promptId: `prompt-${recs.length}`, uuid: `u-${recs.length}`, message: { role: "user", content: request.message } });
+    const turnId = `prompt-${recs.length}`;
+    const userItemId = `u-${recs.length}`;
+    recs.push({ type: "user", cwd: request.cwd, promptSource: "sdk", promptId: turnId, uuid: userItemId, message: { role: "user", content: request.message } });
     this.transcripts.set(request.threadId, recs);
     let settle!: (s: ClaudeTurnStatus) => void;
     const done = new Promise<ClaudeTurnStatus>((r) => { settle = r; });
-    const entry = { threadId: request.threadId, marker, settle, settled: false };
+    const entry = { threadId: request.threadId, turnId, settle, settled: false };
     this.pending.push(entry);
-    return { done, interrupt: () => { if (!entry.settled) { entry.settled = true; entry.settle("failed"); } } };
+    return {
+      materialization: Promise.resolve({ turnId, userItemId }),
+      done,
+      interrupt: () => { if (!entry.settled) { entry.settled = true; entry.settle("failed"); } },
+    };
   }
   complete(status: ClaudeTurnStatus = "completed") {
     const entry = this.pending.find((p) => !p.settled);
@@ -44,7 +49,7 @@ class FakeRunner implements ClaudeCommandRunner {
     entry.settled = true;
     if (status === "completed") {
       const recs = this.transcripts.get(entry.threadId)!;
-      recs.push({ type: "assistant", uuid: `a-${recs.length}`, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `reply to ${entry.marker}` }] } });
+      recs.push({ type: "assistant", uuid: `a-${recs.length}`, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `reply to ${entry.turnId}` }] } });
     }
     entry.settle(status);
   }
@@ -319,6 +324,71 @@ test("shutdown fences a local turn before an asynchronous preparation can spawn 
   assert.equal(rt.state, "stopped");
 });
 
+test("closing a local endpoint interrupts a child waiting for native JSONL materialization", async () => {
+  let interrupted = false;
+  const runner = new FakeRunner();
+  const blocked: ClaudeCommandRunner = {
+    startTurn() {
+      return {
+        materialization: new Promise(() => undefined),
+        done: new Promise(() => undefined),
+        interrupt() { interrupted = true; },
+      };
+    },
+    readTranscriptChunk: (...args) => runner.readTranscriptChunk(...args),
+    transcriptPath: (threadId) => runner.transcriptPath(threadId),
+    listThreads: (...args) => runner.listThreads(...args),
+  };
+  const rt = makeRuntime(blocked);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const pending = rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:materializing",
+    input: [{ type: "text", text: "wait for JSONL" }],
+  });
+  await delay(0);
+
+  await rt.closeConnection();
+
+  assert.equal(interrupted, true);
+  await Promise.race([pending.catch(() => undefined), delay(10)]);
+});
+
+test("closing a local endpoint interrupts a handle returned after asynchronous runner preparation", async () => {
+  let release!: () => void;
+  const startGate = new Promise<void>((resolve) => { release = resolve; });
+  let interrupted = false;
+  const delegate = new FakeRunner();
+  const runner: ClaudeCommandRunner = {
+    async startTurn() {
+      await startGate;
+      return {
+        materialization: new Promise(() => undefined),
+        done: new Promise(() => undefined),
+        interrupt() { interrupted = true; },
+      };
+    },
+    readTranscriptChunk: (...args) => delegate.readTranscriptChunk(...args),
+    transcriptPath: (threadId) => delegate.transcriptPath(threadId),
+    listThreads: (...args) => delegate.listThreads(...args),
+  };
+  const rt = makeRuntime(runner);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const pending = rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "ctx:late-handle",
+    input: [{ type: "text", text: "wait for runner" }],
+  });
+  await delay(0);
+
+  await rt.closeConnection();
+  release();
+  await assert.rejects(pending, /endpoint changed while its turn was starting/u);
+  assert.equal(interrupted, true);
+});
+
 test("a close racing persistent startup cannot republish the endpoint as ready", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -423,23 +493,40 @@ test("first turn uses --session-id, resumes after; turn/completed fires; thread/
   const threadId = thread.id;
 
   const started = await rt.request<{ turn: any }>("turn/start", { threadId, clientUserMessageId: "ctx:call-1", input: [{ type: "text", text: "hello" }] });
-  assert.deepEqual(started.turn, { id: "ctx:call-1", status: "inProgress" });
+  assert.deepEqual(started.turn, { id: "prompt-0", status: "inProgress" });
+  assert.equal(runner.requests[0]?.message, "hello", "QiYan must not append correlation metadata to Claude input");
   assert.equal(runner.requests[0]?.resume, false); // --session-id on the first turn
 
   runner.complete("completed");
   await delay(5);
-  assert.deepEqual(notifications, [{ method: "turn/completed", params: { threadId, turn: { id: "ctx:call-1" } } }]);
+  assert.deepEqual(notifications, [
+    { method: "turn/started", params: { threadId, turn: { id: "prompt-0", status: "inProgress" } } },
+    {
+      method: "item/started",
+      params: {
+        threadId,
+        turnId: "prompt-0",
+        item: {
+          type: "userMessage",
+          id: "u-0",
+          clientId: null,
+          content: [{ type: "text", text: "hello", text_elements: [] }],
+        },
+      },
+    },
+    { method: "turn/completed", params: { threadId, turn: { id: "prompt-0" } } },
+  ]);
 
   const read = await rt.request<{ thread: any }>("thread/read", { threadId, includeTurns: true });
   assert.equal(read.thread.turns.length, 1);
   const turn = read.thread.turns[0];
-  assert.equal(turn.id, "ctx:call-1"); // turn id == clientUserMessageId, so the relay finds it
+  assert.equal(turn.id, "prompt-0");
   assert.equal(turn.status, "completed");
   assert.equal(turn.itemsView, "full");
   assert.equal(turn.items[0].type, "userMessage");
-  assert.equal(turn.items[0].clientId, "ctx:call-1");
+  assert.equal(turn.items[0].clientId, null);
   const final = turn.items.find((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
-  assert.equal(final.text, "reply to ctx:call-1");
+  assert.equal(final.text, "reply to prompt-0");
 
   // second turn resumes
   await rt.request("turn/start", { threadId, clientUserMessageId: "ctx:call-2", input: [{ type: "text", text: "again" }] });
@@ -462,21 +549,21 @@ test("Claude paging uses bounded native transcript windows without backend reten
     threadId: thread.id, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
   } as any);
   assert.deepEqual(latest.data.map((turn: any) => ({ id: turn.id, itemsView: turn.itemsView, items: turn.items })), [
-    { id: "ctx:two", itemsView: "notLoaded", items: [] },
+    { id: "prompt-2", itemsView: "notLoaded", items: [] },
   ]);
   assert.equal(typeof latest.nextCursor, "string");
 
   const older = await history.turnsPage(thread.id, {
     cursor: latest.nextCursor!, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
   });
-  assert.deepEqual(older.data.map((turn: any) => turn.id), ["ctx:one"]);
+  assert.deepEqual(older.data.map((turn: any) => turn.id), ["prompt-0"]);
   assert.equal(older.nextCursor, null);
 
-  const exact = await history.exactTurnItems(thread.id, "ctx:two", {
+  const exact = await history.exactTurnItems(thread.id, "prompt-2", {
     budget: createHistoryScanBudget(),
   });
   assert.equal(exact.items[0]?.type, "userMessage");
-  assert.equal(exact.items[0]?.clientId, "ctx:two");
+  assert.equal(exact.items[0]?.clientId, null);
   assert.equal(exact.turn.itemsView, "full");
   assert.equal(runner.transcriptReadCount, 4);
   assert.ok(runner.transcriptChunkLengths.every((length) => length <= 4 * 1024 * 1024));
@@ -491,8 +578,8 @@ test("Claude paging uses bounded native transcript windows without backend reten
   assert.equal(runner.transcriptReadCount, 4);
   const afterResume = new ThreadHistoryReader((method, params) => rt.request(method, params));
   const stillPersisted = await afterResume.turnsPage(thread.id, { limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
-  assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["ctx:one", "ctx:two"]);
-  const persisted = await afterResume.exactTurnItems(thread.id, "ctx:two", {
+  assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["prompt-0", "prompt-2"]);
+  const persisted = await afterResume.exactTurnItems(thread.id, "prompt-2", {
     budget: createHistoryScanBudget(),
   });
   assert.equal(persisted.items[0]?.type, "userMessage");
@@ -623,7 +710,7 @@ test("a cold-started session (on disk, not in memory) is rehydrated from the tra
   await b.start();
   const read = await b.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
   assert.equal(read.thread.turns.length, 1);
-  assert.equal(read.thread.turns[0].id, "ctx:c1");
+  assert.equal(read.thread.turns[0].id, "prompt-0");
   assert.equal(read.thread.turns[0].status, "completed");
 });
 
