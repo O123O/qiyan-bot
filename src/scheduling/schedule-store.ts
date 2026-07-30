@@ -19,7 +19,7 @@ export interface ScheduleRow {
   message: string;         // the turn message delivered on fire
   state: ScheduleState;
   nextFireAt: number | null;
-  intervalMs: number | null;  // cron/monitor recurrence & monitor poll floor
+  intervalMs: number | null;  // cron recurrence or monitor poll cadence
   createdAt: number;
 }
 
@@ -78,7 +78,7 @@ export class ScheduleStore {
     return (this.db.prepare("SELECT * FROM session_schedules WHERE state = 'armed' AND next_fire_at IS NOT NULL AND next_fire_at <= ? ORDER BY next_fire_at").all(now) as Array<Record<string, unknown>>).map(fromRow);
   }
 
-  // After a fire: a one-shot wakeup is done; a recurring cron/monitor re-arms. Guarded
+  // After a fire: one-shot wakeups and monitors are done; a recurring cron re-arms. Guarded
   // on state='armed' so it can never clobber a row cancelled mid-tick.
   advance(id: string, nextFireAt: number | null): void {
     if (nextFireAt === null) this.db.prepare("UPDATE session_schedules SET state = 'done', next_fire_at = NULL WHERE id = ? AND state = 'armed'").run(id);

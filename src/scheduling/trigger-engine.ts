@@ -8,7 +8,7 @@
 //   wakeup  — one-shot at next_fire_at.
 //   cron    — recurring every interval_ms (interval-based; re-arms after each fire).
 //   monitor — every interval_ms run `spec` as a shell predicate on the session's
-//             endpoint; fire only when it exits 0; always re-arm the next poll.
+//             endpoint; fire once when it exits 0, then finish.
 import type { ScheduleRow, ScheduleStore } from "./schedule-store.ts";
 
 export interface TriggerEngineDeps {
@@ -94,7 +94,7 @@ export class TriggerEngine {
     // (at-least-once + idempotent, not the previous at-most-once).
     const key = `${row.id}:${row.nextFireAt ?? now}`;
     await this.withTimeout(this.deps.fire(row, key));
-    this.deps.store.advance(row.id, row.kind === "wakeup" ? null : now + this.interval(row));
+    this.deps.store.advance(row.id, row.kind === "cron" ? now + this.interval(row) : null);
   }
 
   private interval(row: ScheduleRow): number {

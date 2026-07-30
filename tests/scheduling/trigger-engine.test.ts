@@ -63,7 +63,7 @@ test("a cron re-arms and fires each interval", async () => {
   assert.equal(h.fired.length, 3);
 });
 
-test("a monitor fires only when its check passes, and keeps polling", async () => {
+test("a monitor keeps polling until its check passes, then fires once and is done", async () => {
   const h = harness();
   h.store.create({ ...base, kind: "monitor", spec: "test -f /tmp/ready", nextFireAt: 20_000, intervalMs: 5_000 }, 10_000);
 
@@ -75,10 +75,12 @@ test("a monitor fires only when its check passes, and keeps polling", async () =
   h.setCheck(true);
   h.at(25_000); await h.engine.tick();
   assert.equal(h.fired.length, 1); // condition true -> fires
+  assert.equal(h.store.listForSession("claude-local", "t1").length, 0);
 
-  // still armed (re-polls) after firing
+  // successful monitor is done and never checks or fires again
   h.at(30_000); await h.engine.tick();
-  assert.equal(h.checks.length, 3);
+  assert.equal(h.checks.length, 2);
+  assert.equal(h.fired.length, 1);
 });
 
 test("recovery: a schedule missed while QiYan was down fires on the first tick", async () => {

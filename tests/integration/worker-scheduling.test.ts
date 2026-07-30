@@ -4,12 +4,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { ScheduleStore, type ScheduleRow } from "../../src/scheduling/schedule-store.ts";
 import { TriggerEngine } from "../../src/scheduling/trigger-engine.ts";
 import { WorkerScheduleMcpServer } from "../../src/scheduling/worker-mcp.ts";
 
 const enabled = process.env.RUN_CLAUDE_INTEGRATION === "1";
+
+test("monitor guidance promises one fire and rejects waiting for Claude subagents", async (t) => {
+  const store = new ScheduleStore(createTestDatabase());
+  const session = { nickname: "worker-1", endpointId: "claude-local", threadId: "thread-xyz" };
+  const server = new WorkerScheduleMcpServer({ store, now: () => 1, resolveToken: (token) => token === "tok-secret" ? session : undefined });
+  await server.start();
+  t.after(() => server.stop());
+
+  const client = new Client({ name: "qiyan-scheduling-test", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(server.url), {
+    requestInit: { headers: { authorization: "Bearer tok-secret" } },
+  }) as any);
+  t.after(() => client.close());
+
+  const monitor = (await client.listTools()).tools.find((tool) => tool.name === "monitor");
+  assert.match(monitor?.description ?? "", /fires once/iu);
+  assert.match(monitor?.description ?? "", /do not use.*subagents/iu);
+  assert.match(monitor?.description ?? "", /headless Claude exits/iu);
+});
 
 test("a real Claude worker calls the scheduling MCP tool; the engine then fires it", { skip: !enabled, timeout: 180_000 }, async (t) => {
   const store = new ScheduleStore(createTestDatabase());
