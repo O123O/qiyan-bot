@@ -13,8 +13,8 @@ import {
   workerViewportRevision,
 } from "../../webui-client/src/worker-chat-policy.ts";
 
-test("Claude waits for its native JSONL user row instead of creating an uncorrelatable optimistic copy", () => {
-  assert.equal(workerInputDisplayMode("claude", true), "authoritative");
+test("Claude shows a pending user message before its native JSONL row is materialized", () => {
+  assert.equal(workerInputDisplayMode("claude", true), "optimistic");
   assert.equal(workerInputDisplayMode("codex", true), "optimistic");
   assert.equal(workerInputDisplayMode(undefined, true), "optimistic");
   assert.equal(workerInputDisplayMode("claude", false), "ephemeral");

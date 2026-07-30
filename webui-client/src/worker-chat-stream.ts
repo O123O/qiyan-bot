@@ -199,6 +199,18 @@ export function removeOptimisticWorkerMessage(state: WorkerStreamState, clientId
   return { ...state, messages: state.messages.filter((message) => !(message.optimistic && message.clientId === clientId)) };
 }
 
+function matchingClaudeOptimistic(
+  state: WorkerStreamState,
+  messages: WorkerChatMessage[],
+  body: string,
+  eligible: (message: WorkerChatMessage) => boolean = () => true,
+): WorkerChatMessage | undefined {
+  if (state.provider !== "claude") return undefined;
+  return messages.find((message) => (
+    message.optimistic && message.role === "you" && message.body === body && eligible(message)
+  ));
+}
+
 function upsert(messages: WorkerChatMessage[], message: WorkerChatMessage): WorkerChatMessage[] {
   const index = messages.findIndex((candidate) => candidate.id === message.id);
   if (index < 0) return [...messages, message];
@@ -335,8 +347,12 @@ function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): Wo
   const clientId = event.item.type === "user-message" ? event.item.clientId : undefined;
   const correlated = clientId
     ? messages.find((message) => message.clientId === clientId && message.role === role)
-    : undefined;
+    : role === "you" && !messages.some((message) => message.id === id)
+      ? matchingClaudeOptimistic(state, messages, event.item.text)
+      : undefined;
+  const correlatedIndex = correlated ? messages.indexOf(correlated) : -1;
   if (clientId) messages = messages.filter((message) => message.id === id || message.clientId !== clientId || message.role !== role);
+  else if (correlated) messages = messages.filter((message) => message.id !== correlated.id);
   const existingById = messages.find((message) => message.id === id);
   const existing = existingById ?? correlated;
   if (!completed && existingById && !existingById.streaming) return messages === state.messages ? state : { ...state, messages };
@@ -344,13 +360,18 @@ function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): Wo
   const resolvedPhase = event.item.type === "agent-message" ? event.item.phase ?? existing?.phase : undefined;
   const message: WorkerChatMessage = {
     id, turnId: event.turnId, body: event.item.text,
-    completedAt: event.atMs ?? existing?.completedAt ?? Date.now(), terminalStatus: existing?.terminalStatus ?? "",
+    completedAt: existing?.completedAt ?? event.atMs ?? Date.now(), terminalStatus: existing?.terminalStatus ?? "",
     role, ...(resolvedClientId ? { clientId: resolvedClientId } : {}),
     ...(resolvedPhase ? { phase: resolvedPhase } : {}),
     ...(existing?.turnOrder === undefined ? {} : { turnOrder: existing.turnOrder }),
     ...(existing?.itemOrder === undefined ? {} : { itemOrder: existing.itemOrder }),
     streaming: !completed, optimistic: false, live: true,
   };
+  if (correlatedIndex >= 0 && !existingById) {
+    const next = [...messages];
+    next.splice(Math.min(correlatedIndex, next.length), 0, message);
+    return { ...state, messages: capMessages(next) };
+  }
   return { ...state, messages: capMessages(upsert(messages, message)) };
 }
 
@@ -382,7 +403,21 @@ export function applyWorkerSnapshot(
     live: false,
   }));
   let messages = state.messages;
-  for (const message of snapshotMessages) {
+  for (const snapshotMessage of snapshotMessages) {
+    let message = snapshotMessage;
+    if (message.role === "you" && !message.clientId && !messages.some((candidate) => candidate.id === message.id)) {
+      const correlated = matchingClaudeOptimistic(state, messages, message.body, (candidate) => (
+        message.completedAt > 0 ? message.completedAt >= candidate.completedAt : open.has(message.turnId)
+      ));
+      if (correlated) {
+        messages = messages.filter((candidate) => candidate.id !== correlated.id);
+        message = {
+          ...message,
+          completedAt: correlated.completedAt,
+          ...(correlated.clientId ? { clientId: correlated.clientId } : {}),
+        };
+      }
+    }
     if (message.clientId) messages = messages.filter((candidate) => !(candidate.optimistic && candidate.clientId === message.clientId));
     messages = mergeSnapshotMessage(messages, message);
   }

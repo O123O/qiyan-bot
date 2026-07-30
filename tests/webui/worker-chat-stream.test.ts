@@ -49,6 +49,60 @@ test("native user item replaces history that already replaced its optimistic bub
   assert.deepEqual(state.messages.map((message) => [message.id, message.body, message.optimistic]), [["u:turn:u1", "hello", false]]);
 });
 
+test("a Claude message stays visible while an active turn delays native acceptance", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = addOptimisticWorkerMessage(state, "to:web:pending", "follow up", 10);
+  state = receiveWorkerEvent(state, envelope({ kind: "agent-message-delta", turnId: "active", itemId: "a1", delta: "working" }));
+
+  assert.deepEqual(state.messages.map((message) => [message.body, message.optimistic]), [
+    ["follow up", true],
+    ["working", false],
+  ]);
+});
+
+test("a native Claude user event replaces the oldest exact pending message without a client marker", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = addOptimisticWorkerMessage(state, "to:web:first", "repeat", 10);
+  state = addOptimisticWorkerMessage(state, "to:web:second", "repeat", 11);
+  state = receiveWorkerEvent(state, envelope({
+    kind: "item-started", turnId: "native", atMs: 12,
+    item: { type: "user-message", id: "u1", text: "repeat" },
+  }));
+
+  assert.deepEqual(state.messages.map((message) => [message.id, message.clientId, message.optimistic]), [
+    ["u:native:u1", "to:web:first", false],
+    ["optimistic:to:web:second", "to:web:second", true],
+  ]);
+});
+
+test("a new Claude snapshot row replaces its pending message but an older identical row does not", () => {
+  let state = beginWorkerSubscription("worker", "claude", ids.requestId);
+  state = addOptimisticWorkerMessage(state, "to:web:pending", "repeat", 10);
+  state = applyWorkerSnapshot(state, {
+    messages: [{
+      id: "u:old:u1", turnId: "old", body: "repeat", completedAt: 5,
+      terminalStatus: "inProgress", role: "you", turnOrder: 1, itemOrder: 1,
+    }],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["old"],
+  });
+  assert.deepEqual(state.messages.map((message) => [message.id, message.optimistic]), [
+    ["u:old:u1", false],
+    ["optimistic:to:web:pending", true],
+  ]);
+
+  state = applyWorkerSnapshot(state, {
+    messages: [{
+      id: "u:new:u1", turnId: "new", body: "repeat", completedAt: 12,
+      terminalStatus: "inProgress", role: "you", turnOrder: 2, itemOrder: 1,
+    }],
+    hasOlder: false, terminalTurnIds: [], openTurnIds: ["new"],
+  });
+  assert.deepEqual(state.messages.map((message) => [message.id, message.clientId, message.optimistic]), [
+    ["u:old:u1", undefined, false],
+    ["u:new:u1", "to:web:pending", false],
+  ]);
+});
+
 test("a rejected worker send removes only its optimistic echo", () => {
   let state = beginWorkerSubscription("worker", "codex", ids.requestId);
   state = addOptimisticWorkerMessage(state, "to:web:one", "first", 1);
