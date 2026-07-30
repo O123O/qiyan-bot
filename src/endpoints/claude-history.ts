@@ -79,14 +79,47 @@ export class ClaudeTranscriptHistory {
       : decodeCursor<TurnsCursor>(params.cursor, {
         kind: "turns", threadId, direction: params.sortDirection,
       });
-    const window = await this.turnWindow(threadId, cwd, params.sortDirection, cursor);
+    let window = await this.turnWindow(threadId, cwd, params.sortDirection, cursor);
     if (!window) return { data: [], nextCursor: null, backwardsCursor: null };
-    const { chunk } = window;
-    const records = parseRecords(chunk, window.leadingProbe);
-    const starts = records.flatMap((record, index) => {
+    let records = parseRecords(window.chunk, window.leadingProbe);
+    let starts = records.flatMap((record, index) => {
       const id = claudeTurnIdFromRecord(record.value);
       return id === undefined ? [] : [{ id, recordIndex: index, offset: record.offset }];
     });
+    while (params.sortDirection === "desc" && starts.length === 0 && window.chunk.offset > 0
+      && window.chunk.bytes.length < EXACT_TRANSFER_BYTES) {
+      const remaining = EXACT_TRANSFER_BYTES - window.chunk.bytes.length;
+      const logicalLength = Math.min(
+        CLAUDE_PAGE_WINDOW_BYTES,
+        window.chunk.offset,
+        Math.max(0, remaining - 1),
+      );
+      if (logicalLength === 0) break;
+      const logicalStart: number = window.chunk.offset - logicalLength;
+      const offset: number = logicalStart > 0 ? logicalStart - 1 : 0;
+      const prefix = await this.runner.readTranscriptChunk(threadId, cwd, {
+        offset,
+        length: window.chunk.offset - offset,
+        expected: window.chunk.snapshot,
+      });
+      if (!prefix || prefix.offset !== offset || prefix.offset + prefix.bytes.length !== window.chunk.offset) {
+        throw new AppError("OPERATION_UNCERTAIN", "Claude transcript paging returned a noncontiguous window");
+      }
+      window = {
+        chunk: {
+          snapshot: window.chunk.snapshot,
+          offset,
+          bytes: Buffer.concat([Buffer.from(prefix.bytes), Buffer.from(window.chunk.bytes)]),
+        },
+        leadingProbe: offset > 0,
+      };
+      records = parseRecords(window.chunk, window.leadingProbe);
+      starts = records.flatMap((record, index) => {
+        const id = claudeTurnIdFromRecord(record.value);
+        return id === undefined ? [] : [{ id, recordIndex: index, offset: record.offset }];
+      });
+    }
+    const { chunk } = window;
     if (starts.length === 0) {
       if ((params.sortDirection === "desc" && chunk.offset > 0)
         || (params.sortDirection === "asc" && chunk.offset + chunk.bytes.length < chunk.snapshot.size)) {

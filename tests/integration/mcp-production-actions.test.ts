@@ -90,6 +90,8 @@ test("the exact production MCP map succeeds for every local and remote manager a
   const qiyanHome = join(root, "qiyan-home");
   const dataDir = join(root, "data");
   const assistantWorkdir = join(root, "assistant");
+  const localCodexProjectsRoot = join(root, "local-codex-projects");
+  const localClaudeProjectsRoot = join(root, "local-claude-projects");
   const authTarget = join(dataDir, "assistant-profile", "codex", "auth.json");
   await mkdir(join(dataDir, "assistant-profile", "codex"), { recursive: true, mode: 0o700 });
   await mkdir(qiyanHome, { recursive: true, mode: 0o700 });
@@ -99,8 +101,9 @@ test("the exact production MCP map succeeds for every local and remote manager a
   await writeFile(join(qiyanHome, "endpoints.json"), `${JSON.stringify({
     version: 1,
     endpoints: {
+      local: { provider: "codex", transport: "local", projects_root: localCodexProjectsRoot },
       // The local Claude endpoint is now an endpoints.json entry (was config.claudeCode / env).
-      "claude-local": { provider: "claude", transport: "local" },
+      "claude-local": { provider: "claude", transport: "local", projects_root: localClaudeProjectsRoot },
       "dfw-vscode": { provider: "codex", transport: "ssh", host: "dfw-vscode", projects_root: "~/qiyan-projects" },
       ...(claudeRemoteAlias ? { [claudeRemoteAlias]: { provider: "claude", transport: "ssh", host: claudeRemoteAlias, projects_root: "~/qiyan-projects" } } : {}),
     },
@@ -315,7 +318,11 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const registryAfterCreate = await registryDocument(config.sessionRegistryPath);
     const session = registryAfterCreate.sessions[fixture.nickname];
     assert.ok(session, `${fixture.nickname} was not committed`);
-    assert.match(session.project_dir, new RegExp(`/${fixture.nickname}$`, "u"));
+    if (fixture.endpoint === "local") {
+      assert.equal(session.project_dir, join(localCodexProjectsRoot, fixture.nickname));
+    } else {
+      assert.match(session.project_dir, new RegExp(`/${fixture.nickname}$`, "u"));
+    }
     sessions.set(fixture.nickname, session);
     createdProjects.push({ endpoint: fixture.endpoint, nickname: fixture.nickname, path: session.project_dir });
   }
@@ -500,6 +507,9 @@ test("the exact production MCP map succeeds for every local and remote manager a
     assert.equal(created.nickname, fixture.nickname, `${fixture.endpoint} create`);
     const session = (await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname];
     assert.ok(session, `${fixture.nickname} was not committed`);
+    if (fixture.endpoint === "claude-local") {
+      assert.equal(session.project_dir, join(localClaudeProjectsRoot, fixture.nickname));
+    }
     createdProjects.push({ endpoint: fixture.endpoint, nickname: fixture.nickname, path: session.project_dir });
 
     const managed = await call("list_managed_sessions", {}, fixture.endpoint);

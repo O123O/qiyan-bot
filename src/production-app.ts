@@ -2104,6 +2104,7 @@ export async function buildProductionApp(
   let lifecycle!: SessionLifecycle;
   let threadGate!: ThreadGate;
   let projectWorkspaces!: ProjectWorkspacePolicy;
+  let localWorkspacePolicyOptions!: ConstructorParameters<typeof ProjectWorkspacePolicy>[0];
   let workspaceRouter!: WorkspaceRouter;
   let workerFiles!: WorkerFileBridge;
   let recoveredEndpointIds: string[] = [];
@@ -2317,14 +2318,15 @@ export async function buildProductionApp(
         registryPath = prepared.registryPath;
         dashboardPath = prepared.dashboardPath;
         assistantWarnings = prepared.warnings;
-        projectWorkspaces = new ProjectWorkspacePolicy({
+        localWorkspacePolicyOptions = {
           userHome: prepared.userHome,
           qiyanHome: prepared.qiyanHome,
           assistantWorkdir: prepared.root,
           dataDir: prepared.dataRoot,
           registryPath: prepared.registryPath,
           defaultProjectsRoot: prepared.defaultProjectsRoot,
-        });
+        };
+        projectWorkspaces = new ProjectWorkspacePolicy(localWorkspacePolicyOptions);
         assistantProfile = await prepareAssistantProfile(dataDir);
       },
       stop: async () => undefined,
@@ -2686,12 +2688,30 @@ export async function buildProductionApp(
         // The local Claude endpoint (if any) is an endpoints.json entry with provider:claude,
         // transport:local. At most one is allowed — the wiring below (single builtin, scalar id,
         // one monitor runner) is singular; a second such entry is a loud misconfiguration.
-        const localClaudeDefs = endpointCatalog.definitions().filter((definition) => definition.provider === "claude" && definition.transport === "local");
+        const endpointDefinitions = endpointCatalog.definitions();
+        const localCodexDef = endpointDefinitions.find((definition) => definition.id === "local");
+        const localCodexWorkspaces = localCodexDef
+          ? new ProjectWorkspacePolicy({
+            ...localWorkspacePolicyOptions,
+            defaultProjectsRoot: localCodexDef.projectsRoot.startsWith("~/")
+              ? resolve(localWorkspacePolicyOptions.userHome, localCodexDef.projectsRoot.slice(2))
+              : localCodexDef.projectsRoot,
+          })
+          : projectWorkspaces;
+        const localClaudeDefs = endpointDefinitions.filter((definition) => definition.provider === "claude" && definition.transport === "local");
         if (localClaudeDefs.length > 1) {
           throw new AppError("CONFIGURATION_ERROR", `at most one local Claude endpoint (provider:claude, transport:local) is allowed; found: ${localClaudeDefs.map((definition) => definition.id).join(", ")}`);
         }
         const localClaudeDef = localClaudeDefs[0];
         localClaudeEndpointId = localClaudeDef?.id;
+        const localClaudeWorkspaces = localClaudeDef
+          ? new ProjectWorkspacePolicy({
+            ...localWorkspacePolicyOptions,
+            defaultProjectsRoot: localClaudeDef.projectsRoot.startsWith("~/")
+              ? resolve(localWorkspacePolicyOptions.userHome, localClaudeDef.projectsRoot.slice(2))
+              : localClaudeDef.projectsRoot,
+          })
+          : undefined;
         // Goals + scheduling serve EVERY Claude endpoint (the local one and any remote
         // claude endpoint), keyed by (endpointId, threadId). Construct the stack
         // unconditionally: a remote Claude endpoint is added at runtime by writing
@@ -2988,7 +3008,8 @@ export async function buildProductionApp(
         // bound to a torn-down transport. ensureReady() still gates every lookup onto a ready generation.
         const remotePolicyCache = new Map<string, { context: RemoteContext; policy: ProjectWorkspacePolicy }>();
         workspaceRouter = new WorkspaceRouter(async (id) => {
-          if (isLocalEndpoint(id)) return projectWorkspaces;
+          if (id === "local") return localCodexWorkspaces;
+          if (id === localClaudeDef?.id) return localClaudeWorkspaces!;
           await endpointManager.ensureReady(id);
           const context = remoteContexts.get(id);
           if (!context) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH workspace host is unavailable: ${id}`);

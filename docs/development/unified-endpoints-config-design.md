@@ -25,9 +25,9 @@ Non-goals / decisions (confirmed with the user):
   "please migrate" message, no auto-rewrite). The live `endpoints.json` and the
   test fixtures are rewritten by hand as part of this change. This is *the*
   schema, not "v2".
-- **Built-ins stay implicit.** The default local Codex worker (`local`) and the
-  assistant's own runtime (`assistant-local`) remain reserved built-ins, not
-  entries in `endpoints.json`. "Unified" means all *configurable* endpoints.
+- **Runtimes stay built in.** The default local Codex worker remains the
+  built-in `local` runtime, but an optional exact-id catalog entry configures its
+  project root. The assistant's `assistant-local` runtime remains unconfigurable.
 
 ## The schema
 
@@ -37,9 +37,15 @@ Non-goals / decisions (confirmed with the user):
 {
   "version": 1,                       // format marker only (not a migration anchor)
   "endpoints": {
+    "local": {
+      "provider": "codex",
+      "transport": "local",
+      "projects_root": "~/qiyan-projects"
+    },
     "local-claude": {
       "provider": "claude",           // "codex" | "claude"
       "transport": "local",           // "local" | "ssh"
+      "projects_root": "~/qiyan-projects",
       "model": "opus",                // optional (claude only)
       "effort": "high"                // optional (claude only)
     },
@@ -71,20 +77,20 @@ Non-goals / decisions (confirmed with the user):
 | `effort`       | claude   | no                  | per-endpoint reasoning effort; rejected for codex |
 | `command`      | claude   | no                  | claude binary; default `claude`; rejected for codex |
 
-Map key = endpoint **id** (arbitrary, `^[a-z0-9][a-z0-9_-]{0,63}$`, and not the
-reserved `local`/`assistant-local`). The id is now decoupled from the ssh alias
-(`host`), which was previously the key.
+Map key = endpoint **id** (normally arbitrary,
+`^[a-z0-9][a-z0-9_-]{0,63}$`; `assistant-local` is reserved). The `local` id is
+allowed only for the built-in Codex-local configuration. Other ids remain
+decoupled from the ssh alias (`host`), which was previously the key.
 
 ### Validation (zod, discriminated on `provider`, `.strict()`)
 
-- `provider: "codex"` ⟹ `transport` **must** be `"ssh"` (via `z.literal("ssh")`)
-  with `host` required. A local Codex worker is the built-in `local` endpoint;
-  `codex`+`local` fails the literal with zod's ordinary message (no special
-  "use the built-in" text — consistent with "no special rejection message").
-  `model`/`effort`/`command` are rejected for codex (strict).
-- `provider: "claude"` ⟹ `transport` `local` (no `host`, **no `projects_root`** —
-  local claude uses `projectWorkspaces`, so `projects_root` would be inert;
-  forbid it) or `ssh` (`host` required). `model`/`effort`/`command` allowed.
+- `provider: "codex"` supports `ssh` with a required `host`, or `local` only
+  under the exact `local` id. The local entry configures the existing built-in
+  runtime rather than creating another endpoint. `model`/`effort`/`command` are
+  rejected for codex (strict).
+- `provider: "claude"` ⟹ `transport` `local` (no `host`; `projects_root` selects
+  the local Claude endpoint's default project directory) or `ssh` (`host`
+  required). `model`/`effort`/`command` are allowed.
 - A `.refine` enforces the host↔transport correspondence; `.strict()` rejects
   unknown keys (as today).
 - **At most one** `provider:claude, transport:local` entry (the local Claude
@@ -106,7 +112,7 @@ identity binding is **id**-keyed (see C1). No duplicate-`host` rejection.
 | claude   | local     | local `claude -p` worker (was `.env`) |
 | claude   | ssh       | remote `claude -p` worker (was `type:"claude-code"`) |
 | codex    | ssh       | remote Codex app-server (was `type:"ssh"`) |
-| codex    | local     | **rejected** — that is the built-in `local` |
+| codex    | local     | configures the built-in `local` endpoint (exact id only) |
 
 ## Code changes
 
@@ -116,10 +122,10 @@ identity binding is **id**-keyed (see C1). No duplicate-`host` rejection.
 - `RemoteEndpointDefinition` → carry `provider`, `transport`, optional `host`,
   `projectsRoot`, and claude-only `model`/`effort`/`command`. Keep discriminating
   by provider for the consumer branches.
-- Add a `localClaudeDefinitions()` (or have the catalog expose *all* definitions,
-  including `transport:local`) so production-app can build local Claude builtins
-  from the catalog. `require(id)` still resolves any non-built-in id.
-- Reserved-id rejection unchanged.
+- Expose all definitions, including `transport:local`, so production can build
+  local Claude runtimes and configure the built-in Codex-local workspace.
+- Keep `assistant-local` reserved; validate Codex-local against the exact
+  `local` id.
 
 ### `src/config.ts` / `src/config-source.ts`
 - Delete `CLAUDE_CODE_ENDPOINT_ID`, `CLAUDE_CODE_MODEL`, `CLAUDE_BINARY` env keys,
@@ -171,13 +177,12 @@ identity binding is **id**-keyed (see C1). No duplicate-`host` rejection.
 - **Launch policy**: the single global `claudeLaunchFlags` const becomes
   per-endpoint `claudeLaunchPolicy(entry.model, entry.effort)` (local builtin from
   its entry; remote from `definition`).
-- Guard: a catalog claude id colliding with a reserved built-in already rejected;
-  keep it.
+- Guard: only the reviewed Codex-local configuration may use the `local` id.
 
 ## Tests to update (rewrite fixtures to the new schema)
 
 - `tests/endpoints/catalog.test.ts` — new schema + all validation rules
-  (provider/transport combos, host required/forbidden, codex+local rejected,
+  (provider/transport combos, host required/forbidden, exact-id codex+local,
   model/effort codex-rejected, unknown-key strictness).
 - `tests/config.test.ts` — drop the CLAUDE_CODE_* env expectations; keep the
   `claudeLaunchPolicy` test (extend for effort).

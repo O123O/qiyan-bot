@@ -80,3 +80,15 @@ export function shouldFollowWorkerTail(options: {
 }): boolean {
   return options.pinned && !options.preservePending && options.previousRevision !== options.nextRevision;
 }
+
+export function applyWorkerTailFollow(options: {
+  viewport: { scrollTop: number; readonly scrollHeight: number };
+  pinned: boolean;
+  preservePending: boolean;
+  previousRevision: string;
+  nextRevision: string;
+}): boolean {
+  if (!shouldFollowWorkerTail(options)) return false;
+  options.viewport.scrollTop = options.viewport.scrollHeight;
+  return true;
+}

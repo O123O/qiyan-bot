@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  applyWorkerTailFollow,
   advanceWorkerScrollPreservation,
   nextWorkerHistoryAutoFill,
   releaseWorkerHistoryAutoFill,
@@ -46,6 +47,28 @@ test("a pinned panel follows body growth and auto-prepend but preserves manual p
 
   const goalChanged = workerViewportRevision("worker", [{ id: "a:turn:item", body: "work" }], "active:new goal");
   assert.notEqual(goalChanged, before, "goal-row reflow must update the viewport revision");
+});
+
+test("tail following decides and scrolls atomically before content growth can clear the pin", () => {
+  const viewport = { scrollTop: 120, scrollHeight: 640 };
+  assert.equal(applyWorkerTailFollow({
+    viewport,
+    pinned: true,
+    preservePending: false,
+    previousRevision: "before",
+    nextRevision: "after",
+  }), true);
+  assert.equal(viewport.scrollTop, 640);
+
+  viewport.scrollTop = 120;
+  assert.equal(applyWorkerTailFollow({
+    viewport,
+    pinned: false,
+    preservePending: false,
+    previousRevision: "before",
+    nextRevision: "after",
+  }), false);
+  assert.equal(viewport.scrollTop, 120);
 });
 
 test("a history admission loss releases the consumed cursor without resetting its retry budget", () => {

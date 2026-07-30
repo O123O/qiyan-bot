@@ -59,6 +59,11 @@ Create `~/.qiyan-bot/endpoints.json` as strict JSON with owner-only permissions:
 {
   "version": 1,
   "endpoints": {
+    "local": {
+      "provider": "codex",
+      "transport": "local",
+      "projects_root": "~/qiyan-projects"
+    },
     "devbox": {
       "provider": "codex",
       "transport": "ssh",
@@ -68,6 +73,7 @@ Create `~/.qiyan-bot/endpoints.json` as strict JSON with owner-only permissions:
     "claude-local": {
       "provider": "claude",
       "transport": "local",
+      "projects_root": "~/qiyan-projects",
       "model": "opus"
     },
     "devbox-claude": {
@@ -84,7 +90,7 @@ Create `~/.qiyan-bot/endpoints.json` as strict JSON with owner-only permissions:
 chmod 600 "$HOME/.qiyan-bot/endpoints.json"
 ```
 
-Every configurable endpoint — local or remote, Codex or Claude — is declared here. Each entry has a `provider` (`codex` | `claude`) and a `transport` (`local` | `ssh`), which are independent. `host` is the SSH alias, required for `ssh` and forbidden for `local`; the map key is the endpoint id (decoupled from the alias). `projects_root` is optional (default `~/qiyan-projects`), forbidden for `local`. Claude entries may pin `model` and `effort`. Codex runs only over `ssh` (a local Codex worker is the built-in `local` endpoint). At most one `claude`/`local` endpoint is allowed. Remote (`ssh`) endpoints are read on demand — edits take effect without a restart; **local endpoint changes require a restart**. A malformed file is rejected with its field path.
+Every configurable endpoint — local or remote, Codex or Claude — is declared here. Each entry has a `provider` (`codex` | `claude`) and a `transport` (`local` | `ssh`), which are independent. `host` is the SSH alias, required for `ssh` and forbidden for `local`; the map key is the endpoint id (decoupled from the alias). `projects_root` is optional for both transports (default `~/qiyan-projects`). The optional `local` entry configures the built-in local Codex endpoint; no other id may use `provider:"codex", transport:"local"`. Claude entries may pin `model` and `effort`, and at most one may use `transport:"local"`. Remote (`ssh`) endpoints are read on demand — edits take effect without a restart; **local endpoint changes require a restart**. A malformed file is rejected with its field path.
 
 You can then ask QiYan to create or adopt a session on `devbox`, inspect its models, disconnect it, or restart it. `disconnect_endpoint` and `restart_endpoint` default to local when no endpoint is supplied. Disconnect/restart refuses active or unprovable managed threads.
 

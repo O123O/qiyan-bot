@@ -15,12 +15,12 @@ import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSu
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
 import {
+  applyWorkerTailFollow,
   advanceWorkerScrollPreservation,
   nextWorkerHistoryAutoFill,
   releaseWorkerHistoryAutoFill,
   sameWorkerSubscriptionTarget,
   settleWorkerScrollPreservation,
-  shouldFollowWorkerTail,
   workerViewportRevision,
   type WorkerHistoryAutoFillState,
   type WorkerScrollPreservation,
@@ -216,7 +216,6 @@ export function App() {
   const reconciliationRetryRef = useRef<{ subscriptionId: string; attempt: number; timer: number } | null>(null);
   const workerHistoryAutoFillsRef = useRef(new Map<string, WorkerHistoryAutoFillState>());
   const workerTailRevisionRef = useRef("");
-  const workerTailScrollFrameRef = useRef<number | null>(null);
   const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
   const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
   const clearRecoveryRetries = useCallback(() => {
@@ -448,9 +447,6 @@ export function App() {
   useEffect(() => () => clearRecoveryRetries(), [clearRecoveryRetries]);
   useEffect(() => () => assistantHistoryAbortRef.current?.abort(), []);
   useEffect(() => () => workerHistoryAbortRef.current?.abort(), []);
-  useEffect(() => () => {
-    if (workerTailScrollFrameRef.current !== null) window.cancelAnimationFrame(workerTailScrollFrameRef.current);
-  }, []);
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
   useEffect(() => { // WebSocket live updates
@@ -555,21 +551,17 @@ export function App() {
     const preservation = preserveRef.current;
     const preservePending = preservation !== null;
     if (preservePending) {
-      if (workerTailScrollFrameRef.current !== null) {
-        window.cancelAnimationFrame(workerTailScrollFrameRef.current);
-        workerTailScrollFrameRef.current = null;
-      }
       const advanced = advanceWorkerScrollPreservation(preservation, el.scrollHeight);
       el.scrollTop += advanced.scrollDelta;
       preserveRef.current = advanced.state;
     }
-    else if (shouldFollowWorkerTail({ pinned: stickRef.current, preservePending, previousRevision, nextRevision: tailRevision })
-      && workerTailScrollFrameRef.current === null) {
-      workerTailScrollFrameRef.current = window.requestAnimationFrame(() => {
-        workerTailScrollFrameRef.current = null;
-        if (stickRef.current) el.scrollTop = el.scrollHeight;
-      });
-    }
+    else applyWorkerTailFollow({
+      viewport: el,
+      pinned: stickRef.current,
+      preservePending,
+      previousRevision,
+      nextRevision: tailRevision,
+    });
     workerTailRevisionRef.current = tailRevision;
   }, [rendered.length, tailRevision, selected, loadingOlder, goal?.objective, goal?.status]);
 

@@ -23,24 +23,27 @@ test("bootstraps a private empty endpoint catalog", async (t) => {
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { version: 1, endpoints: {} });
 });
 
-test("resolves a codex/ssh endpoint (host explicit), defaults the projects root, rejects built-ins", async (t) => {
+test("resolves the built-in codex/local configuration and a codex/ssh endpoint", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
-  await writeFile(path, JSON.stringify({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "devbox-alias" } } }), { mode: 0o600 });
+  await writeFile(path, JSON.stringify({ version: 1, endpoints: {
+    local: { provider: "codex", transport: "local", projects_root: "/local-work" },
+    devbox: { provider: "codex", transport: "ssh", host: "devbox-alias" },
+  } }), { mode: 0o600 });
   const catalog = await EndpointCatalog.open(path);
+  assert.deepEqual(catalog.require("local"), { id: "local", provider: "codex", transport: "local", projectsRoot: "/local-work" });
   assert.deepEqual(catalog.require("devbox"), { id: "devbox", provider: "codex", transport: "ssh", host: "devbox-alias", projectsRoot: "~/qiyan-projects" });
-  assert.throws(() => catalog.require("local"), /built-in endpoint/u);
 });
 
 test("resolves claude endpoints — local (no host) and ssh (host + model/effort); definitions() lists all", async (t) => {
   const root = await privateTemp(t);
   const path = join(root, "endpoints.json");
   await writeFile(path, JSON.stringify({ version: 1, endpoints: {
-    "claude-local": { provider: "claude", transport: "local", model: "opus" },
+    "claude-local": { provider: "claude", transport: "local", projects_root: "/local-work", model: "opus" },
     "dfw": { provider: "claude", transport: "ssh", host: "dfw-alias", projects_root: "/work", model: "sonnet", effort: "high" },
   } }), { mode: 0o600 });
   const catalog = await EndpointCatalog.open(path);
-  assert.deepEqual(catalog.require("claude-local"), { id: "claude-local", provider: "claude", transport: "local", projectsRoot: "~/qiyan-projects", model: "opus" });
+  assert.deepEqual(catalog.require("claude-local"), { id: "claude-local", provider: "claude", transport: "local", projectsRoot: "/local-work", model: "opus" });
   assert.deepEqual(catalog.require("dfw"), { id: "dfw", provider: "claude", transport: "ssh", host: "dfw-alias", projectsRoot: "/work", model: "sonnet", effort: "high" });
   assert.deepEqual(catalog.definitions().map((d) => `${d.id}:${d.provider}:${d.transport}`).sort(), ["claude-local:claude:local", "dfw:claude:ssh"]);
 });
@@ -55,14 +58,15 @@ test("rejects unknown fields, bad provider/transport combos, unsafe roots, reser
   };
   await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", extra: true } } }, /extra/u);
   await invalid({ version: 1, endpoints: { devbox: { provider: "docker", transport: "ssh", host: "h" } } }, /devbox/u);
-  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "local" } } }, /devbox/u); // codex is ssh-only
+  await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "local" } } }, /devbox/u); // only the built-in local id may use codex/local
   await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh" } } }, /devbox/u); // codex requires host
   await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", model: "opus" } } }, /model/u); // model is claude-only
   await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "ssh" } } }, /host/u); // ssh requires host
   await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "local", host: "h" } } }, /host/u); // local forbids host
-  await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "local", projects_root: "/w" } } }, /projects_root/u); // local forbids projects_root
+  await invalid({ version: 1, endpoints: { devbox: { provider: "claude", transport: "local", projects_root: "relative" } } }, /projects_root/u);
   await invalid({ version: 1, endpoints: { devbox: { provider: "codex", transport: "ssh", host: "h", projects_root: "relative" } } }, /projects_root/u);
-  await invalid({ version: 1, endpoints: { local: { provider: "claude", transport: "local" } } }, /local/u); // reserved id
+  await invalid({ version: 1, endpoints: { local: { provider: "claude", transport: "local" } } }, /local/u);
+  await invalid({ version: 1, endpoints: { "assistant-local": { provider: "codex", transport: "local" } } }, /assistant-local/u); // assistant endpoint remains unconfigurable
   await rm(path, { force: true });
   await writeFile(path, JSON.stringify({ version: 1, endpoints: {} }), { mode: 0o644 });
   await assert.rejects(EndpointCatalog.open(path), /mode 0600/u);

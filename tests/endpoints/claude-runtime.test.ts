@@ -526,6 +526,41 @@ test("descending Claude paging preserves a turn exactly aligned with the prior w
   assert.deepEqual(prior.data.map((turn) => turn.id), ["older"]);
 });
 
+test("descending Claude paging finds a latest turn boundary beyond one transcript window", async () => {
+  const runner = new FakeRunner();
+  const threadId = "large-latest-turn";
+  const cwd = "/w";
+  runner.seed(threadId, [
+    { type: "user", cwd, promptSource: "sdk", promptId: "older", uuid: "older-user", message: { role: "user", content: "older" } },
+    { type: "assistant", cwd, uuid: "older-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "older reply" }] } },
+    { type: "user", cwd, promptSource: "sdk", promptId: "latest", uuid: "latest-user", message: { role: "user", content: "latest" } },
+    ...Array.from({ length: 4 }, (_, index) => ({ type: "progress", uuid: `progress-${index}`, padding: "x".repeat(80 * 1024) })),
+    { type: "assistant", cwd, uuid: "latest-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "latest reply" }] } },
+  ]);
+
+  const history = new ClaudeTranscriptHistory(runner);
+  const latest = await history.turnsPage(threadId, cwd, {
+    limit: 1,
+    sortDirection: "desc",
+    itemsView: "summary",
+  });
+
+  assert.deepEqual(latest.data.map((turn) => ({
+    id: turn.id,
+    items: turn.items.map((item) => item.type),
+  })), [{ id: "latest", items: ["userMessage", "agentMessage"] }]);
+  assert.equal(typeof latest.nextCursor, "string");
+  const older = await history.turnsPage(threadId, cwd, {
+    cursor: latest.nextCursor!,
+    limit: 1,
+    sortDirection: "desc",
+    itemsView: "summary",
+  });
+  assert.deepEqual(older.data.map((turn) => turn.id), ["older"]);
+  assert.equal(older.nextCursor, null);
+  assert.equal(runner.transcriptReadCount, 3);
+});
+
 test("bounded exact-turn reconstruction keeps agent item IDs stable when the tail window shifts", async () => {
   const runner = new FakeRunner();
   const threadId = "stable-item-ids";

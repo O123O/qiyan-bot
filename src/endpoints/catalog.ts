@@ -5,30 +5,36 @@ import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 
 const MAX_CATALOG_BYTES = 1024 * 1024;
-const endpointId = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).refine((value) => value !== "local" && value !== "assistant-local", "reserved endpoint id");
+const endpointId = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/u).refine((value) => value !== "assistant-local", "reserved endpoint id");
 const projectRoot = z.string().refine((value) => value.startsWith("~/") || isAbsolute(value), "must be absolute or begin with ~/");
 const sshAlias = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u, "invalid ssh host alias");
-// An endpoint has an orthogonal PROVIDER (codex | claude) and TRANSPORT (local | ssh). Codex only
-// runs remotely — a local Codex worker is the built-in `local` endpoint — so codex is ssh-only.
+// An endpoint has an orthogonal PROVIDER (codex | claude) and TRANSPORT (local | ssh). Codex/local
+// configures the built-in `local` endpoint and is therefore valid only under that exact id.
 // A claude worker runs either locally (`claude -p` on QiYan's host) or over ssh. `host` is the ssh
 // alias (required for ssh, forbidden for local). model/effort/command are claude-only per-endpoint.
 const entry = z.discriminatedUnion("provider", [
-  z.object({ provider: z.literal("codex"), transport: z.literal("ssh"), host: sshAlias, projects_root: projectRoot.optional() }).strict(),
+  z.object({
+    provider: z.literal("codex"), transport: z.enum(["local", "ssh"]),
+    host: sshAlias.optional(), projects_root: projectRoot.optional(),
+  }).strict(),
   z.object({
     provider: z.literal("claude"), transport: z.enum(["local", "ssh"]),
     host: sshAlias.optional(), projects_root: projectRoot.optional(),
     command: z.string().min(1).optional(), model: z.string().min(1).optional(), effort: z.string().min(1).optional(),
   }).strict(),
 ]).superRefine((value, ctx) => {
-  if (value.provider !== "claude") return;
   if ((value.transport === "ssh") !== (value.host !== undefined)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host is required for ssh transport and forbidden for local", path: ["host"] });
   }
-  if (value.transport === "local" && value.projects_root !== undefined) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "projects_root is not allowed for a local endpoint", path: ["projects_root"] });
+});
+const documentSchema = z.object({ version: z.literal(1), endpoints: z.record(endpointId, entry) }).strict().superRefine((value, ctx) => {
+  for (const [id, definition] of Object.entries(value.endpoints)) {
+    const builtInCodexLocal = definition.provider === "codex" && definition.transport === "local";
+    if ((id === "local") !== builtInCodexLocal) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "codex/local config is allowed only for the built-in local endpoint", path: ["endpoints", id] });
+    }
   }
 });
-const documentSchema = z.object({ version: z.literal(1), endpoints: z.record(endpointId, entry) }).strict();
 
 export type EndpointProvider = "codex" | "claude";
 export type EndpointTransport = "local" | "ssh";
@@ -54,7 +60,12 @@ export interface EndpointCatalogDocument {
 
 function resolve(id: string, value: RawEntry): EndpointDefinition {
   const projectsRoot = value.projects_root ?? "~/qiyan-projects";
-  if (value.provider === "codex") return { id, provider: "codex", transport: "ssh", host: value.host, projectsRoot };
+  if (value.provider === "codex") {
+    return {
+      id, provider: "codex", transport: value.transport, projectsRoot,
+      ...(value.host === undefined ? {} : { host: value.host }),
+    };
+  }
   return {
     id, provider: "claude", transport: value.transport, projectsRoot,
     ...(value.host === undefined ? {} : { host: value.host }),
@@ -81,14 +92,14 @@ export class EndpointCatalog {
   snapshot(): EndpointCatalogDocument { return structuredClone(this.document); }
 
   require(id: string): EndpointDefinition {
-    if (id === "local" || id === "assistant-local") throw new AppError("CONFIGURATION_ERROR", `${id} is a built-in endpoint`);
+    if (id === "assistant-local") throw new AppError("CONFIGURATION_ERROR", `${id} is a built-in endpoint`);
     const value = this.document.endpoints[id];
     if (!value) throw new AppError("ENDPOINT_UNAVAILABLE", `unknown endpoint: ${id}`);
     return resolve(id, value);
   }
 
-  // All configured endpoints, resolved. Used at startup to build local Claude builtins
-  // (transport:"local") and to look up an endpoint's provider.
+  // All configured endpoints, resolved. Used at startup for local endpoint configuration
+  // (Codex workspace and Claude runtime) and to look up an endpoint's provider.
   definitions(): EndpointDefinition[] {
     return Object.entries(this.document.endpoints).map(([id, value]) => resolve(id, value));
   }
