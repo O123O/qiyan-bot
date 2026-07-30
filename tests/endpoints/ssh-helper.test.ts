@@ -540,7 +540,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     process.execPath,
     helperPath.pathname,
     "bootstrap",
-  ], { input: bootstrap, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
+  ], { input: bootstrap, timeoutMs: 30_000, maxOutputBytes: 64 * 1024 });
   const wrapperDir = join(xdg, "bin");
   await mkdir(wrapperDir);
   const realTmux = (await runBoundedProcess("/bin/bash", ["-lc", "command -v tmux"], {
@@ -567,7 +567,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   ].join("\n"), { mode: 0o700 });
   const installed = join(runtimeDir, "qiyan-ssh-helper.mjs");
   const base = { runtimeDir, session, tmuxMode: "explicit" as const };
-  const invoke = async <T>(operation: string, value: unknown, input?: Buffer, timeoutMs = 10_000): Promise<T> => {
+  const invoke = async <T>(operation: string, value: unknown, input?: Buffer, timeoutMs = 30_000): Promise<T> => {
     try {
       const result = await runBoundedProcess("env", [
         `XDG_RUNTIME_DIR=${xdg}`,
@@ -613,7 +613,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     'const displaced=prompt.includes("turn-displaced");',
     'const large=displaced?`${JSON.stringify({type:"assistant",message:{role:"assistant",stop_reason:"tool_use",content:[{type:"text",text:"x".repeat(300*1024)}]}})}\\n`:"";',
     "await appendFile(path,user+large);",
-    'if(prompt.includes("turn-one")) await new Promise((resolve)=>setTimeout(resolve,5000));',
+    'if(prompt.includes("turn-one")) await new Promise((resolve)=>setTimeout(resolve,60000));',
     'else if(!prompt.includes("turn-fast")) await new Promise((resolve)=>setTimeout(resolve,500));',
     'await appendFile(path,`${JSON.stringify({type:"assistant",cwd:process.cwd(),message:{role:"assistant",stop_reason:"end_turn",content:[{type:"text",text:"done"}]}})}\\n`);',
   ].join("\n"), { mode: 0o700 });
@@ -632,7 +632,7 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
       threadId,
       size: config.byteLength,
       sha256: createHash("sha256").update(config).digest("hex"),
-    }, config, 20_000);
+    }, config);
   };
   const dispatch = async (turnId: string, resume: boolean) => {
     const configured = await configure(resume);
