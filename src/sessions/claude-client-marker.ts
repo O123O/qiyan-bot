@@ -19,6 +19,11 @@ export function extractClaudeClientMarker(message: unknown): string | undefined 
   return clientMarkerPattern.exec(messageText(message))?.[1];
 }
 
+export function isClaudeInternalTaskNotification(message: unknown): boolean {
+  const text = messageText(message).trim();
+  return text.startsWith("<task-notification>") && text.endsWith("</task-notification>");
+}
+
 export function visibleClaudeUserText(message: unknown): string {
   return messageText(message).replace(clientMarkerPattern, "").trim();
 }

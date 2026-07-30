@@ -13,7 +13,11 @@
 // a `user` row with non-empty `promptSource`; a null-`promptSource` user row is a
 // tool_result (mid-turn); a turn ends on an assistant row whose `stop_reason` is a
 // concrete value other than `tool_use`.
-import { extractClaudeClientMarker, visibleClaudeUserText } from "./claude-client-marker.ts";
+import {
+  extractClaudeClientMarker,
+  isClaudeInternalTaskNotification,
+  visibleClaudeUserText,
+} from "./claude-client-marker.ts";
 
 export type ClaudeTurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 export type ClaudeMessagePhase = "final_answer" | "commentary";
@@ -173,6 +177,7 @@ export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const record = raw as Record<string, unknown>;
   if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) return undefined;
+  if (isClaudeInternalTaskNotification(record.message)) return undefined;
   const promptId = turnIdOf(record);
   if (!promptId) return undefined;
   return extractClaudeClientMarker(record.message) ?? promptId;

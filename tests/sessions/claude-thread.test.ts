@@ -34,6 +34,24 @@ test("a tool-use turn is one completed turn with a delivered final_answer", () =
   assert.equal(finalAnswers(v).length >= 1, true);
 });
 
+test("a native subagent task notification remains internal to its parent turn", () => {
+  const recs = [
+    { type: "user", promptSource: "sdk", promptId: "p1", uuid: "u1", message: { role: "user", content: "delegate this" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "delegating" }] } },
+    {
+      type: "user", promptSource: "sdk", promptId: "subagent-result", uuid: "notification",
+      message: { role: "user", content: "<task-notification><task-id>agent-1</task-id><summary>done</summary></task-notification>" },
+    },
+    { type: "assistant", uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "parent result" }] } },
+  ];
+
+  const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
+  assert.equal(v.turns.length, 1);
+  assert.equal(v.turns[0]?.id, "p1");
+  assert.equal(v.turns[0]?.items.filter((item) => item.type === "userMessage").length, 1);
+  assert.equal(v.turns[0]?.items.find((item) => item.phase === "final_answer")?.text, "parent result");
+});
+
 test("a cold incomplete transcript is interrupted because no tracked Claude child is running", () => {
   const v = view("interrupted");
   assert.equal(v.turns.length, 1);
