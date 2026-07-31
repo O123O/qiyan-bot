@@ -113,8 +113,11 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   assert.doesNotMatch(policy, /User: Work on \/projects\/payments|Continue my existing Codex work|What is the status of payments|Monitor payments until tests pass/iu);
   assert.doesNotMatch(policy, /qiyan-bot:(?:managed|user)/u);
   // Budget raised from 7_000 to accommodate the permanent endpoint-provider model
-  // (codex/claude + the remote ssh/claude-code catalog types); the doc stays concise.
-  assert.ok(Buffer.byteLength(policy, "utf8") < 7_800, "assistant policy exceeded the concise prompt budget");
+  // (codex/claude + the remote ssh/claude-code catalog types), then to 8_100 for the one
+  // fact a Claude worker cannot be supervised without: its goal and background work are
+  // native and unobservable, so the absence of both is not evidence of an idle or finished
+  // worker. Paid for by consolidating it into a single line; the doc stays concise.
+  assert.ok(Buffer.byteLength(policy, "utf8") < 8_100, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 3, sessions: {} });

@@ -20,11 +20,11 @@ QiYan keeps the assistant and project workers distinct. The assistant has its ow
 
 ## Codex and Claude Code workers
 
-A worker can run either coding agent, chosen per endpoint. Codex workers run `codex app-server`; Claude workers run headless `claude -p`. Both are managed through the same lifecycle, nickname, and chat tools — create, adopt, send, steer, collect, unadopt, archive — so you pick a provider without learning a second workflow.
+A worker can run either coding agent, chosen per endpoint. Codex workers run `codex app-server`; Claude workers run `qiyan-claude-host`, a persistent supervisor around the Claude Agent SDK that holds one long-lived Claude Code session per worker. Both are managed through the same lifecycle, nickname, and chat tools — create, adopt, send, steer, collect, unadopt, archive — so you pick a provider without learning a second workflow.
 
-Endpoints are declared in `<QIYAN_HOME>/endpoints.json`, each with a `provider` (`codex` or `claude`) and a `transport` (`local` or `ssh`); Claude entries may pin a `model` and `effort`. Remote Claude runs each one-shot `claude -p` turn inside a persistent per-endpoint tmux runtime, so an SSH or QiYan service reconnect does not terminate the worker. See the [worker endpoints guide](docs/ssh-workers.md) for the format.
+Endpoints are declared in `<QIYAN_HOME>/endpoints.json`, each with a `provider` (`codex` or `claude`) and a `transport` (`local` or `ssh`); Claude entries may pin a `model` and `effort`. Remote Claude runs `qiyan-claude-host` inside a persistent per-endpoint tmux runtime and reaches it over an SSH-forwarded Unix socket, so neither an SSH drop nor a QiYan restart terminates a running turn. See the [worker endpoints guide](docs/ssh-workers.md) for the format.
 
-Claude has no built-in goal or scheduling engine, so QiYan supplies them: it drives a Claude worker toward a set goal turn by turn until the worker marks it complete or blocked, and gives the worker MCP tools to schedule its own wakeups, recurring runs, and condition monitors (locally, or over an SSH reverse tunnel for a remote worker). Because `claude -p` runs one turn at a time, a mid-turn "steer" is delivered as the worker's next turn rather than interrupting the running one, and archiving a Claude session tombstones it in QiYan while leaving its transcript on disk.
+A Claude worker is an ordinary Claude Code session, so it keeps its own scheduling, background tasks, subagents, and `/goal` loop, and QiYan supplies no substitutes. Setting a goal from chat installs Claude's native goal and cancelling clears it; native goal state is not exposed while it runs, so QiYan reports the objective rather than live progress, and `pause_goal`/`resume_goal` have no native equivalent. A mid-turn "steer" is handed to the session's own input queue — the same queue the Claude Code CLI uses when you type while it is working — so it runs after the current turn without interrupting it. Background tasks and subagents a worker starts for itself are shown as a live count beside the Web UI composer; their results arrive as ordinary end-of-turn messages. Archiving a Claude session tombstones it in QiYan while leaving its transcript on disk.
 
 ## Security model
 
@@ -43,8 +43,8 @@ Read this before installing or launching:
 - Linux
 - Node.js 24 or newer
 - `codex-cli 0.144.4` or newer (the assistant and Codex workers)
-- The Claude Code CLI (`claude`) — only if you configure Claude workers
-- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+, tmux, and, per endpoint provider, either Codex 0.144.4+ or the `claude` CLI, plus its own authenticated CLI profile
+- The Claude Code CLI (`claude`) 2.1.220+ **and** the Claude Agent SDK (`npm i -g @anthropic-ai/claude-agent-sdk`) — only if you configure Claude workers. Both are deployment prerequisites rather than bundled dependencies: the SDK resolves a large platform-specific binary from its own package, which no bundler can inline. A Claude endpoint fails closed with an actionable message when either is missing or too old.
+- For remote workers: OpenSSH client; the remote Linux host needs Node.js 24+, tmux, and, per endpoint provider, either Codex 0.144.4+ or the `claude` CLI 2.1.220+ together with the Claude Agent SDK, plus its own authenticated CLI profile
 - At least one chat adapter: Telegram owner credentials, Slack owner/workspace credentials, a managed personal WeChat login, or any combination
 
 ## Install
@@ -132,7 +132,7 @@ For sustained coding or project work, QiYan creates or resumes a worker session.
 
 QiYan's own replies have no label prefix. Every eligible worker final is automatically delivered as `[nickname] …`, and backend warnings use `[system]`. Only completion metadata for turns QiYan started through `send_to_session` wakes the assistant; direct `/to`, Web UI, and external worker turns do not. The assistant reads the full worker body only when needed. `session-status.json`, `assistant-context.json`, and the registry are generated, read-only state; do not edit them.
 
-QiYan has one active QiYan conversation globally. A follow-up from the same conversation, including attachments, is appended to the active turn via steer — native `turn/steer` for a Codex worker; a Claude worker, which runs one turn at a time, receives it as its next turn. Messages from another conversation wait in durable FIFO order, and every blocked message immediately receives exactly `[system] queued`. The active turn is never interrupted merely to switch conversations.
+QiYan has one active QiYan conversation globally. A follow-up from the same conversation, including attachments, is appended to the active turn via steer — native `turn/steer` for a Codex worker; for a Claude worker it enters the session's own input queue and runs after the current turn. Messages from another conversation wait in durable FIFO order, and every blocked message immediately receives exactly `[system] queued`. The active turn is never interrupted merely to switch conversations.
 
 The backend remembers which adapter and conversation owns the turn and routes replies there automatically. QiYan itself never chooses a chat platform or destination, and output is not broadcast to every configured adapter. `/pass` and `/collect` are ordinary messages that use the same start, `turn/steer`, queue, and recovery paths as any other input; their only special behavior is a backend exactness safeguard when the corresponding worker tool is called.
 
