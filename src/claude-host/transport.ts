@@ -2,9 +2,10 @@
 // JSON, plus a client that satisfies the same ClaudeHost interface.
 //
 // Dispatch is mechanical — one wire request per interface method — so the protocol cannot
-// drift from the interface. All session behaviour lives in ClaudeHostSession on the
-// server side; the client adds only transport concerns: request correlation, event
-// fan-out, reconnect, and cursor-based replay of the events missed while disconnected.
+// drift from the interface. All session behaviour lives in ClaudeHostSession on the server
+// side; the client adds only transport concerns: request correlation, event fan-out, and
+// lazy re-dialling. Nothing is replayed after a reconnect — events are live-only, and what
+// a client missed it reloads from the durable transcript.
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -168,11 +169,7 @@ export class RemoteClaudeHost implements ClaudeHost {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Set<(event: HostEvent) => void>();
-  private readonly reconnectListeners = new Set<(sessionId: string) => void>();
-  // Sessions this client opened, so a reconnect can tell each one to reload.
-  private readonly openSessions = new Set<string>();
   private closed = false;
-  private connectedOnce = false;
 
   // `openChannel` is the only transport-specific part: unixSocketChannel for a local
   // host, an SSH-bridged stream for a remote one.
@@ -182,13 +179,10 @@ export class RemoteClaudeHost implements ClaudeHost {
   ) {}
 
   async open(request: OpenSessionRequest): Promise<SessionStatus> {
-    const status = await this.call<SessionStatus>({ method: "open", params: [request] });
-    this.openSessions.add(request.sessionId);
-    return status;
+    return await this.call<SessionStatus>({ method: "open", params: [request] });
   }
 
   async close(sessionId: string): Promise<void> {
-    this.openSessions.delete(sessionId);
     await this.call<void>({ method: "close", params: [sessionId] });
   }
 
@@ -233,14 +227,6 @@ export class RemoteClaudeHost implements ClaudeHost {
     return () => { this.listeners.delete(listener); };
   }
 
-  // Fires per open session after the connection is re-established. Events are live-only,
-  // so anything emitted while disconnected was missed: the consumer reloads the tail of
-  // the durable transcript rather than the host replaying a buffer.
-  onReconnect(listener: (sessionId: string) => void): () => void {
-    this.reconnectListeners.add(listener);
-    return () => { this.reconnectListeners.delete(listener); };
-  }
-
   async shutdown(): Promise<void> {
     this.closed = true;
     const channel = this.channel;
@@ -250,11 +236,25 @@ export class RemoteClaudeHost implements ClaudeHost {
     }
     this.pending.clear();
     channel?.close();
+    // A dial still in flight is in neither map, so nothing above reaches it. Wait for it:
+    // `dial` sees `closed` and closes whatever it opened, which is the only way the ssh
+    // child it wraps stops keeping the event loop referenced.
+    await this.connecting?.catch(() => undefined);
   }
+
+  // The endpoint runtime that owns this client is started again in place after being
+  // stopped — the manager hands the same object back — so being shut down has to be
+  // reversible, or activation fails against a perfectly healthy host. Nothing is carried
+  // over: the next call dials fresh.
+  reopen(): void { this.closed = false; }
 
   private async call<T>(request: HostRequest): Promise<T> {
     if (this.closed) throw new AppError("ENDPOINT_UNAVAILABLE", "claude host client is closed");
     const channel = await this.ensureConnected();
+    // Connecting suspends, and a shutdown that lands in that window saw neither this
+    // request nor the channel it was waiting for. Re-check rather than writing into a
+    // stream the client has already given up on.
+    if (this.closed) throw new AppError("ENDPOINT_UNAVAILABLE", "claude host client is closed");
     const id = this.nextId++;
     return await new Promise<T>((resolve, reject) => {
       // A peer that is alive but not answering — a wedged host process, a stalled NFS read
@@ -290,6 +290,13 @@ export class RemoteClaudeHost implements ClaudeHost {
 
   private async dial(): Promise<HostChannel> {
     const channel = await this.openChannel();
+    if (this.closed) {
+      // shutdown() ran while this dial was in flight; it could not close a channel that did
+      // not exist yet. Close it here, or the ssh child behind it keeps its stdio handles —
+      // and the whole process — alive after a graceful stop.
+      channel.close();
+      throw new AppError("ENDPOINT_UNAVAILABLE", "claude host client is closed");
+    }
     channel.output.setEncoding("utf8");
     let buffer = "";
     channel.output.on("data", (chunk: string) => {
@@ -311,13 +318,6 @@ export class RemoteClaudeHost implements ClaudeHost {
     channel.output.on("error", fail);
     channel.output.on("end", fail);
     this.channel = channel;
-    // A first connection has nothing to reload; only a genuine reconnect does.
-    if (this.connectedOnce) {
-      for (const sessionId of this.openSessions) {
-        for (const listener of this.reconnectListeners) listener(sessionId);
-      }
-    }
-    this.connectedOnce = true;
     return channel;
   }
 

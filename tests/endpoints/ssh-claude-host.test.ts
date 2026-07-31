@@ -237,6 +237,25 @@ test("an absent host after a dropped channel is reported as runtime loss", async
   assert.deepEqual(losses, ["runtime-lost"]);
 });
 
+// The manager stops and starts an endpoint runtime in place (restart, disconnect+connect,
+// and every recovery path that reuses the published record). Shutting the client down must
+// therefore be reversible, or activation fails against a host that is running and healthy —
+// after ensureStarted has already launched or adopted one on the worker's machine.
+test("a stopped runtime starts again in place and reaches the surviving host", async (t) => {
+  const { runtime, invocations, live } = await harness(t);
+  await runtime.start();
+  await runtime.host.open({ sessionId: "thread-1", mode: "create", cwd: "/work" });
+
+  await runtime.closeConnection();
+  assert.equal(live.status, "healthy", "the worker's host outlives this client");
+
+  await runtime.start();
+  assert.equal((await runtime.host.status("thread-1")).sessionId, "thread-1",
+    "the session that survived on the worker is reachable again");
+  assert.equal(invocations.filter((item) => item.operation === "start-claude-host").length, 1,
+    "the healthy host is adopted, not relaunched");
+});
+
 test("closing the connection leaves the remote host running; shutdown stops it by identity", async (t) => {
   const { runtime, invocations, live } = await harness(t);
   await runtime.start();

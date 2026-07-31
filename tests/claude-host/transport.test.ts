@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtemp, stat } from "node:fs/promises";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { LocalClaudeHost, type OpenSessionRequest } from "../../src/claude-host/host.ts";
-import { ClaudeHostServer, RemoteClaudeHost, unixSocketChannel } from "../../src/claude-host/transport.ts";
+import { ClaudeHostServer, RemoteClaudeHost, unixSocketChannel, type HostChannel } from "../../src/claude-host/transport.ts";
 import { decodeFrames, encodeFrame, type HostEvent } from "../../src/claude-host/protocol.ts";
 import type { SessionInput, SessionQuery } from "../../src/claude-host/session.ts";
 
@@ -172,30 +173,6 @@ test("the host keeps working while the client is disconnected", async (t) => {
   assert.equal((await client.status("s1")).activity, "idle");
 });
 
-// Events are live-only, so anything emitted while disconnected was missed. The client
-// says so once per session and the consumer reloads the transcript tail.
-test("a reconnect tells each open session to reload", async (t) => {
-  const { client, restart } = await harness(t);
-  await client.open(request("s1"));
-  await client.open(request("s2"));
-  const reloads: string[] = [];
-  client.onReconnect((sessionId) => reloads.push(sessionId));
-
-  await restart();
-  await client.status("s1");                            // any call redials
-  await delay(40);
-  assert.deepEqual(reloads.sort(), ["s1", "s2"]);
-});
-
-test("the first connection asks for no reload", async (t) => {
-  const { client } = await harness(t);
-  const reloads: string[] = [];
-  client.onReconnect((sessionId) => reloads.push(sessionId));
-  await client.open(request("s1"));
-  await delay(20);
-  assert.deepEqual(reloads, [], "there is nothing to catch up on a fresh connection");
-});
-
 test("in-flight requests fail loudly when the connection drops", async (t) => {
   // A host whose call never returns, so the request is provably still in flight when the
   // connection drops — otherwise the assertion races the response.
@@ -259,6 +236,47 @@ test("a shut-down client refuses further calls instead of reconnecting", async (
   await client.open(request("s1"));
   await client.shutdown();
   await assert.rejects(client.status("s1"), /client is closed/u);
+});
+
+// The endpoint runtime that owns this client is stopped and started again in place, so
+// being shut down must be reversible — otherwise activation fails deterministically
+// against a host that is running and healthy.
+test("a reopened client dials again instead of staying latched shut", async (t) => {
+  const { client } = await harness(t);
+  await client.open(request("s1"));
+  await client.shutdown();
+  await assert.rejects(client.status("s1"), /client is closed/u);
+
+  client.reopen();
+  assert.equal((await client.status("s1")).sessionId, "s1", "the surviving session is reachable again");
+});
+
+// shutdown() cannot cancel a dial that has not produced a channel yet: the request is in
+// neither map. Without a hand-off the caller waits forever and the ssh child the channel
+// wraps keeps the process alive.
+test("shutting down during a dial fails the caller and closes the channel that arrives", async (t) => {
+  const { socketPath } = await harness(t);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const opened: HostChannel[] = [];
+  const open = unixSocketChannel(socketPath);
+  const client = new RemoteClaudeHost(async () => {
+    await gate;
+    const channel = await open();
+    opened.push(channel);
+    return channel;
+  });
+  t.after(() => client.shutdown());
+
+  const inflight = client.status("s1");
+  await delay(10);
+  const stopped = client.shutdown();
+  release();
+
+  await assert.rejects(inflight, /client is closed/u);
+  await stopped;
+  assert.equal(opened.length, 1);
+  assert.equal((opened[0]!.input as Socket).destroyed, true, "the late channel is closed, not leaked");
 });
 
 test("an unreachable host reports where it failed to connect", async () => {

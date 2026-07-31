@@ -63,6 +63,10 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
   async start(): Promise<void> {
     this.closing = false;
     this.lossReported = false;
+    // A stopped endpoint is started again in place, and closeConnection/shutdownRuntime shut
+    // this client down. Release that latch first or every call below — including the dial in
+    // hostStatus — refuses against a host that is perfectly healthy.
+    this.host.reopen();
     // Pin before the first dial: attestStarted compares against this, and hostStatus below
     // is what performs that dial.
     this.pinned = await this.ensureStarted();
