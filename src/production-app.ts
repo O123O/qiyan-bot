@@ -828,7 +828,12 @@ export async function settleEarlierEndpointOperations(options: {
         // stalled restart or disconnect was heading. It is NOT sound for a `ready_endpoint`
         // operation such as an in-flight send, whose effect a restart does not subsume.
         if (options.isAwaitingAuthentication(options.endpointId)) throw conflict();
-        if (!unresolved.every((operation) => subsumedByLifecycle(operation, options.currentKind, options.resolver))) {
+        // Every one of them, not just the oldest: the settle below retires the whole list,
+        // so a `dispatched` straggler among them must still refuse. Two bot instances share
+        // one ledger in the deployed setup, so a newer dispatched operation really can sit
+        // behind an older uncertain one.
+        if (!unresolved.every((operation) => operation.state === "uncertain"
+          && subsumedByLifecycle(operation, options.currentKind, options.resolver))) {
           throw conflict();
         }
         // Settle them as superseded so they stop fencing every future attempt. This is the
@@ -4129,7 +4134,9 @@ export async function buildProductionApp(
       resolver: operationTargetResolver(),
       reconcile: reconcileOperations,
       isEndpointReady: isRecoveryEndpointReady,
-      isAwaitingAuthentication: (id) => endpointManager?.awaitingAuthentication(id) ?? false,
+      // Defaults to refusing: an absent manager means unknown, and isRecoveryEndpointReady
+      // also degrades to false, so `?? false` would steer an unknown state into superseding.
+      isAwaitingAuthentication: (id) => endpointManager?.awaitingAuthentication(id) ?? true,
       waitForTerminal: (operationId, operationSignal) => {
         if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
         return operationReconciler.waitForTerminal(operationId, operationSignal);

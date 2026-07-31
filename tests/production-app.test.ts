@@ -1314,20 +1314,27 @@ test("an explicit restart joins an earlier uncertain restart after reconnect", a
 // earlier attempt is stuck `uncertain` deadlocked the only repair — the restart was denied
 // for the very condition it exists to fix — so a restart now supersedes earlier lifecycle
 // work it provably subsumes, and settles it so it stops fencing everything after.
+// The stub MODELS the store rather than recording calls: it must reproduce that
+// `fail(id, error, uncertain=true)` leaves the operation recoverable. Asserting only that
+// fail() was called let a mutation to the uncertain form pass while reproducing the very
+// wedge this fixes — the effect is "the operation stops fencing", not "a method ran".
 function wedgeHarness(overrides: Record<string, unknown> = {}) {
-  const failed: Array<{ id: string; error: unknown }> = [];
   const earlier = {
     id: "restart-wedged", sequence: 1, kind: "restart_endpoint",
     args: { endpoint: "prenyx" }, state: "uncertain" as const,
   };
+  let recoverable = [earlier];
   return {
-    failed,
     earlier,
+    stillFencing: (): string[] => recoverable.map((operation) => operation.id),
     run: () => settleEarlierEndpointOperations({
       operations: {
-        listRecoverable: () => [earlier] as any,
+        listRecoverable: () => recoverable as any,
         get: () => ({ ...earlier }) as any,
-        fail: (id: string, error: unknown) => { failed.push({ id, error }); },
+        fail: (id: string, _error: unknown, uncertain = false) => {
+          // Exactly the store's rule: only a terminal failure leaves listRecoverable().
+          if (!uncertain) recoverable = recoverable.filter((operation) => operation.id !== id);
+        },
       },
       currentSequence: 2,
       endpointId: "prenyx",
@@ -1344,9 +1351,10 @@ function wedgeHarness(overrides: Record<string, unknown> = {}) {
 
 test("a restart supersedes an earlier uncertain restart on an unreachable endpoint", async () => {
   const harness = wedgeHarness();
+  assert.deepEqual(harness.stillFencing(), ["restart-wedged"]);
   assert.equal(await harness.run(), "proceed");
-  assert.deepEqual(harness.failed.map((entry) => entry.id), ["restart-wedged"],
-    "the wedged operation is settled, so it stops fencing every later attempt");
+  assert.deepEqual(harness.stillFencing(), [],
+    "the wedged operation left the recoverable set, so it fences nothing after this");
 });
 
 // Preserved guarantee: retrying into an endpoint waiting on a human only manufactures more
@@ -1354,7 +1362,8 @@ test("a restart supersedes an earlier uncertain restart on an unreachable endpoi
 test("a restart still refuses while the endpoint awaits re-authentication", async () => {
   const harness = wedgeHarness({ isAwaitingAuthentication: () => true });
   await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
-  assert.deepEqual(harness.failed, [], "nothing is settled when the operation may still be repairable");
+  assert.deepEqual(harness.stillFencing(), ["restart-wedged"],
+    "nothing is retired while the operation may still be repairable");
 });
 
 // Preserved guarantee: a dispatched operation is genuinely running, so a second lifecycle
@@ -1363,7 +1372,43 @@ test("a restart still refuses to race an earlier dispatched operation", async ()
   const harness = wedgeHarness();
   (harness.earlier as { state: string }).state = "dispatched";
   await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
-  assert.deepEqual(harness.failed, []);
+  assert.deepEqual(harness.stillFencing(), ["restart-wedged"], "an in-flight operation is never retired");
+});
+
+// The settle retires the WHOLE list, so checking only the oldest would retire a dispatched
+// straggler behind it. Two bot instances share one ledger in the deployed setup, so a newer
+// dispatched operation really can sit behind an older uncertain one.
+test("a restart refuses when a dispatched operation sits behind an uncertain one", async () => {
+  const wedged = {
+    id: "restart-wedged", sequence: 1, kind: "restart_endpoint",
+    args: { endpoint: "prenyx" }, state: "uncertain" as const,
+  };
+  const inflight = {
+    id: "restart-inflight", sequence: 2, kind: "restart_endpoint",
+    args: { endpoint: "prenyx" }, state: "dispatched" as const,
+  };
+  let recoverable: Array<typeof wedged | typeof inflight> = [wedged, inflight];
+
+  await assert.rejects(settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => recoverable as any,
+      get: (id: string) => recoverable.find((operation) => operation.id === id) as any,
+      fail: (id: string, _error: unknown, uncertain = false) => {
+        if (!uncertain) recoverable = recoverable.filter((operation) => operation.id !== id);
+      },
+    },
+    currentSequence: 3,
+    endpointId: "prenyx",
+    currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+    reconcile: async () => {},
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => assert.fail("an unreachable endpoint must never be waited on"),
+  } as any), (error: any) => error.code === "OPERATION_CONFLICT");
+
+  assert.deepEqual(recoverable.map((operation) => operation.id), ["restart-wedged", "restart-inflight"],
+    "neither is retired — a genuinely in-flight operation must survive");
 });
 
 // A restart does not subsume an in-flight send: stopping the endpoint says nothing about
@@ -1399,7 +1444,7 @@ test("a restart does not supersede a non-lifecycle operation", async () => {
 test("a disconnect does not supersede an earlier restart", async () => {
   const harness = wedgeHarness({ currentKind: "disconnect_endpoint" });
   await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
-  assert.deepEqual(harness.failed, []);
+  assert.deepEqual(harness.stillFencing(), ["restart-wedged"]);
 });
 
 test("a recovered different lifecycle operation does not absorb a restart", async () => {

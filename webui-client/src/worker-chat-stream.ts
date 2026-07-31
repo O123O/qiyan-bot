@@ -324,9 +324,12 @@ function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): Wo
   if (event.kind === "stream-discontinuity") return { ...state, reconcilePending: true };
   if (event.kind === "tasks-updated") {
     // An empty set clears the indicator rather than leaving a stale "1 subagent running".
-    return event.background === 0 && event.subagents === 0
-      ? { ...state, tasks: undefined }
-      : { ...state, tasks: { background: event.background, subagents: event.subagents, descriptions: event.descriptions } };
+    // The key is dropped rather than set to undefined, which the optional property forbids.
+    if (event.background === 0 && event.subagents === 0) {
+      const { tasks: _cleared, ...rest } = state;
+      return rest;
+    }
+    return { ...state, tasks: { background: event.background, subagents: event.subagents, descriptions: event.descriptions } };
   }
   if (event.kind === "turn-started") return state.observedTurnIds.includes(event.turnId)
     ? state
