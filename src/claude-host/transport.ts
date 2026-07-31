@@ -133,6 +133,10 @@ interface Pending {
   reject: (error: unknown) => void;
 }
 
+// No host call waits on model inference: a turn is asynchronous, so every request here is a
+// control operation. Sixty seconds is far beyond any of them and still bounds a wedged peer.
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+
 // The client's view of a connection. A local host is a Unix socket; a remote host is the
 // same socket reached over SSH, whose stdio the endpoint layer hands over as a pair of
 // streams. Both are just a duplex byte channel, so the client has one implementation.
@@ -172,7 +176,10 @@ export class RemoteClaudeHost implements ClaudeHost {
 
   // `openChannel` is the only transport-specific part: unixSocketChannel for a local
   // host, an SSH-bridged stream for a remote one.
-  constructor(private readonly openChannel: () => Promise<HostChannel>) {}
+  constructor(
+    private readonly openChannel: () => Promise<HostChannel>,
+    private readonly options: { requestTimeoutMs?: number } = {},
+  ) {}
 
   async open(request: OpenSessionRequest): Promise<SessionStatus> {
     const status = await this.call<SessionStatus>({ method: "open", params: [request] });
@@ -250,10 +257,26 @@ export class RemoteClaudeHost implements ClaudeHost {
     const channel = await this.ensureConnected();
     const id = this.nextId++;
     return await new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+      // A peer that is alive but not answering — a wedged host process, a stalled NFS read
+      // inside `open`, a half-open ssh stream — fires no close/error/end, so `fail` never
+      // runs. Without a deadline the request hangs for the life of the process, and with it
+      // the turn, the thread gate and the endpoint work lease that would let an operator
+      // restart the endpoint at all. OPERATION_UNCERTAIN because the host may well have
+      // applied it: the caller retries with the same idempotency uuid, which the host drops
+      // as a duplicate. The budget is deliberately looser than the Codex app-server's 30 s —
+      // `open` legitimately spawns a CLI and resumes a session.
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new AppError("OPERATION_UNCERTAIN", `claude host request timed out: ${request.method}`));
+      }, this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value as T); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
       channel.input.write(encodeFrame({ id, request }), (error) => {
-        if (!error) return;
-        this.pending.delete(id);
+        if (!error || !this.pending.delete(id)) return;
+        clearTimeout(timer);
         reject(new AppError("ENDPOINT_UNAVAILABLE", `claude host write failed: ${error.message}`));
       });
     });

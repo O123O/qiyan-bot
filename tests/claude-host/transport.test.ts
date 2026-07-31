@@ -224,6 +224,36 @@ test("in-flight requests fail loudly when the connection drops", async (t) => {
   });
 });
 
+// The failure this project already hit with the remote Codex app-server: the peer is alive
+// and the stream is open, but nothing answers. No close/error/end fires, so only a deadline
+// can end the request — otherwise the turn behind it hangs for the life of the process and
+// even an endpoint restart cannot drain the work lease it holds.
+test("a request to an alive but silent host is bounded rather than hung", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-host-mute-"));
+  const socketPath = join(dir, "host.sock");
+  const mute = {
+    ...new LocalClaudeHost(async () => (input) => new FakeQuery(input)),
+    models: () => new Promise<unknown[]>(() => {}),
+    subscribe: () => () => {},
+  } as unknown as LocalClaudeHost;
+  const server = new ClaudeHostServer(mute, {
+    hostBuild: "test", sdkVersion: "0", claudeVersion: "2.1.220", runtimeGeneration: "gen-1",
+  });
+  await server.listen(socketPath);
+  const client = new RemoteClaudeHost(unixSocketChannel(socketPath), { requestTimeoutMs: 30 });
+  t.after(async () => { await client.shutdown(); await server.close(); });
+
+  await assert.rejects(client.models("s1"), (error: any) => {
+    // OPERATION_UNCERTAIN: the host may have applied it, so the caller retries with the same
+    // idempotency uuid rather than treating it as proven-not-dispatched.
+    assert.equal(error.code, "OPERATION_UNCERTAIN");
+    assert.match(error.message, /timed out: models/u);
+    return true;
+  });
+  // The connection itself is unharmed — only the abandoned request went away.
+  assert.equal((await client.hostStatus()).protocolVersion, 1);
+});
+
 test("a shut-down client refuses further calls instead of reconnecting", async (t) => {
   const { client } = await harness(t);
   await client.open(request("s1"));
