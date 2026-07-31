@@ -126,10 +126,86 @@ reads are bounded on a large real transcript; otherwise keep
 JSONL polling stops being the live-message transport — live content comes from
 SDK events.
 
+## Spike results (2026-07-31, SDK 0.3.220, Claude 2.1.220)
+
+Run with `node --import tsx scripts/claude-sdk-spike.ts core tasks goal history`
+against real Claude on this host. 25 of 27 checks passed. What changed in the
+design as a result:
+
+**Settled in favour of the design.**
+
+- Auth is inherited from the Claude CLI. `apiKeySource` is `/login managed
+  key`, read from `~/.claude.json`; no `ANTHROPIC_API_KEY` and no
+  `.credentials.json` are involved. The **bundled** SDK binary works with it —
+  `pathToClaudeCodeExecutable` was never set. API-key billing is not forced.
+- `systemPrompt: {type:"preset", preset:"claude_code"}` with `settingSources`
+  omitted loads 28 tools, 48 commands, 5 agents, and the model from
+  `~/.claude/settings.json`.
+- `Options.sessionId` produces exactly the caller-chosen UUID, and `resume`
+  reopens it without forking (verified by init `session_id` and by restored
+  context after disposing the query).
+- One `Query` takes many sequential messages; two pushed during an active turn
+  execute in order.
+- Re-sending an identical `SDKUserMessage.uuid` creates no second turn: JSONL
+  rows with that uuid stayed at 1 and the result count did not move. Host
+  reconnect can retry safely.
+- `interrupt()` ends only the active response; the session is immediately
+  reusable. The receipt (`{still_queued: []}`) reports queued messages that
+  would otherwise still run.
+- Subagents are unambiguous: nested messages carry `parent_tool_use_id` and
+  `subagent_type`, and one human turn with a subagent produced exactly **one**
+  `result`. A subagent cannot cause a duplicate delivery.
+- A background task started with `run_in_background` **completed after its
+  parent turn** while the query stayed open, and its completion arrived as a
+  separate result with `origin.kind === "task-notification"`. This is what the
+  headless background-agent prohibition was working around; it can go.
+- `supportedModels()` returns `value`, `displayName`, `supportsEffort`, and
+  `supportedEffortLevels`, so it replaces `claude-models.ts` including effort
+  validation. `applyFlagSettings({effortLevel})` is the effort setter.
+- Native `/goal` exists and drove a task to completion unattended.
+
+**Changed the design.**
+
+1. `permissionMode` is **not** inherited from `settings.json`.
+   `permissions.defaultMode: bypassPermissions` there did not reach the SDK;
+   init reported `default` and the sandbox blocked a background Bash. A managed
+   worker must pass `permissionMode: "bypassPermissions"` with
+   `allowDangerouslySkipPermissions: true`. This is the one launch option
+   beyond the preset — a permission setting, not a behavioural prompt.
+2. SDK session helpers do **not** replace the JSONL reader.
+   `getSessionMessages` returned 242 messages for a transcript holding 13,322
+   user+assistant records, and `limit: 100000` still returned 242 — it walks
+   the current context branch, not the full transcript. Adopt `listSessions`
+   (79 sessions in 112 ms) and `getSessionInfo` (18 ms, carries summary,
+   firstPrompt, fileSize) to replace the manual directory scan in
+   `LocalClaudeCommandRunner.listThreads`; **keep** `ClaudeTranscriptHistory`
+   for lazy history paging.
+3. An interrupted turn emits `error_during_execution` with `user_message_uuid`
+   **absent**. Turn settlement is therefore "the result matching the accepted
+   uuid, **or** an uncorrelated non-success result while exactly one turn is in
+   flight" — uuid correlation alone is not sufficient.
+4. `session_state_changed` never fired (0 events across every phase), so it is
+   not available as an idle signal. Idle must be derived from outstanding turn
+   results plus the tracked background-task set.
+
+**Open — needs a decision.**
+
+- `active_goal` events do not reach the query iterator. `SDKActiveGoalMessage`
+  (carrying `condition`, `iterations`, `set_at`, `tokens_at_start`) is declared
+  on `StdoutMessage` but not on the `SDKMessage` union, and none were observed.
+  Without it there is no manager-visible goal projection and no
+  pre-continuation budget signal, which is what decision 2's goal half depends
+  on.
+- Goal continuations are **not** distinguishable from human turns. A single
+  `/goal` turn produced 2 top-level results, both with `origin.kind ===
+  "human"`; no `auto-continuation` origin appeared. Under decision 4 (deliver
+  every top-level end-turn) a goal that runs N continuations delivers N chat
+  messages.
+
 ## What the spike must settle
 
-Only questions that change the design are listed; the earlier handoff's
-MCP-bridge and legacy-migration items are gone.
+Resolved items are struck through by the results above; the remainder stand.
+The earlier handoff's MCP-bridge and legacy-migration items are gone.
 
 1. Authentication in the real service environment, and whether the SDK-bundled
    Claude binary works with it (production prefers the bundled binary; a
