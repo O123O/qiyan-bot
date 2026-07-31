@@ -176,6 +176,42 @@ test("a client reconnect replays the events emitted while it was gone", async (t
     "the events emitted while disconnected arrive exactly once, in order");
 });
 
+// A reconnect that cannot recover everything must say so, or the Web UI renders a
+// conversation with a hole in it and never knows.
+test("a reconnect past the replay bound reports a gap instead of hiding it", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "qiyan-host-gap-"));
+  const socketPath = join(dir, "host.sock");
+  const queries = new Map<string, FakeQuery>();
+  const host = new LocalClaudeHost(async (request) => (input) => {
+    const query = new FakeQuery(input);
+    queries.set(request.sessionId, query);
+    return query;
+  }, { replayLimit: 3 });
+  const identity = {
+    hostBuild: "test", sdkVersion: "0", claudeVersion: "2.1.220", runtimeGeneration: "gen-1",
+  };
+  let server = new ClaudeHostServer(host, identity);
+  await server.listen(socketPath);
+  const client = new RemoteClaudeHost(unixSocketChannel(socketPath));
+  t.after(async () => { await client.shutdown(); await server.close(); });
+
+  await client.open(request("s1"));
+  const gaps: string[] = [];
+  client.onReplayGap((sessionId) => gaps.push(sessionId));
+
+  await server.close();
+  for (let index = 0; index < 6; index += 1) {
+    queries.get("s1")!.push({ type: "assistant", parent_tool_use_id: null, message: { content: [] } });
+  }
+  await delay(20);
+  server = new ClaudeHostServer(host, identity);
+  await server.listen(socketPath);
+
+  await client.status("s1");
+  await delay(60);
+  assert.deepEqual(gaps, ["s1"], "the client is told to reload durable history");
+});
+
 test("in-flight requests fail loudly when the connection drops", async (t) => {
   // A host whose call never returns, so the request is provably still in flight when the
   // connection drops — otherwise the assertion races the response.

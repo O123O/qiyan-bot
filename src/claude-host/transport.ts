@@ -164,6 +164,7 @@ export class RemoteClaudeHost implements ClaudeHost {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Set<(event: HostEvent) => void>();
+  private readonly gapListeners = new Set<(sessionId: string) => void>();
   // Highest event sequence seen per session, so a reconnect can replay exactly the gap
   // rather than re-emitting the whole bounded buffer.
   private readonly cursors = new Map<string, number>();
@@ -211,8 +212,9 @@ export class RemoteClaudeHost implements ClaudeHost {
     await this.call<void>({ method: "stopTask", params: [sessionId, taskId] });
   }
 
-  async eventsSince(sessionId: string, cursor: number): Promise<HostEvent[]> {
-    return await this.call<HostEvent[]>({ method: "eventsSince", params: [sessionId, cursor] });
+  async eventsSince(sessionId: string, cursor: number): Promise<{ events: HostEvent[]; gap: boolean }> {
+    return await this.call<{ events: HostEvent[]; gap: boolean }>(
+      { method: "eventsSince", params: [sessionId, cursor] });
   }
 
   async evictIdle(keep: number): Promise<string[]> {
@@ -226,6 +228,13 @@ export class RemoteClaudeHost implements ClaudeHost {
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
+  }
+
+  // Fires when a reconnect could not recover every missed event. The consumer must reload
+  // that session from the durable transcript; the live stream alone would be incomplete.
+  onReplayGap(listener: (sessionId: string) => void): () => void {
+    this.gapListeners.add(listener);
+    return () => { this.gapListeners.delete(listener); };
   }
 
   async shutdown(): Promise<void> {
@@ -291,7 +300,11 @@ export class RemoteClaudeHost implements ClaudeHost {
   private async replay(sessionId: string): Promise<void> {
     const cursor = this.cursors.get(sessionId) ?? 0;
     try {
-      for (const event of await this.eventsSince(sessionId, cursor)) this.receive({ id: 0, event });
+      const { events, gap } = await this.eventsSince(sessionId, cursor);
+      // Report the gap BEFORE the recovered events, so a consumer reloads durable history
+      // first and then applies what followed, rather than rendering a hole.
+      if (gap) for (const listener of this.gapListeners) listener(sessionId);
+      for (const event of events) this.receive({ id: 0, event });
     } catch {
       // The session may be gone on the host; ordinary requests will report that.
     }

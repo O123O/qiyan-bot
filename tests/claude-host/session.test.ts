@@ -217,9 +217,33 @@ test("events replay from a cursor and stay bounded", async () => {
   }
   await delay(10);
 
-  assert.equal(session.eventsSince(afterAccept).length, 4, "replay is capped at the bound");
-  assert.equal(session.eventsSince(0).length, 4, "older events are dropped, not retained");
+  assert.equal(session.eventsSince(afterAccept).events.length, 4, "replay is capped at the bound");
+  assert.equal(session.eventsSince(0).events.length, 4, "older events are dropped, not retained");
   assert.ok(session.status().cursor > afterAccept);
+  session.close();
+});
+
+// A bounded buffer means a long disconnect can drop events the client never saw. Silently
+// advancing its cursor past them would render a conversation with a hole in it — the
+// missing-message bug this redesign exists to remove.
+test("replay reports a gap when the buffer dropped events the caller never saw", async () => {
+  let query!: FakeQuery;
+  const session = new ClaudeHostSession("session-1", (input) => (query = new FakeQuery(input)), { replayLimit: 3 });
+  for (let index = 0; index < 6; index += 1) {
+    query.push({ type: "assistant", parent_tool_use_id: null, message: { content: [] } });
+  }
+  await delay(10);
+
+  assert.equal(session.eventsSince(0).gap, true, "events 1-3 were dropped before the caller saw them");
+  const retained = session.eventsSince(0).events;
+  assert.equal(session.eventsSince(retained[0]!.seq - 1).gap, false,
+    "a cursor inside the retained window has no gap");
+  session.close();
+});
+
+test("an empty replay buffer is never reported as a gap", async () => {
+  const { session } = makeSession();
+  assert.deepEqual(session.eventsSince(0), { events: [], gap: false });
   session.close();
 });
 

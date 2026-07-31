@@ -163,9 +163,20 @@ export class ClaudeHostSession {
   isEvictable(): boolean { return this.activity() === "idle"; }
 
   // Replay from a cursor so a short client reconnect recovers live output without
-  // re-reading JSONL. Bounded on purpose: durable reconstruction is the transcript.
-  eventsSince(cursor: number): HostEvent[] {
-    return this.events.filter((event) => event.seq > cursor);
+  // re-reading JSONL. The buffer is bounded on purpose — durable reconstruction is the
+  // transcript — so a long disconnect can drop events the caller never saw.
+  //
+  // `gap` reports exactly that. Without it a client would silently advance its cursor
+  // past dropped events and render a conversation with a hole in it, which is the
+  // missing-message class of bug this redesign exists to remove. On a gap the caller
+  // must reload from the durable transcript instead of trusting the live stream.
+  eventsSince(cursor: number): { events: HostEvent[]; gap: boolean } {
+    const events = this.events.filter((event) => event.seq > cursor);
+    const oldestRetained = this.events[0]?.seq;
+    // A gap exists when the first event still retained is newer than the one the caller
+    // would have expected next. An empty buffer is never a gap: nothing was dropped.
+    const gap = oldestRetained !== undefined && oldestRetained > cursor + 1;
+    return { events, gap };
   }
 
   subscribe(listener: (event: HostEvent) => void): () => void {
