@@ -390,10 +390,10 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     }
   }
 
-  // A streaming operation needs its own method rather than an `openHelperStream` case: the
-  // proxy copies raw bytes both ways for the life of the connection, so it is never routed
-  // through `invoke`'s framed request/response path (and needs no helperOperations entry,
-  // which gates only `invoke`).
+  // Each proxy is its own method rather than a shared streaming entry point: it copies raw
+  // bytes both ways for the life of the connection, so it is never routed through `invoke`'s
+  // framed request/response path (and needs no helperOperations entry, which gates only
+  // `invoke`).
   async openClaudeHostStream(
     request: RemoteClaudeHostProxyRequest,
     installedHelperPath: string,
