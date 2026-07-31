@@ -188,19 +188,32 @@ design as a result:
    not available as an idle signal. Idle must be derived from outstanding turn
    results plus the tracked background-task set.
 
-**Open — needs a decision.**
+**Goals — works, but is opaque in flight.**
 
-- `active_goal` events do not reach the query iterator. `SDKActiveGoalMessage`
+A `/goal` spanning several continuations completed unattended (3 of 3 files
+created, one per turn as instructed). Its native transcript shows the mechanism:
+a session-scoped Stop hook plus two `Stop hook feedback` user rows, driving 8
+assistant messages.
+
+Critically, that entire goal produced **exactly one** top-level `result` in the
+SDK stream. Continuations are internal and emit no result of their own, so
+decision 4 yields one delivery per goal, not one per continuation.
+
+What is *not* available:
+
+- `active_goal` events never reach the query iterator. `SDKActiveGoalMessage`
   (carrying `condition`, `iterations`, `set_at`, `tokens_at_start`) is declared
   on `StdoutMessage` but not on the `SDKMessage` union, and none were observed.
-  Without it there is no manager-visible goal projection and no
-  pre-continuation budget signal, which is what decision 2's goal half depends
-  on.
-- Goal continuations are **not** distinguishable from human turns. A single
-  `/goal` turn produced 2 top-level results, both with `origin.kind ===
-  "human"`; no `auto-continuation` origin appeared. Under decision 4 (deliver
-  every top-level end-turn) a goal that runs N continuations delivers N chat
-  messages.
+- `includeHookEvents: true` did not help. Two hook events arrived
+  (`hook_started`, `hook_response`), neither Stop-related.
+- Consequently there is no in-flight goal status to project to the manager and
+  no per-continuation point at which QiYan could enforce a token or turn bound.
+  `Options.maxTurns` and `Options.maxBudgetUsd` exist, but they bound the whole
+  session rather than one goal.
+
+So a Claude worker can hold a native goal and finish it, but QiYan can only
+show "working" until it lands. Whether that is acceptable, or whether goals
+keep a QiYan-side driver, is the one decision the spike does not make.
 
 ## What the spike must settle
 

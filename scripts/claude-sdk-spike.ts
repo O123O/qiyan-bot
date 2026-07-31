@@ -355,7 +355,8 @@ async function tasksPhase(cwd: string): Promise<void> {
 async function goalPhase(cwd: string): Promise<void> {
   const sessionId = randomUUID();
   console.log(`\n=== goal phase (session ${sessionId}) ===`);
-  const session = new Session({ ...baseOptions(cwd), sessionId });
+  // /goal is driven by a Stop hook, so its state may only be visible as hook events.
+  const session = new Session({ ...baseOptions(cwd), sessionId, includeHookEvents: true });
   const boot = session.send("Reply with exactly: READY");
   await withTimeout(boot.done, 180_000, "goal boot turn").catch(() => undefined);
   const commands = await session.query.supportedCommands().catch(() => [] as any[]);
@@ -363,7 +364,11 @@ async function goalPhase(cwd: string): Promise<void> {
   record("10b", "/goal available in this workspace", goalCommand !== undefined,
     goalCommand ? JSON.stringify(goalCommand).slice(0, 200) : "no goal command in supportedCommands()");
   if (goalCommand) {
-    const goalTurn = session.send("/goal write the word DONE into goal.txt, then stop");
+    // A goal needing several continuations, so per-continuation observability is exercised.
+    const goalTurn = session.send(
+      "/goal the files a.txt, b.txt and c.txt each exist in the current directory and each "
+      + "contains its own letter. Create only one file per turn.",
+    );
     const goalResult = await withTimeout(goalTurn.done, 300_000, "goal turn").catch((e) => ({ result: `FAILED: ${e.message}` }));
     // SDKActiveGoalMessage ('active_goal') carries condition/iterations/tokens_at_start —
     // the manager-visible projection. It is declared on StdoutMessage, not the SDKMessage
@@ -371,14 +376,24 @@ async function goalPhase(cwd: string): Promise<void> {
     const goalEvents = session.messages.filter((m) => (m as any).type === "active_goal");
     const stateEvents = session.messages.filter((m) => m.type === "system"
       && String((m as any).subtype) === "session_state_changed");
-    let wrote = false;
-    try { wrote = (await readFile(join(cwd, "goal.txt"), "utf8")).includes("DONE"); } catch { /* not written */ }
-    record("10c", "native goal drives to completion", wrote,
-      `goal.txt=${wrote} result=${JSON.stringify(String((goalResult as any).result ?? "").slice(0, 60))}`);
+    let made = 0;
+    for (const name of ["a.txt", "b.txt", "c.txt"]) {
+      try { if ((await readFile(join(cwd, name), "utf8")).trim().length > 0) made += 1; } catch { /* absent */ }
+    }
+    record("10c", "native goal drives to completion", made === 3,
+      `${made}/3 files created; result=${JSON.stringify(String((goalResult as any).result ?? "").slice(0, 60))}`);
     record("10d", "active_goal events reach the SDK stream", goalEvents.length > 0,
       goalEvents.length > 0
         ? goalEvents.map((m: any) => JSON.stringify(m.value)).join(" | ").slice(0, 300)
         : `none; session_state_changed=${stateEvents.length}`);
+    // Fallback projection source: the Stop hook that implements /goal.
+    const hookEvents = session.messages.filter((m) => m.type === "system"
+      && String((m as any).subtype).startsWith("hook_"));
+    const stopHooks = hookEvents.filter((m: any) => JSON.stringify(m).includes("Stop"));
+    record("10f", "goal state observable via hook events", stopHooks.length > 0,
+      `hook events=${hookEvents.length} stop-related=${stopHooks.length}`
+      + ` subtypes=${[...new Set(hookEvents.map((m: any) => m.subtype))].join(",")}`
+      + (stopHooks.length > 0 ? ` sample=${JSON.stringify(stopHooks[0]).slice(0, 400)}` : ""));
     const autoContinuations = session.messages.filter((m) => (m as any).origin?.kind === "auto-continuation").length;
     const goalResults = session.messages.filter((m) => m.type === "result");
     record("10e", "goal continuations are distinguishable", autoContinuations > 0 || goalResults.length > 1,
