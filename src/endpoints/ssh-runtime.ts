@@ -20,11 +20,14 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "0fa5f22c3502c90f59a52d15b5d79cbdef6e6d71ae5b6490ef9c2ee79afd3347";
+export const REMOTE_HELPER_SHA256 = "17101fd1ef13171cb8d8d3459299f38fd34045e9384e6cf2faaba2814eca6917";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
 export const REMOTE_CLAUDE_LAUNCHER_SHA256 = "a3177e3573150dcc172ff164946eb7fcea5b48273789844eeeeb97d7b3f5e834";
 export const REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256 = "4f52c4e08a8122e2accb8b407916a07659aa86006e020d22b6511f3b49850e6a";
+export const REMOTE_CLAUDE_HOST_SHA256 = "915fede4ac45fdb43282f48fc73e48d07c68652497f50d03b9697f6268780f8d";
+export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
+export const REMOTE_CLAUDE_HOST_PROXY_READY = Buffer.from("qiyan-claude-host-proxy-v1-ready\n");
 export const REMOTE_CLAUDE_RUNTIME_WATCH_READY = Buffer.from("qiyan-claude-runtime-watch-v1-ready\n");
 export const REMOTE_CLAUDE_TURN_WATCH_READY = Buffer.from("qiyan-claude-turn-watch-v1-ready\n");
 
@@ -35,6 +38,7 @@ const REMOTE_HELPER_RESPONSE_PREFIX = "qiyan-helper-v1:";
 const REMOTE_HELPER_TIMEOUT_MS = 300_000;
 const helperOperations = new Set([
   "preflight", "bootstrap", "inspect", "start", "stop",
+  "inspect-claude-host", "start-claude-host", "stop-claude-host",
   "inspect-claude-runtime", "start-claude-runtime", "stop-claude-runtime",
   "configure-claude-thread", "dispatch-claude-turn", "inspect-claude-turn",
   "interrupt-claude-turn", "release-claude-thread",
@@ -57,12 +61,15 @@ export interface RemoteAssets {
   launcher: Buffer;
   claudeLauncher: Buffer;
   claudeRuntimeLauncher: Buffer;
+  claudeHost: Buffer;
+  claudeHostLauncher: Buffer;
 }
 
 export interface RemoteRuntimeClient {
   bootstrap(payload: RemoteBootstrapPayload): Promise<void>;
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string, options?: { signal?: AbortSignal }): Promise<T>;
   openAppServerStream?(request: RemoteAppServerProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
+  openClaudeHostStream?(request: RemoteClaudeHostProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
   openHelperStream?(
     operation: "watch-claude-runtime" | "watch-claude-turn",
     request: unknown,
@@ -76,6 +83,15 @@ export interface RemoteAppServerProxyRequest {
   runtimeDir: string;
   session: string;
   tmuxMode: "explicit" | "legacy";
+  expected: RuntimeIdentity;
+}
+
+// The Claude host's socket lives in the same runtime directory but only ever under an
+// explicit tmux socket: a Claude endpoint has no legacy generation to reattach to.
+export interface RemoteClaudeHostProxyRequest {
+  runtimeDir: string;
+  session: string;
+  tmuxMode: "explicit";
   expected: RuntimeIdentity;
 }
 
@@ -94,6 +110,8 @@ export interface RemoteBootstrapPayload {
   launcher: Buffer;
   claudeLauncher: Buffer;
   claudeRuntimeLauncher: Buffer;
+  claudeHost: Buffer;
+  claudeHostLauncher: Buffer;
 }
 
 export async function attestUserControlMaster(
@@ -335,6 +353,10 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
       claudeRuntimeLauncherBase64: payload.claudeRuntimeLauncher.toString("base64url"),
       claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+      claudeHostBase64: payload.claudeHost.toString("base64url"),
+      claudeHostSha256: REMOTE_CLAUDE_HOST_SHA256,
+      claudeHostLauncherBase64: payload.claudeHostLauncher.toString("base64url"),
+      claudeHostLauncherSha256: REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
     });
     // Keep the large asset payload off argv: the pinned helper program itself is already carried
     // there, and their combined size can exceed the host's execve limit.
@@ -381,6 +403,33 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     try {
       return await (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
         readyMarker: REMOTE_APP_SERVER_PROXY_READY,
+        timeoutMs: 10_000,
+        maxPreludeBytes: 64 * 1024,
+      });
+    } catch (error) {
+      return this.throwFreshChannelFailure(error);
+    }
+  }
+
+  // A streaming operation needs its own method rather than an `openHelperStream` case: the
+  // proxy copies raw bytes both ways for the life of the connection, so it is never routed
+  // through `invoke`'s framed request/response path (and needs no helperOperations entry,
+  // which gates only `invoke`).
+  async openClaudeHostStream(
+    request: RemoteClaudeHostProxyRequest,
+    installedHelperPath: string,
+  ): Promise<ReadyProcessStream> {
+    validateInstalledHelperPath(installedHelperPath);
+    parseRuntimeIdentity(request.expected);
+    await this.prepareConnection();
+    const args = buildSshRemoteNodeProgramArgs(
+      this.options.plan,
+      this.helperProgram,
+      ["proxy-claude-host", encodeRemoteArgument(JSON.stringify(request))],
+    );
+    try {
+      return await (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
+        readyMarker: REMOTE_CLAUDE_HOST_PROXY_READY,
         timeoutMs: 10_000,
         maxPreludeBytes: 64 * 1024,
       });
@@ -560,11 +609,15 @@ async function loadRemoteAssets(root?: string): Promise<RemoteAssets> {
       const launcher = await readFile(resolve(candidate, "qiyan-app-server-launcher.sh"));
       const claudeLauncher = await readFile(resolve(candidate, "qiyan-claude.mjs"));
       const claudeRuntimeLauncher = await readFile(resolve(candidate, "qiyan-claude-runtime-launcher.sh"));
+      const claudeHost = await readFile(resolve(candidate, "qiyan-claude-host.mjs"));
+      const claudeHostLauncher = await readFile(resolve(candidate, "qiyan-claude-host-launcher.sh"));
       requireDigest(helper, REMOTE_HELPER_SHA256);
       requireDigest(launcher, REMOTE_LAUNCHER_SHA256);
       requireDigest(claudeLauncher, REMOTE_CLAUDE_LAUNCHER_SHA256);
       requireDigest(claudeRuntimeLauncher, REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256);
-      return { helper, launcher, claudeLauncher, claudeRuntimeLauncher };
+      requireDigest(claudeHost, REMOTE_CLAUDE_HOST_SHA256);
+      requireDigest(claudeHostLauncher, REMOTE_CLAUDE_HOST_LAUNCHER_SHA256);
+      return { helper, launcher, claudeLauncher, claudeRuntimeLauncher, claudeHost, claudeHostLauncher };
     } catch (error) {
       if (candidate === candidates.at(-1) || root) throw error;
     }

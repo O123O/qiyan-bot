@@ -182,6 +182,8 @@ test("bootstrap streams packaged assets instead of placing them in SSH argv", as
     launcher: Buffer.from("launcher"),
     claudeLauncher: Buffer.from("claude-launcher"),
     claudeRuntimeLauncher: Buffer.from("claude-runtime-launcher"),
+    claudeHost: Buffer.from("claude-host"),
+    claudeHostLauncher: Buffer.from("claude-host-launcher"),
   });
   assert.ok(observedArgs.every((argument) => argument.length < 64 * 1024));
   assert.ok(observedInput instanceof Uint8Array);

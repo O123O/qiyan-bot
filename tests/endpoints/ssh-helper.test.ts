@@ -6,7 +6,7 @@ import { unlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import {
@@ -14,7 +14,10 @@ import {
   REMOTE_LAUNCHER_SHA256,
   REMOTE_CLAUDE_LAUNCHER_SHA256,
   REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+  REMOTE_CLAUDE_HOST_SHA256,
+  REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
   REMOTE_APP_SERVER_PROXY_READY,
+  REMOTE_CLAUDE_HOST_PROXY_READY,
   REMOTE_CLAUDE_RUNTIME_WATCH_READY,
   SshRemoteClient,
   encodeRemoteArgument,
@@ -22,11 +25,14 @@ import {
   validateInstalledHelperPath,
 } from "../../src/endpoints/ssh-runtime.ts";
 import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+import { RemoteClaudeHost } from "../../src/claude-host/transport.ts";
 
 const helperPath = new URL("../../assets/remote/qiyan-ssh-helper.mjs", import.meta.url);
 const launcherPath = new URL("../../assets/remote/qiyan-app-server-launcher.sh", import.meta.url);
 const claudeLauncherPath = new URL("../../assets/remote/qiyan-claude.mjs", import.meta.url);
 const claudeRuntimeLauncherPath = new URL("../../assets/remote/qiyan-claude-runtime-launcher.sh", import.meta.url);
+const claudeHostPath = new URL("../../assets/remote/qiyan-claude-host.mjs", import.meta.url);
+const claudeHostLauncherPath = new URL("../../assets/remote/qiyan-claude-host-launcher.sh", import.meta.url);
 
 test("packaged remote assets match their pinned digests", async () => {
   const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -34,6 +40,26 @@ test("packaged remote assets match their pinned digests", async () => {
   assert.equal(digest(await readFile(launcherPath)), REMOTE_LAUNCHER_SHA256);
   assert.equal(digest(await readFile(claudeLauncherPath)), REMOTE_CLAUDE_LAUNCHER_SHA256);
   assert.equal(digest(await readFile(claudeRuntimeLauncherPath)), REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256);
+  assert.equal(digest(await readFile(claudeHostPath)), REMOTE_CLAUDE_HOST_SHA256);
+  assert.equal(digest(await readFile(claudeHostLauncherPath)), REMOTE_CLAUDE_HOST_LAUNCHER_SHA256);
+});
+
+// The Claude host asset is generated, so a source change that is not rebuilt would ship a
+// stale host — and `npm pack` rebuilds it during packaging, which would then contradict the
+// digest pinned in src. Reproduce the build and require the committed bytes to match.
+test("the packaged Claude host asset is the current build of its source", async (t) => {
+  const target = join(await mkdtemp(join(tmpdir(), "qiyan-claude-host-build-")), "qiyan-claude-host.mjs");
+  t.after(() => rm(dirname(target), { recursive: true, force: true }));
+
+  await runBoundedProcess(process.execPath, ["scripts/build.mjs", "--claude-host", target], {
+    timeoutMs: 120_000, maxOutputBytes: 1024 * 1024,
+  });
+
+  assert.equal(
+    (await readFile(target)).equals(await readFile(claudeHostPath)),
+    true,
+    "run `npm run build` and commit assets/remote/qiyan-claude-host.mjs (and repin REMOTE_CLAUDE_HOST_SHA256)",
+  );
 });
 
 test("the packaged remote Claude launcher is one-shot, stdin-driven, and leaves completion to native JSONL", async () => {
@@ -99,6 +125,8 @@ test("every shared runtime operation re-attests its XDG root", async (t) => {
   const launcher = await readFile(launcherPath);
   const claudeLauncher = await readFile(claudeLauncherPath);
   const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const claudeHost = await readFile(claudeHostPath);
+  const claudeHostLauncher = await readFile(claudeHostLauncherPath);
   const bootstrap = Buffer.from(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
@@ -109,6 +137,10 @@ test("every shared runtime operation re-attests its XDG root", async (t) => {
     claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
     claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
     claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+    claudeHostBase64: claudeHost.toString("base64url"),
+    claudeHostSha256: REMOTE_CLAUDE_HOST_SHA256,
+    claudeHostLauncherBase64: claudeHostLauncher.toString("base64url"),
+    claudeHostLauncherSha256: REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
   }), "utf8");
   await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "bootstrap"], {
     input: bootstrap, timeoutMs: 15_000, maxOutputBytes: 64 * 1024,
@@ -156,6 +188,8 @@ test("an unsafe XDG replacement cannot execute cached helper bytes", async (t) =
     launcher,
     claudeLauncher: await readFile(claudeLauncherPath),
     claudeRuntimeLauncher: await readFile(claudeRuntimeLauncherPath),
+    claudeHost: await readFile(claudeHostPath),
+    claudeHostLauncher: await readFile(claudeHostLauncherPath),
   });
   const upload = Buffer.from("trusted-program-upload");
   const uploadSha = createHash("sha256").update(upload).digest("hex");
@@ -435,6 +469,8 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   const launcher = await readFile(launcherPath);
   const claudeLauncher = await readFile(claudeLauncherPath);
   const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const claudeHost = await readFile(claudeHostPath);
+  const claudeHostLauncher = await readFile(claudeHostLauncherPath);
   const bootstrap = Buffer.from(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
@@ -445,6 +481,10 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
     claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
     claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
     claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+    claudeHostBase64: claudeHost.toString("base64url"),
+    claudeHostSha256: REMOTE_CLAUDE_HOST_SHA256,
+    claudeHostLauncherBase64: claudeHostLauncher.toString("base64url"),
+    claudeHostLauncherSha256: REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
   }), "utf8");
   await runBoundedProcess(process.execPath, [helperPath.pathname, "bootstrap"], {
     input: bootstrap,
@@ -456,6 +496,8 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   assert.equal((await stat(`${runtimeDir}/qiyan-app-server-launcher.sh`)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-claude.mjs`)).mode & 0o777, 0o700);
   assert.equal((await stat(`${runtimeDir}/qiyan-claude-runtime-launcher.sh`)).mode & 0o777, 0o700);
+  assert.equal((await stat(`${runtimeDir}/qiyan-claude-host.mjs`)).mode & 0o777, 0o700);
+  assert.equal((await stat(`${runtimeDir}/qiyan-claude-host-launcher.sh`)).mode & 0o777, 0o700);
   const inspectArg = encodeRemoteArgument(JSON.stringify({
     runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
   }));
@@ -524,6 +566,8 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   const launcher = await readFile(launcherPath);
   const claudeLauncher = await readFile(claudeLauncherPath);
   const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const claudeHost = await readFile(claudeHostPath);
+  const claudeHostLauncher = await readFile(claudeHostLauncherPath);
   const bootstrap = Buffer.from(JSON.stringify({
     runtimeDir,
     helperBase64: helper.toString("base64url"),
@@ -534,6 +578,10 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
     claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
     claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
     claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+    claudeHostBase64: claudeHost.toString("base64url"),
+    claudeHostSha256: REMOTE_CLAUDE_HOST_SHA256,
+    claudeHostLauncherBase64: claudeHostLauncher.toString("base64url"),
+    claudeHostLauncherSha256: REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
   }), "utf8");
   await runBoundedProcess("env", [
     `XDG_RUNTIME_DIR=${xdg}`,
@@ -951,12 +999,184 @@ test("the remote Claude helper reuses one tmux pane and derives settlement from 
   ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
 });
 
+// The whole remote Claude chain, with only the Claude CLI and the Agent SDK stubbed: the
+// helper resolves the SDK and launches the packaged host under tmux, the launcher's identity
+// describes the host process itself, and the proxied socket carries a real session whose turn
+// completes. Everything between QiYan and the SDK is the production code path.
+test("the remote Claude host serves proxied sessions from one supervised process", async (t) => {
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-claude-host-xdg-"));
+  const stubRoot = await mkdtemp(join(tmpdir(), "qiyan-claude-host-sdk-"));
+  const cwd = await mkdtemp(join(tmpdir(), "qiyan-claude-host-cwd-"));
+  t.after(() => Promise.all([
+    rm(xdg, { recursive: true, force: true }),
+    rm(stubRoot, { recursive: true, force: true }),
+    rm(cwd, { recursive: true, force: true }),
+  ]));
+  await chmod(xdg, 0o700);
+  const runtimeDir = `${xdg}/qiyan-bot/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const helper = await readFile(helperPath);
+  const launcher = await readFile(launcherPath);
+  const claudeLauncher = await readFile(claudeLauncherPath);
+  const claudeRuntimeLauncher = await readFile(claudeRuntimeLauncherPath);
+  const claudeHost = await readFile(claudeHostPath);
+  const claudeHostLauncher = await readFile(claudeHostLauncherPath);
+  const bootstrap = Buffer.from(JSON.stringify({
+    runtimeDir,
+    helperBase64: helper.toString("base64url"),
+    helperSha256: REMOTE_HELPER_SHA256,
+    launcherBase64: launcher.toString("base64url"),
+    launcherSha256: REMOTE_LAUNCHER_SHA256,
+    claudeLauncherBase64: claudeLauncher.toString("base64url"),
+    claudeLauncherSha256: REMOTE_CLAUDE_LAUNCHER_SHA256,
+    claudeRuntimeLauncherBase64: claudeRuntimeLauncher.toString("base64url"),
+    claudeRuntimeLauncherSha256: REMOTE_CLAUDE_RUNTIME_LAUNCHER_SHA256,
+    claudeHostBase64: claudeHost.toString("base64url"),
+    claudeHostSha256: REMOTE_CLAUDE_HOST_SHA256,
+    claudeHostLauncherBase64: claudeHostLauncher.toString("base64url"),
+    claudeHostLauncherSha256: REMOTE_CLAUDE_HOST_LAUNCHER_SHA256,
+  }), "utf8");
+  await runBoundedProcess("env", [`XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "bootstrap"], {
+    input: bootstrap, timeoutMs: 30_000, maxOutputBytes: 64 * 1024,
+  });
+
+  // `npm root -g` must name a directory called node_modules for Node's own resolver to look
+  // inside it, which is exactly the shape of a real global prefix.
+  const globalRoot = join(stubRoot, "node_modules");
+  const sdkDir = join(globalRoot, "@anthropic-ai", "claude-agent-sdk");
+  await mkdir(sdkDir, { recursive: true });
+  await writeFile(join(sdkDir, "package.json"), JSON.stringify({
+    name: "@anthropic-ai/claude-agent-sdk", version: "0.3.220", type: "module", main: "sdk.mjs",
+  }));
+  await writeFile(join(sdkDir, "sdk.mjs"), [
+    'export const VERSION = "9.9.9-stub";',
+    "export function query({ prompt, options }) {",
+    "  const pending = []; const waiters = []; let ended = false;",
+    "  const push = (value) => { const waiter = waiters.shift(); if (waiter) waiter({ value, done: false }); else pending.push(value); };",
+    "  void (async () => { for await (const message of prompt) {",
+    "    push({ type: 'assistant', uuid: 'assistant-' + message.uuid, message: { content: [{ type: 'text', text: 'echo:' + message.message.content }] } });",
+    "    push({ type: 'result', subtype: 'success', user_message_uuid: message.uuid, cwd: options.cwd });",
+    "  } })();",
+    "  return {",
+    "    async interrupt() {}, async setModel() {}, async setPermissionMode() {},",
+    "    async applyFlagSettings() {}, async stopTask() {},",
+    "    async supportedModels() { return []; }, async initializationResult() { return {}; },",
+    "    close() { ended = true; for (const waiter of waiters.splice(0)) waiter({ value: undefined, done: true }); },",
+    "    [Symbol.asyncIterator]() { return { next: async () => {",
+    "      const ready = pending.shift();",
+    "      if (ready !== undefined) return { value: ready, done: false };",
+    "      if (ended) return { value: undefined, done: true };",
+    "      return await new Promise((resolve) => waiters.push(resolve));",
+    "    } }; },",
+    "  };",
+    "}",
+  ].join("\n"));
+
+  const wrapperDir = join(xdg, "bin");
+  await mkdir(wrapperDir);
+  await writeFile(join(wrapperDir, "claude"), "#!/bin/sh\nprintf '2.9.9 (Claude Code)\\n'\n", { mode: 0o700 });
+  await writeFile(join(wrapperDir, "npm"), `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(globalRoot)}\n`, { mode: 0o700 });
+  const capabilityShell = join(wrapperDir, "shell");
+  await writeFile(capabilityShell, [
+    "#!/bin/sh",
+    'if [ "$1" = "-lc" ]; then',
+    "  shift",
+    '  exec /bin/bash -c "$1"',
+    "fi",
+    'exec /bin/bash "$@"',
+  ].join("\n"), { mode: 0o700 });
+
+  const installed = join(runtimeDir, "qiyan-ssh-helper.mjs");
+  const base = { runtimeDir, session, tmuxMode: "explicit" as const };
+  const environment = [
+    `XDG_RUNTIME_DIR=${xdg}`,
+    `PATH=${wrapperDir}:${dirname(process.execPath)}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+  ];
+  const invoke = async <T>(operation: string, value: unknown, timeoutMs = 60_000): Promise<T> => {
+    try {
+      const result = await runBoundedProcess("env", [
+        ...environment, process.execPath, installed, operation, encodeRemoteArgument(JSON.stringify(value)),
+      ], { timeoutMs, maxOutputBytes: 64 * 1024 });
+      return parseRemoteHelperResponse<T>(result.stdout, operation);
+    } catch (error) {
+      const log = await readFile(join(runtimeDir, "claude-host.log"), "utf8").catch(() => "<no host log>");
+      throw new Error(`${operation} failed: ${log}`, { cause: error });
+    }
+  };
+
+  let identity: { token: string; pid: number } | undefined;
+  t.after(async () => {
+    if (identity) await invoke("stop-claude-host", { ...base, expected: identity }, 15_000).catch(() => undefined);
+    await rm(runtimeDir, { recursive: true, force: true });
+  });
+  const token = randomBytes(16).toString("hex");
+  const started = await invoke<{ identity: any }>("start-claude-host", {
+    ...base, shell: capabilityShell, token,
+  });
+  identity = started.identity;
+  // `exec` in the launcher is what makes the recorded identity describe the server itself.
+  assert.match(
+    (await readFile(`/proc/${started.identity.pid}/cmdline`, "utf8")).replaceAll("\0", " "),
+    /qiyan-claude-host\.mjs --socket .*claude\.sock/u,
+  );
+  assert.equal(
+    (await readFile(`/proc/${started.identity.pid}/environ`, "utf8")).split("\0").includes(`QIYAN_RUNTIME_TOKEN=${token}`),
+    true,
+  );
+  const socketState = await stat(join(runtimeDir, "claude.sock"));
+  assert.equal(socketState.isSocket(), true);
+  assert.equal(socketState.mode & 0o777, 0o600);
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "healthy", identity: started.identity });
+
+  const stream = await openReadyProcessStream("env", [
+    ...environment, process.execPath, installed,
+    "proxy-claude-host", encodeRemoteArgument(JSON.stringify({ ...base, expected: started.identity })),
+  ], { readyMarker: REMOTE_CLAUDE_HOST_PROXY_READY, timeoutMs: 15_000, maxPreludeBytes: 64 * 1024 });
+  const client = new RemoteClaudeHost(async () => ({
+    input: stream.input, output: stream.output, close: () => { void stream.close(); },
+  }));
+  t.after(async () => { await client.shutdown(); await stream.close(); });
+
+  const status = await client.hostStatus();
+  assert.equal(status.sdkVersion, "9.9.9-stub", "the host imported the SDK at the resolved path");
+  assert.equal(status.claudeVersion, "2.9.9", "the host probed the Claude CLI on the worker's PATH");
+  assert.equal(status.runtimeGeneration, token);
+
+  const events: any[] = [];
+  client.subscribe((event: unknown) => events.push(event));
+  await client.open({ sessionId: "11111111-2222-3333-4444-555555555555", mode: "create", cwd });
+  assert.equal(await client.send("11111111-2222-3333-4444-555555555555", "turn-1", "hello host"), true);
+  const completed = await waitFor(() => events.find((event) => event.type === "turn/completed"));
+  assert.equal(completed.uuid, "turn-1");
+  assert.equal(
+    events.find((event) => event.type === "content/assistant")?.message.message.content[0].text,
+    "echo:hello host",
+  );
+
+  await invoke("stop-claude-host", { ...base, expected: started.identity }, 15_000);
+  identity = undefined;
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent" });
+  await assert.rejects(stat(join(runtimeDir, "claude.sock")));
+});
+
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 10_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error("timed out waiting for a host event");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 test("published packages include every remote runtime asset", async () => {
   const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { files: string[] };
   assert.ok(manifest.files.includes("assets/remote/qiyan-ssh-helper.mjs"));
   assert.ok(manifest.files.includes("assets/remote/qiyan-app-server-launcher.sh"));
   assert.ok(manifest.files.includes("assets/remote/qiyan-claude.mjs"));
   assert.ok(manifest.files.includes("assets/remote/qiyan-claude-runtime-launcher.sh"));
+  assert.ok(manifest.files.includes("assets/remote/qiyan-claude-host.mjs"));
+  assert.ok(manifest.files.includes("assets/remote/qiyan-claude-host-launcher.sh"));
 });
 
 test("the remote workspace helper returns a structured missing-path error", async (t) => {

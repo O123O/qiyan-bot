@@ -7,6 +7,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { connect } from "node:net";
 
 const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
+// The Agent SDK resolves under a scoped package directory, so its path is the one remote
+// path that legitimately carries an `@`.
+const SAFE_SDK_PATH = /^\/[A-Za-z0-9_./@+-]+$/u;
 const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
@@ -15,6 +18,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
 const APP_SERVER_PROXY_READY = "qiyan-app-server-proxy-v1-ready\n";
+const CLAUDE_HOST_PROXY_READY = "qiyan-claude-host-proxy-v1-ready\n";
 const CLAUDE_RUNTIME_WATCH_READY = "qiyan-claude-runtime-watch-v1-ready\n";
 const CLAUDE_TURN_WATCH_READY = "qiyan-claude-turn-watch-v1-ready\n";
 const MAX_CLAUDE_MATERIALIZATION_SCAN_BYTES = 128 * 1024 * 1024;
@@ -26,6 +30,8 @@ const encoded = process.argv.slice(3);
 try {
   if (operation === "proxy-app-server") {
     await proxyAppServer(decodeJson(encoded, 1));
+  } else if (operation === "proxy-claude-host") {
+    await proxyClaudeHost(decodeJson(encoded, 1));
   } else if (operation === "watch-claude-runtime") {
     await watchClaudeRuntime(decodeJson(encoded, 1));
   } else if (operation === "watch-claude-turn") {
@@ -38,6 +44,9 @@ try {
       case "inspect": result = await inspect(decodeJson(encoded, 1)); break;
       case "start": result = await start(decodeJson(encoded, 1)); break;
       case "stop": result = await stop(decodeJson(encoded, 1)); break;
+      case "inspect-claude-host": result = await inspectClaudeHost(decodeJson(encoded, 1)); break;
+      case "start-claude-host": result = await startClaudeHost(decodeJson(encoded, 1)); break;
+      case "stop-claude-host": result = await stopClaudeHost(decodeJson(encoded, 1)); break;
       case "inspect-claude-runtime": result = await inspectClaudeRuntime(decodeJson(encoded, 1)); break;
       case "start-claude-runtime": result = await startClaudeRuntime(decodeJson(encoded, 1)); break;
       case "stop-claude-runtime": result = await stopClaudeRuntime(decodeJson(encoded, 1)); break;
@@ -107,14 +116,20 @@ async function bootstrap(value) {
     claudeLauncherSha256,
     claudeRuntimeLauncherBase64,
     claudeRuntimeLauncherSha256,
+    claudeHostBase64,
+    claudeHostSha256,
+    claudeHostLauncherBase64,
+    claudeHostLauncherSha256,
   } = value ?? {};
   requireRuntimeDir(runtimeDir, true);
-  if (![helperSha256, launcherSha256, claudeLauncherSha256, claudeRuntimeLauncherSha256]
+  if (![helperSha256, launcherSha256, claudeLauncherSha256, claudeRuntimeLauncherSha256, claudeHostSha256, claudeHostLauncherSha256]
     .every((item) => typeof item === "string" && /^[a-f0-9]{64}$/u.test(item))) throw new Error("invalid asset digest");
   const helper = decodeAsset(helperBase64, helperSha256);
   const launcher = decodeAsset(launcherBase64, launcherSha256);
   const claudeLauncher = decodeAsset(claudeLauncherBase64, claudeLauncherSha256);
   const claudeRuntimeLauncher = decodeAsset(claudeRuntimeLauncherBase64, claudeRuntimeLauncherSha256);
+  const claudeHost = decodeAsset(claudeHostBase64, claudeHostSha256);
+  const claudeHostLauncher = decodeAsset(claudeHostLauncherBase64, claudeHostLauncherSha256);
   await ensurePrivateDirectory(dirname(runtimeDir));
   await ensurePrivateDirectory(runtimeDir);
   requireRuntimeDir(runtimeDir);
@@ -122,6 +137,8 @@ async function bootstrap(value) {
   await atomicWrite(join(runtimeDir, "qiyan-app-server-launcher.sh"), launcher, 0o700);
   await atomicWrite(join(runtimeDir, "qiyan-claude.mjs"), claudeLauncher, 0o700);
   await atomicWrite(join(runtimeDir, "qiyan-claude-runtime-launcher.sh"), claudeRuntimeLauncher, 0o700);
+  await atomicWrite(join(runtimeDir, "qiyan-claude-host.mjs"), claudeHost, 0o700);
+  await atomicWrite(join(runtimeDir, "qiyan-claude-host-launcher.sh"), claudeHostLauncher, 0o700);
   return { installed: true };
 }
 
@@ -193,6 +210,117 @@ async function stop(value) {
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
+  return { stopped: true };
+}
+
+// The Claude host runtime is the Codex app-server runtime with a different server: one
+// tmux-supervised process holding an owner-only unix socket, identified by the token it
+// carries in its own /proc environ. Inspection is therefore the same three proofs — the
+// supervising session exists, the recorded process is still that process, and the socket is
+// private — so the two providers cannot drift into different liveness semantics.
+async function inspectClaudeHost(value) {
+  const paths = claudeRuntimePaths(value, true);
+  const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
+  const identityFile = await stat(paths.claudeHostIdentityPath).catch(() => undefined);
+  const socketFile = await stat(paths.claudeHostSocketPath).catch(() => undefined);
+  const identity = await readIdentity(paths.claudeHostIdentityPath);
+  const group = identity ? membersOfGroup(identity.processGroupId) : [];
+  const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
+  const groupAlive = group.length > 0;
+  if (tmux.code !== 0) {
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "absent" };
+  }
+  // The launcher exports QIYAN_RUNTIME_TOKEN before exec, so the environ check proves the
+  // live process is the one we started rather than a recycled pid that matches by accident.
+  if (!identity || !identityMatches(identity) || !processHasToken(identity.pid, identity.token)) {
+    return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+  }
+  if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
+    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+  }
+  return { status: "healthy", identity };
+}
+
+async function startClaudeHost(value) {
+  const paths = claudeRuntimePaths(value);
+  if (paths.tmuxMode !== "explicit" || !HEX_128.test(value?.token ?? "")
+    || typeof value?.shell !== "string" || !SAFE_PATH.test(value.shell)) throw new Error("invalid Claude host start request");
+  // Capability probe on the login PATH: node runs the host bundle, claude is the CLI the
+  // SDK drives, tmux supervises the generation, tail rotates the host log.
+  const capability = spawnSync(value.shell, ["-lc", "command -v node; command -v claude; command -v tmux; command -v tail"], {
+    encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  const capabilityPaths = (capability.stdout ?? "").split(/\r?\n/u).map((line) => line.trim()).filter((line) => SAFE_PATH.test(line));
+  if (capability.status !== 0 || capabilityPaths.slice(-4).length !== 4) {
+    throw new Error("node, claude, tmux, and tail are required to start a remote Claude host");
+  }
+  const before = await inspectClaudeHost(value);
+  if (before.status === "healthy") return { identity: before.identity };
+  if (before.status === "unhealthy") throw new Error("existing Claude host is unhealthy");
+  // Only a real launch pays for this: it shells out to `npm root -g`, and reattaching to a
+  // healthy host above must stay a cheap round-trip.
+  const sdkPath = resolveAgentSdkPath(value.shell);
+  await unlink(paths.claudeHostSocketPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+  await unlink(paths.claudeHostIdentityPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+  const inner = `exec ${paths.claudeHostLauncherPath} ${value.token} ${paths.claudeHostSocketPath} ${paths.claudeHostIdentityPath} ${paths.claudeHostPath} ${sdkPath}`;
+  if (![paths.claudeHostLauncherPath, paths.claudeHostSocketPath, paths.claudeHostIdentityPath, paths.claudeHostPath].every((item) => SAFE_PATH.test(item))) {
+    throw new Error("unsafe Claude host launcher path");
+  }
+  const command = `${value.shell} -lc '${inner}'`;
+  await run("tmux", [...tmuxArgs(paths), "new-session", "-d", "-s", paths.session, command]);
+  // Longer than the app-server's window: before it binds, the host imports the Agent SDK
+  // and probes `claude --version`, so it fails its prerequisites here rather than later.
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const state = await inspectClaudeHost(value);
+    if (state.status === "healthy") return { identity: state.identity };
+    if (state.status === "absent") break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error("Claude host did not become healthy");
+}
+
+// The host bundle lives outside any node_modules tree, so it cannot resolve the SDK itself
+// (and NODE_PATH would not help: it is ignored for ESM). Resolve it here, under the login
+// shell, from the roots an install actually lands in — the npm global prefix, then the
+// account's own node_modules — and hand the host the absolute entry path.
+function resolveAgentSdkPath(shell) {
+  const script = "const { createRequire } = require('node:module');"
+    + "for (const root of process.argv.slice(1)) {"
+    + "  if (!root) continue;"
+    + "  try { process.stdout.write(createRequire(root + '/qiyan.js').resolve('@anthropic-ai/claude-agent-sdk')); process.exit(0); } catch { /* try the next root */ }"
+    + "}"
+    + "process.exit(1);";
+  const resolved = spawnSync(shell, ["-lc", `node -e ${shellQuote(script)} -- "$(npm root -g 2>/dev/null)" "$HOME"`], {
+    encoding: "utf8", timeout: 60_000, maxBuffer: 64 * 1024,
+  });
+  const sdkPath = (resolved.stdout ?? "").trim();
+  if (resolved.status !== 0 || !SAFE_SDK_PATH.test(sdkPath) || !isAbsolute(sdkPath)) {
+    throw new Error("the Claude Agent SDK is not installed on this host (npm i -g @anthropic-ai/claude-agent-sdk)");
+  }
+  return sdkPath;
+}
+
+async function stopClaudeHost(value) {
+  const paths = claudeRuntimePaths(value);
+  const identity = await readIdentity(paths.claudeHostIdentityPath);
+  const expected = validIdentity(value?.expected);
+  if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  let members = ownedGroupMembers(identity);
+  if (members.length > 0) {
+    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+    await waitForEmptyGroup(identity.processGroupId, 2_000);
+    members = ownedGroupMembers(identity);
+    if (members.length > 0) {
+      try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+      await waitForEmptyGroup(identity.processGroupId, 2_000);
+    }
+    if (ownedGroupMembers(identity).length > 0) throw new Error("Claude host process group did not stop");
+  }
+  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
+  await rm(paths.claudeHostSocketPath, { force: true });
+  await rm(paths.claudeHostIdentityPath, { force: true });
+  await rm(paths.tmuxSocketPath, { force: true });
   return { stopped: true };
 }
 
@@ -556,11 +684,57 @@ async function proxyAppServer(value) {
   } finally { socket.destroy(); }
 }
 
+// Byte-for-byte the app-server proxy against the Claude host's socket: prove the recorded
+// runtime identity before AND after connecting, prove the socket did not change inode
+// underneath us, and only then announce readiness and copy bytes. A swapped socket must
+// never receive a single framed request.
+async function proxyClaudeHost(value) {
+  const paths = claudeRuntimePaths(value);
+  const expected = validIdentity(value?.expected);
+  if (!expected) throw new Error("invalid expected Claude host identity");
+  const beforeIdentity = await readIdentity(paths.claudeHostIdentityPath);
+  if (!beforeIdentity || !sameIdentity(beforeIdentity, expected) || !identityMatches(beforeIdentity)
+    || !processHasToken(beforeIdentity.pid, beforeIdentity.token)) {
+    throw new Error("Claude host identity changed");
+  }
+  const beforeSocket = await privateSocketIdentity(paths.claudeHostSocketPath);
+  const socket = connect(paths.claudeHostSocketPath);
+  try {
+    await new Promise((resolveConnection, rejectConnection) => {
+      const connected = () => { cleanup(); resolveConnection(); };
+      const failed = () => { cleanup(); rejectConnection(new Error("Claude host socket connection failed")); };
+      const cleanup = () => { socket.off("connect", connected); socket.off("error", failed); };
+      socket.once("connect", connected);
+      socket.once("error", failed);
+    });
+    const [afterSocket, afterIdentity] = await Promise.all([
+      privateSocketIdentity(paths.claudeHostSocketPath),
+      readIdentity(paths.claudeHostIdentityPath),
+    ]);
+    if (afterSocket.device !== beforeSocket.device || afterSocket.inode !== beforeSocket.inode
+      || !afterIdentity || !sameIdentity(afterIdentity, expected) || !identityMatches(afterIdentity)) {
+      throw new Error("Claude host changed during connection");
+    }
+    await new Promise((resolveReady, rejectReady) => {
+      process.stdout.write(CLAUDE_HOST_PROXY_READY, (error) => error ? rejectReady(error) : resolveReady());
+    });
+    await new Promise((resolveProxy, rejectProxy) => {
+      const failed = () => rejectProxy(new Error("Claude host proxy failed"));
+      process.stdin.once("error", failed);
+      process.stdout.once("error", failed);
+      socket.once("error", failed);
+      socket.once("close", resolveProxy);
+      process.stdin.pipe(socket);
+      socket.pipe(process.stdout, { end: false });
+    });
+  } finally { socket.destroy(); }
+}
+
 async function privateSocketIdentity(path) {
   const state = await lstat(path, { bigint: true });
   const uid = process.getuid?.();
   if (!state.isSocket() || state.isSymbolicLink() || (state.mode & 0o077n) !== 0n
-    || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid app-server socket");
+    || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid runtime socket");
   return { device: state.dev.toString(10), inode: state.ino.toString(10) };
 }
 
@@ -805,6 +979,13 @@ function claudeRuntimePaths(value, allowMissing = false) {
   if (paths.tmuxMode !== "explicit") throw new Error("Claude requires an explicit tmux socket");
   return {
     ...paths,
+    // Deliberately short: requireRuntimeDir bounds `app-server.sock` (15 bytes) against the
+    // 107-byte unix path limit, so an 11-byte socket name keeps that one check sufficient
+    // for every socket this runtime directory holds.
+    claudeHostSocketPath: join(paths.runtimeDir, "claude.sock"),
+    claudeHostIdentityPath: join(paths.runtimeDir, "claude-host-identity.json"),
+    claudeHostLauncherPath: join(paths.runtimeDir, "qiyan-claude-host-launcher.sh"),
+    claudeHostPath: join(paths.runtimeDir, "qiyan-claude-host.mjs"),
     claudeIdentityPath: join(paths.runtimeDir, "claude-identity.json"),
     claudeWatchPath: join(paths.runtimeDir, "claude-watch.fifo"),
     claudeRuntimeLauncherPath: join(paths.runtimeDir, "qiyan-claude-runtime-launcher.sh"),
