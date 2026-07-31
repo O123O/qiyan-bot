@@ -112,7 +112,7 @@ export class WorkerScheduleMcpServer {
     // over ssh for a remote worker. It is registered only when a host check runner exists
     // (supportsMonitor), so the description's "on your session's host" promise always holds.
     if (this.options.supportsMonitor?.(session) ?? true) mcp.registerTool("monitor", {
-      description: "Watch an external condition: QiYan runs `check` every poll_seconds on your session's host; when it exits 0, the monitor fires once, sends `message` as a new turn, and finishes. Use for durable external work such as builds, files, and jobs. Do not use it to wait for Claude subagents or background agents: headless Claude exits terminate them.",
+      description: "Watch an external condition: QiYan runs `check` every poll_seconds on your session's host; when it exits 0, the monitor fires once, sends `message` as a new turn, and finishes. Use for durable external work such as builds, files, and jobs. The check only observes the host, so do not use it to wait on work running inside this session.",
       inputSchema: { check: z.string().min(1).describe("shell command run on your host; exit 0 = condition met"), message: z.string().min(1).describe("the message sent to you when the check passes"), poll_seconds: z.number().int().min(1).describe("seconds between checks").optional() },
     }, async (args) => {
       const ms = (args.poll_seconds ?? 30) * 1000;
