@@ -13,6 +13,13 @@ await build({
   outfile,
   bundle: true,
   packages: "bundle",
+  // The Claude Agent SDK is a deployment prerequisite, not a bundled dependency: it
+  // resolves a ~264 MB platform-specific native Claude binary from its own package
+  // directory, which no bundler can inline. Marking it external keeps dist/qiyan-bot
+  // small and lets the host import the SDK installed on the worker's own machine.
+  // src/claude-host/requirements.ts fails closed with an actionable message when it
+  // is missing, so this never degrades into an opaque module-resolution error.
+  external: ["@anthropic-ai/claude-agent-sdk"],
   platform: "node",
   format: "esm",
   target: "node24",

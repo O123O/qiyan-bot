@@ -69,6 +69,42 @@ wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
    `claude_session_goals` is empty. The cutover therefore needs a precondition
    assertion, not a migration. Re-check immediately before switching.
 
+## Deployment prerequisites
+
+**Both the Claude Agent SDK and the Claude CLI must be installed on every machine
+that runs a Claude worker host** — the QiYan host for local endpoints, and each
+remote worker host for SSH endpoints. Neither is bundled.
+
+The reason is measurable rather than stylistic. The SDK does not use the CLI on
+`PATH`; it spawns a platform-specific native binary shipped as an optional
+dependency of its own package. Traced during the spike:
+
+```
+execve(".../node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude")
+```
+
+That package is ~264 MB per platform. No bundler can inline it into
+`dist/qiyan-bot`, so bundling the SDK's JavaScript alone would produce a binary
+that fails at first use. `@anthropic-ai/claude-agent-sdk` is therefore marked
+`external` in `scripts/build.mjs` and imported from the host's own installation,
+which also preserves the repo's zero-runtime-dependency packaging contract.
+
+The CLI is required separately because the host passes
+`pathToClaudeCodeExecutable` pointing at it, rather than using the SDK's vendored
+copy — one Claude per machine instead of two, and the same binary the operator
+already manages. QiYan already required the CLI on every worker host, so this
+adds no new install step there; the SDK is the new one.
+
+`src/claude-host/requirements.ts` gates both at startup and fails closed:
+
+- A missing SDK reports a deployment prerequisite with the install command, not
+  an unresolvable-module crash.
+- A missing or unreadable CLI names the executable that failed.
+- A CLI older than `MIN_CLAUDE_CLI_VERSION` (2.1.220, the version the spike
+  proved against) is refused. The SDK's JS and the CLI are released together and
+  the SDK's manifest pins an exact CLI build, so an older CLI can lack
+  control-protocol capabilities the host depends on.
+
 ## Manager tool coverage
 
 Every manager tool that operates on a worker needs a working path under this design.
@@ -276,10 +312,9 @@ session-level backstop against a goal that never terminates.
 Resolved items are struck through by the results above; the remainder stand.
 The earlier handoff's MCP-bridge and legacy-migration items are gone.
 
-1. Authentication in the real service environment, and whether the SDK-bundled
-   Claude binary works with it (production prefers the bundled binary; a
-   configured `pathToClaudeCodeExecutable` is an override behind a
-   version/capability gate).
+1. ~~Authentication and which Claude binary to prefer.~~ Settled below: both the
+   Agent SDK and the Claude CLI are deployment prerequisites, and the host
+   points `pathToClaudeCodeExecutable` at the installed CLI.
 2. `claude_code` preset with no append, `settingSources` omitted, loads the
    same settings/`CLAUDE.md`/skills/agents/commands/hooks as the CLI.
 3. `Options.sessionId` produces exactly the caller-chosen UUID that
