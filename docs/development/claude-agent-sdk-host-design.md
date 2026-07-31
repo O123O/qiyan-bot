@@ -1,0 +1,194 @@
+# Claude Agent SDK host design
+
+Supersedes the architecture section of
+`claude-agent-sdk-redesign-handoff.md`. That handoff was written before the
+scope decisions below; where the two disagree, this document wins. The handoff
+remains useful as the inventory of what exists today and why.
+
+## Decisions
+
+The Claude endpoint is rebuilt around one persistent host process per endpoint,
+wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
+**QiYan does not manage Claude's native features.**
+
+1. **A managed Claude session is an ordinary Claude Code session.** No appended
+   system prompt, no tool allow/deny list, no injected MCP servers. The only
+   launch configuration is the one required to *be* a normal session:
+
+   ```ts
+   systemPrompt: { type: "preset", preset: "claude_code" }
+   ```
+
+   This field is mandatory, not optional: omitting `systemPrompt` selects the
+   SDK's minimal prompt instead of Claude Code's. `settingSources` stays
+   omitted so user/project/local settings, `CLAUDE.md`, skills, agents,
+   commands, and hooks load exactly as in the CLI.
+
+2. **Claude owns scheduling, background tasks, subagents, and goals.** The
+   worker no longer receives QiYan's `schedule_wakeup` / `schedule_cron` /
+   `monitor` tools, and `ClaudeGoalDriver` is retired in favour of native
+   `/goal`. `SchedulingService` and `WorkerScheduleMcpServer` remain in the
+   codebase for Codex workers, which have no native equivalent.
+
+3. **Native state is not made durable by QiYan.** If a host restart loses a
+   native cron or wakeup, it is lost. QiYan adds no shadow store, no
+   re-arming, and no reconciliation layer. On restart the existing behaviour is
+   retained: a resume prompt is sent to the session ("the worker restarted;
+   resume if unfinished, otherwise do nothing"). This is a deliberate trade of
+   durability for the removal of an entire compatibility layer.
+
+4. **Every top-level end-of-turn is delivered.** QiYan does not distinguish
+   human-initiated from self-initiated turns. Any terminal `SDKResultMessage`
+   for a *top-level* turn produces one worker-completion delivery. Subagent and
+   other nested results never do, or one turn would fan out into several chat
+   messages.
+
+5. **Background status is readable, not manageable.** The host tracks the
+   native background-task set already (it gates idle and eviction), so
+   `session/status` exposes it and QiYan projects it to the manager: idle vs
+   working, and what is still pending that may wake the session. No management
+   verbs.
+
+6. **No legacy migration.** Verified against the live database on 2026-07-31:
+   `session_schedules` holds no `armed` rows (only `done`/`cancelled`),
+   `scheduled_sends` holds no unresolved `sending` claims, and
+   `claude_session_goals` is empty. The cutover therefore needs a precondition
+   assertion, not a migration. Re-check immediately before switching.
+
+## Architecture
+
+```text
+QiYan backend
+    |  provider-neutral thread/turn/goal RPC (unchanged)
+    v
+ClaudeCodeRuntime            (keeps its ManagedAppServerEndpoint surface)
+    |  host client
+    v
+local Unix socket, or SSH-forwarded socket to the same protocol
+    |
+qiyan-claude-host            (one per endpoint, independently supervised)
+    |  one long-lived SDK Query per loaded session
+    v
+Claude Code + its native JSONL transcript
+```
+
+`ClaudeCodeRuntime` keeps its external interface — `thread/start`,
+`thread/read`, `thread/resume`, `thread/turns/list`, `turn/start`,
+`turn/interrupt`, `turn/steer`, `thread/list`, `thread/archive`,
+`thread/unsubscribe`, `model/list`, `thread/goal/*`, and the `turn/started` /
+`item/started` / `turn/completed` notifications. What changes is everything
+beneath it: `ClaudeCommandRunner` and its two implementations are replaced by a
+host client.
+
+### Host process
+
+Supervision reuses the pattern that already works for remote Codex and Claude:
+the host runs inside the endpoint's tmux generation under the shared runtime
+root, never `/tmp`. Local supervision is the known gap — local turns die with
+the QiYan service today, and that stays true until local supervision is added.
+With QiYan-side scheduling gone, a local restart now also drops any pending
+native wakeup; that is accepted under decision 3.
+
+Protocol: newline-framed JSON over an owner-only Unix socket. Methods are added
+only when a caller exists.
+
+- `host/status` — protocol, host build, SDK and Claude versions, generation
+- `session/open` — caller-chosen native session id, create-or-resume, cwd
+- `session/close` — idle eviction / unadopt
+- `session/send` — caller-generated idempotency id, structured input
+- `session/interrupt`
+- `session/status` — activity, background-task set, pending native schedules
+- `session/setModel`, `session/setPermissionMode`
+- `session/stopTask`
+- `events/subscribe` — host generation + event cursor
+
+The channel is unidirectional in the sense that matters: the host has no
+callback into QiYan's durable state, because no QiYan MCP tools are attached to
+Claude sessions. That removes the bridge, operation ledger, request-hash
+replay, and goal-continuation fence the earlier handoff required.
+
+### Session lifetime
+
+One loaded session owns one long-lived `Query`. Sessions load lazily and are
+evicted only while no top-level response and no native background task is
+active. A QiYan restart reconnects to the host; it does not terminate the host
+or an active turn. A host generation owns a fenced process tree, and a
+replacement host may not start until the prior generation's Claude, tool, and
+background-agent processes are proven gone.
+
+### History
+
+Claude's JSONL remains the only durable transcript; QiYan keeps no cache and
+writes nothing into it. Prefer the SDK's `listSessions` / `getSessionInfo` /
+`getSessionMessages` for discovery and lazy paging if the spike shows their
+reads are bounded on a large real transcript; otherwise keep
+`ClaudeTranscriptHistory`'s snapshot-pinned reader behind the host. Either way,
+JSONL polling stops being the live-message transport — live content comes from
+SDK events.
+
+## What the spike must settle
+
+Only questions that change the design are listed; the earlier handoff's
+MCP-bridge and legacy-migration items are gone.
+
+1. Authentication in the real service environment, and whether the SDK-bundled
+   Claude binary works with it (production prefers the bundled binary; a
+   configured `pathToClaudeCodeExecutable` is an override behind a
+   version/capability gate).
+2. `claude_code` preset with no append, `settingSources` omitted, loads the
+   same settings/`CLAUDE.md`/skills/agents/commands/hooks as the CLI.
+3. `Options.sessionId` produces exactly the caller-chosen UUID that
+   `thread/start` reserves, and `resume` accepts CLI-created session ids
+   without forking them.
+4. One streaming `Query` takes three or more sequential messages without
+   respawning, preserving context.
+5. A message sent during an active turn is queued once and ordered correctly.
+6. `interrupt()` ends only the active response; the session stays usable.
+7. `SDKUserMessage.uuid` survives into live events and JSONL, so a retry after
+   an ambiguous send does not create a second user turn.
+8. Events carry reliable top-level vs subagent identity and per-turn result
+   boundaries — decision 4 depends entirely on this.
+9. Background tasks: can one complete after its parent response while the query
+   stays open, what does `stopTask()` do, and does a task notification avoid
+   producing a duplicate user bubble or a second completion delivery?
+10. Native `/goal`: set, clear, pause/resume, automatic completion, resume
+    after the query is disposed and recreated, and enforcement of a turn/token
+    bound before the next internal continuation. Preflight trusted-workspace
+    and hooks availability; unsupported goal operations must fail closed with
+    `UNSUPPORTED_CAPABILITY` without disturbing ordinary turns.
+11. `supportedModels()` can replace the static catalog in `claude-models.ts`
+    without losing effort validation.
+12. Session-history helpers on a large real transcript: bounded and fast enough
+    to replace the manual JSONL parser.
+
+Item 10 is the only remaining fork. If native `/goal` cannot hold the turn/token
+bound, goals are not offered on Claude workers rather than reviving a second
+driver — decision 2 does not get partially reversed.
+
+## Sequence
+
+1. SDK spike (disposable, real Claude, local).
+2. Host + client prototype: client disconnect does not stop the host; SSH
+   transport survives ControlMaster loss; killing the host leaves no
+   descendant alive.
+3. Production: host client behind `ClaudeCodeRuntime`, SDK-event-driven live
+   flow, local then remote.
+4. Delete in the same migration: `claudeLaunchPolicy` and its prompt/tool
+   constants, `LocalClaudeCommandRunner.startTurn`, per-turn tmux dispatch and
+   materialization scans, `assets/remote/qiyan-claude.mjs`, `ClaudeGoalDriver`,
+   Claude's worker-MCP attachment, and the static model catalog.
+
+No long-lived dual engine. A short canary flag is acceptable; two lifecycle
+models are not.
+
+## Accepted losses
+
+Stated plainly so they are not rediscovered as bugs:
+
+- A native cron or wakeup does not survive host replacement or a local QiYan
+  restart.
+- The manager cannot cancel a worker's schedule from QiYan; it can only see
+  that something is pending and ask the worker.
+- Claude workers gain Claude's own scheduling semantics, which differ from
+  Codex workers' QiYan-backed ones. The two providers are no longer symmetric
+  here.
