@@ -34,6 +34,11 @@ export interface WorkerScheduleMcpOptions {
 const SCHEDULE_TOOLS = ["schedule_wakeup", "schedule_cron", "monitor", "list_schedules", "cancel_schedule"] as const;
 export const WORKER_SCHEDULE_TOOL_NAMES: readonly string[] = SCHEDULE_TOOLS;
 
+// TODO(worker-mcp): retained deliberately, not dead code. Claude workers no longer receive
+// these tools — a persistent Claude Code session owns its own scheduling, background tasks
+// and goals natively (see docs/development/claude-agent-sdk-host-design.md). Codex workers
+// have no native equivalent, so this stays available for a future Codex worker-side
+// scheduling surface. It currently has no caller; do not delete it on that basis alone.
 export class WorkerScheduleMcpServer {
   private http: Server | undefined;
   private actualPort = 0;

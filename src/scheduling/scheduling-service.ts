@@ -139,6 +139,12 @@ export class SchedulingService {
   // per-session --mcp-config path (byte-identical across the session's turns, so it
   // doesn't break the prompt cache). Idempotent per session.
   // The loopback port the worker MCP listens on (for the remote reverse tunnel's local end).
+  // TODO(worker-mcp): retained deliberately, not dead code. Claude workers no longer
+  // receive these tools — a persistent Claude Code session owns its own scheduling,
+  // background tasks and goals natively (see
+  // docs/development/claude-agent-sdk-host-design.md). Codex workers have no native
+  // equivalent, so this stays available for a future Codex worker-side scheduling
+  // surface. It currently has no caller; do not delete it on that basis alone.
   get mcpPort(): number { return this.server.port; }
 
   // The stable per-session bearer token (minted on first use). A remote worker's config uses
