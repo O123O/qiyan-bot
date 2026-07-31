@@ -120,8 +120,10 @@ import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
-import { attestUserControlMaster, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
+import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
+import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
+import { SshClaudeHostRuntime } from "./endpoints/ssh-claude-host.ts";
 import { prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
@@ -2852,19 +2854,41 @@ export async function buildProductionApp(
             if (definition.transport === "local") {
               throw new AppError("CONFIGURATION_ERROR", `local endpoint '${definition.id}' cannot be activated remotely; local endpoint changes require a restart`);
             }
-            // TODO(remote-claude-host): remote Claude runs its turns inside a long-lived
-            // `qiyan-claude-host` in the endpoint's tmux generation, reached over a unix
-            // socket; that host process is the next stage. Until it exists, fail CLOSED at
-            // activation rather than handing the endpoint an in-process host, which would
-            // run Claude on the QiYan machine against the wrong filesystem.
-            if (definition.provider === "claude") {
-              throw new AppError("UNSUPPORTED_CAPABILITY",
-                `remote Claude endpoint '${definition.id}' is being migrated to the persistent Claude host and cannot be activated yet; `
-                + "use a local Claude endpoint or a Codex (ssh) endpoint until qiyan-claude-host ships");
-            }
             // host drives the ssh alias (ssh -G, ControlMaster path); id stays the identity/binding key.
             const generation = await planner.createGeneration(definition.id, definition.host!);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
+            if (definition.provider === "claude") {
+              // A Claude endpoint has no app-server to lazily prepare, so bootstrap the
+              // helper eagerly here (installs it + establishes the ControlMaster) — the
+              // Workspace and file operations need the installed helper immediately.
+              const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+              // The turns run inside `qiyan-claude-host` on the worker's machine, reached
+              // over an attested unix socket; the runner stays only as the transcript and
+              // discovery source, and as the host for this worker's `monitor` checks.
+              const claudeHostRuntime = new SshClaudeHostRuntime({
+                endpointId: definition.id,
+                host: { ...host, remote },
+              });
+              const claudeRemoteRunner = new SshClaudeCommandRunner({
+                plan: generation.plan,
+                host: { ...host, remote },
+              });
+              // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
+              monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
+              const claudeRemoteEndpoint = new ClaudeCodeRuntime({
+                id: definition.id,
+                host: claudeHostRuntime.host,
+                runner: claudeRemoteRunner,
+                persistentRuntime: claudeHostRuntime,
+                launchFlags: {
+                  ...(definition.model === undefined ? {} : { model: definition.model }),
+                  ...(definition.effort === undefined ? {} : { effort: definition.effort }),
+                },
+                ...claudeRuntimeOptions(definition.id),
+              });
+              remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
+              return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
+            }
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
             const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
