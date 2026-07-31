@@ -590,16 +590,21 @@ function noRollout(threadId: string): JsonRpcResponseError {
 
 // Top-level assistant text from an SDK event. Nested (subagent) content never reaches
 // here: the host classifies it separately so it cannot appear as a top-level message.
+// Must enumerate exactly as reconstructClaudeThread's textBlocks does, because the live
+// item id is `${uuid}:${index}` and the reconstructed one is `${uuid}:${blockIndex}`.
+// A divergent index would key the same message twice and the Web UI would show duplicates.
 function assistantTextBlocks(message: Record<string, unknown>): string[] {
   const content = (message.message as { content?: unknown } | undefined)?.content;
+  if (typeof content === "string") return content.length > 0 ? [content] : [];
   if (!Array.isArray(content)) return [];
-  return content
-    .filter((block): block is { type: "text"; text: string } =>
-      typeof block === "object" && block !== null
-      && (block as { type?: unknown }).type === "text"
-      && typeof (block as { text?: unknown }).text === "string")
-    .map((block) => block.text)
-    .filter((text) => text.length > 0);
+  const blocks: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const value = block as Record<string, unknown>;
+    if (value.type !== "text") continue;
+    if (typeof value.text === "string" && value.text.length > 0) blocks.push(value.text);
+  }
+  return blocks;
 }
 
 function messageUuid(message: Record<string, unknown>): string | undefined {

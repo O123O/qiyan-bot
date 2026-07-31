@@ -180,7 +180,13 @@ export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
   if (isClaudeInternalTaskNotification(record.message)) return undefined;
   const promptId = turnIdOf(record);
   if (!promptId) return undefined;
-  return extractClaudeClientMarker(record.message) ?? promptId;
+  // A turn's id is the user row's own uuid, which for a QiYan-driven turn IS the
+  // clientUserMessageId we handed the SDK. That makes a live turn and its reconstructed
+  // history agree on identity, so the Web UI merges them instead of rendering both.
+  // `promptId` is a separate Claude-generated id and must NOT be used: it never matches
+  // anything QiYan knows. A legacy client marker still wins so transcripts written by the
+  // retired one-shot path keep their historical turn ids.
+  return extractClaudeClientMarker(record.message) ?? idOf(record) ?? promptId;
 }
 
 function turnIdOf(record: Record<string, unknown>): string | undefined {

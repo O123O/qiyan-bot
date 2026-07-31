@@ -47,7 +47,10 @@ test("a native subagent task notification remains internal to its parent turn", 
 
   const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
   assert.equal(v.turns.length, 1);
-  assert.equal(v.turns[0]?.id, "p1");
+  // The turn id is the user row's own uuid — for a QiYan-driven turn that IS the
+  // clientUserMessageId handed to the SDK, so live events and history agree. promptId is
+  // a separate Claude-generated id that matches nothing QiYan knows.
+  assert.equal(v.turns[0]?.id, "u1");
   assert.equal(v.turns[0]?.items.filter((item) => item.type === "userMessage").length, 1);
   assert.equal(v.turns[0]?.items.find((item) => item.phase === "final_answer")?.text, "parent result");
 });
@@ -65,7 +68,7 @@ test("an incomplete transcript is active only while its exact tracked Claude chi
   const raw = records("interrupted");
   const turnStart = raw.find((record): record is Record<string, unknown> => !!record && typeof record === "object"
     && (record as Record<string, unknown>).type === "user" && typeof (record as Record<string, unknown>).promptSource === "string");
-  const runningTurnId = String((turnStart as Record<string, unknown>).promptId);
+  const runningTurnId = String((turnStart as Record<string, unknown>).uuid);
   const v = reconstructClaudeThread({ threadId: "interrupted", cwd: "/tmp/x", records: raw, runningTurnId });
   assert.equal(v.turns[0]?.status, "inProgress");
   assert.equal(v.status.type, "active");
@@ -74,9 +77,30 @@ test("an incomplete transcript is active only while its exact tracked Claude chi
 test("a known-interrupted turn id is reported interrupted (terminal)", () => {
   const raw = records("interrupted");
   const turnStart = raw.find((r): r is Record<string, unknown> => !!r && typeof r === "object" && (r as Record<string, unknown>).type === "user" && typeof (r as Record<string, unknown>).promptSource === "string");
-  const turnId = String((turnStart as Record<string, unknown>).promptId);
+  const turnId = String((turnStart as Record<string, unknown>).uuid);
   const v = reconstructClaudeThread({ threadId: "interrupted", cwd: "/tmp/x", records: raw, interruptedTurnIds: new Set([turnId]) });
   assert.equal(v.turns[0]?.status, "interrupted");
+});
+
+// A live turn and its reconstructed history must key identically or the Web UI merges
+// nothing and renders every message twice: it matches on item id first, then clientId,
+// then a fallback needing turnId + body + phase to agree.
+test("reconstructed ids match what the live host events carry", () => {
+  const recs = [
+    { type: "user", promptSource: "sdk", promptId: "claude-generated", uuid: "client-uuid",
+      message: { role: "user", content: "hi" } },
+    { type: "assistant", uuid: "assistant-uuid",
+      message: { role: "assistant", stop_reason: "end_turn", content: [
+        { type: "text", text: "first" }, { type: "thinking", thinking: "ignored" }, { type: "text", text: "second" },
+      ] } },
+  ];
+  const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
+  assert.equal(v.turns[0]?.id, "client-uuid", "turn id === the uuid QiYan sent");
+  const items = v.turns[0]!.items;
+  assert.equal(items.find((item) => item.type === "userMessage")?.id, "client-uuid");
+  // Non-text blocks are skipped by BOTH enumerations, so the indices stay aligned.
+  assert.deepEqual(items.filter((item) => item.type === "agentMessage").map((item) => item.id),
+    ["assistant-uuid:0", "assistant-uuid:1"]);
 });
 
 test("userMessage carries the QiYan clientId marker; phases split final vs commentary", () => {
