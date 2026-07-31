@@ -560,14 +560,20 @@ export class EndpointManager {
       const state = this.options.managedThreadState?.(endpointId, threadId, generation);
       if (!state || state.availability !== "ready" || state.endpointGeneration !== generation
         || state.status === "unknown" || state.status === "error") {
-        // OPERATION_CONFLICT, not OPERATION_UNCERTAIN: this guard runs at the `draining`
-        // phase, before stopEndpointRuntime, and a failure here reopens the endpoint
-        // untouched — so nothing was dispatched and the outcome is not in doubt. Reporting
-        // it as uncertain left the operation permanently recoverable, and because an
-        // unresolved earlier operation fences the next lifecycle action, a worker whose
-        // status could not be read wedged every future restart of its endpoint: the repair
-        // was refused by the wreckage of its own last attempt. The sibling not-idle branch
-        // below has always used CONFLICT for exactly the same reason.
+        // OPERATION_CONFLICT, not OPERATION_UNCERTAIN. This guard runs at the `draining`
+        // phase, before stopEndpointRuntime, so the operation's OWN effect — stopping the
+        // runtime — provably did not happen, which is what the code has to report.
+        //
+        // Note this is narrower than "nothing happened": shutdownTarget may have started
+        // the endpoint to prove its identity (startedForProof), and reopenAfterLifecycleFailure
+        // then publishes it. That restores service rather than performing the shutdown, so
+        // the operation is still proven-no-effect, but the endpoint is not untouched.
+        //
+        // Reporting UNCERTAIN left the operation permanently recoverable, and an unresolved
+        // earlier operation fences the next lifecycle action on the endpoint. So a worker
+        // whose status could not be read wedged every future restart of its endpoint: the
+        // repair was refused by the wreckage of its own last attempt. The sibling not-idle
+        // branch below has always used CONFLICT for the same reason.
         throw new AppError("OPERATION_CONFLICT", `could not prove managed thread idle on endpoint ${endpointId}`);
       }
       if (state.status !== "idle") {
