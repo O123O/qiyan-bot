@@ -31,7 +31,6 @@ export class RuntimeRestartRecovery {
     resolve(endpointId: string, threadId: string): ManagedWorker | undefined;
     native(session: RegistrySession): { availability: "ready" | "unavailable"; status: NativeSessionStatus } | undefined;
     enqueueResume(worker: ManagedWorker): void;
-    resumeActiveGoal(worker: ManagedWorker): boolean;
   }) {}
 
   endpointUnavailable(endpointId: string, kind: EndpointLossKind): void {
@@ -62,7 +61,7 @@ export class RuntimeRestartRecovery {
         this.pending.delete(key);
         continue;
       }
-      if (!this.deps.resumeActiveGoal(current)) this.deps.enqueueResume(current);
+      this.deps.enqueueResume(current);
       this.pending.delete(key);
     }
   }

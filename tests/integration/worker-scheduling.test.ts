@@ -78,28 +78,3 @@ function runClaude(cwd: string, args: string[], prompt: string): Promise<number>
   });
 }
 
-test("a real Claude worker ends its own goal via the set_goal_status MCP tool", { skip: !enabled, timeout: 180_000 }, async (t) => {
-  const store = new ScheduleStore(createTestDatabase());
-  const session = { nickname: "worker-2", endpointId: "claude-local", threadId: "thread-goal" };
-  const marked: Array<{ status: string }> = [];
-  const server = new WorkerScheduleMcpServer({
-    store, now: () => 1, resolveToken: (tok) => tok === "tok" ? session : undefined,
-    setGoalStatus: (_s, status) => { marked.push({ status }); },
-  });
-  await server.start();
-  t.after(() => server.stop());
-
-  const dir = await mkdtemp(join(tmpdir(), "qiyan-goal-mcp-"));
-  const configPath = join(dir, "mcp.json");
-  await writeFile(configPath, JSON.stringify({
-    mcpServers: { "qiyan-worker-scheduling": { type: "http", url: `http://127.0.0.1:${server.port}/mcp`, headers: { Authorization: "Bearer tok" } } },
-  }));
-
-  const status = await runClaude(dir, [
-    "-p", "--output-format", "stream-json", "--verbose",
-    "--mcp-config", configPath, "--strict-mcp-config",
-    "--allowedTools", "mcp__qiyan-worker-scheduling__set_goal_status",
-  ], "You have accomplished your goal. Call the set_goal_status tool with status=complete. Then reply DONE.");
-  assert.equal(status, 0);
-  assert.deepEqual(marked, [{ status: "complete" }]);
-});

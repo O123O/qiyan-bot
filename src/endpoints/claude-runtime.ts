@@ -15,7 +15,6 @@ import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
 import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
-import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
@@ -62,7 +61,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     runner: ClaudeCommandRunner;
     launchFlags: ClaudeLaunchFlags;
     persistentRuntime?: ClaudePersistentRuntime;
-    goals?: ClaudeGoalStore;
     // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
     archives?: ClaudeArchiveStore;
@@ -197,11 +195,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // Claude has no model-list API; return the curated catalog (Codex `{data,nextCursor}` shape)
       // so set_session_model / the model picker have real entries to validate against.
       case "model/list": return { data: claudeModelCatalog(this.options.launchFlags.model), nextCursor: null } as T;
-      // An endpoint without a goal store (e.g. a remote Claude endpoint — goals are scoped to
-      // the local endpoint) simply has no goal; reading it must not fail get_session_status.
-      case "thread/goal/get": return { goal: this.options.goals ? this.options.goals.get(this.id, requireString(args.threadId, "threadId")) : null } as T;
-      case "thread/goal/set": return this.goalSet(args) as T;
-      case "thread/goal/clear": { this.goals().clear(this.id, requireString(args.threadId, "threadId")); return { goal: null } as T; }
+      // A goal is Claude's own `/goal`, driven by its Stop hook. QiYan stores none: the
+      // manager's goal tools install and clear the NATIVE goal by delivering the command,
+      // and `thread/goal/get` reports "no goal" because native goal state is not exposed
+      // to the SDK stream (see docs/development/claude-agent-sdk-host-design.md).
+      case "thread/goal/get": return { goal: null } as T;
+      case "thread/goal/set": return await this.goalSet(args) as T;
+      case "thread/goal/clear": return await this.goalClear(args) as T;
       case "turn/steer": return await this.turnSteer(args) as T;
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
@@ -497,26 +497,35 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
   }
 
-  private goals(): ClaudeGoalStore {
-    if (!this.options.goals) throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no goal store configured");
-    return this.options.goals;
+  // The manager's set_goal installs Claude's own goal by delivering `/goal <objective>`;
+  // its Stop hook then drives the session until the condition is met. QiYan keeps no goal
+  // row, so the returned projection is synthesized for the caller, not persisted.
+  //
+  // Native `/goal` has no pause/resume: without stored state there is no objective to
+  // reinstate, so a status-only change is refused rather than silently dropped.
+  private async goalSet(params: Record<string, unknown>): Promise<{ goal: unknown }> {
+    const threadId = requireString(params.threadId, "threadId");
+    const objective = typeof params.objective === "string" ? params.objective.trim() : "";
+    if (objective.length === 0) {
+      throw new AppError("UNSUPPORTED_CAPABILITY",
+        "claude goals are native /goal: set an objective, or clear it — pause/resume has no native equivalent");
+    }
+    await this.deliverGoalCommand(threadId, `/goal ${objective}`);
+    return { goal: { objective, status: "active" } };
   }
 
-  // thread/goal/set carries either a fresh objective (set) or a status-only change
-  // (pause/resume/blocked/complete), mirroring the Codex goal RPC the service calls.
-  private goalSet(params: Record<string, unknown>): { goal: unknown } {
-    const threadId = requireString(params.threadId, "threadId");
-    const now = this.options.now?.() ?? Date.now();
-    const status = typeof params.status === "string" ? requireGoalStatus(params.status) : undefined;
-    if (typeof params.objective === "string" && params.objective.length > 0) {
-      return { goal: this.goals().set(this.id, threadId, {
-        objective: params.objective,
-        ...(status === undefined ? {} : { status }),
-        ...(typeof params.tokenBudget === "number" ? { tokenBudget: params.tokenBudget } : {}),
-      }, now) };
+  private async goalClear(params: Record<string, unknown>): Promise<{ goal: null }> {
+    await this.deliverGoalCommand(requireString(params.threadId, "threadId"), "/goal clear");
+    return { goal: null };
+  }
+
+  // The command must arrive as its own turn for the CLI to parse the leading slash, so it
+  // rides the same durable enqueue as steer rather than racing a running turn.
+  private async deliverGoalCommand(threadId: string, command: string): Promise<void> {
+    if (!this.options.steer) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no delivery queue for goal commands");
     }
-    if (status !== undefined) return { goal: this.goals().setStatus(this.id, threadId, status, now) };
-    throw new AppError("CONFIGURATION_ERROR", "thread/goal/set requires an objective or a status");
+    await this.options.steer(threadId, command);
   }
 
   // Claude steer = durable enqueue (never abort the running turn). Delivered as the
@@ -564,14 +573,6 @@ function requireItemsView(value: unknown): "full" | "summary" | "notLoaded" {
     throw new AppError("CONFIGURATION_ERROR", "claude endpoint: invalid itemsView");
   }
   return value;
-}
-
-// The goal statuses QiYan's recovery/dashboard accept (production-app parseManagedGoal);
-// reject anything else at write time rather than letting recovery throw later.
-const CLAUDE_GOAL_STATUSES = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
-function requireGoalStatus(status: string): string {
-  if (!CLAUDE_GOAL_STATUSES.has(status)) throw new AppError("CONFIGURATION_ERROR", `invalid goal status: ${status}`);
-  return status;
 }
 
 // Render the Codex-shaped input items as text for `claude -p`. Text items pass through;

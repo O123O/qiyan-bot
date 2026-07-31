@@ -13,7 +13,6 @@ import {
 } from "../../src/endpoints/claude-command-runner.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
-import { ClaudeGoalStore } from "../../src/sessions/claude-goals.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 // A fake runner that simulates the transcript `claude -p` writes. Realistic: the
@@ -750,31 +749,35 @@ test("a cold incomplete transcript is terminal because no tracked Claude child i
   assert.equal(read.thread.turns[0].status, "interrupted");
 });
 
-test("thread/goal get/set/status/clear are emulated via the goal store", async () => {
-  const goals = new ClaudeGoalStore(createTestDatabase());
-  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner: new FakeRunner(), launchFlags: {}, goals, now: () => 1 });
+// Goals are Claude's own `/goal`: the manager's goal tools install and clear the NATIVE
+// goal, and QiYan stores no goal row of its own.
+test("the manager's goal tools install and clear Claude's native goal", async () => {
+  const delivered: Array<{ threadId: string; message: string }> = [];
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", runner: new FakeRunner(), launchFlags: {},
+    steer: async (threadId, message) => { delivered.push({ threadId, message }); },
+  });
   await rt.start();
-  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
 
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: thread.id }), { goal: null });
-  const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: thread.id, objective: "finish phase 2", status: "active" });
+  // Reading stays graceful so a provider-neutral get_session_status still works: native
+  // goal state is not exposed to the SDK stream, so there is nothing to report.
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "t" }), { goal: null });
+
+  const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: "t", objective: "finish phase 2" });
   assert.equal(set.goal.objective, "finish phase 2");
-  assert.equal(set.goal.status, "active");
+  assert.deepEqual(delivered.at(-1), { threadId: "t", message: "/goal finish phase 2" });
 
-  const paused = await rt.request<{ goal: any }>("thread/goal/set", { threadId: thread.id, status: "paused" });
-  assert.equal(paused.goal.status, "paused");
-
-  assert.deepEqual(await rt.request("thread/goal/clear", { threadId: thread.id }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/clear", { threadId: "t" }), { goal: null });
+  assert.deepEqual(delivered.at(-1), { threadId: "t", message: "/goal clear" });
 });
 
-test("with no goal store, goal read is empty but goal writes fail loud, not silently", async () => {
-  const rt = makeRuntime(new FakeRunner()); // no goals configured (e.g. a remote Claude endpoint)
+// Native /goal has no pause/resume, and QiYan stores no objective to reinstate.
+test("a status-only goal change is refused rather than silently dropped", async () => {
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", runner: new FakeRunner(), launchFlags: {}, steer: async () => {},
+  });
   await rt.start();
-  // Reading is graceful — no store means no goal — so get_session_status doesn't blow up.
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "t" }), { goal: null });
-  // Writing a goal you can't persist must still fail loudly.
-  await assert.rejects(rt.request("thread/goal/set", { threadId: "t", objective: "x" }), /goal store/u);
-  await assert.rejects(rt.request("thread/goal/clear", { threadId: "t" }), /goal store/u);
+  await assert.rejects(rt.request("thread/goal/set", { threadId: "t", status: "paused" }), /pause\/resume/u);
 });
 
 test("turn/steer durably enqueues the message (never aborts the running turn)", async () => {

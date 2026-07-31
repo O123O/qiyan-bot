@@ -23,10 +23,6 @@ export interface WorkerScheduleMcpOptions {
   // Resolve a per-session bearer token to the calling worker session.
   resolveToken(token: string): WorkerScheduleSession | undefined;
   now(): number;
-  // Let the calling WORKER mark its own goal complete/blocked (Claude only; Codex has a
-  // native goal engine and the assistant is not a worker). When present, exposes the
-  // set_goal_status tool.
-  setGoalStatus?(session: WorkerScheduleSession, status: "complete" | "blocked"): void;
   // Whether `monitor` is usable by the calling session. It is offered only when the session's
   // own host can run the check (locally for the local worker, over ssh for a remote worker), so
   // the tool description's "on your session's host" promise always holds. Default: usable.
@@ -136,16 +132,6 @@ export class WorkerScheduleMcpServer {
         : `no such active schedule: ${args.id}`);
     });
 
-    if (this.options.setGoalStatus) {
-      const setGoalStatus = this.options.setGoalStatus;
-      mcp.registerTool("set_goal_status", {
-        description: "Report the status of YOUR current goal so QiYan stops driving you. Use status=\"complete\" when the goal is fully accomplished, or \"blocked\" when you cannot make progress without help.",
-        inputSchema: { status: z.enum(["complete", "blocked"]).describe("'complete' = goal accomplished; 'blocked' = cannot progress without help") },
-      }, async (args) => {
-        setGoalStatus(session, args.status);
-        return text(`goal marked ${args.status}`);
-      });
-    }
 
     // SDK 1.29 models stateless mode as an explicitly-undefined generator, which
     // conflicts with exactOptionalPropertyTypes despite being the documented API
