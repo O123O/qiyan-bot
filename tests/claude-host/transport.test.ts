@@ -154,62 +154,45 @@ test("host/status reports protocol and build identity", async (t) => {
   assert.equal(status.runtimeGeneration, "gen-1");
 });
 
-// The whole point of the remote transport: the client going away does not stop the host,
-// and reconnecting recovers what was missed rather than losing it.
-test("a client reconnect replays the events emitted while it was gone", async (t) => {
+// The whole point of the remote transport: the client going away does not stop the host.
+// The work continues and the result lands; the client just has to reload to see it.
+test("the host keeps working while the client is disconnected", async (t) => {
   const { client, queries, restart } = await harness(t);
   await client.open(request("s1"));
-  const events: HostEvent[] = [];
-  client.subscribe((event) => events.push(event));
   await client.send("s1", "u1", "hello");
   await delay(20);
+  assert.equal((await client.status("s1")).activity, "working");
 
   await restart();                                     // the client's connection drops
-  queries.get("s1")!.push({ type: "assistant", parent_tool_use_id: null, message: { content: [] } });
   queries.get("s1")!.push({ type: "result", subtype: "success", origin: { kind: "human" }, user_message_uuid: "u1" });
   await delay(20);
 
-  await client.status("s1");                            // any call redials and triggers replay
-  await delay(60);
-  assert.deepEqual(events.map((event) => event.type),
-    ["turn/accepted", "content/assistant", "turn/completed"],
-    "the events emitted while disconnected arrive exactly once, in order");
+  // The turn ran to completion on the host with nobody listening.
+  assert.equal((await client.status("s1")).activity, "idle");
 });
 
-// A reconnect that cannot recover everything must say so, or the Web UI renders a
-// conversation with a hole in it and never knows.
-test("a reconnect past the replay bound reports a gap instead of hiding it", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "qiyan-host-gap-"));
-  const socketPath = join(dir, "host.sock");
-  const queries = new Map<string, FakeQuery>();
-  const host = new LocalClaudeHost(async (request) => (input) => {
-    const query = new FakeQuery(input);
-    queries.set(request.sessionId, query);
-    return query;
-  }, { replayLimit: 3 });
-  const identity = {
-    hostBuild: "test", sdkVersion: "0", claudeVersion: "2.1.220", runtimeGeneration: "gen-1",
-  };
-  let server = new ClaudeHostServer(host, identity);
-  await server.listen(socketPath);
-  const client = new RemoteClaudeHost(unixSocketChannel(socketPath));
-  t.after(async () => { await client.shutdown(); await server.close(); });
-
+// Events are live-only, so anything emitted while disconnected was missed. The client
+// says so once per session and the consumer reloads the transcript tail.
+test("a reconnect tells each open session to reload", async (t) => {
+  const { client, restart } = await harness(t);
   await client.open(request("s1"));
-  const gaps: string[] = [];
-  client.onReplayGap((sessionId) => gaps.push(sessionId));
+  await client.open(request("s2"));
+  const reloads: string[] = [];
+  client.onReconnect((sessionId) => reloads.push(sessionId));
 
-  await server.close();
-  for (let index = 0; index < 6; index += 1) {
-    queries.get("s1")!.push({ type: "assistant", parent_tool_use_id: null, message: { content: [] } });
-  }
+  await restart();
+  await client.status("s1");                            // any call redials
+  await delay(40);
+  assert.deepEqual(reloads.sort(), ["s1", "s2"]);
+});
+
+test("the first connection asks for no reload", async (t) => {
+  const { client } = await harness(t);
+  const reloads: string[] = [];
+  client.onReconnect((sessionId) => reloads.push(sessionId));
+  await client.open(request("s1"));
   await delay(20);
-  server = new ClaudeHostServer(host, identity);
-  await server.listen(socketPath);
-
-  await client.status("s1");
-  await delay(60);
-  assert.deepEqual(gaps, ["s1"], "the client is told to reload durable history");
+  assert.deepEqual(reloads, [], "there is nothing to catch up on a fresh connection");
 });
 
 test("in-flight requests fail loudly when the connection drops", async (t) => {

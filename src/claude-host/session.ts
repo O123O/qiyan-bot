@@ -16,8 +16,13 @@
 //   - Subagent content carries `parent_tool_use_id`; it is nested, never top-level.
 //   - Re-sending an accepted uuid is a no-op in the CLI, so retry after an ambiguous
 //     transport failure is safe and must not enqueue a second message here either.
+//
+// Events are live fan-out only. Nothing is buffered for replay: a client that was away
+// reloads the tail of the durable transcript, which is both simpler and the only complete
+// source. The Web UI only renders an active panel, so there is nothing to catch up for an
+// inactive one.
 import { AppError } from "../core/errors.ts";
-import type { HostEvent, HostEventDraft, SessionActivity, SessionStatus } from "./protocol.ts";
+import type { HostEvent, SessionActivity, SessionStatus } from "./protocol.ts";
 
 // The slice of the SDK's Query that a session actor uses. Narrowed to what the host
 // calls so tests can drive the actor without spawning Claude.
@@ -43,8 +48,6 @@ export interface SessionInput {
 export interface SessionQueryFactory {
   (input: AsyncIterable<SessionInput>): SessionQuery;
 }
-
-const DEFAULT_REPLAY_LIMIT = 512;
 
 // Push-based streaming input. The SDK consumes this for the life of the session, so it
 // must stay open between turns — closing it ends the query.
@@ -85,21 +88,19 @@ interface AcceptedTurn {
 export class ClaudeHostSession {
   private readonly input = new InputStream();
   private readonly query: SessionQuery;
-  private readonly events: HostEvent[] = [];
   private readonly listeners = new Set<(event: HostEvent) => void>();
   // Accepted sends that have not yet settled, in submission order. The SDK executes
   // queued messages in order, so the head is the turn a uuid-less result belongs to.
   private readonly inFlight: AcceptedTurn[] = [];
   private readonly acceptedUuids = new Set<string>();
   private readonly backgroundTasks = new Map<string, { type?: string; startedAt: number }>();
-  private cursor = 0;
   private closed = false;
   readonly drained: Promise<void>;
 
   constructor(
     readonly sessionId: string,
     createQuery: SessionQueryFactory,
-    private readonly options: { now?: () => number; replayLimit?: number } = {},
+    private readonly options: { now?: () => number } = {},
   ) {
     this.query = createQuery(this.input);
     this.drained = this.drain();
@@ -148,7 +149,6 @@ export class ClaudeHostSession {
         ...(task.type === undefined ? {} : { taskType: task.type }),
         startedAt: task.startedAt,
       })),
-      cursor: this.cursor,
     };
   }
 
@@ -162,23 +162,6 @@ export class ClaudeHostSession {
 
   isEvictable(): boolean { return this.activity() === "idle"; }
 
-  // Replay from a cursor so a short client reconnect recovers live output without
-  // re-reading JSONL. The buffer is bounded on purpose — durable reconstruction is the
-  // transcript — so a long disconnect can drop events the caller never saw.
-  //
-  // `gap` reports exactly that. Without it a client would silently advance its cursor
-  // past dropped events and render a conversation with a hole in it, which is the
-  // missing-message class of bug this redesign exists to remove. On a gap the caller
-  // must reload from the durable transcript instead of trusting the live stream.
-  eventsSince(cursor: number): { events: HostEvent[]; gap: boolean } {
-    const events = this.events.filter((event) => event.seq > cursor);
-    const oldestRetained = this.events[0]?.seq;
-    // A gap exists when the first event still retained is newer than the one the caller
-    // would have expected next. An empty buffer is never a gap: nothing was dropped.
-    const gap = oldestRetained !== undefined && oldestRetained > cursor + 1;
-    return { events, gap };
-  }
-
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -191,12 +174,8 @@ export class ClaudeHostSession {
     this.query.close();
   }
 
-  private emit(event: HostEventDraft): void {
-    const full = { ...event, seq: ++this.cursor } as HostEvent;
-    this.events.push(full);
-    const limit = this.options.replayLimit ?? DEFAULT_REPLAY_LIMIT;
-    if (this.events.length > limit) this.events.splice(0, this.events.length - limit);
-    for (const listener of this.listeners) listener(full);
+  private emit(event: HostEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 
   private async drain(): Promise<void> {

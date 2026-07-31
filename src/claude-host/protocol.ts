@@ -19,8 +19,6 @@ export interface SessionStatus {
   // Accepted sends that have not settled, in submission order.
   inFlightTurns: string[];
   backgroundTasks: BackgroundTaskView[];
-  // Latest event sequence number, for replay after a reconnect.
-  cursor: number;
 }
 
 export interface HostStatus {
@@ -35,8 +33,10 @@ export interface HostStatus {
   sessions: SessionStatus[];
 }
 
+// Events are live fan-out only — the host buffers nothing. A client that misses events
+// while disconnected reloads the tail of the durable transcript instead, which is the
+// only complete source anyway.
 interface HostEventBase {
-  seq: number;
   sessionId: string;
   at: number;
 }
@@ -59,18 +59,6 @@ export type HostEvent =
   | (HostEventBase & { type: "task/settled"; taskId: string; status: string })
   | (HostEventBase & { type: "task/set"; taskIds: string[] });
 
-// A HostEvent before the host stamps its sequence number. Written as a distributive
-// conditional because a plain `Omit<HostEvent, "seq">` collapses the union to its
-// common keys and would reject every variant-specific field.
-export type HostEventDraft = HostEvent extends infer Variant
-  ? Variant extends HostEvent ? Omit<Variant, "seq"> : never
-  : never;
-
-// Turn completion for an interrupted turn arrives without a uuid, so a client that is
-// waiting on one specific send must fall back to this ordering rule: the oldest
-// in-flight turn owns the next uncorrelated terminal result. The host applies it, and
-// the event's `uuid` reports the attribution it made.
-
 // One request per ClaudeHost method, so the server's dispatch is mechanical and the wire
 // cannot drift from the interface. `params` is the method's argument tuple.
 export type HostRequest =
@@ -83,7 +71,6 @@ export type HostRequest =
   | { method: "setModel"; params: [string, string | undefined] }
   | { method: "models"; params: [string] }
   | { method: "stopTask"; params: [string, string] }
-  | { method: "eventsSince"; params: [string, number] }
   | { method: "evictIdle"; params: [number] }
   | { method: "shutdown"; params: [] };
 

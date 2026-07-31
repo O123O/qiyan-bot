@@ -35,9 +35,6 @@ export interface ClaudeHost {
   setModel(sessionId: string, model?: string): Promise<void>;
   models(sessionId: string): Promise<unknown[]>;
   stopTask(sessionId: string, taskId: string): Promise<void>;
-  // `gap` is true when the bounded replay buffer dropped events the caller never saw;
-  // the caller must then reload from the durable transcript rather than trust the stream.
-  eventsSince(sessionId: string, cursor: number): Promise<{ events: HostEvent[]; gap: boolean }>;
   subscribe(listener: (event: HostEvent) => void): () => void;
   // Unload idle sessions above the loaded-session budget. A session with a running turn
   // or a live background task is never evicted, or its output would be lost.
@@ -53,16 +50,12 @@ export class LocalClaudeHost implements ClaudeHost {
   // `prepare` resolves everything a session needs (launch options, permission
   // pass-through) before the actor exists, so the actor's constructor stays synchronous
   // and nothing is patched in afterwards.
-  constructor(
-    private readonly prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>,
-    private readonly options: { replayLimit?: number } = {},
-  ) {}
+  constructor(private readonly prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>) {}
 
   async open(request: OpenSessionRequest): Promise<SessionStatus> {
     const existing = this.sessions.get(request.sessionId);
     if (existing) return existing.status();
-    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request),
-      this.options.replayLimit === undefined ? {} : { replayLimit: this.options.replayLimit });
+    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request));
     this.sessions.set(request.sessionId, session);
     this.unsubscribes.set(request.sessionId, session.subscribe((event) => {
       for (const listener of this.listeners) listener(event);
@@ -88,9 +81,6 @@ export class LocalClaudeHost implements ClaudeHost {
   async setModel(sessionId: string, model?: string): Promise<void> { await this.require(sessionId).setModel(model); }
   async models(sessionId: string): Promise<unknown[]> { return await this.require(sessionId).supportedModels(); }
   async stopTask(sessionId: string, taskId: string): Promise<void> { await this.require(sessionId).stopTask(taskId); }
-  async eventsSince(sessionId: string, cursor: number): Promise<{ events: HostEvent[]; gap: boolean }> {
-    return this.require(sessionId).eventsSince(cursor);
-  }
 
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
