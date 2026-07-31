@@ -36,6 +36,11 @@ interface ThreadState {
   recovery?: Promise<void>;
   loaded: boolean;                       // is the session open on the host?
   running?: { turnId: string };
+  // The last turn this endpoint saw complete normally, i.e. the newest turn the transcript
+  // certainly holds. Native background output that arrives while the session is idle is
+  // folded into that turn by reconstruction, so it is the only identity live and history
+  // agree on for it.
+  lastTurnId?: string;
   terminalTurns: Set<string>;            // turn ids known interrupted/failed
 }
 
@@ -106,7 +111,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       return;
     }
     if (event.type === "content/assistant") {
-      const turnId = state.running?.turnId;
+      // Top-level assistant text with no turn running is a native background task reporting
+      // in after its parent turn. Claude writes those rows after the last turn's rows, and
+      // reconstruction folds them into that turn, so attributing them to it is what keeps
+      // the live stream and the reconstructed history keyed the same way.
+      const turnId = state.running?.turnId ?? state.lastTurnId;
       if (!turnId) return;
       for (const [index, text] of assistantTextBlocks(event.message).entries()) {
         this.emitter.emit("notification", "item/completed", {
@@ -118,13 +127,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       return;
     }
     if (event.type !== "turn/completed") return;
-    // A background task's result is a real end-of-turn and is delivered, but it settles
-    // no accepted send, so it must not close the running human turn.
+    // A background task's result is a real end-of-turn, but it has no turn of its own:
+    // Claude is answering a `<task-notification>` row, which reconstruction deliberately
+    // does not start a turn on, so its output belongs to the turn it follows. Republish
+    // THAT turn's terminal so the newly folded response is still delivered. Synthesizing an
+    // id from the result message instead would hand the relay a turn no transcript can ever
+    // hold: bounded retries, then a degraded endpoint and a spurious recovery warning.
     if (event.origin === "task-notification") {
-      this.emitter.emit("notification", "turn/completed", {
-        threadId,
-        turn: { id: messageUuid(event.result ?? {}) ?? `${threadId}:task`, status: "completed" },
-      });
+      // A running turn will carry the folded output through its own completion.
+      if (state.running || state.lastTurnId === undefined) return;
+      this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: state.lastTurnId } });
       return;
     }
     const turnId = event.uuid ?? state.running?.turnId;
@@ -132,6 +144,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     state.materialized = true;
     if (state.running?.turnId === turnId) delete state.running;
     if (event.status !== "completed") state.terminalTurns.add(turnId);
+    // Only a normally completed turn is certain to be a findable transcript turn: a turn
+    // that failed before `claude` wrote its user row exists only as a synthesized terminal.
+    else state.lastTurnId = turnId;
     this.emitter.emit("notification", "turn/completed", {
       threadId,
       turn: event.status === "completed" ? { id: turnId } : { id: turnId, status: "interrupted" },
@@ -537,6 +552,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // the response it produced while QiYan was away is still delivered instead of lost.
     if (state.running?.turnId === clientId) delete state.running;
     state.materialized = true;
+    state.lastTurnId = clientId;
     this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
     return { turn: { id: clientId, status: "completed" } };
   }

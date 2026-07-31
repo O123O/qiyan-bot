@@ -130,6 +130,23 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     if (uuid !== undefined) this.settle(sessionId, uuid, status);
   }
 
+  // A native background task reports in after its parent turn: Claude answers a
+  // <task-notification> row and the run ends in a task-notification result. Reconstruction
+  // starts no turn on that row, so both rows fold into the turn they follow.
+  backgroundReply(sessionId: string, text: string): string {
+    const session = this.require(sessionId);
+    this.append(sessionId, {
+      type: "user", cwd: session.cwd, promptSource: "sdk", uuid: `task-user-${this.replies}`,
+      message: { role: "user", content: "<task-notification><task-id>task-1</task-id></task-notification>" },
+    });
+    const uuid = this.reply(sessionId, text);
+    this.emit({
+      type: "turn/completed", sessionId, origin: "task-notification", status: "completed",
+      result: { uuid: `result-${uuid}` }, at: this.clock += 1,
+    });
+    return uuid;
+  }
+
   // The `claude` child dies under a loaded session: the host settles whatever was running
   // and retires the session, exactly as ClaudeHostSession.drain does.
   killSession(sessionId: string): void {
@@ -639,6 +656,76 @@ test("the first turn creates the native session and the next resumes it; the cal
   await rt.request("turn/start", { threadId, clientUserMessageId: "ctx:call-2", input: [{ type: "text", text: "again" }] });
   assert.equal(claude.opens.length, 1, "a loaded session is reused without reopening");
   assert.deepEqual(claude.sends.at(-1), { sessionId: threadId, uuid: "ctx:call-2", text: "again" });
+});
+
+// Native background tasks are the design: Claude owns them, and one settles after its
+// parent turn. Its report must reach the live panel AND chat, and every turn id published
+// for it has to be one the relay can find in the native history — a synthesized id makes
+// the relay retry to exhaustion and degrade the endpoint with a recovery warning.
+test("a background task's report is published on the turn history folds it into", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const threadId = thread.id;
+  await rt.request("turn/start", {
+    threadId, clientUserMessageId: "ctx:1", input: [{ type: "text", text: "count the files in the background" }],
+  });
+  claude.answer(threadId, "started it");
+  await delay(5);
+
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  const backgroundUuid = claude.backgroundReply(threadId, "the background job finished: 42 files");
+  await delay(5);
+
+  assert.deepEqual(notifications, [
+    {
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId: "ctx:1",
+        item: { type: "agentMessage", id: `${backgroundUuid}:0`, text: "the background job finished: 42 files" },
+      },
+    },
+    { method: "turn/completed", params: { threadId, turn: { id: "ctx:1" } } },
+  ]);
+
+  // The relay resolves a published turn through thread/turns/list. Every id above has to be
+  // findable there, and the folded report has to be part of the turn it resolves to.
+  const history = new ThreadHistoryReader((method, params) => rt.request(method, params));
+  const found = await history.findTurn(threadId, "ctx:1", createHistoryScanBudget());
+  assert.equal(found?.id, "ctx:1");
+  const exact = await history.exactTurnItems(threadId, "ctx:1", { budget: createHistoryScanBudget() });
+  assert.deepEqual(
+    exact.turn.items.filter((item: any) => item.type === "agentMessage").map((item: any) => [item.id, item.text]),
+    [["agent-0:0", "started it"], [`${backgroundUuid}:0`, "the background job finished: 42 files"]],
+    "the live item id is the id history reports for the same block");
+});
+
+// While a turn is running, its own completion carries whatever the background task added,
+// so a second terminal for the same content would be noise.
+test("a background task settling inside a running turn publishes no extra terminal", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:1", input: [{ type: "text", text: "go" }],
+  });
+  claude.answer(thread.id, "first answer");
+  await delay(5);
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:2", input: [{ type: "text", text: "more" }],
+  });
+
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.backgroundReply(thread.id, "background note");
+  await delay(5);
+
+  assert.deepEqual(notifications.map((entry) => entry.method), ["item/completed"]);
+  assert.equal(notifications[0]!.params.turnId, "ctx:2", "the running turn owns the rows it precedes");
 });
 
 // A loaded session never forgets a uuid it accepted, so a refused send says nothing about
