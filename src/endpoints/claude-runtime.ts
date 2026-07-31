@@ -1,14 +1,16 @@
-// ManagedAppServerEndpoint-shaped adapter for headless `claude -p` sessions.
-// Local Claude is daemonless; remote Claude composes this adapter with a persistent
-// tmux controller so turns survive SSH and QiYan reconnects.
+// ManagedAppServerEndpoint-shaped adapter over a ClaudeHost.
 //
-// Model: one endpoint per host, multiplexing many sessions; threadId === Claude
-// session id. `thread/start` pre-reserves a session id (claude's --session-id) and
-// returns a synthetic idle thread — no subprocess yet. `turn/start` runs `claude -p`
-// asynchronously (fire-and-resume: --session-id on the first turn, --resume after)
-// and, on exit, pushes a synthesized `turn/completed`; the relay then uses bounded
-// transcript turn/item pages for authoritative content. `turn/interrupt`
-// kills the subprocess.
+// Model: one endpoint per host, multiplexing many sessions; threadId === Claude session
+// id. `thread/start` reserves a session id and returns a synthetic idle thread — no
+// session is loaded yet. `turn/start` opens the session on the host if needed and hands
+// the message to its long-lived SDK query; the host's events drive `turn/started`,
+// live `item/completed`, and `turn/completed` directly, rather than being inferred from
+// transcript writes. `turn/interrupt` interrupts the running response and leaves the
+// session usable.
+//
+// A QiYan turn id IS the caller's message uuid. The SDK preserves it into the native
+// transcript as the user row's `uuid`, so the live stream and the reconstructed history
+// agree on turn identity without QiYan writing a correlation marker into the transcript.
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { AppError } from "../core/errors.ts";
@@ -20,7 +22,9 @@ import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
   claudeModelCatalog,
 } from "./claude-models.ts";
-import type { ClaudeCommandRunner, ClaudeLaunchFlags, ClaudeTurnHandle } from "./claude-command-runner.ts";
+import type { ClaudeCommandRunner, ClaudeLaunchFlags } from "./claude-command-runner.ts";
+import type { ClaudeHost } from "../claude-host/host.ts";
+import type { HostEvent } from "../claude-host/protocol.ts";
 import { ClaudeTranscriptHistory } from "./claude-history.ts";
 import type { EndpointLossKind, EndpointLossReason, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
 
@@ -30,9 +34,9 @@ interface ThreadState {
   materialized: boolean;                 // has at least one turn been run (transcript exists)?
   recoveryChecked: boolean;
   recovery?: Promise<void>;
-  starting?: { clientId: string; handle?: ClaudeTurnHandle };
-  running?: { turnId: string; handle: ClaudeTurnHandle };
-  terminalTurns: Set<string>;            // turn ids known interrupted/failed (no transcript end_turn)
+  loaded: boolean;                       // is the session open on the host?
+  running?: { turnId: string };
+  terminalTurns: Set<string>;            // turn ids known interrupted/failed
 }
 
 export interface ClaudePersistentRuntime {
@@ -41,7 +45,10 @@ export interface ClaudePersistentRuntime {
   shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
-  recoverTurn(threadId: string, cwd: string): Promise<{ turnId: string; handle: ClaudeTurnHandle } | undefined>;
+  // Reconnect-time reattach. The host already knows whether a response is still running,
+  // so this only has to report the turn id it belongs to — no process handles, PID
+  // markers, or transcript materialization scans.
+  recoverTurn(threadId: string, cwd: string): Promise<{ turnId: string } | undefined>;
   releaseThread(threadId: string): Promise<void>;
 }
 
@@ -54,10 +61,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private readonly stateLoads = new Map<string, Promise<ThreadState>>();
   private readonly history: ClaudeTranscriptHistory;
   private persistentUnavailableSubscription?: () => void;
+  private readonly hostSubscription: () => void;
   private lifecycleGeneration = 0;
 
   constructor(private readonly options: {
     id: string;
+    // Runs turns: one long-lived SDK query per loaded session, local or remote.
+    host: ClaudeHost;
+    // Reads the native transcript for durable history and session discovery. Claude's
+    // JSONL stays the only durable conversation store.
     runner: ClaudeCommandRunner;
     launchFlags: ClaudeLaunchFlags;
     persistentRuntime?: ClaudePersistentRuntime;
@@ -76,6 +88,47 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     this.daemonless = options.persistentRuntime === undefined;
     this.history = new ClaudeTranscriptHistory(options.runner);
     this.emitter.setMaxListeners(100);
+    this.hostSubscription = options.host.subscribe((event) => this.onHostEvent(event));
+  }
+
+  // Host events are the live source of truth for an active turn. They are translated
+  // straight into the provider-neutral notifications the relay and Web UI already
+  // consume, so no consumer learns that Claude is behind them.
+  private onHostEvent(event: HostEvent): void {
+    const threadId = event.sessionId;
+    const state = this.threads.get(threadId);
+    if (!state) return;
+    if (event.type === "content/assistant") {
+      const turnId = state.running?.turnId;
+      if (!turnId) return;
+      for (const [index, text] of assistantTextBlocks(event.message).entries()) {
+        this.emitter.emit("notification", "item/completed", {
+          threadId,
+          turnId,
+          item: { type: "agentMessage", id: `${messageUuid(event.message) ?? turnId}:${index}`, text },
+        });
+      }
+      return;
+    }
+    if (event.type !== "turn/completed") return;
+    // A background task's result is a real end-of-turn and is delivered, but it settles
+    // no accepted send, so it must not close the running human turn.
+    if (event.origin === "task-notification") {
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: { id: messageUuid(event.result ?? {}) ?? `${threadId}:task`, status: "completed" },
+      });
+      return;
+    }
+    const turnId = event.uuid ?? state.running?.turnId;
+    if (!turnId) return;
+    state.materialized = true;
+    if (state.running?.turnId === turnId) delete state.running;
+    if (event.status !== "completed") state.terminalTurns.add(turnId);
+    this.emitter.emit("notification", "turn/completed", {
+      threadId,
+      turn: event.status === "completed" ? { id: turnId } : { id: turnId, status: "interrupted" },
+    });
   }
 
   get state(): "starting" | "ready" | "unavailable" | "stopped" { return this.endpointState; }
@@ -113,10 +166,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       await this.options.persistentRuntime.closeConnection();
       return;
     }
-    for (const state of this.threads.values()) {
-      state.starting?.handle?.interrupt();
-      state.running?.handle.interrupt();
-    }
+    await this.options.host.shutdown();
   }
 
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
@@ -125,10 +175,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       this.endpointState = "stopped";
       this.persistentUnavailableSubscription?.();
       delete this.persistentUnavailableSubscription;
-      for (const state of this.threads.values()) {
-        await state.starting?.handle?.interrupt();
-        await state.running?.handle.interrupt();
-      }
+      await this.options.host.shutdown();
       return;
     }
     this.endpointState = "stopped";
@@ -172,12 +219,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/archive": {
         const id = typeof args.threadId === "string" ? args.threadId : "";
         const state = this.threads.get(id);
-        if (id && this.options.persistentRuntime) {
-          await this.options.persistentRuntime.releaseThread(id);
-        } else {
-          state?.starting?.handle?.interrupt();
-          state?.running?.handle.interrupt();
-        }
+        if (id && this.options.persistentRuntime) await this.options.persistentRuntime.releaseThread(id);
+        if (id && state?.loaded) await this.options.host.close(id);
         this.threads.delete(id);
         // Claude has no native archive: tombstone the thread so discover hides it (Codex parity).
         if (id) this.options.archives?.add(this.id, id, this.options.now?.());
@@ -185,10 +228,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       }
       case "thread/unsubscribe": {
         const id = requireString(args.threadId, "threadId");
-        if (this.options.persistentRuntime) {
-          await this.options.persistentRuntime.releaseThread(id);
-          this.threads.delete(id);
-        }
+        if (this.threads.get(id)?.loaded) await this.options.host.close(id);
+        if (this.options.persistentRuntime) await this.options.persistentRuntime.releaseThread(id);
+        this.threads.delete(id);
         return { status: "unsubscribed" } as T;
       }
       case "thread/name/set": return {} as T;
@@ -221,7 +263,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadSource = typeof params.threadSource === "string" ? params.threadSource : undefined;
     const id = randomUUID();
     this.threads.set(id, {
-      cwd, materialized: false, recoveryChecked: true, terminalTurns: new Set(),
+      cwd, materialized: false, recoveryChecked: true, loaded: false, terminalTurns: new Set(),
       ...(threadSource === undefined ? {} : { threadSource }),
     });
     return this.withCurrentSettings({
@@ -292,6 +334,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       cwd: cwd ?? recoveryCwd!,
       materialized: cwd !== undefined,
       recoveryChecked: false,
+      loaded: false,
       terminalTurns: new Set(),
     };
     this.threads.set(threadId, state);
@@ -302,9 +345,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     try {
       const recovered = await this.options.persistentRuntime?.recoverTurn(threadId, state.cwd);
       state.recoveryChecked = true;
+      // The host kept running while QiYan was away; adopt its in-flight turn so the
+      // relay still settles it when the host reports completion.
       if (recovered) {
-        state.running = recovered;
-        this.observeTurnHandle(threadId, state, recovered.turnId, recovered.handle);
+        state.running = { turnId: recovered.turnId };
+        state.loaded = true;
       }
     } finally {
       delete state.recovery;
@@ -362,7 +407,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return {
       id: threadId,
       cwd: state.cwd,
-      status: { type: state.running || state.starting ? "active" : "idle" },
+      status: { type: state.running ? "active" : "idle" },
       itemsView: "full",
       turns: [],
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
@@ -385,121 +430,53 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   }
 
   private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
-    const lifecycleGeneration = this.lifecycleGeneration;
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
-    // Defense-in-depth: the pool/lifecycle serialize turns per thread, but never let
-    // a second turn/start silently orphan a running child (losing interrupt control).
-    if (state.running || state.starting) {
-      throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
-    }
+    // Defense-in-depth: the pool serializes turns per thread, but a second turn/start
+    // must never orphan a running one and lose interrupt control over it.
+    if (state.running) throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = inputToText(params.input);
     // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
     this.options.archives?.remove(this.id, threadId);
-    const starting: NonNullable<ThreadState["starting"]> = { clientId };
-    state.starting = starting;
-    try {
-      // Per-session model/effort: `service.send` spreads the sticky settings into these params;
-      // prefer them over the endpoint-wide launch defaults (Claude applies them as `--model`/
-      // `--effort` per invocation). Attach the worker scheduling tools (stable per session).
-      const workerConfig = await this.options.workerMcpConfigPath?.(threadId);
-      const flags: ClaudeLaunchFlags = {
-        ...this.options.launchFlags,
-        ...(typeof params.model === "string" ? { model: params.model } : {}),
-        ...(typeof params.effort === "string" ? { effort: params.effort } : {}),
-        ...(workerConfig === undefined ? {} : { mcpConfig: [...(this.options.launchFlags.mcpConfig ?? []), workerConfig] }),
-      };
-      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
-        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
-      }
 
-      const handle = await this.options.runner.startTurn({
-        threadId, cwd: state.cwd, message, resume: state.materialized, flags,
+    // Lazily load the session. `materialized` distinguishes creating the caller-chosen
+    // native session id from resuming one that already exists on disk.
+    if (!state.loaded) {
+      await this.options.host.open({
+        sessionId: threadId,
+        mode: state.materialized ? "resume" : "create",
+        cwd: state.cwd,
+        ...(typeof params.model === "string"
+          ? { model: params.model }
+          : this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
       });
-      starting.handle = handle;
-      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
-        if (this.options.persistentRuntime) await this.options.persistentRuntime.closeConnection();
-        else await handle.interrupt();
-        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
-      }
-      const materialization = await handle.materialization;
-      if (!this.turnGenerationIsCurrent(lifecycleGeneration, threadId, state, starting)) {
-        if (this.options.persistentRuntime) await this.options.persistentRuntime.closeConnection();
-        else await handle.interrupt();
-        throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
-      }
-      if (materialization === undefined) {
-        await handle.interrupt();
-        state.terminalTurns.add(clientId);
-        return { turn: { id: clientId, status: "interrupted" } };
-      }
-      const { turnId: nativeTurnId, userItemId } = materialization;
-      state.running = { turnId: nativeTurnId, handle };
-      this.observeTurnHandle(threadId, state, nativeTurnId, handle);
+      state.loaded = true;
+    }
+    if (typeof params.model === "string") await this.options.host.setModel(threadId, params.model);
+
+    // The uuid IS the turn id: the SDK preserves it into the transcript's user row, so
+    // the live stream and reconstructed history agree without a correlation marker.
+    const accepted = await this.options.host.send(threadId, clientId, message);
+    state.running = { turnId: clientId };
+    if (accepted) {
       this.emitter.emit("notification", "turn/started", {
         threadId,
-        turn: { id: nativeTurnId, status: "inProgress" },
+        turn: { id: clientId, status: "inProgress" },
       });
       this.emitter.emit("notification", "item/started", {
         threadId,
-        turnId: nativeTurnId,
+        turnId: clientId,
         item: {
           type: "userMessage",
-          id: userItemId,
-          clientId: null,
+          id: clientId,
+          clientId,
           content: [{ type: "text", text: message, text_elements: [] }],
         },
       });
-      return { turn: { id: nativeTurnId, status: "inProgress" } };
-    } finally {
-      if (state.starting === starting) delete state.starting;
     }
-  }
-
-  private turnGenerationIsCurrent(
-    generation: number,
-    threadId: string,
-    state: ThreadState,
-    starting: NonNullable<ThreadState["starting"]>,
-  ): boolean {
-    return this.endpointState === "ready"
-      && this.lifecycleGeneration === generation
-      && this.threads.get(threadId) === state
-      && state.starting === starting;
-  }
-
-  private observeTurnHandle(
-    threadId: string,
-    state: ThreadState,
-    turnId: string,
-    handle: ClaudeTurnHandle,
-  ): void {
-    void handle.done.then((status) => {
-      if (state.running?.turnId !== turnId || state.running.handle !== handle) return;
-      state.materialized = true;
-      delete state.running;
-      // A failed turn is marked terminal so reconstruct synthesizes a findable
-      // terminal turn even if `claude` never wrote its user row (relay would else hang).
-      if (status === "failed") state.terminalTurns.add(turnId);
-      // Successful turns use the minimal trigger and are hydrated through bounded native
-      // paging. A failure may have no JSONL user row, so emit its complete synthetic terminal.
-      this.emitter.emit("notification", "turn/completed", {
-        threadId,
-        turn: status === "failed"
-          ? { id: turnId, status: "interrupted" }
-          : { id: turnId },
-      });
-    }).catch(() => {
-      if (state.running?.turnId !== turnId || state.running.handle !== handle) return;
-      delete state.running;
-      state.terminalTurns.add(turnId);
-      this.emitter.emit("notification", "turn/completed", {
-        threadId,
-        turn: { id: turnId, status: "interrupted" },
-      });
-    });
+    return { turn: { id: clientId, status: "inProgress" } };
   }
 
   // The manager's set_goal installs Claude's own goal by delivering `/goal <objective>`;
@@ -549,8 +526,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadId = requireString(params.threadId, "threadId");
     const turnId = requireString(params.turnId, "turnId");
     const state = this.threads.get(threadId);
-    if (state?.running?.turnId === turnId) await state.running.handle.interrupt();
-    if (state?.starting?.clientId === turnId) await state.starting.handle?.interrupt();
+    // interrupt() ends only the active response; the session stays usable for the next
+    // message, so the thread is never closed here.
+    if (state?.running?.turnId === turnId) await this.options.host.interrupt(threadId);
     state?.terminalTurns.add(turnId);
     return {};
   }
@@ -608,4 +586,22 @@ function inputToText(input: unknown): string {
 function noRollout(threadId: string): JsonRpcResponseError {
   // Exact Codex message so `isExactThreadNoRollout` recovery paths behave.
   return new JsonRpcResponseError(-32600, `no rollout found for thread id ${threadId}`);
+}
+
+// Top-level assistant text from an SDK event. Nested (subagent) content never reaches
+// here: the host classifies it separately so it cannot appear as a top-level message.
+function assistantTextBlocks(message: Record<string, unknown>): string[] {
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block): block is { type: "text"; text: string } =>
+      typeof block === "object" && block !== null
+      && (block as { type?: unknown }).type === "text"
+      && typeof (block as { text?: unknown }).text === "string")
+    .map((block) => block.text)
+    .filter((text) => text.length > 0);
+}
+
+function messageUuid(message: Record<string, unknown>): string | undefined {
+  return typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
 }
