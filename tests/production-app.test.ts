@@ -705,20 +705,15 @@ test("bounded start recovery proves absence from a nonempty baseline suffix and 
   }, () => undefined), true);
 });
 
-test("Claude start recovery uses the sole native turn appended after its durable baseline", () => {
-  const native = { id: "native-prompt", status: "completed", items: [{ type: "userMessage", clientId: null }] };
-  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
-    provider: "claude", mode: "start", baselineRecorded: true,
-  }), native);
-  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
-    provider: "claude", mode: "start", baselineRecorded: false,
-  }), undefined);
-  assert.equal(selectRecoveredSendTurn([native, { ...native, id: "other" }], "ctx:call", {
-    provider: "claude", mode: "start", baselineRecorded: true,
-  }), undefined);
-  assert.equal(selectRecoveredSendTurn([native], "ctx:call", {
-    provider: "codex", mode: "start", baselineRecorded: true,
-  }), undefined);
+test("Claude send recovery correlates the native turn whose id is the send's client id", () => {
+  // The reconstructed user item carries no clientId (only a legacy one-shot transcript
+  // did), so the turn id is the only correlation — and it is exact.
+  const native = { id: "ctx:call", status: "completed", items: [{ type: "userMessage", clientId: null }] };
+  const other = { id: "other", status: "completed", items: [{ type: "userMessage", clientId: null }] };
+  // Neighbouring turns no longer defeat recovery the way the old cardinality rule did.
+  assert.equal(selectRecoveredSendTurn([other, native], "ctx:call", { provider: "claude" }), native);
+  assert.equal(selectRecoveredSendTurn([other], "ctx:call", { provider: "claude" }), undefined);
+  assert.equal(selectRecoveredSendTurn([native], "ctx:call", { provider: "codex" }), undefined);
 });
 
 test("start recovery never proves absence from a non-exhausted bounded window", () => {

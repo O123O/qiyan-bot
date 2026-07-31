@@ -738,18 +738,16 @@ export function selectRecoveredSendTurn<T extends {
 }>(
   turns: readonly T[],
   clientId: string,
-  options: { provider: string; mode: string; baselineRecorded: boolean },
+  options: { provider: string },
 ): T | undefined {
   const correlated = turns.find((candidate) => candidate.items.some(
     (item) => item.type === "userMessage" && item.clientId === clientId,
   ));
   if (correlated) return correlated;
-  // Claude runs one serialized `claude -p` process per turn. Once the pre-dispatch
-  // native baseline is durable, one appended native turn is the exact outcome.
-  return options.provider === "claude" && options.mode === "start"
-    && options.baselineRecorded && turns.length === 1
-    ? turns[0]
-    : undefined;
+  // A Claude turn's id IS the clientUserMessageId QiYan handed the SDK, which the SDK
+  // writes as the transcript user row's uuid — so the send is correlated exactly, not
+  // inferred from "the baseline was durable and exactly one turn was appended".
+  return options.provider === "claude" ? turns.find((candidate) => candidate.id === clientId) : undefined;
 }
 
 export function recoverableOperationEndpointReferences(
@@ -4674,8 +4672,6 @@ export async function buildProductionApp(
           const clientId = `${operation.contextId}:${operation.callId}`;
           const turn = selectRecoveredSendTurn(history.thread.turns, clientId, {
             provider: sessionProvider(session.endpoint),
-            mode: args.mode,
-            baselineRecorded: hasBaseline,
           });
           const holds = (args.attachment_ids as string[]).map((id, index) => {
             const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
