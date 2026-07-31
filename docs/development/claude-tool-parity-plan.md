@@ -1,5 +1,13 @@
 # Claude manager/worker tool parity — plan
 
+Status: historical. The parity gaps below were closed against the one-shot
+`claude -p` engine, which has since been replaced by the persistent Agent SDK
+host (`claude-agent-sdk-host-design.md`). The behaviours still hold; the
+mechanisms named here (`ClaudeLaunchFlags`, `buildClaudeArgs`, `--model` /
+`--effort` argv, `ClaudeGoalDriver`, the worker's own `schedule_*` tools) do
+not — model and effort now reach the SDK's `Options` and `applyFlagSettings`,
+and a Claude worker schedules natively.
+
 Goal: every manager + worker tool that "returns success" on a Claude session must do the right
 thing, at parity with Codex, OR be honestly reported as having no Claude equivalent. Driven by an
 adversarial per-tool audit (all findings code-evidenced). Principle: simple, robust, modular —

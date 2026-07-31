@@ -42,7 +42,9 @@ wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
    worker no longer receives QiYan's `schedule_wakeup` / `schedule_cron` /
    `monitor` tools, and `ClaudeGoalDriver` is retired in favour of native
    `/goal`. `SchedulingService` and `WorkerScheduleMcpServer` remain in the
-   codebase for Codex workers, which have no native equivalent.
+   codebase for Codex workers, which have no native equivalent; the manager's
+   own scheduling, steer queue and runtime-recovery wakeups still run through
+   `SchedulingService` for both providers.
 
 3. **Native state is not made durable by QiYan.** If a host restart loses a
    native cron or wakeup, it is lost. QiYan adds no shadow store, no
@@ -116,14 +118,14 @@ Audited against `ASSISTANT_TOOL_SCHEMAS` in `src/assistant/tools.ts`:
 | `adopt_session` | `thread/resume` → `session/open` (resume); proven not to fork |
 | `unadopt_session` | `thread/unsubscribe` → `session/close` |
 | `archive_session` | tombstone in `ClaudeArchiveStore` + `session/close` |
-| `discover_sessions` | `thread/list` → SDK `listSessions` (79 sessions in 112 ms) |
+| `discover_sessions` | `thread/list` → `ClaudeCommandRunner.listThreads` (bounded transcript scan; SDK `listSessions` not adopted) |
 | `send_to_session` | `turn/start` → `session/send` with an idempotency uuid |
 | `interrupt_session` | `turn/interrupt` → `session/interrupt` |
 | `get_session_status` | `session/status`: activity plus the background-task set |
 | `inspect_worker_conversation` | `thread/turns/list` → `ClaudeTranscriptHistory` (SDK helpers are branch-limited) |
 | `read_worker_message` | same bounded JSONL reader |
 | `collect_messages` | same bounded JSONL reader |
-| `list_models` | `model/list` → `supportedModels()` |
+| `list_models` | `model/list` → the curated `claude-models.ts` catalog; the host exposes `supportedModels()` but nothing has switched to it yet |
 | `set_session_model` | `session/setModel` |
 | `set_reasoning_effort` | `applyFlagSettings({ effortLevel })` |
 | `compact_session` | delivers Claude's native `/compact` |
@@ -131,7 +133,7 @@ Audited against `ASSISTANT_TOOL_SCHEMAS` in `src/assistant/tools.ts`:
 | `cancel_goal` | delivers `/goal clear` |
 | `get_goal` | reports no goal — native goal state is not exposed to the SDK stream |
 | `pause_goal`, `resume_goal` | **unsupported**: native `/goal` has no pause, and QiYan keeps no objective to reinstate |
-| `rename_session` | **gap**: currently a silent no-op. SDK `renameSession()` is the equivalent and must run on the worker's host, so it lands with the host |
+| `rename_session` | **still a gap**: a silent no-op. SDK `renameSession()` is the equivalent and must run on the worker's host; the host exists now, the method has no caller yet |
 | `update_session_notes`, `list_managed_sessions` | QiYan-side, provider-neutral |
 | `restart_endpoint`, `disconnect_endpoint` | endpoint manager, unchanged |
 | chat/attachment/Slack tools | provider-neutral, unchanged |
@@ -140,18 +142,20 @@ Two gaps are deliberate rather than accidental: `pause_goal`/`resume_goal` have 
 native equivalent, and `rename_session` waits for the host because it must write on
 the worker's filesystem.
 
-## Architecture
+## Architecture (as built)
 
 ```text
 QiYan backend
     |  provider-neutral thread/turn/goal RPC (unchanged)
     v
 ClaudeCodeRuntime            (keeps its ManagedAppServerEndpoint surface)
-    |  host client
-    v
-local Unix socket, or SSH-forwarded socket to the same protocol
+    |  ClaudeHost interface            + ClaudeCommandRunner (transcript reads only)
+    v                                    |
+LocalClaudeHost (in QiYan's process)     |  local fs, or `find`/`node -e` over ssh
+  or RemoteClaudeHost over an            v
+  SSH-proxied Unix socket           Claude's native JSONL transcript
     |
-qiyan-claude-host            (one per endpoint, independently supervised)
+qiyan-claude-host            (one per remote endpoint, tmux-supervised)
     |  one long-lived SDK Query per loaded session
     v
 Claude Code + its native JSONL transcript
@@ -161,55 +165,82 @@ Claude Code + its native JSONL transcript
 `thread/read`, `thread/resume`, `thread/turns/list`, `turn/start`,
 `turn/interrupt`, `turn/steer`, `thread/list`, `thread/archive`,
 `thread/unsubscribe`, `model/list`, `thread/goal/*`, and the `turn/started` /
-`item/started` / `turn/completed` notifications. What changes is everything
-beneath it: `ClaudeCommandRunner` and its two implementations are replaced by a
-host client.
+`item/started` / `turn/completed` notifications. What changed is everything
+beneath it: the one-shot `claude -p` engine is gone and turns run on a
+`ClaudeHost`.
+
+`ClaudeCommandRunner` survives, narrowed to what the host cannot serve: bounded
+snapshot-pinned transcript paging and session discovery (see History below). It
+no longer starts turns, and `SshClaudeCommandRunner` is no longer a persistent
+runtime — `SshClaudeHostRuntime` is.
 
 ### Host process
 
-Supervision reuses the pattern that already works for remote Codex and Claude:
-the host runs inside the endpoint's tmux generation under the shared runtime
-root, never `/tmp`. Local supervision is the known gap — local turns die with
-the QiYan service today, and that stays true until local supervision is added.
-With QiYan-side scheduling gone, a local restart now also drops any pending
-native wakeup; that is accepted under decision 3.
+A **local** endpoint runs `LocalClaudeHost` in QiYan's own process. Local turns
+therefore still die with the QiYan service; that is the known gap, unchanged by
+this migration, and with QiYan-side scheduling gone a local restart now also
+drops any pending native wakeup (accepted under decision 3).
 
-Protocol: newline-framed JSON over an owner-only Unix socket. Methods are added
-only when a caller exists.
+A **remote** endpoint runs `qiyan-claude-host` on the worker's machine,
+supervised exactly like the Codex app-server: inside the endpoint's tmux
+generation under the shared runtime root, never `/tmp`, identified by the
+runtime token it carries in its own `/proc` environ, holding an owner-only Unix
+socket that the ssh helper proxies raw bytes to. A QiYan restart re-dials that
+socket and the turn it left running is still there.
+
+Protocol: newline-framed JSON over that socket, one request per `ClaudeHost`
+method so the wire cannot drift from the interface. Methods exist only where a
+caller does (`src/claude-host/protocol.ts`):
 
 - `host/status` — protocol, host build, SDK and Claude versions, generation
-- `session/open` — caller-chosen native session id, create-or-resume, cwd
-- `session/close` — idle eviction / unadopt
-- `session/send` — caller-generated idempotency id, structured input
-- `session/interrupt`
-- `session/status` — activity, background-task set, pending native schedules
-- `session/setModel`, `session/setPermissionMode`
-- `session/stopTask`
-- `events/subscribe` — host generation + event cursor
+- `open` — caller-chosen native session id, create-or-resume, cwd, model, effort
+- `close` — idle eviction / unadopt
+- `send` — caller-generated idempotency id (which is the QiYan turn id), message
+- `interrupt`, `status`, `setModel`, `setEffort`, `models`, `stopTask`
+- `evictIdle`, `shutdown`
 
-The channel is unidirectional in the sense that matters: the host has no
+Events are live fan-out only, in one direction; the host buffers nothing and a
+client that missed events reloads the transcript tail instead. There is no
 callback into QiYan's durable state, because no QiYan MCP tools are attached to
 Claude sessions. That removes the bridge, operation ledger, request-hash
 replay, and goal-continuation fence the earlier handoff required.
+
+Permission mode is a pass-through of the user's own settings, so a session whose
+resolved mode is `default` would have every tool denied; the host warns rather
+than choosing a mode, and QiYan surfaces that as a `claude_permission_mode`
+operational event.
 
 ### Session lifetime
 
 One loaded session owns one long-lived `Query`. Sessions load lazily and are
 evicted only while no top-level response and no native background task is
-active. A QiYan restart reconnects to the host; it does not terminate the host
-or an active turn. A host generation owns a fenced process tree, and a
+active. A QiYan restart reconnects to a remote host; it does not terminate the
+host or an active turn. A host generation owns a fenced process tree, and a
 replacement host may not start until the prior generation's Claude, tool, and
-background-agent processes are proven gone.
+background-agent processes are proven gone — so `SshClaudeHostRuntime` pins the
+identity it started and refuses to dial a replacement, reporting the generation
+lost instead, because that replacement never heard of the loaded sessions.
+
+### Turn identity
+
+A QiYan turn id **is** the caller's `clientUserMessageId`. The SDK preserves it
+as the transcript user row's `uuid`, so the live stream and the reconstructed
+history agree on turn identity without QiYan writing a correlation marker into
+the transcript. A live assistant item id is `${sdkAssistantUuid}:${index}` over
+the filtered text blocks, matching reconstruction exactly. This is what makes
+duplicate Web UI bubbles after a reload structurally impossible, and it is why
+recovery correlates a send by turn id rather than by counting appended turns.
 
 ### History
 
 Claude's JSONL remains the only durable transcript; QiYan keeps no cache and
-writes nothing into it. Prefer the SDK's `listSessions` / `getSessionInfo` /
-`getSessionMessages` for discovery and lazy paging if the spike shows their
-reads are bounded on a large real transcript; otherwise keep
-`ClaudeTranscriptHistory`'s snapshot-pinned reader behind the host. Either way,
-JSONL polling stops being the live-message transport — live content comes from
-SDK events.
+writes nothing into it. The SDK's session helpers did **not** replace the
+reader: `getSessionMessages` walks the current context branch only (242 of
+13,322 records on a compacted transcript — see the spike results), so
+`ClaudeTranscriptHistory` over `ClaudeCommandRunner` stays the complete-history
+source, and discovery stays a bounded, body-free transcript scan rather than
+`listSessions`. JSONL polling did stop being the live-message transport: live
+content comes from SDK events.
 
 ## Spike results (2026-07-31, SDK 0.3.220, Claude 2.1.220)
 
@@ -345,7 +376,7 @@ Item 10 is the only remaining fork. If native `/goal` cannot hold the turn/token
 bound, goals are not offered on Claude workers rather than reviving a second
 driver — decision 2 does not get partially reversed.
 
-## Sequence
+## Sequence (done)
 
 1. SDK spike (disposable, real Claude, local).
 2. Host + client prototype: client disconnect does not stop the host; SSH
@@ -353,13 +384,27 @@ driver — decision 2 does not get partially reversed.
    descendant alive.
 3. Production: host client behind `ClaudeCodeRuntime`, SDK-event-driven live
    flow, local then remote.
-4. Delete in the same migration: `claudeLaunchPolicy` and its prompt/tool
-   constants, `LocalClaudeCommandRunner.startTurn`, per-turn tmux dispatch and
-   materialization scans, `assets/remote/qiyan-claude.mjs`, `ClaudeGoalDriver`,
-   Claude's worker-MCP attachment, and the static model catalog.
+4. Delete in the same migration. Deleted: `claudeLaunchPolicy` and its
+   prompt/tool constants; `LocalClaudeCommandRunner.startTurn`,
+   `buildClaudeArgs`, `ClaudeLaunchFlags` and the transcript-materialization
+   scan; `SshClaudeCommandRunner`'s per-turn tmux pane dispatch, turn observers
+   and turn inspection, with the eight helper ops behind them;
+   `assets/remote/qiyan-claude.mjs` and
+   `assets/remote/qiyan-claude-runtime-launcher.sh`; `ClaudeGoalDriver`; and
+   Claude's worker-MCP attachment.
+
+Two things on that list were **kept**, deliberately:
+
+- The worker-MCP surface itself (`WorkerScheduleMcpServer`, `RemoteWorkerTunnel`,
+  `SchedulingService`'s MCP config plumbing). No provider is wired to it today,
+  but Codex workers have no native scheduling and it is the obvious home for
+  theirs. It carries `TODO(worker-mcp)` notes saying so, so "no callers" is not
+  read as "dead".
+- The static model catalog in `claude-models.ts`, which still backs `model/list`.
 
 No long-lived dual engine. A short canary flag is acceptable; two lifecycle
-models are not.
+models are not — which is why the one-shot engine was deleted rather than left
+installed and unreferenced.
 
 ## Accepted losses
 

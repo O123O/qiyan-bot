@@ -10,8 +10,9 @@ const projectRoot = z.string().refine((value) => value.startsWith("~/") || isAbs
 const sshAlias = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u, "invalid ssh host alias");
 // An endpoint has an orthogonal PROVIDER (codex | claude) and TRANSPORT (local | ssh). Codex/local
 // configures the built-in `local` endpoint and is therefore valid only under that exact id.
-// A claude worker runs either locally (`claude -p` on QiYan's host) or over ssh. `host` is the ssh
-// alias (required for ssh, forbidden for local). model/effort/command are claude-only per-endpoint.
+// A claude worker runs on a ClaudeHost either in QiYan's own process or inside qiyan-claude-host
+// on the worker's machine. `host` is the ssh alias (required for ssh, forbidden for local).
+// model/effort/command are claude-only per-endpoint; `command` is the Claude CLI the SDK drives.
 const entry = z.discriminatedUnion("provider", [
   z.object({
     provider: z.literal("codex"), transport: z.enum(["local", "ssh"]),

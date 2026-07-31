@@ -1,5 +1,14 @@
 # Remote Claude worker: goals, steer, and self-scheduling
 
+Status: historical. Goals and steer for remote Claude shipped and remain. Claude
+worker self-scheduling did **not** survive the Agent SDK host migration: a
+persistent Claude Code session owns scheduling, background tasks and subagents
+natively, so no MCP config is attached to a Claude session and the reverse
+tunnel described here has no Claude caller. `WorkerScheduleMcpServer` and
+`RemoteWorkerTunnel` are retained for a future Codex worker-side surface — see
+the `TODO(worker-mcp)` notes in the code and
+`claude-agent-sdk-host-design.md`.
+
 Extends the remote Claude endpoint (`claude-remote-endpoint-design.md` §3.5, deferred) so a **remote**
 `dfw-claude`-style endpoint has the same goal/steer/scheduling surface the local `claude-local` endpoint
 already has. Today a remote Claude session is a driven worker only: `set_goal`→UNSUPPORTED, `turn/steer`→

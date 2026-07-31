@@ -4,7 +4,7 @@
 // successful turn completion is hydrated through bounded authoritative transcript pages
 // (`events/relay.ts` projectTarget). So the source of truth for delivered content is
 // the transcript on disk, not the live stream: a COMPLETED turn is fully persisted
-// by the time `claude -p` exits (spike 0.2/interrupt finding — only interrupted
+// by the time the SDK reports it done (spike 0.2/interrupt finding — only interrupted
 // turns lose un-flushed stream output). This pure function reconstructs the Codex
 // `thread/read` view from parsed transcript records; 1.3 wraps it with file I/O and
 // uses the live stream only to detect turn completion.
@@ -56,11 +56,11 @@ export interface ReconstructClaudeThreadParams {
   records: readonly unknown[];
   threadSource?: string;
   model?: string;
-  // Turn ids the runtime knows were interrupted (subprocess killed).
+  // Turn ids the runtime knows were interrupted (the SDK query's response was aborted).
   interruptedTurnIds?: ReadonlySet<string>;
-  // The turn whose `claude -p` subprocess is running right now (in-memory, authoritative).
-  // A turn can be executing before `claude` flushes its user row, so disk reconstruction
-  // alone can read `idle`; overlaying this forces the thread `active`.
+  // The turn the host is running right now (in-memory, authoritative). A turn can be
+  // executing before `claude` flushes its user row, so disk reconstruction alone can
+  // read `idle`; overlaying this forces the thread `active`.
   runningTurnId?: string;
 }
 

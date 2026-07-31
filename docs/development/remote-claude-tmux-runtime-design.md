@@ -2,7 +2,18 @@
 
 ## Status
 
-Implementation design for persistent remote Claude endpoints.
+**Superseded and removed.** This design made a remote Claude turn survive an SSH
+drop while each turn was still one `claude -p` process in a persistent tmux
+pane. A remote Claude turn now runs inside `qiyan-claude-host` — one long-lived
+Agent SDK query per session — supervised the same way the Codex app-server is;
+see `claude-agent-sdk-host-design.md`.
+
+Everything below described code that no longer exists: `qiyan-claude.mjs`,
+`qiyan-claude-runtime-launcher.sh`, the per-thread panes, the watch FIFO, and
+the `*-claude-turn` / `*-claude-runtime` helper operations were all deleted with
+the one-shot engine. It is kept as the record of why the pane model was built
+and what it could not do — a turn still died with the QiYan process that
+started it, which is the limit that motivated the host.
 
 ## Problem
 
