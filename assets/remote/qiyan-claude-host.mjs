@@ -166,17 +166,11 @@ var ClaudeHostSession = class {
   async setEffort(effort) {
     await this.query.applyFlagSettings({ effortLevel: effort ?? null });
   }
-  async setPermissionMode(mode) {
-    await this.query.setPermissionMode(mode);
-  }
   async stopTask(taskId) {
     await this.query.stopTask(taskId);
   }
   async supportedModels() {
     return await this.query.supportedModels();
-  }
-  async initializationResult() {
-    return await this.query.initializationResult();
   }
   status() {
     return {

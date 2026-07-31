@@ -91,17 +91,18 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     const type = record.type;
 
     if (type === "user") {
-      const promptId = turnIdOf(record);
+      const rowId = promptOrRowId(record);
       const turnId = claudeTurnIdFromRecord(record);
-      if (!promptId || !turnId) continue; // tool_result or malformed user row
+      if (!rowId || !turnId) continue; // tool_result or malformed user row
       finalize(current);
       const marker = extractClaudeClientMarker(record.message);
-      // New turns use Claude's native promptId. Older QiYan transcripts may still
-      // carry a legacy client marker, which preserves their historical turn ids.
+      // The turn id is the row's own uuid (see claudeTurnIdFromRecord); Claude's promptId is
+      // only a fallback identity for a row that somehow has no uuid. A legacy client marker
+      // still wins, so transcripts written by the retired one-shot path keep their ids.
       const text = visibleClaudeUserText(record.message);
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
-        id: idOf(record) ?? `${promptId}:user`,
+        id: idOf(record) ?? `${rowId}:user`,
         clientId: marker ?? null,
         ...(text ? { content: [{ type: "text", text, text_elements: [] }] } : {}),
       };
@@ -178,21 +179,23 @@ export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
   const record = raw as Record<string, unknown>;
   if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) return undefined;
   if (isClaudeInternalTaskNotification(record.message)) return undefined;
-  const promptId = turnIdOf(record);
-  if (!promptId) return undefined;
+  const fallback = promptOrRowId(record);
+  if (!fallback) return undefined;
   // A turn's id is the user row's own uuid, which for a QiYan-driven turn IS the
   // clientUserMessageId we handed the SDK. That makes a live turn and its reconstructed
   // history agree on identity, so the Web UI merges them instead of rendering both.
   // `promptId` is a separate Claude-generated id and must NOT be used: it never matches
   // anything QiYan knows. A legacy client marker still wins so transcripts written by the
   // retired one-shot path keep their historical turn ids.
-  return extractClaudeClientMarker(record.message) ?? idOf(record) ?? promptId;
+  return extractClaudeClientMarker(record.message) ?? idOf(record) ?? fallback;
 }
 
-function turnIdOf(record: Record<string, unknown>): string | undefined {
+// Any identity the row carries, in the order the retired one-shot path used. Only a
+// presence check and the user item's id fallback still need it — a TURN's id comes from
+// claudeTurnIdFromRecord, which prefers the uuid.
+function promptOrRowId(record: Record<string, unknown>): string | undefined {
   if (typeof record.promptId === "string" && record.promptId.length > 0) return record.promptId;
-  if (typeof record.uuid === "string" && record.uuid.length > 0) return record.uuid;
-  return undefined;
+  return idOf(record);
 }
 
 function idOf(record: Record<string, unknown>): string | undefined {

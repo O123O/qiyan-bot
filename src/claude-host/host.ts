@@ -35,6 +35,9 @@ export interface ClaudeHost {
   status(sessionId: string): Promise<SessionStatus>;
   setModel(sessionId: string, model?: string): Promise<void>;
   setEffort(sessionId: string, effort?: string): Promise<void>;
+  // Provisioned ahead of their callers, and kept because switching to them is a QiYan-side
+  // change only: `model/list` still answers from the static claude-models.ts catalog, and no
+  // manager tool cancels a native background task yet.
   models(sessionId: string): Promise<unknown[]>;
   stopTask(sessionId: string, taskId: string): Promise<void>;
   subscribe(listener: (event: HostEvent) => void): () => void;

@@ -1,8 +1,11 @@
 // Wire contract between the QiYan backend and qiyan-claude-host.
 //
-// Deliberately smaller than the Codex App Server protocol: a method exists only when a
-// QiYan capability already calls it. Newline-delimited JSON over an owner-only Unix
-// socket; the handshake is the first request on every connection.
+// Deliberately smaller than the Codex App Server protocol: it carries what QiYan's
+// capabilities need and nothing speculative. Two methods are provisioned ahead of their
+// callers and say so where they are declared — `models`, because `model/list` still answers
+// from the static catalog, and `stopTask`, because no manager tool cancels a native
+// background task yet. Newline-delimited JSON over an owner-only Unix socket; the handshake
+// is the first request on every connection.
 export const CLAUDE_HOST_PROTOCOL_VERSION = 1;
 
 export type SessionActivity = "idle" | "working" | "background";

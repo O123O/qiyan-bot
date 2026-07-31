@@ -60,10 +60,12 @@ wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
    messages.
 
 5. **Background status is readable, not manageable.** The host tracks the
-   native background-task set already (it gates idle and eviction), so
-   `session/status` exposes it and QiYan projects it to the manager: idle vs
-   working, and what is still pending that may wake the session. No management
-   verbs.
+   native background-task set already — it gates idle and eviction, so a
+   session with a live task is never unloaded and its result is never lost —
+   and `session/status` exposes it. As built, nothing projects that set to the
+   manager: `get_session_status` reports QiYan's own idle/active view, so a
+   background task running past its parent turn reads as idle until it settles
+   and its output is delivered. No management verbs either.
 
 6. **No legacy migration.** Verified against the live database on 2026-07-31:
    `session_schedules` holds no `armed` rows (only `done`/`cancelled`),
@@ -121,7 +123,7 @@ Audited against `ASSISTANT_TOOL_SCHEMAS` in `src/assistant/tools.ts`:
 | `discover_sessions` | `thread/list` → `ClaudeCommandRunner.listThreads` (bounded transcript scan; SDK `listSessions` not adopted) |
 | `send_to_session` | `turn/start` → `session/send` with an idempotency uuid |
 | `interrupt_session` | `turn/interrupt` → `session/interrupt` |
-| `get_session_status` | `session/status`: activity plus the background-task set |
+| `get_session_status` | QiYan's own idle/active view. The host's `session/status` also carries the background-task set, but **no caller projects it yet**, so a task outliving its parent turn reads as idle |
 | `inspect_worker_conversation` | `thread/turns/list` → `ClaudeTranscriptHistory` (SDK helpers are branch-limited) |
 | `read_worker_message` | same bounded JSONL reader |
 | `collect_messages` | same bounded JSONL reader |
@@ -330,51 +332,45 @@ What is *not* available:
 So a Claude worker can hold a native goal and finish it, but QiYan can only
 show "working" until it lands.
 
-**Decided: native `/goal`, accepting that opacity.** `ClaudeGoalDriver` is
-retired. `ClaudeGoalStore` keeps the manager-visible objective and a reduced
-projection — objective plus working/idle/complete — and drops the live
-`paused` / `blocked` / `usageLimited` / `budgetLimited` states and the
-`tokenBudget` contract, none of which are observable in flight.
-`Options.maxTurns` and `Options.maxBudgetUsd` remain available as a
-session-level backstop against a goal that never terminates.
+**Decided: native `/goal`, accepting that opacity.** `ClaudeGoalDriver` and
+`ClaudeGoalStore` are both retired: QiYan stores no objective at all.
+`set_goal` and `cancel_goal` deliver `/goal <objective>` and `/goal clear`
+through the steer queue, and `thread/goal/get` reports no goal, because native
+goal state is not exposed to the SDK stream. The live `paused` / `blocked` /
+`usageLimited` / `budgetLimited` states and the `tokenBudget` contract go with
+it — none are observable in flight, and without stored state there is nothing
+to reinstate, so pause/resume fail closed. `Options.maxTurns` and
+`Options.maxBudgetUsd` remain available as a session-level backstop against a
+goal that never terminates.
 
-## What the spike must settle
+## What the spike settled
 
-Resolved items are struck through by the results above; the remainder stand.
-The earlier handoff's MCP-bridge and legacy-migration items are gone.
+Every question the spike was written to answer is answered above, in "Spike
+results" and the decisions that follow: authentication and the preferred
+binary, the `claude_code` preset, caller-chosen session ids and non-forking
+resume, one `Query` across many sequential messages, queued mid-turn sends,
+`interrupt()` semantics, uuid survival into the JSONL, top-level vs subagent
+identity, background tasks outliving their parent turn, native `/goal`, and
+`supportedModels()` plus the session-history helpers. The earlier handoff's
+MCP-bridge and legacy-migration questions are gone with the surfaces they asked
+about.
 
-1. ~~Authentication and which Claude binary to prefer.~~ Settled below: both the
-   Agent SDK and the Claude CLI are deployment prerequisites, and the host
-   points `pathToClaudeCodeExecutable` at the installed CLI.
-2. `claude_code` preset with no append, `settingSources` omitted, loads the
-   same settings/`CLAUDE.md`/skills/agents/commands/hooks as the CLI.
-3. `Options.sessionId` produces exactly the caller-chosen UUID that
-   `thread/start` reserves, and `resume` accepts CLI-created session ids
-   without forking them.
-4. One streaming `Query` takes three or more sequential messages without
-   respawning, preserving context.
-5. A message sent during an active turn is queued once and ordered correctly.
-6. `interrupt()` ends only the active response; the session stays usable.
-7. `SDKUserMessage.uuid` survives into live events and JSONL, so a retry after
-   an ambiguous send does not create a second user turn.
-8. Events carry reliable top-level vs subagent identity and per-turn result
-   boundaries — decision 4 depends entirely on this.
-9. Background tasks: can one complete after its parent response while the query
-   stays open, what does `stopTask()` do, and does a task notification avoid
-   producing a duplicate user bubble or a second completion delivery?
-10. Native `/goal`: set, clear, pause/resume, automatic completion, resume
-    after the query is disposed and recreated, and enforcement of a turn/token
-    bound before the next internal continuation. Preflight trusted-workspace
-    and hooks availability; unsupported goal operations must fail closed with
-    `UNSUPPORTED_CAPABILITY` without disturbing ordinary turns.
-11. `supportedModels()` can replace the static catalog in `claude-models.ts`
-    without losing effort validation.
-12. Session-history helpers on a large real transcript: bounded and fast enough
-    to replace the manual JSONL parser.
+The one fork resolved against enforcement: native `/goal` offers no
+per-continuation point at which QiYan could hold a turn or token bound, so a
+goal in flight shows only as "working" (see "Accepted losses"). Goals are still
+offered — the spike watched native `/goal` drive a task to completion
+unattended — but pause and resume are not.
 
-Item 10 is the only remaining fork. If native `/goal` cannot hold the turn/token
-bound, goals are not offered on Claude workers rather than reviving a second
-driver — decision 2 does not get partially reversed.
+Answered by the spike, not yet taken up by the code:
+
+- `list_models` still returns the static `claude-models.ts` catalog rather than
+  the host's `supportedModels()`.
+- `rename_session` is still a silent no-op; SDK `renameSession()` is the
+  equivalent and must run on the worker's host.
+- `LocalClaudeCommandRunner.listThreads` still scans the transcript directory
+  by hand rather than using `listSessions`/`getSessionInfo`. History paging
+  stays on `ClaudeTranscriptHistory` deliberately: `getSessionMessages` walks
+  the current context branch, not the full transcript.
 
 ## Sequence (done)
 
@@ -412,8 +408,9 @@ Stated plainly so they are not rediscovered as bugs:
 
 - A native cron or wakeup does not survive host replacement or a local QiYan
   restart.
-- The manager cannot cancel a worker's schedule from QiYan; it can only see
-  that something is pending and ask the worker.
+- The manager cannot cancel a worker's schedule from QiYan, and cannot see it
+  either: no tool projects the host's background-task set, so a pending wakeup
+  is invisible until it fires. Asking the worker is the only route.
 - A goal in flight shows only as "working". The paused, blocked, usage-limited,
   and budget-limited statuses and the per-goal token budget are gone, because
   native `/goal` exposes no in-flight state to the SDK stream.

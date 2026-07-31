@@ -29,12 +29,10 @@ import type { HostEvent, SessionActivity, SessionStatus } from "./protocol.ts";
 export interface SessionQuery extends AsyncIterable<unknown> {
   interrupt(): Promise<unknown>;
   setModel(model?: string): Promise<void>;
-  setPermissionMode(mode: string): Promise<void>;
   // Reasoning effort has no dedicated setter; it rides the flag-settings layer.
   applyFlagSettings(settings: { effortLevel?: string | null }): Promise<void>;
   stopTask(taskId: string): Promise<void>;
   supportedModels(): Promise<unknown[]>;
-  initializationResult(): Promise<unknown>;
   close(): void;
 }
 
@@ -146,10 +144,8 @@ export class ClaudeHostSession {
   async setEffort(effort?: string): Promise<void> {
     await this.query.applyFlagSettings({ effortLevel: effort ?? null });
   }
-  async setPermissionMode(mode: string): Promise<void> { await this.query.setPermissionMode(mode); }
   async stopTask(taskId: string): Promise<void> { await this.query.stopTask(taskId); }
   async supportedModels(): Promise<unknown[]> { return await this.query.supportedModels(); }
-  async initializationResult(): Promise<unknown> { return await this.query.initializationResult(); }
 
   status(): SessionStatus {
     return {
