@@ -111,6 +111,7 @@ var ClaudeHostSession = class {
   constructor(sessionId, createQuery, options = {}) {
     this.sessionId = sessionId;
     this.options = options;
+    this.lastActiveAt = this.now();
     this.query = createQuery(this.input);
     this.drained = this.drain();
   }
@@ -125,7 +126,13 @@ var ClaudeHostSession = class {
   acceptedUuids = /* @__PURE__ */ new Set();
   backgroundTasks = /* @__PURE__ */ new Map();
   closed = false;
+  lastActiveAt = 0;
   drained;
+  // When this session last did anything observable. Eviction orders on it, so a session a
+  // worker uses constantly outlives one that was merely opened earlier.
+  get activeAt() {
+    return this.lastActiveAt;
+  }
   now() {
     return this.options.now?.() ?? Date.now();
   }
@@ -209,7 +216,10 @@ var ClaudeHostSession = class {
     this.query.close();
     this.emit({ type: "session/closed", sessionId: this.sessionId, at: this.now() });
   }
+  // Everything the session does — an accepted send, streamed content, a task change, a
+  // settled turn — passes through here, so this is the one place activity is observed.
   emit(event) {
+    this.lastActiveAt = this.now();
     for (const listener of this.listeners) listener(event);
   }
   async drain() {
@@ -343,17 +353,19 @@ var LocalClaudeHost = class {
   // `prepare` resolves everything a session needs (launch options, permission
   // pass-through) before the actor exists, so the actor's constructor stays synchronous
   // and nothing is patched in afterwards.
-  constructor(prepare) {
+  constructor(prepare, options = {}) {
     this.prepare = prepare;
+    this.options = options;
   }
   prepare;
+  options;
   sessions = /* @__PURE__ */ new Map();
   listeners = /* @__PURE__ */ new Set();
   unsubscribes = /* @__PURE__ */ new Map();
   async open(request) {
     const existing = this.sessions.get(request.sessionId);
     if (existing) return existing.status();
-    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request));
+    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request), this.options);
     this.sessions.set(request.sessionId, session);
     this.unsubscribes.set(request.sessionId, session.subscribe((event) => {
       for (const listener of this.listeners) listener(event);
@@ -397,11 +409,12 @@ var LocalClaudeHost = class {
       this.listeners.delete(listener);
     };
   }
-  // Oldest-first among evictable sessions, so the most recently active stay loaded.
+  // Least recently active first, so the sessions a worker is actually driving stay loaded
+  // and the ones merely opened first do not outrank them.
   async evictIdle(keep) {
-    const evictable = [...this.sessions.entries()].filter(([, session]) => session.isEvictable());
     const excess = this.sessions.size - keep;
     if (excess <= 0) return [];
+    const evictable = [...this.sessions.entries()].filter(([, session]) => session.isEvictable()).sort(([, left], [, right]) => left.activeAt - right.activeAt);
     const evicted = [];
     for (const [sessionId] of evictable.slice(0, excess)) {
       await this.close(sessionId);

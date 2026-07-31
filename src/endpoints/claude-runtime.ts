@@ -44,6 +44,10 @@ interface ThreadState {
   terminalTurns: Set<string>;            // turn ids known interrupted/failed
 }
 
+// Enough for the handful of workers one endpoint drives at a time, small enough that an
+// endpoint touched by dozens of threads does not keep a `claude` process for each.
+const DEFAULT_LOADED_SESSION_BUDGET = 8;
+
 export interface ClaudePersistentRuntime {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
@@ -68,6 +72,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private persistentUnavailableSubscription?: () => void;
   private readonly hostSubscription: () => void;
   private lifecycleGeneration = 0;
+  private evicting?: Promise<void>;
 
   constructor(private readonly options: {
     id: string;
@@ -88,6 +93,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Claude has no native mid-turn steer (spike 0.4). turn/steer durably enqueues the
     // message; it is delivered as the next turn once the running one completes.
     steer?: (threadId: string, message: string) => Promise<void>;
+    // How many sessions may stay loaded on the host. Each one pins a live SDK query and the
+    // `claude` child behind it, so without a ceiling a long-running QiYan holds one process
+    // per thread it has ever driven.
+    loadedSessionBudget?: number;
   }) {
     this.id = options.id;
     this.daemonless = options.persistentRuntime === undefined;
@@ -151,6 +160,20 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       threadId,
       turn: event.status === "completed" ? { id: turnId } : { id: turnId, status: "interrupted" },
     });
+    this.sweepIdleSessions();
+  }
+
+  // A settled turn is the only moment a session can newly become evictable, so it is where
+  // the loaded-session budget is applied. The host spares anything that can still produce
+  // output — a running turn or a live background task — and announces each unload with
+  // session/closed, which is what clears `loaded` above. Best effort: an unreachable host
+  // has bigger problems than its session count, and the next turn tries again.
+  private sweepIdleSessions(): void {
+    if (this.endpointState !== "ready" || this.evicting) return;
+    this.evicting = this.options.host
+      .evictIdle(this.options.loadedSessionBudget ?? DEFAULT_LOADED_SESSION_BUDGET)
+      .then(() => undefined, () => undefined)
+      .finally(() => { delete this.evicting; });
   }
 
   get state(): "starting" | "ready" | "unavailable" | "stopped" { return this.endpointState; }

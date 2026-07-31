@@ -102,7 +102,21 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     return () => { this.listeners.delete(listener); };
   }
 
-  async evictIdle(): Promise<string[]> { return []; }
+  // Mirrors LocalClaudeHost: unload idle sessions down to the budget, sparing anything that
+  // can still produce output, and announce each unload so the endpoint drops its load state.
+  async evictIdle(keep: number): Promise<string[]> {
+    const excess = this.sessions.size - keep;
+    if (excess <= 0) return [];
+    const evictable = [...this.sessions.entries()]
+      .filter(([, session]) => session.inFlight.length === 0)
+      .map(([sessionId]) => sessionId);
+    const evicted = evictable.slice(0, excess);
+    for (const sessionId of evicted) {
+      this.sessions.delete(sessionId);
+      this.emit({ type: "session/closed", sessionId, at: this.clock += 1 });
+    }
+    return evicted;
+  }
 
   async shutdown(): Promise<void> {
     this.shutdowns += 1;
@@ -656,6 +670,34 @@ test("the first turn creates the native session and the next resumes it; the cal
   await rt.request("turn/start", { threadId, clientUserMessageId: "ctx:call-2", input: [{ type: "text", text: "again" }] });
   assert.equal(claude.opens.length, 1, "a loaded session is reused without reopening");
   assert.deepEqual(claude.sends.at(-1), { sessionId: threadId, uuid: "ctx:call-2", text: "again" });
+});
+
+// Every loaded session pins a live SDK query and the `claude` child behind it. Nothing else
+// ever unloads one, so without a budget applied at turn completion a long-running QiYan
+// holds one resident process per thread it has ever driven.
+test("a settled turn unloads idle sessions above the budget, and a later turn reloads them", async () => {
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", host: claude, runner: claude, launchFlags: {}, loadedSessionBudget: 1,
+  });
+  await rt.start();
+  const first = (await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" })).thread.id;
+  const second = (await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" })).thread.id;
+
+  await rt.request("turn/start", { threadId: first, clientUserMessageId: "a:1", input: [{ type: "text", text: "one" }] });
+  claude.answer(first, "done one");
+  await delay(5);
+  await rt.request("turn/start", { threadId: second, clientUserMessageId: "b:1", input: [{ type: "text", text: "two" }] });
+  claude.answer(second, "done two");
+  await delay(5);
+
+  assert.equal(claude.isLoaded(first), false, "the idle session above the budget is unloaded");
+  assert.equal(claude.isLoaded(second), true, "the session just used stays loaded");
+
+  await rt.request("turn/start", { threadId: first, clientUserMessageId: "a:2", input: [{ type: "text", text: "again" }] });
+  assert.equal(claude.isLoaded(first), true, "an unloaded thread reopens on its next turn");
+  assert.deepEqual(claude.opens.map((request) => [request.sessionId, request.mode]),
+    [[first, "create"], [second, "create"], [first, "resume"]]);
 });
 
 // Native background tasks are the design: Claude owns them, and one settles after its

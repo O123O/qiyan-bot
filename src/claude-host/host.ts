@@ -52,12 +52,15 @@ export class LocalClaudeHost implements ClaudeHost {
   // `prepare` resolves everything a session needs (launch options, permission
   // pass-through) before the actor exists, so the actor's constructor stays synchronous
   // and nothing is patched in afterwards.
-  constructor(private readonly prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>) {}
+  constructor(
+    private readonly prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>,
+    private readonly options: { now?: () => number } = {},
+  ) {}
 
   async open(request: OpenSessionRequest): Promise<SessionStatus> {
     const existing = this.sessions.get(request.sessionId);
     if (existing) return existing.status();
-    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request));
+    const session = new ClaudeHostSession(request.sessionId, await this.prepare(request), this.options);
     this.sessions.set(request.sessionId, session);
     this.unsubscribes.set(request.sessionId, session.subscribe((event) => {
       for (const listener of this.listeners) listener(event);
@@ -101,11 +104,14 @@ export class LocalClaudeHost implements ClaudeHost {
     return () => { this.listeners.delete(listener); };
   }
 
-  // Oldest-first among evictable sessions, so the most recently active stay loaded.
+  // Least recently active first, so the sessions a worker is actually driving stay loaded
+  // and the ones merely opened first do not outrank them.
   async evictIdle(keep: number): Promise<string[]> {
-    const evictable = [...this.sessions.entries()].filter(([, session]) => session.isEvictable());
     const excess = this.sessions.size - keep;
     if (excess <= 0) return [];
+    const evictable = [...this.sessions.entries()]
+      .filter(([, session]) => session.isEvictable())
+      .sort(([, left], [, right]) => left.activeAt - right.activeAt);
     const evicted: string[] = [];
     for (const [sessionId] of evictable.slice(0, excess)) {
       await this.close(sessionId);

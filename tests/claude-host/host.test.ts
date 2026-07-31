@@ -172,6 +172,28 @@ test("eviction spares working and background sessions", async () => {
   await host.shutdown();
 });
 
+// Insertion order is not usefulness: a session opened first and driven every minute must
+// outrank one opened later and idle since.
+test("eviction unloads the least recently active sessions, not the first opened", async () => {
+  // A monotonic clock, because real sessions opened in the same millisecond would order by
+  // insertion and hide exactly the bug under test.
+  let tick = 0;
+  const queries = new Map<string, FakeQuery>();
+  const host = new LocalClaudeHost(async (request) => (input) => {
+    const query = new FakeQuery(input);
+    queries.set(request.sessionId, query);
+    return query;
+  }, { now: () => (tick += 1) });
+  for (const id of ["oldest", "middle", "newest"]) await host.open(request(id));
+  await host.send("oldest", "u1", "still working with this one");
+  queries.get("oldest")!.push({ type: "result", subtype: "success", origin: { kind: "human" }, user_message_uuid: "u1" });
+  await delay(5);
+
+  assert.deepEqual(await host.evictIdle(1), ["middle", "newest"]);
+  assert.equal((await host.status("oldest")).sessionId, "oldest", "the session in active use stays loaded");
+  await host.shutdown();
+});
+
 test("eviction is a no-op when the loaded count is within budget", async () => {
   const { host } = makeHost();
   await host.open(request("s1"));

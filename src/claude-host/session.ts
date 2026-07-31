@@ -97,6 +97,7 @@ export class ClaudeHostSession {
   private readonly acceptedUuids = new Set<string>();
   private readonly backgroundTasks = new Map<string, { type?: string; startedAt: number }>();
   private closed = false;
+  private lastActiveAt = 0;
   readonly drained: Promise<void>;
 
   constructor(
@@ -104,9 +105,14 @@ export class ClaudeHostSession {
     createQuery: SessionQueryFactory,
     private readonly options: { now?: () => number } = {},
   ) {
+    this.lastActiveAt = this.now();
     this.query = createQuery(this.input);
     this.drained = this.drain();
   }
+
+  // When this session last did anything observable. Eviction orders on it, so a session a
+  // worker uses constantly outlives one that was merely opened earlier.
+  get activeAt(): number { return this.lastActiveAt; }
 
   private now(): number { return this.options.now?.() ?? Date.now(); }
 
@@ -183,7 +189,10 @@ export class ClaudeHostSession {
     this.emit({ type: "session/closed", sessionId: this.sessionId, at: this.now() });
   }
 
+  // Everything the session does — an accepted send, streamed content, a task change, a
+  // settled turn — passes through here, so this is the one place activity is observed.
   private emit(event: HostEvent): void {
+    this.lastActiveAt = this.now();
     for (const listener of this.listeners) listener(event);
   }
 
