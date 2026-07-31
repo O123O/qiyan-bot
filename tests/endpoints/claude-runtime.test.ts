@@ -400,6 +400,63 @@ test("a close racing a session open fences the turn and unloads the session it o
   assert.equal(rt.state, "stopped");
 });
 
+// The local Claude endpoint is a builtin: the manager hands the SAME object back across a
+// restart, so this thread map outlives the sessions the host just swept. A thread still
+// marked loaded would skip host.open and send into a session that no longer exists.
+test("a restarted local endpoint reopens the sessions its host dropped", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:before", input: [{ type: "text", text: "hi" }],
+  });
+  claude.answer(thread.id, "answered");
+  await delay(5);
+
+  await rt.closeConnection();
+  assert.equal(claude.isLoaded(thread.id), false, "the in-process host closed every session");
+  await rt.start();
+
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:after", input: [{ type: "text", text: "again" }],
+  });
+  assert.equal(claude.isLoaded(thread.id), true, "the next turn reopens the session it needs");
+  assert.deepEqual(claude.opens.map((request) => request.mode), ["create", "resume"],
+    "the reopened session resumes the native transcript rather than forking a new one");
+  assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:before", "ctx:after"]);
+});
+
+// Stopping the remote host replaces the process that owned the sessions, so the same
+// staleness applies there — plus a turn it was running can never be settled by an event.
+test("stopping the remote runtime forgets the sessions and the turn that died with it", async () => {
+  const claude = new FakeClaude();
+  const identity = {
+    kind: "ssh" as const,
+    token: "0123456789abcdef0123456789abcdef",
+    pid: 321,
+    linuxStartTime: "654",
+    processGroupId: 321,
+  };
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote", host: claude, runner: claude, launchFlags: {},
+    persistentRuntime: persistentRuntime({ async runtimeIdentity() { return identity; } }),
+  });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:remote", input: [{ type: "text", text: "work" }],
+  });
+
+  await rt.shutdownRuntime(identity);
+  await rt.start();
+  const restarted = await rt.request<{ turn: { id: string } }>("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:next", input: [{ type: "text", text: "next" }],
+  });
+  assert.equal(restarted.turn.id, "ctx:next", "the thread is not wedged on the turn that died with the host");
+  assert.deepEqual(claude.opens.map((request) => request.sessionId), [thread.id, thread.id]);
+});
+
 test("a close racing persistent startup cannot republish the endpoint as ready", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });

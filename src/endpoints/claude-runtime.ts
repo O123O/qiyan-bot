@@ -163,25 +163,38 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     this.persistentUnavailableSubscription?.();
     delete this.persistentUnavailableSubscription;
     if (this.options.persistentRuntime) {
+      // Only this client detaches; the remote host and its sessions keep running, which is
+      // exactly what lets a remote turn outlive a QiYan restart. The thread map stays true.
       await this.options.persistentRuntime.closeConnection();
       return;
     }
     await this.options.host.shutdown();
+    this.forgetLoadedSessions();
   }
 
   async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
     this.lifecycleGeneration += 1;
-    if (!this.options.persistentRuntime) {
-      this.endpointState = "stopped";
-      this.persistentUnavailableSubscription?.();
-      delete this.persistentUnavailableSubscription;
-      await this.options.host.shutdown();
-      return;
-    }
     this.endpointState = "stopped";
     this.persistentUnavailableSubscription?.();
     delete this.persistentUnavailableSubscription;
-    await this.options.persistentRuntime.shutdownRuntime(expected);
+    if (this.options.persistentRuntime) await this.options.persistentRuntime.shutdownRuntime(expected);
+    else await this.options.host.shutdown();
+    // Both branches end the sessions themselves: the in-process host walks its own session
+    // map, and the remote branch stops the host process that owned them.
+    this.forgetLoadedSessions();
+  }
+
+  // Every session the host held is gone. This endpoint object outlives them — the manager
+  // hands a builtin back unchanged across a restart, and a stopped endpoint is started in
+  // place — so a thread still marked loaded would skip `host.open` on its next turn and
+  // send into a session the host no longer has, failing UNKNOWN_SESSION for good.
+  private forgetLoadedSessions(): void {
+    for (const state of this.threads.values()) {
+      state.loaded = false;
+      // A turn that was running on a session that has since died can never be settled by a
+      // host event, so leaving the reservation would wedge the thread as SESSION_BUSY.
+      delete state.running;
+    }
   }
 
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
