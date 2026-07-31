@@ -782,13 +782,16 @@ export function hasEarlierEndpointOperation(
 type EndpointLifecycleOperationKind = "disconnect_endpoint" | "restart_endpoint";
 
 export async function settleEarlierEndpointOperations(options: {
-  operations: Pick<OperationStore, "listRecoverable" | "get">;
+  operations: Pick<OperationStore, "listRecoverable" | "get" | "fail">;
   currentSequence: number;
   endpointId: string;
   currentKind: EndpointLifecycleOperationKind;
   resolver: OperationRecoveryTargetResolver;
   reconcile(): Promise<void>;
   isEndpointReady(endpointId: string): boolean;
+  // Parked waiting for a human to re-authenticate. Retrying into that only manufactures
+  // more unresolved operations, so the fence still refuses there.
+  isAwaitingAuthentication(endpointId: string): boolean;
   waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
   waitTimeoutMs?: number;
   signal?: AbortSignal;
@@ -811,7 +814,33 @@ export async function settleEarlierEndpointOperations(options: {
     let unresolved = earlier();
     while (unresolved.length > 0) {
       const oldest = unresolved[0]!;
-      if (!options.isEndpointReady(options.endpointId) || oldest.state !== "uncertain") throw conflict();
+      // A `dispatched` operation is genuinely in flight; a second lifecycle action would
+      // race it. Refuse regardless of endpoint health.
+      if (oldest.state !== "uncertain") throw conflict();
+      if (!options.isEndpointReady(options.endpointId)) {
+        // Waiting cannot settle anything here: an endpoint that does not answer has nothing
+        // left to report an earlier attempt's outcome, so the join below would only time out.
+        //
+        // Refusing outright is what wedged endpoints permanently — the restart was denied
+        // because the endpoint was unhealthy, which was the reason for the restart. But
+        // proceeding is only sound when this action's postcondition subsumes every earlier
+        // one: a restart ends with the endpoint stopped and replaced, which is also where a
+        // stalled restart or disconnect was heading. It is NOT sound for a `ready_endpoint`
+        // operation such as an in-flight send, whose effect a restart does not subsume.
+        if (options.isAwaitingAuthentication(options.endpointId)) throw conflict();
+        if (!unresolved.every((operation) => subsumedByLifecycle(operation, options.currentKind, options.resolver))) {
+          throw conflict();
+        }
+        // Settle them as superseded so they stop fencing every future attempt. This is the
+        // ONLY place an unresolvable lifecycle operation is retired, and it is a proof about
+        // postconditions, never a timeout.
+        for (const operation of unresolved) {
+          options.operations.fail(operation.id, {
+            message: `superseded by a later ${options.currentKind} on endpoint ${options.endpointId}`,
+          });
+        }
+        return "proceed";
+      }
       const controller = new AbortController();
       const abort = (): void => controller.abort(options.signal?.reason);
       if (options.signal?.aborted) abort();
@@ -838,6 +867,20 @@ export async function settleEarlierEndpointOperations(options: {
     && options.operations.get(lastEarlier.id)?.state === "succeeded"
     ? "satisfied"
     : "proceed";
+}
+
+// A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
+// So a restart subsumes an unfinished restart or disconnect, and a disconnect subsumes only
+// an unfinished disconnect — a stalled restart still owes a replacement that a disconnect
+// will not provide. Anything that is not an endpoint-lifecycle operation is never subsumed.
+function subsumedByLifecycle(
+  operation: RecoverableOperation,
+  currentKind: EndpointLifecycleOperationKind,
+  resolver: OperationRecoveryTargetResolver,
+): boolean {
+  if (recoverableOperationTarget(operation, resolver).policy !== "endpoint_lifecycle") return false;
+  if (operation.kind === "disconnect_endpoint") return true;
+  return operation.kind === "restart_endpoint" && currentKind === "restart_endpoint";
 }
 
 export function hasEarlierSessionCreation(
@@ -4086,6 +4129,7 @@ export async function buildProductionApp(
       resolver: operationTargetResolver(),
       reconcile: reconcileOperations,
       isEndpointReady: isRecoveryEndpointReady,
+      isAwaitingAuthentication: (id) => endpointManager?.awaitingAuthentication(id) ?? false,
       waitForTerminal: (operationId, operationSignal) => {
         if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
         return operationReconciler.waitForTerminal(operationId, operationSignal);

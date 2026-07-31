@@ -1290,6 +1290,7 @@ test("an explicit restart joins an earlier uncertain restart after reconnect", a
     operations: {
       listRecoverable: () => recoverable as any,
       get: (id) => id === earlier.id ? { ...earlier, state: states.get(id) } as any : undefined,
+      fail: () => {},
     },
     currentSequence: 2,
     endpointId: "lyris",
@@ -1297,6 +1298,7 @@ test("an explicit restart joins an earlier uncertain restart after reconnect", a
     resolver,
     reconcile: async () => { ready = true; },
     isEndpointReady: () => ready,
+    isAwaitingAuthentication: () => false,
     waitForTerminal: async (id) => {
       waitedFor = id;
       states.set(id, "succeeded");
@@ -1306,6 +1308,98 @@ test("an explicit restart joins an earlier uncertain restart after reconnect", a
 
   assert.equal(waitedFor, earlier.id);
   assert.equal(result, "satisfied");
+});
+
+// The endpoint most in need of a restart is the one that is down. Refusing because an
+// earlier attempt is stuck `uncertain` deadlocked the only repair — the restart was denied
+// for the very condition it exists to fix — so a restart now supersedes earlier lifecycle
+// work it provably subsumes, and settles it so it stops fencing everything after.
+function wedgeHarness(overrides: Record<string, unknown> = {}) {
+  const failed: Array<{ id: string; error: unknown }> = [];
+  const earlier = {
+    id: "restart-wedged", sequence: 1, kind: "restart_endpoint",
+    args: { endpoint: "prenyx" }, state: "uncertain" as const,
+  };
+  return {
+    failed,
+    earlier,
+    run: () => settleEarlierEndpointOperations({
+      operations: {
+        listRecoverable: () => [earlier] as any,
+        get: () => ({ ...earlier }) as any,
+        fail: (id: string, error: unknown) => { failed.push({ id, error }); },
+      },
+      currentSequence: 2,
+      endpointId: "prenyx",
+      currentKind: "restart_endpoint",
+      resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+      reconcile: async () => {},
+      isEndpointReady: () => false,
+      isAwaitingAuthentication: () => false,
+      waitForTerminal: async () => assert.fail("an unreachable endpoint must never be waited on"),
+      ...overrides,
+    } as any),
+  };
+}
+
+test("a restart supersedes an earlier uncertain restart on an unreachable endpoint", async () => {
+  const harness = wedgeHarness();
+  assert.equal(await harness.run(), "proceed");
+  assert.deepEqual(harness.failed.map((entry) => entry.id), ["restart-wedged"],
+    "the wedged operation is settled, so it stops fencing every later attempt");
+});
+
+// Preserved guarantee: retrying into an endpoint waiting on a human only manufactures more
+// unresolved operations, so that case still refuses.
+test("a restart still refuses while the endpoint awaits re-authentication", async () => {
+  const harness = wedgeHarness({ isAwaitingAuthentication: () => true });
+  await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+  assert.deepEqual(harness.failed, [], "nothing is settled when the operation may still be repairable");
+});
+
+// Preserved guarantee: a dispatched operation is genuinely running, so a second lifecycle
+// action would race it — endpoint health is irrelevant.
+test("a restart still refuses to race an earlier dispatched operation", async () => {
+  const harness = wedgeHarness();
+  (harness.earlier as { state: string }).state = "dispatched";
+  await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+  assert.deepEqual(harness.failed, []);
+});
+
+// A restart does not subsume an in-flight send: stopping the endpoint says nothing about
+// whether that message was delivered, so it must not be retired as superseded.
+test("a restart does not supersede a non-lifecycle operation", async () => {
+  const send = {
+    id: "send-inflight", sequence: 1, kind: "send_to_session",
+    args: { nickname: "sparse-att-scale" }, state: "uncertain" as const,
+  };
+  const failed: string[] = [];
+  await assert.rejects(settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [send] as any,
+      get: () => ({ ...send }) as any,
+      fail: (id: string) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "prenyx",
+    currentKind: "restart_endpoint",
+    resolver: {
+      defaultProjectEndpointId: "local",
+      session: () => ({ endpoint: "prenyx" }) as any,
+    },
+    reconcile: async () => {},
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => {},
+  } as any), (error: any) => error.code === "OPERATION_CONFLICT");
+  assert.deepEqual(failed, [], "an undelivered send is not retired by restarting its endpoint");
+});
+
+// A stalled restart still owes a replacement that a disconnect will not provide.
+test("a disconnect does not supersede an earlier restart", async () => {
+  const harness = wedgeHarness({ currentKind: "disconnect_endpoint" });
+  await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+  assert.deepEqual(harness.failed, []);
 });
 
 test("a recovered different lifecycle operation does not absorb a restart", async () => {
@@ -1324,6 +1418,7 @@ test("a recovered different lifecycle operation does not absorb a restart", asyn
     operations: {
       listRecoverable: () => recoverable as any,
       get: (id) => id === earlier.id ? { ...earlier, state: states.get(id) } as any : undefined,
+      fail: () => {},
     },
     currentSequence: 2,
     endpointId: "lyris",
@@ -1334,6 +1429,7 @@ test("a recovered different lifecycle operation does not absorb a restart", asyn
       recoverable = [];
     },
     isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
     waitForTerminal: async () => undefined,
   });
 
@@ -1363,6 +1459,7 @@ test("an intervening endpoint operation prevents an older restart from absorbing
     operations: {
       listRecoverable: () => recoverable as any,
       get: (id) => ({ ...recoverable.find((operation) => operation.id === id), state: states.get(id) }) as any,
+      fail: () => {},
     },
     currentSequence: 3,
     endpointId: "lyris",
@@ -1379,6 +1476,7 @@ test("an intervening endpoint operation prevents an older restart from absorbing
       recoverable = [];
     },
     isEndpointReady: () => true,
+    isAwaitingAuthentication: () => false,
     waitForTerminal: async () => undefined,
   });
 
@@ -1399,6 +1497,7 @@ test("joining a ready but permanently uncertain restart has a bounded wait", asy
     operations: {
       listRecoverable: () => [earlier] as any,
       get: () => earlier as any,
+      fail: () => {},
     },
     currentSequence: 2,
     endpointId: "lyris",
@@ -1406,6 +1505,7 @@ test("joining a ready but permanently uncertain restart has a bounded wait", asy
     resolver,
     reconcile: async () => undefined,
     isEndpointReady: () => true,
+    isAwaitingAuthentication: () => false,
     waitTimeoutMs: 1,
     waitForTerminal: async (_id, signal) => new Promise((_resolve, reject) => {
       signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -1429,6 +1529,7 @@ test("an explicit restart fails without creating another uncertain action when r
     operations: {
       listRecoverable: () => [earlier] as any,
       get: () => earlier as any,
+      fail: () => {},
     },
     currentSequence: 2,
     endpointId: "lyris",
@@ -1436,6 +1537,7 @@ test("an explicit restart fails without creating another uncertain action when r
     resolver,
     reconcile: async () => undefined,
     isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
     waitForTerminal: async () => assert.fail("an unavailable endpoint must not wait indefinitely"),
   }), (error: unknown) => error instanceof AppError
     && error.code === "OPERATION_CONFLICT"

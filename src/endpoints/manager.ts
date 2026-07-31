@@ -465,6 +465,14 @@ export class EndpointManager {
 
   desiredState(id: string): EndpointDesiredState { return this.record(id).gate.desiredState; }
 
+  // True while automatic recovery is parked waiting for a human to re-authenticate (an SSH
+  // host with no fresh channel — MFA). Distinguishes "a person must act before anything can
+  // work" from "the runtime is simply gone", which is the case a restart exists to repair.
+  // Lifecycle fencing needs that distinction: retrying into an auth-blocked endpoint only
+  // manufactures more unresolved operations, while refusing a restart for a merely absent
+  // runtime deadlocks the only repair available.
+  awaitingAuthentication(id: string): boolean { return this.record(id).recoveryPause !== undefined; }
+
   onEndpoint(listener: (endpoint: ManagedAppServerEndpoint, generation: number) => void): () => void {
     this.endpointListeners.add(listener);
     return () => this.endpointListeners.delete(listener);
