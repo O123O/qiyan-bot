@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { reconstructClaudeThread, type ClaudeThreadView } from "../../src/sessions/claude-thread.ts";
+import { claudeMessagePhase, reconstructClaudeThread, type ClaudeThreadView } from "../../src/sessions/claude-thread.ts";
 
 function records(name: string): unknown[] {
   const path = fileURLToPath(new URL(`./fixtures/claude/${name}.jsonl`, import.meta.url));
@@ -145,4 +145,26 @@ test("a turn truncated by max_tokens still completes (not open forever)", () => 
   const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
   assert.equal(v.turns[0]?.status, "completed");
   assert.equal(v.status.type, "idle");
+});
+
+// Live SDK events and reconstructed history are merged by item id, so they must phase an
+// assistant message identically or the merged message describes itself two ways.
+test("the phase rule is shared between the live path and reconstruction", () => {
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "end_turn" } }), "final_answer");
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "max_tokens" } }), "final_answer",
+    "a turn truncated by the model still ends it");
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "tool_use" } }), "commentary",
+    "text before a tool call is intermediate, and is shown as it arrives");
+  assert.equal(claudeMessagePhase({ message: {} }), "commentary", "still streaming");
+  assert.equal(claudeMessagePhase({}), "commentary", "a malformed record is never a final answer");
+
+  // The same rule must produce the same phases reconstruction assigns.
+  const view = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: [
+    { type: "user", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "checking" }] } },
+    { type: "assistant", uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } },
+  ] });
+  assert.deepEqual(
+    view.turns[0]!.items.filter((item) => item.type === "agentMessage").map((item) => [item.text, item.phase]),
+    [["checking", "commentary"], ["done", "final_answer"]]);
 });

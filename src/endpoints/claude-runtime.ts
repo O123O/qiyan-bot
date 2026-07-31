@@ -16,7 +16,7 @@ import { EventEmitter } from "node:events";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
+import { claudeMessagePhase, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
@@ -140,11 +140,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // the live stream and the reconstructed history keyed the same way.
       const turnId = state.running?.turnId ?? state.lastTurnId;
       if (!turnId) return;
+      // Intermediate text — what Claude says before a tool call — is delivered as it
+      // arrives, not withheld until the turn ends. Phase comes from the same rule
+      // reconstruction uses, so the live item and its reconstructed twin agree once the
+      // Web UI merges them by id.
+      const phase = claudeMessagePhase(event.message);
       for (const [index, text] of assistantTextBlocks(event.message).entries()) {
         this.emitter.emit("notification", "item/completed", {
           threadId,
           turnId,
-          item: { type: "agentMessage", id: `${messageUuid(event.message) ?? turnId}:${index}`, text },
+          item: { type: "agentMessage", id: `${messageUuid(event.message) ?? turnId}:${index}`, text, phase },
         });
       }
       return;

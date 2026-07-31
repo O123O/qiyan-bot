@@ -652,7 +652,9 @@ test("the first turn creates the native session and the next resumes it; the cal
       params: {
         threadId,
         turnId: "ctx:call-1",
-        item: { type: "agentMessage", id: `${agentUuid}:0`, text: "reply to hello" },
+        // phase comes from the shared rule, so this live item and its reconstructed twin
+        // describe themselves identically once the Web UI merges them by id.
+        item: { type: "agentMessage", id: `${agentUuid}:0`, text: "reply to hello", phase: "final_answer" },
       },
     },
     { method: "turn/completed", params: { threadId, turn: { id: "ctx:call-1" } } },
@@ -758,7 +760,7 @@ test("a background task's report is published on the turn history folds it into"
       params: {
         threadId,
         turnId: "ctx:1",
-        item: { type: "agentMessage", id: `${backgroundUuid}:0`, text: "the background job finished: 42 files" },
+        item: { type: "agentMessage", id: `${backgroundUuid}:0`, text: "the background job finished: 42 files", phase: "final_answer" },
       },
     },
     { method: "turn/completed", params: { threadId, turn: { id: "ctx:1" } } },

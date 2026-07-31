@@ -212,10 +212,22 @@ function timestampOf(record: Record<string, unknown>): number | undefined {
 }
 
 function isTurnEnd(record: Record<string, unknown>): boolean {
+  return claudeMessagePhase(record) === "final_answer";
+}
+
+// Shared by reconstruction and by the live SDK event path, so an assistant message is
+// phased identically whether the Web UI sees it stream in or reloads it from the
+// transcript. The two must agree: a live item and its reconstructed twin are merged by id,
+// and a divergent phase would leave the merged message describing itself two ways.
+// `stop_reason` is "tool_use" when the model is pausing to call a tool, so anything else
+// non-empty terminates the turn; absent means still streaming.
+export function claudeMessagePhase(record: Record<string, unknown>): ClaudeMessagePhase {
   const message = record.message;
-  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (!message || typeof message !== "object" || Array.isArray(message)) return "commentary";
   const stopReason = (message as Record<string, unknown>).stop_reason;
-  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use";
+  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use"
+    ? "final_answer"
+    : "commentary";
 }
 
 // Only assistant TEXT blocks become deliverable agentMessages; thinking and tool_use
