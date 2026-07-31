@@ -1380,3 +1380,23 @@ test("a session with background work reports active, with what is running", asyn
   const settled = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
   assert.equal(settled.thread.nativeActivity, undefined, "none is reported as absent, never as a zero");
 });
+
+// Session status is read from NativeSessionState, which tracks thread/status/changed.
+// Reporting background work only on thread/read left get_session_status and the archive
+// idle-proof still calling the session idle — so a worker with a live subagent read as
+// finished, and archiving would have closed the session out from under it.
+test("background work is announced as a status change the tool layer observes", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const seen: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => { if (method === "thread/status/changed") seen.push({ method, params }); });
+
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 1, subagents: 1, descriptions: [], at: 1 });
+  assert.deepEqual(seen.at(-1)?.params.status, { type: "active" },
+    "a session whose background work outlives its turn is not idle");
+
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 0, descriptions: [], at: 2 });
+  assert.deepEqual(seen.at(-1)?.params.status, { type: "idle" }, "and returns to idle when it settles");
+});

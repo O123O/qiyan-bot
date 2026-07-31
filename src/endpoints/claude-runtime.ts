@@ -130,7 +130,20 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // end-of-turn. It is republished only as a live activity indicator, so the Web UI can
     // show "2 background tasks, 1 subagent running" while a panel is open.
     if (event.type === "task/set") {
-      this.taskActivity.set(threadId, { backgroundTasks: event.background, subagents: event.subagents });
+      const running = event.background + event.subagents;
+      if (running > 0) this.taskActivity.set(threadId, { backgroundTasks: event.background, subagents: event.subagents });
+      else this.taskActivity.delete(threadId);
+      // Emitted as thread/status/changed, not only as the tasks notification: session status
+      // is read from NativeSessionState, which tracks that method. Reporting the counts
+      // without it left get_session_status and the idle proof still calling the session
+      // idle, so a worker with a live subagent read as finished and archive would close the
+      // session out from under it.
+      if (state.running.length === 0) {
+        this.emitter.emit("notification", "thread/status/changed", {
+          threadId,
+          status: { type: running > 0 ? "active" : "idle" },
+        });
+      }
       this.emitter.emit("notification", "thread/tasks/updated", {
         threadId,
         background: event.background,
