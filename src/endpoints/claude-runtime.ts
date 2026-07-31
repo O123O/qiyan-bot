@@ -22,7 +22,7 @@ import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
   claudeModelCatalog,
 } from "./claude-models.ts";
-import type { ClaudeCommandRunner, ClaudeLaunchFlags } from "./claude-command-runner.ts";
+import type { ClaudeCommandRunner } from "./claude-command-runner.ts";
 import type { ClaudeHost } from "../claude-host/host.ts";
 import type { HostEvent } from "../claude-host/protocol.ts";
 import { ClaudeTranscriptHistory } from "./claude-history.ts";
@@ -71,15 +71,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Reads the native transcript for durable history and session discovery. Claude's
     // JSONL stays the only durable conversation store.
     runner: ClaudeCommandRunner;
-    launchFlags: ClaudeLaunchFlags;
+    // The endpoint-wide defaults from its endpoints.json entry; a per-turn model/effort
+    // overrides them. Nothing else is imposed on a managed session — it is an ordinary
+    // Claude Code session.
+    launchFlags: { model?: string; effort?: string };
     persistentRuntime?: ClaudePersistentRuntime;
     // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
     archives?: ClaudeArchiveStore;
     now?: () => number;
-    // Returns the stable per-session --mcp-config path exposing the worker scheduling
-    // tools, or undefined. Attached to every turn (byte-identical per session).
-    workerMcpConfigPath?: (threadId: string) => Promise<string | undefined>;
     // Claude has no native mid-turn steer (spike 0.4). turn/steer durably enqueues the
     // message; it is delivered as the next turn once the running one completes.
     steer?: (threadId: string, message: string) => Promise<void>;
@@ -441,25 +441,49 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
     this.options.archives?.remove(this.id, threadId);
 
-    // Lazily load the session. `materialized` distinguishes creating the caller-chosen
-    // native session id from resuming one that already exists on disk.
-    if (!state.loaded) {
-      await this.options.host.open({
-        sessionId: threadId,
-        mode: state.materialized ? "resume" : "create",
-        cwd: state.cwd,
-        ...(typeof params.model === "string"
-          ? { model: params.model }
-          : this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
-      });
-      state.loaded = true;
-    }
-    if (typeof params.model === "string") await this.options.host.setModel(threadId, params.model);
-
-    // The uuid IS the turn id: the SDK preserves it into the transcript's user row, so
-    // the live stream and reconstructed history agree without a correlation marker.
-    const accepted = await this.options.host.send(threadId, clientId, message);
+    // Reserve the turn BEFORE the first await: opening and sending both suspend, and a
+    // second turn/start slipping through in between would orphan this one and lose
+    // interrupt control over it.
     state.running = { turnId: clientId };
+    // Everything below is fenced against a concurrent closeConnection/archive: a session
+    // opened after the endpoint stopped would outlive it (host.shutdown has already walked
+    // its session map), running a turn nobody can observe or interrupt.
+    const generation = this.lifecycleGeneration;
+    const current = (): boolean =>
+      this.lifecycleGeneration === generation && this.threads.get(threadId) === state;
+    let accepted: boolean;
+    try {
+      // Lazily load the session. `materialized` distinguishes creating the caller-chosen
+      // native session id from resuming one that already exists on disk.
+      if (!state.loaded) {
+        await this.options.host.open({
+          sessionId: threadId,
+          mode: state.materialized ? "resume" : "create",
+          cwd: state.cwd,
+          ...(typeof params.model === "string"
+            ? { model: params.model }
+            : this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
+          ...(typeof params.effort === "string"
+            ? { effort: params.effort }
+            : this.options.launchFlags.effort === undefined ? {} : { effort: this.options.launchFlags.effort }),
+        });
+        state.loaded = true;
+      }
+      // Per-session model/effort: `service.send` spreads the sticky settings into these
+      // params, and an already-loaded session takes them through the live query rather
+      // than a relaunch.
+      if (typeof params.model === "string") await this.options.host.setModel(threadId, params.model);
+      if (typeof params.effort === "string") await this.options.host.setEffort(threadId, params.effort);
+      if (!current()) await this.abandonStartingTurn(threadId, state);
+
+      // The uuid IS the turn id: the SDK preserves it into the transcript's user row, so
+      // the live stream and reconstructed history agree without a correlation marker.
+      accepted = await this.options.host.send(threadId, clientId, message);
+      if (!current()) await this.abandonStartingTurn(threadId, state);
+    } catch (error) {
+      if (state.running?.turnId === clientId) delete state.running;
+      throw error;
+    }
     if (accepted) {
       this.emitter.emit("notification", "turn/started", {
         threadId,
@@ -477,6 +501,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       });
     }
     return { turn: { id: clientId, status: "inProgress" } };
+  }
+
+  // A turn whose endpoint changed mid-start must not be left running on the host: closing
+  // the session ends its query, which settles any message already accepted as interrupted
+  // instead of leaving it to produce output nothing is listening for. The thread is marked
+  // unloaded so a later turn reopens it rather than sending into a session that is gone.
+  private async abandonStartingTurn(threadId: string, state: ThreadState): Promise<never> {
+    state.loaded = false;
+    try { await this.options.host.close(threadId); } catch { /* the host may already be gone */ }
+    throw new AppError("ENDPOINT_UNAVAILABLE", `claude endpoint changed while its turn was starting: ${threadId}`);
   }
 
   // The manager's set_goal installs Claude's own goal by delivering `/goal <objective>`;
