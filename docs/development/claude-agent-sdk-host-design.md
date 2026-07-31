@@ -24,6 +24,20 @@ wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
    omitted so user/project/local settings, `CLAUDE.md`, skills, agents,
    commands, and hooks load exactly as in the CLI.
 
+   The one exception is permission mode, and it is a **pass-through, not a
+   policy**. The SDK ignores `permissions.defaultMode` from settings files and
+   requires an in-process opt-in for `bypassPermissions`; with nothing passed,
+   every tool is denied (measured — see results below). So the host resolves
+   the user's own `permissions.defaultMode` across the normal precedence
+   (managed policy, then local, project, user settings for the session's cwd)
+   and forwards it as `permissionMode`, attaching
+   `allowDangerouslySkipPermissions: true` only when the user's own config
+   asked for `bypassPermissions`. QiYan chooses nothing: a user who configures
+   nothing gets `default` and sees tools denied, and the fix remains their
+   Claude config. This preserves Codex parity in intent — the worker's
+   permission policy is the user's — past an SDK guard that only accepts the
+   value in-process.
+
 2. **Claude owns scheduling, background tasks, subagents, and goals.** The
    worker no longer receives QiYan's `schedule_wakeup` / `schedule_cron` /
    `monitor` tools, and `ClaudeGoalDriver` is retired in favour of native
@@ -166,12 +180,12 @@ design as a result:
 
 **Changed the design.**
 
-1. `permissionMode` is **not** inherited from `settings.json`.
-   `permissions.defaultMode: bypassPermissions` there did not reach the SDK;
-   init reported `default` and the sandbox blocked a background Bash. A managed
-   worker must pass `permissionMode: "bypassPermissions"` with
-   `allowDangerouslySkipPermissions: true`. This is the one launch option
-   beyond the preset — a permission setting, not a behavioural prompt.
+1. `permissionMode` is **not** inherited from `settings.json`. With nothing
+   passed and `permissions.defaultMode: bypassPermissions` set in
+   `~/.claude/settings.json`, init reported `default` and *every* tool was
+   denied: foreground Bash, `Write`, and background Bash all blocked across
+   four permission denials. A worker launched on user settings alone cannot
+   execute a single tool. Hence the pass-through in decision 1.
 2. SDK session helpers do **not** replace the JSONL reader.
    `getSessionMessages` returned 242 messages for a transcript holding 13,322
    user+assistant records, and `limit: 100000` still returned 242 — it walks
@@ -212,8 +226,15 @@ What is *not* available:
   session rather than one goal.
 
 So a Claude worker can hold a native goal and finish it, but QiYan can only
-show "working" until it lands. Whether that is acceptable, or whether goals
-keep a QiYan-side driver, is the one decision the spike does not make.
+show "working" until it lands.
+
+**Decided: native `/goal`, accepting that opacity.** `ClaudeGoalDriver` is
+retired. `ClaudeGoalStore` keeps the manager-visible objective and a reduced
+projection — objective plus working/idle/complete — and drops the live
+`paused` / `blocked` / `usageLimited` / `budgetLimited` states and the
+`tokenBudget` contract, none of which are observable in flight.
+`Options.maxTurns` and `Options.maxBudgetUsd` remain available as a
+session-level backstop against a goal that never terminates.
 
 ## What the spike must settle
 
@@ -278,6 +299,11 @@ Stated plainly so they are not rediscovered as bugs:
   restart.
 - The manager cannot cancel a worker's schedule from QiYan; it can only see
   that something is pending and ask the worker.
+- A goal in flight shows only as "working". The paused, blocked, usage-limited,
+  and budget-limited statuses and the per-goal token budget are gone, because
+  native `/goal` exposes no in-flight state to the SDK stream.
+- A worker whose Claude config sets no permission mode will have every tool
+  denied. QiYan reports it but does not fix it.
 - Claude workers gain Claude's own scheduling semantics, which differ from
   Codex workers' QiYan-backed ones. The two providers are no longer symmetric
   here.
