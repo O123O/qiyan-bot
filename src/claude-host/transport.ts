@@ -8,6 +8,7 @@
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { Readable, Writable } from "node:stream";
 import { AppError } from "../core/errors.ts";
 import type { ClaudeHost, OpenSessionRequest } from "./host.ts";
 import {
@@ -132,9 +133,34 @@ interface Pending {
   reject: (error: unknown) => void;
 }
 
+// The client's view of a connection. A local host is a Unix socket; a remote host is the
+// same socket reached over SSH, whose stdio the endpoint layer hands over as a pair of
+// streams. Both are just a duplex byte channel, so the client has one implementation.
+export interface HostChannel {
+  input: Writable;
+  output: Readable;
+  close(): void;
+}
+
+export function unixSocketChannel(socketPath: string): () => Promise<HostChannel> {
+  return async () => {
+    const socket = await new Promise<Socket>((resolve, reject) => {
+      const candidate = connect(socketPath);
+      candidate.once("connect", () => { candidate.off("error", reject); resolve(candidate); });
+      candidate.once("error", (error) => {
+        // Destroy the failed socket explicitly: a half-open handle would keep the
+        // process alive long after the caller has given up.
+        candidate.destroy();
+        reject(new AppError("ENDPOINT_UNAVAILABLE", `cannot reach the claude host: ${error.message}`));
+      });
+    });
+    return { input: socket, output: socket, close: () => socket.destroy() };
+  };
+}
+
 export class RemoteClaudeHost implements ClaudeHost {
-  private socket: Socket | undefined;
-  private connecting: Promise<Socket> | undefined;
+  private channel: HostChannel | undefined;
+  private connecting: Promise<HostChannel> | undefined;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Set<(event: HostEvent) => void>();
@@ -144,7 +170,9 @@ export class RemoteClaudeHost implements ClaudeHost {
   private readonly openSessions = new Map<string, OpenSessionRequest>();
   private closed = false;
 
-  constructor(private readonly socketPath: string) {}
+  // `openChannel` is the only transport-specific part: unixSocketChannel for a local
+  // host, an SSH-bridged stream for a remote one.
+  constructor(private readonly openChannel: () => Promise<HostChannel>) {}
 
   async open(request: OpenSessionRequest): Promise<SessionStatus> {
     const status = await this.call<SessionStatus>({ method: "open", params: [request] });
@@ -202,22 +230,22 @@ export class RemoteClaudeHost implements ClaudeHost {
 
   async shutdown(): Promise<void> {
     this.closed = true;
-    const socket = this.socket;
-    this.socket = undefined;
+    const channel = this.channel;
+    this.channel = undefined;
     for (const [, waiter] of this.pending) {
       waiter.reject(new AppError("ENDPOINT_UNAVAILABLE", "claude host client shut down"));
     }
     this.pending.clear();
-    socket?.destroy();
+    channel?.close();
   }
 
   private async call<T>(request: HostRequest): Promise<T> {
     if (this.closed) throw new AppError("ENDPOINT_UNAVAILABLE", "claude host client is closed");
-    const socket = await this.ensureConnected();
+    const channel = await this.ensureConnected();
     const id = this.nextId++;
     return await new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-      socket.write(encodeFrame({ id, request }), (error) => {
+      channel.input.write(encodeFrame({ id, request }), (error) => {
         if (!error) return;
         this.pending.delete(id);
         reject(new AppError("ENDPOINT_UNAVAILABLE", `claude host write failed: ${error.message}`));
@@ -225,33 +253,24 @@ export class RemoteClaudeHost implements ClaudeHost {
     });
   }
 
-  private async ensureConnected(): Promise<Socket> {
-    if (this.socket && !this.socket.destroyed) return this.socket;
+  private async ensureConnected(): Promise<HostChannel> {
+    if (this.channel && this.channel.input.writable) return this.channel;
     this.connecting ??= this.dial().finally(() => { this.connecting = undefined; });
     return await this.connecting;
   }
 
-  private async dial(): Promise<Socket> {
-    const socket = await new Promise<Socket>((resolve, reject) => {
-      const candidate = connect(this.socketPath);
-      candidate.once("connect", () => { candidate.off("error", reject); resolve(candidate); });
-      candidate.once("error", (error) => {
-        // Destroy the failed socket explicitly: a half-open handle would keep the
-        // process alive long after the caller has given up.
-        candidate.destroy();
-        reject(new AppError("ENDPOINT_UNAVAILABLE", `cannot reach the claude host: ${error.message}`));
-      });
-    });
-    socket.setEncoding("utf8");
+  private async dial(): Promise<HostChannel> {
+    const channel = await this.openChannel();
+    channel.output.setEncoding("utf8");
     let buffer = "";
-    socket.on("data", (chunk: string) => {
+    channel.output.on("data", (chunk: string) => {
       buffer += chunk;
       const { frames, rest } = decodeFrames(buffer);
       buffer = rest;
       for (const frame of frames) this.receive(frame);
     });
     const fail = (): void => {
-      if (this.socket === socket) this.socket = undefined;
+      if (this.channel === channel) this.channel = undefined;
       // A dropped connection fails every in-flight request rather than hanging it. The
       // caller retries with the same idempotency uuid, which the host drops as a duplicate.
       for (const [id, waiter] of this.pending) {
@@ -259,13 +278,14 @@ export class RemoteClaudeHost implements ClaudeHost {
         waiter.reject(new AppError("OPERATION_UNCERTAIN", "claude host connection lost in flight"));
       }
     };
-    socket.on("close", fail);
-    socket.on("error", fail);
-    this.socket = socket;
+    channel.output.on("close", fail);
+    channel.output.on("error", fail);
+    channel.output.on("end", fail);
+    this.channel = channel;
     // Replay what was missed while disconnected, so live output survives a short gap
     // without re-reading the transcript.
     for (const sessionId of this.openSessions.keys()) void this.replay(sessionId);
-    return socket;
+    return channel;
   }
 
   private async replay(sessionId: string): Promise<void> {

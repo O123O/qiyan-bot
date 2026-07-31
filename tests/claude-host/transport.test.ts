@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { LocalClaudeHost, type OpenSessionRequest } from "../../src/claude-host/host.ts";
-import { ClaudeHostServer, RemoteClaudeHost } from "../../src/claude-host/transport.ts";
+import { ClaudeHostServer, RemoteClaudeHost, unixSocketChannel } from "../../src/claude-host/transport.ts";
 import { decodeFrames, encodeFrame, type HostEvent } from "../../src/claude-host/protocol.ts";
 import type { SessionInput, SessionQuery } from "../../src/claude-host/session.ts";
 
@@ -68,7 +68,7 @@ async function harness(t: { after(fn: () => void | Promise<void>): void }): Prom
   };
   let server = new ClaudeHostServer(host, identity);
   await server.listen(socketPath);
-  const client = new RemoteClaudeHost(socketPath);
+  const client = new RemoteClaudeHost(unixSocketChannel(socketPath));
   t.after(async () => { await client.shutdown(); await server.close(); });
   return {
     client, queries, socketPath, server,
@@ -190,7 +190,7 @@ test("in-flight requests fail loudly when the connection drops", async (t) => {
     hostBuild: "test", sdkVersion: "0", claudeVersion: "2.1.220", runtimeGeneration: "gen-1",
   });
   await server.listen(socketPath);
-  const client = new RemoteClaudeHost(socketPath);
+  const client = new RemoteClaudeHost(unixSocketChannel(socketPath));
   t.after(async () => { await client.shutdown(); await server.close(); });
 
   const inflight = client.models("s1");
@@ -212,7 +212,7 @@ test("a shut-down client refuses further calls instead of reconnecting", async (
 });
 
 test("an unreachable host reports where it failed to connect", async () => {
-  const client = new RemoteClaudeHost(join(tmpdir(), "qiyan-nonexistent", "host.sock"));
+  const client = new RemoteClaudeHost(unixSocketChannel(join(tmpdir(), "qiyan-nonexistent", "host.sock")));
   await assert.rejects(client.status("s1"), (error: any) => {
     assert.equal(error.code, "ENDPOINT_UNAVAILABLE");
     assert.match(error.message, /cannot reach the claude host/u);
