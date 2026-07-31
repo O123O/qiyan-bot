@@ -288,15 +288,23 @@ function parseRecords(chunk: ClaudeTranscriptChunk, leadingProbe: boolean): Pars
   return records;
 }
 
+// `summary` exists so a foreground panel never pulls historical TOOL payloads over the
+// transport. A Claude turn cannot contain any: reconstruction emits only userMessage and
+// agentMessage items, having already dropped thinking and tool_use blocks. So the summary
+// keeps every assistant message rather than only the last.
+//
+// Dropping the intermediate ones cost real content: the text Claude writes before a tool
+// call streams into the panel live, and a summary keeping only the final answer made it
+// vanish on reload — the message-disappears-on-refresh bug in a new place.
 function projectTurn(turn: ThreadHistoryTurn, view: ThreadItemsView): ThreadHistoryTurn {
   if (view === "full") return turn;
   if (view === "notLoaded") return { ...turn, itemsView: "notLoaded", items: [] };
   const firstUser = turn.items.find((item) => item.type === "userMessage");
-  const lastAgent = [...turn.items].reverse().find((item) => item.type === "agentMessage");
+  const agents = turn.items.filter((item) => item.type === "agentMessage");
   return {
     ...turn,
     itemsView: "summary",
-    items: [firstUser, lastAgent].filter((item): item is ThreadHistoryItem => item !== undefined),
+    items: [firstUser, ...agents].filter((item): item is ThreadHistoryItem => item !== undefined),
   };
 }
 

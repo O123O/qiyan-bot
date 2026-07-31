@@ -1279,3 +1279,26 @@ test("turn input renders file attachments as readable paths for Claude", async (
   assert.match(message, /report\.pdf/u, "mention display name forwarded");
   assert.match(message, /\/runtime\/files\/def/u, "mention attachment path forwarded");
 });
+
+// Intermediate assistant text streams into the panel live, so history must keep it too —
+// a summary that returned only the final answer made those messages vanish on reload.
+// Claude turns carry no tool payloads (reconstruction drops thinking and tool_use), which
+// is the only thing the summary projection exists to withhold.
+test("the summary view keeps every assistant message, not just the last", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-sum", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "checking the files" }] } },
+    { type: "assistant", uuid: "a2", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "now running tests" }] } },
+    { type: "assistant", uuid: "a3", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "all green" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-sum", cwd: "/w", excludeTurns: true });
+
+  const page = await rt.request<{ data: Array<{ items: Array<{ type: string; text?: string }> }> }>(
+    "thread/turns/list", { threadId: "thread-sum", limit: 10, sortDirection: "asc", itemsView: "summary" });
+  const texts = page.data[0]!.items.filter((item) => item.type === "agentMessage").map((item) => item.text);
+  assert.deepEqual(texts, ["checking the files", "now running tests", "all green"],
+    "the two intermediate blocks survive the summary projection");
+});
