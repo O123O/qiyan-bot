@@ -18,6 +18,9 @@ export type OperationalEventCode =
   | "database_metadata_recovered"
   | "database_metadata_recovery_required"
   | "worker_scheduling_unavailable"
+  // A managed Claude session inherits the user's own permission settings; "default" mode
+  // denies every tool call, so an unattended worker silently does nothing without this.
+  | "claude_permission_mode"
   | "endpoint_recovery_paused"
   | "endpoint_reconnect_gave_up"
   | "endpoint_connection_lost"

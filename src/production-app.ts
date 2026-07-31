@@ -40,7 +40,6 @@ import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-cont
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { ensureWebUiToken } from "./webui/web-token.ts";
-import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
@@ -121,9 +120,7 @@ import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
-import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
-import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
-import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
+import { attestUserControlMaster, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
@@ -140,7 +137,11 @@ import {
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
-import { LocalClaudeCommandRunner, type ClaudeLaunchFlags } from "./endpoints/claude-command-runner.ts";
+import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
+import { LocalClaudeHost, type OpenSessionRequest } from "./claude-host/host.ts";
+import { loadAgentSdk, resolveClaudeCli } from "./claude-host/requirements.ts";
+import { sdkSessionPreparer, type QueryFn } from "./claude-host/sdk-query.ts";
+import type { SessionQueryFactory } from "./claude-host/session.ts";
 import { ClaudeArchiveStore } from "./sessions/claude-archives.ts";
 import { SchedulingService } from "./scheduling/scheduling-service.ts";
 import type { ScheduleRow } from "./scheduling/schedule-store.ts";
@@ -178,6 +179,35 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
 // cannot diverge (they did — the local Claude endpoint was mis-sent through the ssh path).
 export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: string): boolean {
   return endpointId === "local" || (localClaudeEndpointId !== undefined && endpointId === localClaudeEndpointId);
+}
+
+// The in-process host that runs local Claude sessions.
+//
+// The Agent SDK and the Claude CLI are deployment PREREQUISITES, not bundled dependencies
+// (the SDK carries a ~264 MB platform-specific binary and is `external` in the build), so
+// they are resolved on the first session open rather than at composition time: a
+// Codex-only deployment must still start, and startup must not pay for a `claude
+// --version` probe. Only a successful load is memoized, so an operator who installs the
+// SDK mid-run can simply retry the turn instead of restarting QiYan.
+function localClaudeHost(claudeExecutable: string, onWarning: (message: string) => void): LocalClaudeHost {
+  let loading: Promise<(request: OpenSessionRequest) => Promise<SessionQueryFactory>> | undefined;
+  const load = async (): Promise<(request: OpenSessionRequest) => Promise<SessionQueryFactory>> => {
+    const sdk = await loadAgentSdk();
+    await resolveClaudeCli(claudeExecutable);
+    return sdkSessionPreparer(sdk.query as QueryFn, { claudeExecutable, onWarning });
+  };
+  return new LocalClaudeHost(async (request) => {
+    const pending = loading ?? load();
+    loading = pending;
+    let prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>;
+    try {
+      prepare = await pending;
+    } catch (error) {
+      if (loading === pending) loading = undefined;
+      throw error;
+    }
+    return await prepare(request);
+  });
 }
 
 function isForeignAssistantThreadNotification(
@@ -2775,8 +2805,7 @@ export async function buildProductionApp(
         });
         // Steer + archive options wired into a Claude runtime (local or remote). Both are
         // QiYan-side and host-agnostic; steer = durable enqueue delivered as the next turn
-        // (Claude has no mid-turn injection). workerMcpConfigPath is added per-endpoint
-        // separately (local: loopback; remote: reverse tunnel).
+        // (Claude has no mid-turn injection).
         const claudeRuntimeOptions = (endpointId: string) => ({
           archives: claudeArchives!,
           steer: async (threadId: string, message: string): Promise<void> => {
@@ -2784,19 +2813,21 @@ export async function buildProductionApp(
             if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId, threadId }, message);
           },
         });
-        // The launch policy (disabled built-in scheduling tools + redirect prompt) applies to
-        // EVERY Claude session, local or remote; model/effort are the per-endpoint overrides from
-        // the endpoint's endpoints.json entry.
+        // A managed Claude session is an ordinary Claude Code session: the only per-endpoint
+        // launch settings are the model/effort defaults from its endpoints.json entry. The
+        // host runs the turns (one long-lived SDK query per session); the runner stays only
+        // as the transcript/discovery source.
         claudeEndpoint = localClaudeDef === undefined ? undefined : new ClaudeCodeRuntime({
           id: localClaudeDef.id,
+          host: localClaudeHost(localClaudeDef.command ?? "claude", (message) => reportOperationalSafely(report, {
+            level: "warn", code: "claude_permission_mode", component: "claude_host", reason: message,
+          })),
           runner: new LocalClaudeCommandRunner({ command: localClaudeDef.command ?? "claude" }),
-          launchFlags: claudeLaunchPolicy(localClaudeDef.model, localClaudeDef.effort),
-          ...claudeRuntimeOptions(localClaudeDef.id),
-          // Local: the worker reaches the loopback MCP directly (no tunnel).
-          workerMcpConfigPath: async (threadId: string) => {
-            const found = registry.getByIdentity(localClaudeDef.id, threadId);
-            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: localClaudeDef.id, threadId }) : undefined;
+          launchFlags: {
+            ...(localClaudeDef.model === undefined ? {} : { model: localClaudeDef.model }),
+            ...(localClaudeDef.effort === undefined ? {} : { effort: localClaudeDef.effort }),
           },
+          ...claudeRuntimeOptions(localClaudeDef.id),
         });
         // The local worker's `monitor` check runs on this host.
         if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
@@ -2821,88 +2852,19 @@ export async function buildProductionApp(
             if (definition.transport === "local") {
               throw new AppError("CONFIGURATION_ERROR", `local endpoint '${definition.id}' cannot be activated remotely; local endpoint changes require a restart`);
             }
+            // TODO(remote-claude-host): remote Claude runs its turns inside a long-lived
+            // `qiyan-claude-host` in the endpoint's tmux generation, reached over a unix
+            // socket; that host process is the next stage. Until it exists, fail CLOSED at
+            // activation rather than handing the endpoint an in-process host, which would
+            // run Claude on the QiYan machine against the wrong filesystem.
+            if (definition.provider === "claude") {
+              throw new AppError("UNSUPPORTED_CAPABILITY",
+                `remote Claude endpoint '${definition.id}' is being migrated to the persistent Claude host and cannot be activated yet; `
+                + "use a local Claude endpoint or a Codex (ssh) endpoint until qiyan-claude-host ships");
+            }
             // host drives the ssh alias (ssh -G, ControlMaster path); id stays the identity/binding key.
             const generation = await planner.createGeneration(definition.id, definition.host!);
             const remote = new SshRemoteClient({ plan: generation.plan, helperSource });
-            if (definition.provider === "claude") {
-              // A Claude endpoint has no app-server to lazily prepare, so bootstrap the
-              // helper eagerly here (installs it + establishes the ControlMaster) — the
-              // Workspace and file operations need the installed helper immediately.
-              const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-              // Tier B: expose QiYan's worker-MCP on the remote host via an ssh -R reverse
-              // tunnel over this endpoint's ControlMaster, so the remote worker can self-schedule.
-              // The remote listen port is allocated dynamically by the remote sshd (read back
-              // after ensure()); the worker learns it from the URL in its per-session config.
-              const tunnel = new RemoteWorkerTunnel({
-                plan: generation.plan, localPort: scheduling!.mcpPort,
-              });
-              // Warn the user once per session when the tunnel degrades (below), so the loss of
-              // self-scheduling is visible, not just an operational log line.
-              const tunnelWarned = new Set<string>();
-              const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
-                const found = registry.getByIdentity(definition.id, threadId);
-                if (!found) return undefined;
-                // Self-scheduling is best-effort: the reverse tunnel must NOT be a single point of
-                // failure for basic remote messaging. If establishing it (or writing the config)
-                // fails, run the turn WITHOUT the scheduling tools rather than failing the whole
-                // turn. The degradation is surfaced as an operational warning (not silent), and the
-                // acceptance test's schedule-step assertion still fails loudly on a real regression.
-                try {
-                  await tunnel.ensure();
-                  const content = scheduling!.workerMcpConfigContent(
-                    { nickname: found.nickname, endpointId: definition.id, threadId },
-                    `http://127.0.0.1:${tunnel.remotePort}/mcp`,
-                  );
-                  // Write the token-bearing config to the REMOTE runtime dir (content-addressed
-                  // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
-                  const buffer = Buffer.from(content, "utf8");
-                  const result = await remote.invokeTransfer<{ path: string }>("write-file",
-                    [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
-                    { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
-                  return result.path;
-                } catch (error) {
-                  const reason = error instanceof Error ? error.message : String(error);
-                  reportOperationalSafely(report, {
-                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel", reason,
-                  });
-                  // The reverse tunnel (Tier B) only carries the worker's SELF-scheduling tools; the
-                  // worker's turns and QiYan-side goal drive/steer (Tier A) go over the ControlMaster
-                  // and are unaffected. Surface the degradation to the user once per session — but,
-                  // like the operational log above, this MUST NOT fail the turn (this whole branch
-                  // exists to degrade gracefully), so swallow any delivery/binding error and add to
-                  // the dedup set only after a successful prepare (so a throw doesn't lose the warning).
-                  try {
-                    if (deliveries && !tunnelWarned.has(threadId)) {
-                      deliveries.prepare({
-                        id: `worker-scheduling-unavailable:${definition.id}:${threadId}`,
-                        kind: "worker_warning", binding: currentOwnerBinding(), mandatory: true,
-                        body: `[${found.nickname}] the remote worker can't reach QiYan's scheduling tools (reverse tunnel failed: ${reason}). It still runs turns and pursues its goal, but can't set its own wakeups, crons, or monitors this turn.`,
-                      });
-                      tunnelWarned.add(threadId);
-                    }
-                  } catch { /* surfacing the warning must not fail the turn */ }
-                  return undefined;
-                }
-              };
-              const claudeRemoteRunner = new SshClaudeCommandRunner({
-                plan: generation.plan,
-                host: { ...host, remote },
-              });
-              // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
-              monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
-              const claudeRemoteEndpoint = new ClaudeCodeRuntime({
-                id: definition.id,
-                runner: claudeRemoteRunner,
-                persistentRuntime: claudeRemoteRunner,
-                launchFlags: claudeLaunchPolicy(definition.model, definition.effort),
-                // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
-                // over the reverse tunnel (Tier B).
-                ...claudeRuntimeOptions(definition.id),
-                workerMcpConfigPath: remoteWorkerMcpConfigPath,
-              });
-              remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
-              return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
-            }
             const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
             const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
