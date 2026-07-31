@@ -136,12 +136,9 @@ function baseOptions(cwd: string): Options {
     // settingSources omitted on purpose: load user/project/local settings, CLAUDE.md,
     // skills, agents, commands, and hooks exactly as the CLI does.
     //
-    // Permission mode is the one launch option that is NOT inherited from settings.json:
-    // `permissions.defaultMode: bypassPermissions` there does not reach the SDK, and
-    // bypassPermissions requires this explicit opt-in pair. Without it tools are
-    // sandbox-blocked, so a managed worker must set it deliberately.
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
+    // Permission mode is deliberately NOT set here by default: QiYan does not manage
+    // worker permissions (Codex parity) — the user's own ~/.claude settings decide.
+    // The `perm` phase measures whether that actually holds for the SDK.
     includePartialMessages: false,
   };
 }
@@ -352,6 +349,45 @@ async function tasksPhase(cwd: string): Promise<void> {
   session.close();
 }
 
+// Does the user's own ~/.claude/settings.json `permissions.defaultMode` actually govern
+// tool execution in an SDK session, with no permissionMode passed by the host? If it does,
+// QiYan manages nothing (Codex parity). If it does not, a worker cannot run tools at all.
+async function permPhase(cwd: string): Promise<void> {
+  const sessionId = randomUUID();
+  console.log(`\n=== perm phase (session ${sessionId}) — no permissionMode passed ===`);
+  const session = new Session({ ...baseOptions(cwd), sessionId });
+
+  const fg = session.send("Use the Bash tool to run exactly: echo FG_OK > fg.txt   Then reply with only: DONE");
+  const fgResult = await withTimeout(fg.done, 240_000, "foreground bash turn")
+    .catch((e) => ({ result: `FAILED: ${e.message}` }));
+  const init = session.messages.find((m) => m.type === "system" && (m as any).subtype === "init") as any;
+  let fgWrote = false;
+  try { fgWrote = (await readFile(join(cwd, "fg.txt"), "utf8")).includes("FG_OK"); } catch { /* blocked */ }
+  record("P1", "foreground Bash runs on user settings alone", fgWrote,
+    `init.permissionMode=${init?.permissionMode} fg.txt=${fgWrote}`
+    + ` reply=${JSON.stringify(String((fgResult as any).result ?? "").slice(0, 80))}`);
+
+  const edit = session.send("Use the Write tool to create edit.txt containing EDIT_OK. Then reply with only: DONE");
+  await withTimeout(edit.done, 240_000, "write turn").catch(() => undefined);
+  let editWrote = false;
+  try { editWrote = (await readFile(join(cwd, "edit.txt"), "utf8")).includes("EDIT_OK"); } catch { /* blocked */ }
+  record("P2", "file write runs on user settings alone", editWrote, `edit.txt=${editWrote}`);
+
+  const bg = session.send(
+    "Use the Bash tool with run_in_background true to run: `sleep 20 && echo BG2_OK > bg2.txt`. "
+    + "Then immediately reply with only: STARTED",
+  );
+  await withTimeout(bg.done, 240_000, "background bash turn").catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 45_000));
+  let bgWrote = false;
+  try { bgWrote = (await readFile(join(cwd, "bg2.txt"), "utf8")).includes("BG2_OK"); } catch { /* blocked */ }
+  const denials = session.messages.filter((m: any) => m.type === "result" && (m.permission_denials ?? []).length > 0);
+  record("P3", "background Bash runs on user settings alone", bgWrote,
+    `bg2.txt=${bgWrote} results-with-denials=${denials.length}`
+    + ` denials=${JSON.stringify(denials.flatMap((m: any) => m.permission_denials.map((d: any) => d.tool_name))).slice(0, 120)}`);
+  session.close();
+}
+
 async function goalPhase(cwd: string): Promise<void> {
   const sessionId = randomUUID();
   console.log(`\n=== goal phase (session ${sessionId}) ===`);
@@ -450,6 +486,7 @@ async function main(): Promise<void> {
 
   let coreSession: string | undefined;
   if (phases.includes("core")) coreSession = await corePhase(cwd);
+  if (phases.includes("perm")) await permPhase(cwd);
   if (phases.includes("tasks")) await tasksPhase(cwd);
   if (phases.includes("goal")) await goalPhase(cwd);
   if (phases.includes("history")) await historyPhase(coreSession);
