@@ -1,0 +1,1453 @@
+
+{
+  "header": {
+    "reportVersion": 5,
+    "event": "undefined",
+    "trigger": "Signal",
+    "filename": "report.20260731.044054.4149170.0.002.json",
+    "dumpEventTime": "2026-07-31T04:40:54Z",
+    "dumpEventTimeStamp": "1785472854496",
+    "processId": 4149170,
+    "threadId": 0,
+    "cwd": "/home/scratch.mxin_hw/sources/qiyan-bot",
+    "commandLine": [
+      "/home/scratch.mxin_hw/.local/lib/nodejs/node-v24.18.0-linux-x64/bin/node",
+      "--test-coverage-functions=0",
+      "--test-concurrency=8",
+      "--inspect-publish-uid=stderr,http",
+      "--inspect-port=127.0.0.1:9229",
+      "--report-signal=SIGUSR2",
+      "--test-coverage-lines=0",
+      "--test-isolation=process",
+      "--heap-prof-interval=524288",
+      "--cpu-prof-interval=1000",
+      "--import=tsx",
+      "--v8-pool-size=4",
+      "--trace-event-file-pattern=node_trace.${rotation}.log",
+      "--secure-heap-min=2",
+      "--network-family-autoselection-attempt-timeout=250",
+      "--tls-cipher-list=TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA",
+      "--use-largepages=off",
+      "--secure-heap=0",
+      "--watch-kill-signal=SIGTERM",
+      "--test-coverage-branches=0",
+      "--max-http-header-size=16384",
+      "--test-timeout=0",
+      "--node-snapshot",
+      "--stack-trace-limit=10",
+      "--heapsnapshot-near-heap-limit=0",
+      "--import",
+      "tsx",
+      "tests/webui/webui-signal.test.ts"
+    ],
+    "nodejsVersion": "v24.18.0",
+    "glibcVersionRuntime": "2.35",
+    "glibcVersionCompiler": "2.28",
+    "wordSize": 64,
+    "arch": "x64",
+    "platform": "linux",
+    "componentVersions": {
+      "acorn": "8.16.0",
+      "ada": "3.4.4",
+      "amaro": "1.1.9",
+      "ares": "1.34.6",
+      "brotli": "1.2.0",
+      "cldr": "48.0",
+      "icu": "78.3",
+      "llhttp": "9.4.2",
+      "merve": "1.2.2",
+      "modules": "137",
+      "napi": "10",
+      "nbytes": "0.1.4",
+      "ncrypto": "0.0.1",
+      "nghttp2": "1.69.0",
+      "nghttp3": "",
+      "ngtcp2": "",
+      "node": "24.18.0",
+      "openssl": "3.5.7",
+      "simdjson": "4.6.4",
+      "simdutf": "6.4.0",
+      "sqlite": "3.53.1",
+      "tz": "2026b",
+      "undici": "7.28.0",
+      "unicode": "17.0",
+      "uv": "1.52.1",
+      "uvwasi": "0.0.23",
+      "v8": "13.6.233.17-node.50",
+      "zlib": "1.3.1-e00f703",
+      "zstd": "1.5.7"
+    },
+    "release": {
+      "name": "node",
+      "lts": "Krypton",
+      "headersUrl": "https://nodejs.org/download/release/v24.18.0/node-v24.18.0-headers.tar.gz",
+      "sourceUrl": "https://nodejs.org/download/release/v24.18.0/node-v24.18.0.tar.gz"
+    },
+    "osName": "Linux",
+    "osRelease": "5.15.0-134-generic",
+    "osVersion": "#145-Ubuntu SMP Wed Feb 12 20:08:39 UTC 2025",
+    "osMachine": "x86_64",
+    "cpus": [
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3749,
+        "user": 11105560,
+        "nice": 113830,
+        "sys": 6630680,
+        "idle": 23441494250,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3163,
+        "user": 12248460,
+        "nice": 159900,
+        "sys": 7537640,
+        "idle": 23564996120,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3109,
+        "user": 8746440,
+        "nice": 152810,
+        "sys": 6338590,
+        "idle": 23571473750,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2079,
+        "user": 9933590,
+        "nice": 156450,
+        "sys": 5783060,
+        "idle": 23572448030,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2221,
+        "user": 9485640,
+        "nice": 174660,
+        "sys": 5293840,
+        "idle": 23574049220,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3196,
+        "user": 9114320,
+        "nice": 171530,
+        "sys": 4959640,
+        "idle": 23575313220,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3112,
+        "user": 20677250,
+        "nice": 184870,
+        "sys": 5551980,
+        "idle": 23564345820,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2789,
+        "user": 18456220,
+        "nice": 196630,
+        "sys": 4206850,
+        "idle": 23568128460,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2342,
+        "user": 13848710,
+        "nice": 175640,
+        "sys": 3915930,
+        "idle": 23573149290,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2483,
+        "user": 10700210,
+        "nice": 209280,
+        "sys": 5559210,
+        "idle": 23569530070,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1914,
+        "user": 10023840,
+        "nice": 213460,
+        "sys": 4551560,
+        "idle": 23575471980,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2111,
+        "user": 10224200,
+        "nice": 184320,
+        "sys": 4206150,
+        "idle": 23576068450,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2669,
+        "user": 19613910,
+        "nice": 206590,
+        "sys": 5330760,
+        "idle": 23565674160,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2357,
+        "user": 15664260,
+        "nice": 185490,
+        "sys": 4112980,
+        "idle": 23571106570,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3010,
+        "user": 9632420,
+        "nice": 161350,
+        "sys": 3721720,
+        "idle": 23577528950,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2281,
+        "user": 8267110,
+        "nice": 186290,
+        "sys": 3588400,
+        "idle": 23579248030,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3210,
+        "user": 8360340,
+        "nice": 173690,
+        "sys": 3565120,
+        "idle": 23579050880,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3207,
+        "user": 8076680,
+        "nice": 191530,
+        "sys": 3513700,
+        "idle": 23579371060,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3212,
+        "user": 17642000,
+        "nice": 216760,
+        "sys": 4558500,
+        "idle": 23568692460,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2239,
+        "user": 17095950,
+        "nice": 180520,
+        "sys": 3821950,
+        "idle": 23570242930,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2388,
+        "user": 12014350,
+        "nice": 168850,
+        "sys": 3559180,
+        "idle": 23575354060,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3742,
+        "user": 8500570,
+        "nice": 218600,
+        "sys": 3695860,
+        "idle": 23578518720,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3724,
+        "user": 8493870,
+        "nice": 185000,
+        "sys": 3418140,
+        "idle": 23579071100,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1796,
+        "user": 8322080,
+        "nice": 212110,
+        "sys": 3555540,
+        "idle": 23579140340,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2620,
+        "user": 36850940,
+        "nice": 310020,
+        "sys": 18359320,
+        "idle": 23518508630,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1493,
+        "user": 15638040,
+        "nice": 212950,
+        "sys": 13568860,
+        "idle": 23552196440,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 20854880,
+        "nice": 168280,
+        "sys": 12704430,
+        "idle": 23545300820,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1490,
+        "user": 11830960,
+        "nice": 134580,
+        "sys": 8728920,
+        "idle": 23563863310,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 13085000,
+        "nice": 109470,
+        "sys": 7350140,
+        "idle": 23565344800,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 8952580,
+        "nice": 90630,
+        "sys": 5702170,
+        "idle": 23571122650,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 23821080,
+        "nice": 133240,
+        "sys": 7859420,
+        "idle": 23556586000,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 11616150,
+        "nice": 108850,
+        "sys": 6423230,
+        "idle": 23570540600,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1492,
+        "user": 9791790,
+        "nice": 120510,
+        "sys": 6657360,
+        "idle": 23572609180,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1466,
+        "user": 10834380,
+        "nice": 110910,
+        "sys": 5212380,
+        "idle": 23572127180,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1495,
+        "user": 11447490,
+        "nice": 108470,
+        "sys": 5141250,
+        "idle": 23572674780,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1495,
+        "user": 10529110,
+        "nice": 117950,
+        "sys": 5623790,
+        "idle": 23571788410,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1495,
+        "user": 31377710,
+        "nice": 112180,
+        "sys": 12355790,
+        "idle": 23534215430,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1484,
+        "user": 16682300,
+        "nice": 106040,
+        "sys": 11078940,
+        "idle": 23552991110,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1493,
+        "user": 13983250,
+        "nice": 92030,
+        "sys": 8715150,
+        "idle": 23562350970,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1481,
+        "user": 15083890,
+        "nice": 90640,
+        "sys": 7984060,
+        "idle": 23559694010,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 10665920,
+        "nice": 85740,
+        "sys": 8364110,
+        "idle": 23566902620,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 11592140,
+        "nice": 87480,
+        "sys": 7824370,
+        "idle": 23567587620,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3859,
+        "user": 29050260,
+        "nice": 98210,
+        "sys": 11439820,
+        "idle": 23542280060,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3110,
+        "user": 16816920,
+        "nice": 98350,
+        "sys": 9155940,
+        "idle": 23558969000,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3108,
+        "user": 11450720,
+        "nice": 96560,
+        "sys": 6982660,
+        "idle": 23568325270,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3109,
+        "user": 8631310,
+        "nice": 97690,
+        "sys": 6336680,
+        "idle": 23572514660,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3049,
+        "user": 8934390,
+        "nice": 77400,
+        "sys": 6691850,
+        "idle": 23571357820,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3112,
+        "user": 16932330,
+        "nice": 95480,
+        "sys": 6927560,
+        "idle": 23564313390,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3146,
+        "user": 16346180,
+        "nice": 206020,
+        "sys": 6309500,
+        "idle": 23565613010,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2251,
+        "user": 7713440,
+        "nice": 159130,
+        "sys": 4729030,
+        "idle": 23577451200,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2125,
+        "user": 6362270,
+        "nice": 155990,
+        "sys": 4057590,
+        "idle": 23579819630,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1493,
+        "user": 5108940,
+        "nice": 150530,
+        "sys": 3626120,
+        "idle": 23581592900,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2220,
+        "user": 5347710,
+        "nice": 161500,
+        "sys": 3263780,
+        "idle": 23581787090,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2558,
+        "user": 4943620,
+        "nice": 159480,
+        "sys": 3354660,
+        "idle": 23582159470,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3280,
+        "user": 7485980,
+        "nice": 138520,
+        "sys": 3878540,
+        "idle": 23579644920,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3113,
+        "user": 7229640,
+        "nice": 148800,
+        "sys": 3419380,
+        "idle": 23580639570,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3942,
+        "user": 5804760,
+        "nice": 148540,
+        "sys": 3006270,
+        "idle": 23582487950,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 5050710,
+        "nice": 169300,
+        "sys": 2966470,
+        "idle": 23583516690,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 4813880,
+        "nice": 150740,
+        "sys": 2791880,
+        "idle": 23583915120,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3110,
+        "user": 5510340,
+        "nice": 152950,
+        "sys": 2843420,
+        "idle": 23583335170,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3106,
+        "user": 7258490,
+        "nice": 143290,
+        "sys": 3314600,
+        "idle": 23580927000,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3107,
+        "user": 7134580,
+        "nice": 152080,
+        "sys": 3002240,
+        "idle": 23581238130,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 5143550,
+        "nice": 122890,
+        "sys": 2954090,
+        "idle": 23583234300,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3882,
+        "user": 5280760,
+        "nice": 127300,
+        "sys": 2842490,
+        "idle": 23583346590,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3058,
+        "user": 5085400,
+        "nice": 134820,
+        "sys": 2892890,
+        "idle": 23583639770,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3892,
+        "user": 5471750,
+        "nice": 153560,
+        "sys": 2871610,
+        "idle": 23583111750,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2656,
+        "user": 9488740,
+        "nice": 164270,
+        "sys": 3215090,
+        "idle": 23578549410,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3141,
+        "user": 7229590,
+        "nice": 146140,
+        "sys": 3004240,
+        "idle": 23581173720,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3112,
+        "user": 6571060,
+        "nice": 140330,
+        "sys": 2868860,
+        "idle": 23581943660,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3822,
+        "user": 5271840,
+        "nice": 152080,
+        "sys": 2883000,
+        "idle": 23582914280,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3542,
+        "user": 5490260,
+        "nice": 134760,
+        "sys": 2764780,
+        "idle": 23583203140,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3097,
+        "user": 4900080,
+        "nice": 153130,
+        "sys": 2928650,
+        "idle": 23583664510,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 8451420,
+        "nice": 124840,
+        "sys": 12018080,
+        "idle": 23566644150,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 7114560,
+        "nice": 95230,
+        "sys": 7218410,
+        "idle": 23573213120,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1491,
+        "user": 12701210,
+        "nice": 100590,
+        "sys": 6100480,
+        "idle": 23567274840,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 6827470,
+        "nice": 101650,
+        "sys": 5732550,
+        "idle": 23575221180,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1493,
+        "user": 7466860,
+        "nice": 90200,
+        "sys": 5259260,
+        "idle": 23575519550,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 12442430,
+        "nice": 101150,
+        "sys": 5661590,
+        "idle": 23569842180,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1495,
+        "user": 18489990,
+        "nice": 113270,
+        "sys": 5847030,
+        "idle": 23564065290,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 9471690,
+        "nice": 122880,
+        "sys": 4509500,
+        "idle": 23575202820,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1495,
+        "user": 7138490,
+        "nice": 117670,
+        "sys": 4767160,
+        "idle": 23577769040,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1494,
+        "user": 10277040,
+        "nice": 110400,
+        "sys": 4491000,
+        "idle": 23574486400,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 9823090,
+        "nice": 115080,
+        "sys": 4440070,
+        "idle": 23575099870,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1496,
+        "user": 6867130,
+        "nice": 124170,
+        "sys": 4064460,
+        "idle": 23578769700,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3107,
+        "user": 9437170,
+        "nice": 84300,
+        "sys": 6675810,
+        "idle": 23570741620,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3112,
+        "user": 10636530,
+        "nice": 78790,
+        "sys": 6103600,
+        "idle": 23570236590,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2950,
+        "user": 7589660,
+        "nice": 70560,
+        "sys": 5805780,
+        "idle": 23564861340,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 1613,
+        "user": 12013590,
+        "nice": 72120,
+        "sys": 7620210,
+        "idle": 23567662310,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3781,
+        "user": 7564580,
+        "nice": 88740,
+        "sys": 6930860,
+        "idle": 23572525950,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3110,
+        "user": 8256500,
+        "nice": 72740,
+        "sys": 6538370,
+        "idle": 23573332620,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2729,
+        "user": 29403570,
+        "nice": 94020,
+        "sys": 10009170,
+        "idle": 23547372660,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2039,
+        "user": 9954390,
+        "nice": 112560,
+        "sys": 6332670,
+        "idle": 23572052580,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 11202070,
+        "nice": 96630,
+        "sys": 5420440,
+        "idle": 23571904120,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 6444680,
+        "nice": 87550,
+        "sys": 6171130,
+        "idle": 23575803320,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 3111,
+        "user": 6657880,
+        "nice": 90400,
+        "sys": 7080190,
+        "idle": 23574392930,
+        "irq": 0
+      },
+      {
+        "model": "AMD EPYC 7443 24-Core Processor",
+        "speed": 2132,
+        "user": 17063740,
+        "nice": 97240,
+        "sys": 7739040,
+        "idle": 23563238990,
+        "irq": 0
+      }
+    ],
+    "networkInterfaces": [
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "127.0.0.1",
+        "netmask": "255.0.0.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "enp194s0np0",
+        "internal": false,
+        "mac": "08:c0:eb:b8:f9:92",
+        "address": "10.126.7.118",
+        "netmask": "255.255.255.128",
+        "family": "IPv4"
+      },
+      {
+        "name": "docker0",
+        "internal": false,
+        "mac": "82:97:9c:c5:14:01",
+        "address": "192.168.0.1",
+        "netmask": "255.255.252.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "::1",
+        "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "family": "IPv6",
+        "scopeid": 0
+      },
+      {
+        "name": "enp194s0np0",
+        "internal": false,
+        "mac": "08:c0:eb:b8:f9:92",
+        "address": "fe80::ac0:ebff:feb8:f992",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 3
+      },
+      {
+        "name": "enx9a2abe05de20",
+        "internal": false,
+        "mac": "9a:2a:be:05:de:20",
+        "address": "fe80::982a:beff:fe05:de20",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 4
+      },
+      {
+        "name": "docker0",
+        "internal": false,
+        "mac": "82:97:9c:c5:14:01",
+        "address": "fe80::8097:9cff:fec5:1401",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 6
+      },
+      {
+        "name": "veth29d17b7",
+        "internal": false,
+        "mac": "9e:08:b9:ff:52:0d",
+        "address": "fe80::9c08:b9ff:feff:520d",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 7
+      },
+      {
+        "name": "veth174a6c1",
+        "internal": false,
+        "mac": "1a:e0:43:3c:d2:6e",
+        "address": "fe80::18e0:43ff:fe3c:d26e",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 526
+      },
+      {
+        "name": "vethe775903",
+        "internal": false,
+        "mac": "5e:2b:77:e4:34:74",
+        "address": "fe80::5c2b:77ff:fee4:3474",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 721
+      },
+      {
+        "name": "veth706ac12",
+        "internal": false,
+        "mac": "d2:cb:3e:97:a7:7f",
+        "address": "fe80::d0cb:3eff:fe97:a77f",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 722
+      }
+    ],
+    "host": "omniml-a5.nvidia.com"
+  },
+  "javascriptStack": {
+    "message": "",
+    "errorProperties": {
+    }
+  },
+  "javascriptHeap": {
+    "totalMemory": 13348864,
+    "executableMemory": 786432,
+    "totalCommittedMemory": 13635584,
+    "availableMemory": 4486952776,
+    "totalGlobalHandlesMemory": 8192,
+    "usedGlobalHandlesMemory": 6208,
+    "usedMemory": 9333392,
+    "memoryLimit": 4496293888,
+    "mallocedMemory": 442496,
+    "externalMemory": 3004582,
+    "peakMallocedMemory": 1010824,
+    "nativeContextCount": 1,
+    "detachedContextCount": 0,
+    "doesZapGarbage": 0,
+    "heapSpaces": {
+      "read_only_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_space": {
+        "memorySize": 4194304,
+        "committedMemory": 4194304,
+        "capacity": 2097024,
+        "used": 1291224,
+        "available": 805800
+      },
+      "old_space": {
+        "memorySize": 6160384,
+        "committedMemory": 6291456,
+        "capacity": 6158664,
+        "used": 5730552,
+        "available": 428112
+      },
+      "code_space": {
+        "memorySize": 786432,
+        "committedMemory": 786432,
+        "capacity": 786336,
+        "used": 428416,
+        "available": 357920
+      },
+      "shared_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_space": {
+        "memorySize": 1941504,
+        "committedMemory": 2097152,
+        "capacity": 1939808,
+        "used": 1621040,
+        "available": 318768
+      },
+      "shared_trusted_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 2097152,
+        "used": 0,
+        "available": 2097152
+      },
+      "large_object_space": {
+        "memorySize": 266240,
+        "committedMemory": 266240,
+        "capacity": 262160,
+        "used": 262160,
+        "available": 0
+      },
+      "code_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "shared_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "shared_trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      }
+    }
+  },
+  "nativeStack": [
+    {
+      "pc": "0x00000000009ecbfb",
+      "symbol": "node::TriggerNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, v8::Local<v8::Value>) [/home/scratch.mxin_hw/.local/lib/nodejs/node-v24.18.0-linux-x64/bin/node]"
+    },
+    {
+      "pc": "0x00000000009ed157",
+      "symbol": "node::TriggerNodeReport(node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, v8::Local<v8::Value>) [/home/scratch.mxin_hw/.local/lib/nodejs/node-v24.18.0-linux-x64/bin/node]"
+    },
+    {
+      "pc": "0x00000000009f16ae",
+      "symbol": "node::report::WriteReport(v8::FunctionCallbackInfo<v8::Value> const&) [/home/scratch.mxin_hw/.local/lib/nodejs/node-v24.18.0-linux-x64/bin/node]"
+    },
+    {
+      "pc": "0x00007f26db58f08d",
+      "symbol": ""
+    }
+  ],
+  "resourceUsage": {
+    "free_memory": 251995000832,
+    "total_memory": 270285430784,
+    "rss": 67960832,
+    "constrained_memory": 18446744073709551615,
+    "available_memory": 251995000832,
+    "userCpuSeconds": 0.092169,
+    "kernelCpuSeconds": 0.02765,
+    "cpuConsumptionPercent": 3.99397,
+    "userCpuConsumptionPercent": 3.0723,
+    "kernelCpuConsumptionPercent": 0.921667,
+    "maxRss": 67960832,
+    "pageFaults": {
+      "IORequired": 2,
+      "IONotRequired": 5855
+    },
+    "fsActivity": {
+      "reads": 0,
+      "writes": 128
+    }
+  },
+  "uvthreadResourceUsage": {
+    "userCpuSeconds": 0.077845,
+    "kernelCpuSeconds": 0.025948,
+    "cpuConsumptionPercent": 3.45977,
+    "userCpuConsumptionPercent": 2.59483,
+    "kernelCpuConsumptionPercent": 0.864933,
+    "fsActivity": {
+      "reads": 0,
+      "writes": 128
+    }
+  },
+  "libuv": [
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012edc850"
+    },
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00000000068c6a60"
+    },
+    {
+      "type": "timer",
+      "is_active": false,
+      "is_referenced": false,
+      "address": "0x0000000012fbd488",
+      "repeat": 0,
+      "firesInMsFromNow": -23593601697,
+      "expired": true
+    },
+    {
+      "type": "check",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012fbd520"
+    },
+    {
+      "type": "idle",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x0000000012fbd598"
+    },
+    {
+      "type": "prepare",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012fbd610"
+    },
+    {
+      "type": "check",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012fbd688"
+    },
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012fbd700"
+    },
+    {
+      "type": "signal",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x0000000012f92298",
+      "signum": 12,
+      "signal": "SIGUSR2"
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": true,
+      "address": "0x0000000012f53570",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 2,
+      "stdio": "stderr",
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": false,
+      "address": "0x000000001300a290",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 212992,
+      "recvBufferSize": 212992,
+      "fd": 21,
+      "writeQueueSize": 0,
+      "readable": false,
+      "writable": false
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": true,
+      "address": "0x000000001300a450",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 1,
+      "stdio": "stdout",
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": false,
+      "address": "0x000000001304cda0",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 212992,
+      "recvBufferSize": 212992,
+      "fd": 22,
+      "writeQueueSize": 0,
+      "readable": false,
+      "writable": false
+    },
+    {
+      "type": "loop",
+      "is_active": true,
+      "address": "0x00000000068d9aa0",
+      "loopIdleTimeSeconds": 0
+    }
+  ],
+  "workers": [
+  ],
+  "environmentVariables": {
+    "NODE_TEST_CONTEXT": "child-v8",
+    "SHELL": "/bin/bash",
+    "COREPACK_ENABLE_AUTO_PIN": "0",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "TERM_PROGRAM_VERSION": "3.2a",
+    "CONDA_EXE": "/home/mxin/miniconda3/bin/conda",
+    "_CE_M": "",
+    "TMUX": "/tmp/tmux-104284/default,2069263,2",
+    "AI_AGENT": "claude-code_2-1-220_agent",
+    "CLAUDE_CODE_SESSION_ID": "c7f2ce68-a753-49d2-8786-4706e17716fb",
+    "P4CONFIG": ".p4config",
+    "CLAUDE_PID": "4080091",
+    "CLAUDE_EFFORT": "high",
+    "PWD": "/home/mxin/mxin/sources/qiyan-bot",
+    "LOGNAME": "mxin",
+    "XDG_SESSION_TYPE": "tty",
+    "CONDA_PREFIX": "/home/mxin/miniconda3",
+    "NoDefaultCurrentDirectoryInExePath": "1",
+    "CLAUDECODE": "1",
+    "MOTD_SHOWN": "pam",
+    "HOME": "/home/mxin",
+    "LANG": "C.UTF-8",
+    "LS_COLORS": "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:",
+    "CONDA_PROMPT_MODIFIER": "(base) ",
+    "CLAUDE_SESSION_ID": "c7f2ce68-a753-49d2-8786-4706e17716fb",
+    "SSH_CONNECTION": "172.29.226.136 61895 10.126.7.118 22",
+    "LESSCLOSE": "/usr/bin/lesspipe %s %s",
+    "XDG_SESSION_CLASS": "user",
+    "TERM": "screen",
+    "_CE_CONDA": "",
+    "LESSOPEN": "| /usr/bin/lesspipe %s",
+    "USER": "mxin",
+    "TMUX_PANE": "%2",
+    "CONDA_SHLVL": "1",
+    "SHLVL": "2",
+    "GIT_EDITOR": "true",
+    "XDG_SESSION_ID": "34860",
+    "CONDA_PYTHON_EXE": "/home/mxin/miniconda3/bin/python",
+    "LC_CTYPE": "C.UTF-8",
+    "XDG_RUNTIME_DIR": "/run/user/104284",
+    "SSH_CLIENT": "172.29.226.136 59079 22",
+    "CONDA_DEFAULT_ENV": "base",
+    "CLAUDE_CODE_ENTRYPOINT": "cli",
+    "XDG_DATA_DIRS": "/usr/share/gnome:/usr/local/share:/usr/share:/var/lib/snapd/desktop",
+    "CLAUDE_CODE_EXECPATH": "/home/scratch.mxin_hw/.local/share/claude/versions/2.1.220",
+    "PATH": "/home/mxin/.local/bin:/home/mxin/.local/bin:/home/mxin/.local/bin:/home/mxin/.local/bin:/home/mxin/miniconda3/bin:/home/mxin/miniconda3/condabin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/mxin/ngc-cli:/home/mxin/ngc-cli:/home/mxin/.claude/plugins/cache/claude-plugins-official/skill-creator/unknown/bin:/home/mxin/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown/bin",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/104284/bus",
+    "SSH_TTY": "/dev/pts/1",
+    "OLDPWD": "/home/mxin/mxin/sources",
+    "TERM_PROGRAM": "tmux",
+    "_": "/home/mxin/.local/bin/node",
+    "NODE_TEST_WORKER_ID": "2"
+  },
+  "userLimits": {
+    "core_file_size_blocks": {
+      "soft": 0,
+      "hard": "unlimited"
+    },
+    "data_seg_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "file_size_blocks": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_locked_memory_bytes": {
+      "soft": 33785675776,
+      "hard": 33785675776
+    },
+    "max_memory_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "open_files": {
+      "soft": 1048576,
+      "hard": 1048576
+    },
+    "stack_size_bytes": {
+      "soft": 8388608,
+      "hard": "unlimited"
+    },
+    "cpu_time_seconds": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_user_processes": {
+      "soft": 1030573,
+      "hard": 1030573
+    },
+    "virtual_memory_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    }
+  },
+  "sharedObjects": [
+    "linux-vdso.so.1",
+    "/lib/x86_64-linux-gnu/libdl.so.2",
+    "/lib/x86_64-linux-gnu/libstdc++.so.6",
+    "/lib/x86_64-linux-gnu/libm.so.6",
+    "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+    "/lib/x86_64-linux-gnu/libpthread.so.0",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib64/ld-linux-x86-64.so.2"
+  ]
+}

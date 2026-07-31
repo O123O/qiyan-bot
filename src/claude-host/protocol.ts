@@ -70,18 +70,31 @@ export type HostEventDraft = HostEvent extends infer Variant
 // waiting on one specific send must fall back to this ordering rule: the oldest
 // in-flight turn owns the next uncorrelated terminal result. The host applies it, and
 // the event's `uuid` reports the attribution it made.
+
+// One request per ClaudeHost method, so the server's dispatch is mechanical and the wire
+// cannot drift from the interface. `params` is the method's argument tuple.
 export type HostRequest =
   | { method: "host/status" }
-  | { method: "session/open"; sessionId: string; mode: "create" | "resume"; cwd: string; model?: string }
-  | { method: "session/close"; sessionId: string }
-  | { method: "session/send"; sessionId: string; uuid: string; text: string }
-  | { method: "session/interrupt"; sessionId: string }
-  | { method: "session/status"; sessionId: string }
-  | { method: "session/setModel"; sessionId: string; model?: string }
-  | { method: "session/setPermissionMode"; sessionId: string; mode: string }
-  | { method: "session/stopTask"; sessionId: string; taskId: string }
-  | { method: "session/models"; sessionId: string }
-  | { method: "events/subscribe"; sessionId: string; cursor: number };
+  | { method: "open"; params: [OpenSessionRequestWire] }
+  | { method: "close"; params: [string] }
+  | { method: "send"; params: [string, string, string] }
+  | { method: "interrupt"; params: [string] }
+  | { method: "status"; params: [string] }
+  | { method: "setModel"; params: [string, string | undefined] }
+  | { method: "models"; params: [string] }
+  | { method: "stopTask"; params: [string, string] }
+  | { method: "eventsSince"; params: [string, number] }
+  | { method: "evictIdle"; params: [number] }
+  | { method: "shutdown"; params: [] };
+
+// Structurally identical to OpenSessionRequest; declared here so protocol.ts stays free
+// of an import cycle with host.ts.
+export interface OpenSessionRequestWire {
+  sessionId: string;
+  mode: "create" | "resume";
+  cwd: string;
+  model?: string;
+}
 
 export interface HostFrame {
   id: number;
