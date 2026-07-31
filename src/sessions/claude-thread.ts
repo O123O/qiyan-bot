@@ -44,6 +44,9 @@ export interface ClaudeThreadView {
   id: string;
   cwd: string;
   status: { type: "idle" | "active" };
+  // Work Claude started for itself and is still running after the turn that began it.
+  // Present only for a Claude worker; absent means "none", not "unknown".
+  nativeActivity?: { backgroundTasks: number; subagents: number };
   itemsView: "full";
   turns: ClaudeThreadTurn[];
   threadSource?: string;
@@ -245,4 +248,37 @@ function textBlocks(message: unknown): string[] {
     }
   }
   return blocks;
+}
+
+// Claude's `/goal` writes its state into the session's own transcript: the slash command
+// echoes `Goal set: <condition>` on stdout, and clearing echoes `Goal cleared`. That is a
+// durable record QiYan already reads for history, so a native goal is observable after all
+// — what the SDK withholds is only the LIVE progress of one (iterations, tokens), never
+// whether one exists. Reading the last marker wins over storing a duplicate goal row.
+export function claudeNativeGoal(records: readonly unknown[]): { objective: string } | null {
+  let goal: { objective: string } | null = null;
+  for (const raw of records) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    if (record.type !== "user") continue;
+    const text = messageTextOf(record.message);
+    if (!text.includes("<local-command-stdout>")) continue;
+    // Later markers supersede earlier ones, so the last one in the file is current.
+    const set = /Goal set:\s*([^<\n]+)/u.exec(text);
+    if (set?.[1]) { goal = { objective: set[1].trim() }; continue; }
+    if (/Goal cleared/u.test(text)) goal = null;
+  }
+  return goal;
+}
+
+function messageTextOf(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const content = (message as Record<string, unknown>).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => block && typeof block === "object" && (block as Record<string, unknown>).type === "text"
+      ? String((block as Record<string, unknown>).text ?? "")
+      : "")
+    .join("");
 }

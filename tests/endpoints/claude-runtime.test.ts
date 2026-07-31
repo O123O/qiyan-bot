@@ -207,7 +207,7 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     this.emit({ type: "turn/completed", sessionId, origin: "human", uuid, status, at: this.clock += 1 });
   }
 
-  private emit(event: HostEvent): void { for (const listener of this.listeners) listener(event); }
+  emit(event: HostEvent): void { for (const listener of this.listeners) listener(event); }
 
   private require(sessionId: string) {
     const session = this.sessions.get(sessionId);
@@ -1326,4 +1326,57 @@ test("the summary view keeps every assistant message, not just the last", async 
   const texts = page.data[0]!.items.filter((item) => item.type === "agentMessage").map((item) => item.text);
   assert.deepEqual(texts, ["checking the files", "now running tests", "all green"],
     "the two intermediate blocks survive the summary projection");
+});
+
+// A native goal IS observable: /goal records it in the session's own transcript, which
+// QiYan already reads for history. Reporting "no goal" was a gap, not a constraint — only
+// a running goal's progress (iterations, tokens) is genuinely unavailable.
+test("get_goal reads the objective Claude's native /goal recorded", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-goal", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: all tests pass</local-command-stdout>" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal", cwd: "/w", excludeTurns: true });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "thread-goal" });
+  assert.equal(read.goal?.objective, "all tests pass");
+  assert.equal(read.goal?.status, "active");
+});
+
+test("a cleared native goal reports none, and the last marker wins", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-cleared", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: first</local-command-stdout>" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u3",
+      message: { role: "user", content: "<local-command-stdout>Goal cleared</local-command-stdout>" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-cleared", cwd: "/w", excludeTurns: true });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "thread-cleared" }), { goal: null });
+});
+
+// A session whose background task outlives its parent turn will speak again unprompted.
+// Reporting it as plain idle invited concluding the work had finished.
+test("a session with background work reports active, with what is running", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 2, subagents: 1, descriptions: ["npm test"], at: 1 });
+
+  const read = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.deepEqual(read.thread.status, { type: "active" });
+  assert.deepEqual(read.thread.nativeActivity, { backgroundTasks: 2, subagents: 1 });
+
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 0, descriptions: [], at: 2 });
+  const settled = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(settled.thread.nativeActivity, undefined, "none is reported as absent, never as a zero");
 });

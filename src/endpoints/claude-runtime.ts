@@ -16,7 +16,7 @@ import { EventEmitter } from "node:events";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { claudeMessagePhase, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
+import { claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
@@ -72,6 +72,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private endpointState: "starting" | "ready" | "unavailable" | "stopped" = "starting";
   private readonly emitter = new EventEmitter();
   private readonly threads = new Map<string, ThreadState>();
+  // Live background/subagent counts per session, fed by the host's task/set events. Purely
+  // observational: it drives what the manager and Web UI can see, never any lifecycle rule.
+  private readonly taskActivity = new Map<string, { backgroundTasks: number; subagents: number }>();
   private readonly stateLoads = new Map<string, Promise<ThreadState>>();
   private readonly history: ClaudeTranscriptHistory;
   private persistentUnavailableSubscription?: () => void;
@@ -127,6 +130,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // end-of-turn. It is republished only as a live activity indicator, so the Web UI can
     // show "2 background tasks, 1 subagent running" while a panel is open.
     if (event.type === "task/set") {
+      this.taskActivity.set(threadId, { backgroundTasks: event.background, subagents: event.subagents });
       this.emitter.emit("notification", "thread/tasks/updated", {
         threadId,
         background: event.background,
@@ -316,11 +320,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // Claude has no model-list API; return the curated catalog (Codex `{data,nextCursor}` shape)
       // so set_session_model / the model picker have real entries to validate against.
       case "model/list": return { data: claudeModelCatalog(this.options.launchFlags.model), nextCursor: null } as T;
-      // A goal is Claude's own `/goal`, driven by its Stop hook. QiYan stores none: the
-      // manager's goal tools install and clear the NATIVE goal by delivering the command,
-      // and `thread/goal/get` reports "no goal" because native goal state is not exposed
-      // to the SDK stream (see docs/development/claude-agent-sdk-host-design.md).
-      case "thread/goal/get": return { goal: null } as T;
+      // A goal is Claude's own `/goal`, driven by its Stop hook. QiYan stores none and
+      // reads the objective back out of the session's transcript, where the slash command
+      // records it — so an installed goal is reported without a duplicate goal row, and it
+      // survives a restart because the transcript does. Only a running goal's PROGRESS
+      // (iterations, tokens) is unavailable; the SDK does not surface it.
+      case "thread/goal/get": return { goal: await this.readNativeGoal(requireString(args.threadId, "threadId")) } as T;
       case "thread/goal/set": return await this.goalSet(args) as T;
       case "thread/goal/clear": return await this.goalClear(args) as T;
       // Claude's context compaction is its own `/compact` command, delivered like `/goal`.
@@ -487,7 +492,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return {
       id: threadId,
       cwd: state.cwd,
-      status: { type: state.running.length > 0 ? "active" : "idle" },
+      // A session with a background task or subagent still running is NOT idle in any sense
+      // the manager cares about: it will speak again without being prompted. Reporting it
+      // as plain idle invited concluding the work was finished.
+      status: { type: state.running.length > 0 || this.nativeActivityOf(threadId) ? "active" : "idle" },
+      ...(this.nativeActivityOf(threadId) === undefined ? {} : { nativeActivity: this.nativeActivityOf(threadId)! }),
       itemsView: "full",
       turns: [],
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
@@ -636,6 +645,27 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     }
     await this.deliverGoalCommand(threadId, `/goal ${objective}`);
     return { goal: { objective, status: "active" } };
+  }
+
+  // The live background/subagent set the host tracks for this session. Undefined when the
+  // session is not loaded or nothing is running, so callers cannot mistake "none" for
+  // "unknown" — a loaded session with no tasks reports no activity rather than a zero.
+  private nativeActivityOf(threadId: string): { backgroundTasks: number; subagents: number } | undefined {
+    const tasks = this.taskActivity.get(threadId);
+    return tasks && (tasks.backgroundTasks > 0 || tasks.subagents > 0) ? tasks : undefined;
+  }
+
+  // Reads the goal from the transcript rather than a QiYan row. An unmaterialized or
+  // unreadable session simply has no goal to report — never an error, because a goal read
+  // rides along in get_session_status and must not fail it.
+  private async readNativeGoal(threadId: string): Promise<{ objective: string; status: string } | null> {
+    const state = this.threads.get(threadId);
+    if (!state?.materialized) return null;
+    const records = await this.history.fullRecords(threadId, state.cwd).catch(() => undefined);
+    const goal = records ? claudeNativeGoal(records) : null;
+    // Claude drives its own goal to completion, so an installed goal is by definition still
+    // being pursued; there is no paused or blocked state to distinguish.
+    return goal ? { ...goal, status: "active" } : null;
   }
 
   private async goalClear(params: Record<string, unknown>): Promise<{ goal: null }> {
