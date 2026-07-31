@@ -35,7 +35,12 @@ interface ThreadState {
   recoveryChecked: boolean;
   recovery?: Promise<void>;
   loaded: boolean;                       // is the session open on the host?
-  running?: { turnId: string };
+  // In-flight host.open, shared by every send that arrives while it is still resolving.
+  opening?: Promise<void>;
+  // Accepted turns that have not settled, oldest first. The SDK queues input while a turn
+  // runs and executes it in order, so more than one can be outstanding and the head is the
+  // one currently producing output.
+  running: string[];
   // The last turn this endpoint saw complete normally, i.e. the newest turn the transcript
   // certainly holds. Native background output that arrives while the session is idle is
   // folded into that turn by reconstruction, so it is the only identity live and history
@@ -91,9 +96,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
     archives?: ClaudeArchiveStore;
     now?: () => number;
-    // Claude has no native mid-turn steer (spike 0.4). turn/steer durably enqueues the
-    // message; it is delivered as the next turn once the running one completes.
-    steer?: (threadId: string, message: string) => Promise<void>;
     // How many sessions may stay loaded on the host. Each one pins a live SDK query and the
     // `claude` child behind it, so without a ceiling a long-running QiYan holds one process
     // per thread it has ever driven.
@@ -138,7 +140,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // in after its parent turn. Claude writes those rows after the last turn's rows, and
       // reconstruction folds them into that turn, so attributing them to it is what keeps
       // the live stream and the reconstructed history keyed the same way.
-      const turnId = state.running?.turnId ?? state.lastTurnId;
+      const turnId = state.running[0] ?? state.lastTurnId;
       if (!turnId) return;
       // Intermediate text — what Claude says before a tool call — is delivered as it
       // arrives, not withheld until the turn ends. Phase comes from the same rule
@@ -163,14 +165,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // hold: bounded retries, then a degraded endpoint and a spurious recovery warning.
     if (event.origin === "task-notification") {
       // A running turn will carry the folded output through its own completion.
-      if (state.running || state.lastTurnId === undefined) return;
+      if (state.running.length > 0 || state.lastTurnId === undefined) return;
       this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: state.lastTurnId } });
       return;
     }
-    const turnId = event.uuid ?? state.running?.turnId;
+    const turnId = event.uuid ?? state.running[0];
     if (!turnId) return;
     state.materialized = true;
-    if (state.running?.turnId === turnId) delete state.running;
+    state.running = state.running.filter((id) => id !== turnId);
     if (event.status !== "completed") state.terminalTurns.add(turnId);
     // Only a normally completed turn is certain to be a findable transcript turn: a turn
     // that failed before `claude` wrote its user row exists only as a synthesized terminal.
@@ -257,7 +259,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       state.loaded = false;
       // A turn that was running on a session that has since died can never be settled by a
       // host event, so leaving the reservation would wedge the thread as SESSION_BUSY.
-      delete state.running;
+      state.running = [];
     }
   }
 
@@ -340,7 +342,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadSource = typeof params.threadSource === "string" ? params.threadSource : undefined;
     const id = randomUUID();
     this.threads.set(id, {
-      cwd, materialized: false, recoveryChecked: true, loaded: false, terminalTurns: new Set(),
+      cwd, materialized: false, recoveryChecked: true, loaded: false, running: [], terminalTurns: new Set(),
       ...(threadSource === undefined ? {} : { threadSource }),
     });
     return this.withCurrentSettings({
@@ -412,6 +414,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       materialized: cwd !== undefined,
       recoveryChecked: false,
       loaded: false,
+      running: [],
       terminalTurns: new Set(),
     };
     this.threads.set(threadId, state);
@@ -425,7 +428,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // The host kept running while QiYan was away; adopt its in-flight turn so the
       // relay still settles it when the host reports completion.
       if (recovered) {
-        state.running = { turnId: recovered.turnId };
+        state.running = [recovered.turnId];
         state.loaded = true;
       }
     } finally {
@@ -453,7 +456,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,
-      ...(state.running === undefined ? {} : { runningTurnId: state.running.turnId }),
+      ...(state.running[0] === undefined ? {} : { runningTurnId: state.running[0] }),
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
       ...(this.options.launchFlags.model === undefined ? {} : { model: this.options.launchFlags.model }),
     });
@@ -471,10 +474,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       sortDirection,
       itemsView,
     });
-    if (!state.running) return page;
+    if (state.running.length === 0) return page;
     return {
       ...page,
-      data: page.data.map((turn) => turn.id === state.running?.turnId
+      data: page.data.map((turn) => state.running.includes(turn.id)
         ? { ...turn, status: "inProgress" }
         : turn),
     };
@@ -484,7 +487,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return {
       id: threadId,
       cwd: state.cwd,
-      status: { type: state.running ? "active" : "idle" },
+      status: { type: state.running.length > 0 ? "active" : "idle" },
       itemsView: "full",
       turns: [],
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
@@ -510,9 +513,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
-    // Defense-in-depth: the pool serializes turns per thread, but a second turn/start
-    // must never orphan a running one and lose interrupt control over it.
-    if (state.running) throw new AppError("SESSION_BUSY", `claude turn already running: ${threadId}`);
+    // No SESSION_BUSY. The SDK accepts input while a turn runs and executes it in order,
+    // so a second send is queued rather than refused — that native queue is why the
+    // persistent host exists, and refusing here was a `claude -p` limitation.
     const clientId = requireString(params.clientUserMessageId, "clientUserMessageId");
     const message = inputToText(params.input);
     // A driven turn revives an (emulated) archived thread — clear the tombstone (Codex parity).
@@ -521,7 +524,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Reserve the turn BEFORE the first await: opening and sending both suspend, and a
     // second turn/start slipping through in between would orphan this one and lose
     // interrupt control over it.
-    state.running = { turnId: clientId };
+    state.running.push(clientId);
     // Everything below is fenced against a concurrent closeConnection/archive: a session
     // opened after the endpoint stopped would outlive it (host.shutdown has already walked
     // its session map), running a turn nobody can observe or interrupt.
@@ -536,8 +539,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     try {
       // Lazily load the session. `materialized` distinguishes creating the caller-chosen
       // native session id from resuming one that already exists on disk.
+      // Sends now queue instead of being refused, so several can reach this line before the
+      // first open resolves. They share one open: opening twice would race two SDK queries
+      // onto the same native session id.
       if (!state.loaded) {
-        await this.options.host.open({
+        state.opening ??= this.options.host.open({
           sessionId: threadId,
           mode: state.materialized ? "resume" : "create",
           cwd: state.cwd,
@@ -547,8 +553,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
           ...(typeof params.effort === "string"
             ? { effort: params.effort }
             : this.options.launchFlags.effort === undefined ? {} : { effort: this.options.launchFlags.effort }),
-        });
-        state.loaded = true;
+        }).then(() => { state.loaded = true; })
+          .finally(() => { delete state.opening; });
+        await state.opening;
       }
       // Per-session model/effort: `service.send` spreads the sticky settings into these
       // params, and an already-loaded session takes them through the live query rather
@@ -572,7 +579,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         alreadySettled = !status.inFlightTurns.includes(clientId);
       }
     } catch (error) {
-      if (state.running?.turnId === clientId) delete state.running;
+      state.running = state.running.filter((id) => id !== clientId);
       throw error;
     } finally {
       this.startingTurns -= 1;
@@ -597,7 +604,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (!alreadySettled) return { turn: { id: clientId, status: "inProgress" } };
     // The duplicate's turn is over. Release the reservation and republish its terminal, so
     // the response it produced while QiYan was away is still delivered instead of lost.
-    if (state.running?.turnId === clientId) delete state.running;
+    state.running = state.running.filter((id) => id !== clientId);
     state.materialized = true;
     state.lastTurnId = clientId;
     this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
@@ -636,25 +643,29 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { goal: null };
   }
 
-  // A slash command must arrive as its own turn for the CLI to parse the leading slash, so
-  // it rides the same durable enqueue as steer rather than racing a running turn.
+  // A slash command must arrive as its own turn for the CLI to parse the leading slash.
+  // That is just an ordinary send: the SDK queues it behind a running turn and runs it next.
   private async deliverGoalCommand(threadId: string, command: string): Promise<void> {
-    if (!this.options.steer) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no delivery queue for slash commands");
-    }
-    await this.options.steer(threadId, command);
+    await this.turnStart({
+      threadId,
+      clientUserMessageId: randomUUID(),
+      input: [{ type: "text", text: command }],
+    });
   }
 
-  // Claude steer = durable enqueue (never abort the running turn). Delivered as the
-  // next turn once the running one completes (the schedule engine retries while the
-  // session is SESSION_BUSY).
+  // Steer IS an ordinary send now: the SDK queues input arriving mid-turn and runs it in
+  // order once the current response finishes. QiYan used to hold the message in a durable
+  // schedule row and redeliver it as a later turn, because a one-shot `claude -p` had
+  // nowhere to put it. Nothing is held back here any more.
   private async turnSteer(params: Record<string, unknown>): Promise<{ turnId: string }> {
-    const threadId = requireString(params.threadId, "threadId");
-    if (!this.options.steer) throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no steer queue configured");
-    const message = inputToText(params.input);
-    if (message.length === 0) throw new AppError("CONFIGURATION_ERROR", "turn/steer requires input text");
-    await this.options.steer(threadId, message);
-    return { turnId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID() };
+    if (inputToText(params.input).length === 0) {
+      throw new AppError("CONFIGURATION_ERROR", "turn/steer requires input text");
+    }
+    const started = await this.turnStart({
+      ...params,
+      clientUserMessageId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID(),
+    });
+    return { turnId: started.turn.id };
   }
 
   private async turnInterrupt(params: Record<string, unknown>): Promise<Record<string, never>> {
@@ -663,7 +674,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const state = this.threads.get(threadId);
     // interrupt() ends only the active response; the session stays usable for the next
     // message, so the thread is never closed here.
-    if (state?.running?.turnId === turnId) await this.options.host.interrupt(threadId);
+    if (state?.running.includes(turnId)) await this.options.host.interrupt(threadId);
     state?.terminalTurns.add(turnId);
     return {};
   }

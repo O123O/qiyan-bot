@@ -296,7 +296,11 @@ test("cold resume adopts the turn the persistent host reports still running", as
     launchFlags: {},
     persistentRuntime: persistentRuntime({
       async recoverTurn(threadId: string) {
-        return threadId === "remote-live" ? { turnId: "ctx:live" } : undefined;
+        if (threadId !== "remote-live") return undefined;
+        // A recovered turn means the host still holds that session, so model it: the
+        // runtime adopts it as loaded and sends to it without reopening.
+        await claude.open({ sessionId: threadId, mode: "resume", cwd: "/remote/work" });
+        return { turnId: "ctx:live" };
       },
     }),
   });
@@ -314,14 +318,18 @@ test("cold resume adopts the turn the persistent host reports still running", as
     "thread/read", { threadId: "remote-live", includeTurns: true },
   );
   assert.deepEqual(read.thread.turns.map((turn) => [turn.id, turn.status]), [["ctx:live", "inProgress"]]);
-  await assert.rejects(
-    rt.request("turn/start", {
-      threadId: "remote-live",
-      clientUserMessageId: "ctx:duplicate",
-      input: [{ type: "text", text: "duplicate" }],
-    }),
-    /already running/u,
+  // The adopted turn is not refused-on-top any more: the SDK queues a new send behind it,
+  // exactly as the Claude Code CLI queues what you type while it is working.
+  await rt.request("turn/start", {
+    threadId: "remote-live",
+    clientUserMessageId: "ctx:queued",
+    input: [{ type: "text", text: "next" }],
+  });
+  const after = await rt.request<{ thread: { turns: Array<{ id: string; status: string }> } }>(
+    "thread/read", { threadId: "remote-live", includeTurns: true },
   );
+  assert.ok(after.thread.turns.some((turn) => turn.id === "ctx:live" && turn.status === "inProgress"),
+    "the adopted turn keeps running");
 });
 
 test("concurrent cold resumes share one state load and one persistent turn recovery", async () => {
@@ -411,11 +419,13 @@ test("a Claude thread reserves its start before the session finishes opening", a
   release();
   const [firstOutcome, secondOutcome] = await Promise.all([Promise.allSettled([first]).then((items) => items[0]!), second]);
 
+  // Sends arriving while the session is still opening share that one open — opening twice
+  // would race two SDK queries onto the same native session id — and both are then queued.
   assert.equal(claude.opens.length, 1, "the second turn must not open a second session");
   assert.equal(firstOutcome.status, "fulfilled");
-  assert.equal(secondOutcome.status, "rejected");
-  assert.match(String(secondOutcome.status === "rejected" ? secondOutcome.reason : ""), /already running/u);
-  assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:first"]);
+  assert.equal(secondOutcome.status, "fulfilled", "a concurrent send queues rather than being refused");
+  assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:first", "ctx:second"],
+    "both reached the session, in submission order");
 });
 
 test("a close racing a session open fences the turn and unloads the session it opened", async () => {
@@ -1125,65 +1135,80 @@ test("a cold incomplete transcript is terminal on a daemonless endpoint, which l
 // Goals are Claude's own `/goal`: the manager's goal tools install and clear the NATIVE
 // goal, and QiYan stores no goal row of its own.
 test("the manager's goal tools install and clear Claude's native goal", async () => {
-  const delivered: Array<{ threadId: string; message: string }> = [];
   const claude = new FakeClaude();
-  const rt = new ClaudeCodeRuntime({
-    id: "claude-local", host: claude, runner: claude, launchFlags: {},
-    steer: async (threadId, message) => { delivered.push({ threadId, message }); },
-  });
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {} });
   await rt.start();
+  const delivered = (): string[] => claude.sends.map((send) => send.text);
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const t = thread.id;
 
   // Reading stays graceful so a provider-neutral get_session_status still works: native
   // goal state is not exposed to the SDK stream, so there is nothing to report.
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "t" }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: t }), { goal: null });
 
-  const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: "t", objective: "finish phase 2" });
+  const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: t, objective: "finish phase 2" });
   assert.equal(set.goal.objective, "finish phase 2");
-  assert.deepEqual(delivered.at(-1), { threadId: "t", message: "/goal finish phase 2" });
+  assert.equal(delivered().at(-1), "/goal finish phase 2");
 
-  assert.deepEqual(await rt.request("thread/goal/clear", { threadId: "t" }), { goal: null });
-  assert.deepEqual(delivered.at(-1), { threadId: "t", message: "/goal clear" });
+  assert.deepEqual(await rt.request("thread/goal/clear", { threadId: t }), { goal: null });
+  assert.equal(delivered().at(-1), "/goal clear");
 });
 
 // Claude compacts through its own /compact command; QiYan drives no compaction of its own.
 test("compact_session drives Claude's native /compact", async () => {
-  const delivered: string[] = [];
   const claude = new FakeClaude();
-  const rt = new ClaudeCodeRuntime({
-    id: "claude-local", host: claude, runner: claude, launchFlags: {},
-    steer: async (_threadId, message) => { delivered.push(message); },
-  });
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {} });
   await rt.start();
-  await rt.request("thread/compact/start", { threadId: "t" });
-  assert.deepEqual(delivered, ["/compact"]);
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("thread/compact/start", { threadId: thread.id });
+  assert.deepEqual(claude.sends.map((send) => send.text), ["/compact"]);
 });
 
 // Native /goal has no pause/resume, and QiYan stores no objective to reinstate.
 test("a status-only goal change is refused rather than silently dropped", async () => {
   const claude = new FakeClaude();
   const rt = new ClaudeCodeRuntime({
-    id: "claude-local", host: claude, runner: claude, launchFlags: {}, steer: async () => {},
+    id: "claude-local", host: claude, runner: claude, launchFlags: {},
   });
   await rt.start();
   await assert.rejects(rt.request("thread/goal/set", { threadId: "t", status: "paused" }), /pause\/resume/u);
 });
 
-test("turn/steer durably enqueues the message (never aborts the running turn)", async () => {
-  const steered: Array<{ threadId: string; message: string }> = [];
+// Steer rides the SDK's own queue — the same one the Claude Code CLI uses when you type
+// while it is working. QiYan no longer holds the message in a durable schedule row and
+// redelivers it later; that existed only because a one-shot `claude -p` had nowhere to put it.
+test("turn/steer hands the message to the native queue without aborting the running turn", async () => {
   const claude = new FakeClaude();
-  const rt = new ClaudeCodeRuntime({
-    id: "claude-local", host: claude, runner: claude, launchFlags: {},
-    steer: async (threadId, message) => { steered.push({ threadId, message }); },
-  });
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
-  // a turn is running
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c1", input: [{ type: "text", text: "long task" }] });
-  const res = await rt.request<{ turnId: string }>("turn/steer", { threadId: thread.id, clientUserMessageId: "ctx:steer1", input: [{ type: "text", text: "also do X" }], expectedTurnId: "ctx:c1" });
+
+  const res = await rt.request<{ turnId: string }>("turn/steer", {
+    threadId: thread.id, clientUserMessageId: "ctx:steer1",
+    input: [{ type: "text", text: "also do X" }], expectedTurnId: "ctx:c1",
+  });
+
   assert.equal(res.turnId, "ctx:steer1");
-  assert.deepEqual(steered, [{ threadId: thread.id, message: "also do X" }]);
-  assert.deepEqual(claude.interrupts, [], "steer must never abort the running response");
-  assert.deepEqual(claude.inFlight(thread.id), ["ctx:c1"]);
+  assert.deepEqual(claude.sends.map((send) => send.text), ["long task", "also do X"],
+    "the steer reached the session itself, in order behind the running turn");
+  assert.deepEqual(claude.interrupts, [], "steering never aborts the running response");
+  assert.deepEqual(claude.inFlight(thread.id), ["ctx:c1", "ctx:steer1"],
+    "both turns are outstanding — the SDK runs the queued one next");
+});
+
+// A one-shot `claude -p` could only run one turn, so a concurrent send was refused with
+// SESSION_BUSY. The SDK accepts input mid-turn, so refusing would now discard usable work.
+test("a second turn/start is queued rather than refused", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  const second = await rt.request<{ turn: any }>("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+
+  assert.equal(second.turn.id, "ctx:b");
+  assert.deepEqual(claude.inFlight(thread.id), ["ctx:a", "ctx:b"], "queued in submission order");
 });
 
 test("model/list returns the curated catalog in Codex {data,nextCursor} shape with efforts", async () => {

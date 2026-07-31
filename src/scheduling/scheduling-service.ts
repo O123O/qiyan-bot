@@ -119,12 +119,6 @@ export class SchedulingService {
     }
   }
 
-  // Claude steer: enqueue the message as an immediate one-shot so the engine delivers
-  // it as the next turn (retrying while the session is busy). Durable + recovers.
-  enqueueSteer(session: WorkerScheduleSession, message: string): void {
-    this.enqueueImmediate(session, "steer", message);
-  }
-
   enqueueRuntimeRecovery(session: WorkerScheduleSession & { mappingId: string }, message: string): void {
     const spec = `${RUNTIME_RECOVERY_SPEC}${session.mappingId}`;
     if (this.store.hasArmedSpec(session.endpointId, session.threadId, spec)) return;

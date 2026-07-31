@@ -2851,16 +2851,10 @@ export async function buildProductionApp(
             return current.nickname;
           },
         });
-        // Steer + archive options wired into a Claude runtime (local or remote). Both are
-        // QiYan-side and host-agnostic; steer = durable enqueue delivered as the next turn
-        // (Claude has no mid-turn injection).
-        const claudeRuntimeOptions = (endpointId: string) => ({
-          archives: claudeArchives!,
-          steer: async (threadId: string, message: string): Promise<void> => {
-            const found = registry.getByIdentity(endpointId, threadId);
-            if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId, threadId }, message);
-          },
-        });
+        // Archive tombstones are the only QiYan-side state a Claude runtime still needs.
+        // Steering is no longer one: the SDK queues input arriving mid-turn and runs it in
+        // order, so a steer is an ordinary send rather than a durable row redelivered later.
+        const claudeRuntimeOptions = (_endpointId: string) => ({ archives: claudeArchives! });
         // A managed Claude session is an ordinary Claude Code session: the only per-endpoint
         // launch settings are the model/effort defaults from its endpoints.json entry. The
         // host runs the turns (one long-lived SDK query per session); the runner stays only
