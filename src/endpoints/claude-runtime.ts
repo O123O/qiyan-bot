@@ -189,7 +189,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const turnId = event.uuid ?? state.running[0];
     if (!turnId) return;
     state.materialized = true;
+    const wasHead = state.running[0] === turnId;
     state.running = state.running.filter((id) => id !== turnId);
+    // The queue moved on: the next send is now the one producing output, and nothing else
+    // would ever announce it.
+    if (wasHead && state.running[0] !== undefined) this.announceHead(threadId, state.running[0]);
     if (event.status !== "completed") state.terminalTurns.add(turnId);
     // Only a normally completed turn is certain to be a findable transcript turn: a turn
     // that failed before `claude` wrote its user row exists only as a synthesized terminal.
@@ -527,7 +531,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const metas = await this.options.runner.listThreads(cwd);
     const data = metas
       .filter((meta) => (this.options.archives?.has(this.id, meta.id) ?? false) === wantArchived)
-      .map((meta) => ({ id: meta.id, cwd: meta.cwd, updatedAt: meta.updatedAt, preview: meta.preview }));
+      // status/turns are REQUIRED by adoption: SessionLifecycle reads thread.status.type on
+      // this row before it resumes the thread, so omitting them threw a TypeError and made
+      // adopt_session — and the adopt leg of crash recovery — fail outright. A discovery row
+      // has no live state to report, and the true status is re-read by thread/resume, so
+      // idle-with-no-turns is the honest placeholder rather than a claim.
+      .map((meta) => ({
+        id: meta.id,
+        cwd: meta.cwd,
+        updatedAt: meta.updatedAt,
+        preview: meta.preview,
+        status: { type: "idle" as const },
+        turns: [],
+      }));
     return { data, nextCursor: null };
   }
 
@@ -607,10 +623,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       this.startingTurns -= 1;
     }
     if (accepted) {
-      this.emitter.emit("notification", "turn/started", {
-        threadId,
-        turn: { id: clientId, status: "inProgress" },
-      });
+      // turn/started ONLY for the turn actually executing. A queued send announced as
+      // started makes it the tracked active turn, and an interrupt then names the queued
+      // uuid while the SDK aborts the executing head — killing the wrong work and marking
+      // the survivor terminal. The queued one is announced when it reaches the head.
+      if (state.running[0] === clientId) this.announceHead(threadId, clientId);
+      // The user's message is shown immediately even while queued, so a follow-up sent
+      // during a long turn does not vanish from the panel until that turn ends.
       this.emitter.emit("notification", "item/started", {
         threadId,
         turnId: clientId,
@@ -671,6 +690,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // Reads the goal from the transcript rather than a QiYan row. An unmaterialized or
   // unreadable session simply has no goal to report — never an error, because a goal read
   // rides along in get_session_status and must not fail it.
+  // Announce the turn now executing. Called when a send is accepted into an empty queue,
+  // and again each time the head settles and the next send takes over.
+  private announceHead(threadId: string, turnId: string): void {
+    this.emitter.emit("notification", "turn/started", {
+      threadId,
+      turn: { id: turnId, status: "inProgress" },
+    });
+  }
+
   private async readNativeGoal(threadId: string): Promise<{ objective: string; status: string } | null> {
     const state = this.threads.get(threadId);
     if (!state?.materialized) return null;
@@ -704,6 +732,17 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (inputToText(params.input).length === 0) {
       throw new AppError("CONFIGURATION_ERROR", "turn/steer requires input text");
     }
+    // The caller steers a SPECIFIC turn. Honour that: if the turn it meant has already
+    // finished and another is running, appending to the new one silently redirects the
+    // message to work the user never saw.
+    const expected = typeof params.expectedTurnId === "string" ? params.expectedTurnId : undefined;
+    if (expected !== undefined) {
+      const running = this.threads.get(requireString(params.threadId, "threadId"))?.running[0];
+      if (running !== expected) {
+        throw new AppError("OPERATION_CONFLICT",
+          `turn ${expected} is no longer running${running ? ` (${running} is)` : ""}; send it as a new turn instead`);
+      }
+    }
     const started = await this.turnStart({
       ...params,
       clientUserMessageId: typeof params.clientUserMessageId === "string" ? params.clientUserMessageId : randomUUID(),
@@ -717,7 +756,17 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const state = this.threads.get(threadId);
     // interrupt() ends only the active response; the session stays usable for the next
     // message, so the thread is never closed here.
-    if (state?.running.includes(turnId)) await this.options.host.interrupt(threadId);
+    //
+    // It aborts whatever is EXECUTING, which is the head of the queue. Asking to interrupt
+    // a merely-queued turn must therefore be refused rather than served: interrupting would
+    // kill the running turn instead, and reporting the queued one terminal while it later
+    // runs is the corruption this refuses to produce. The SDK exposes no targeted cancel for
+    // one queued message, so refusing is the honest answer.
+    if (state?.running.includes(turnId) && state.running[0] !== turnId) {
+      throw new AppError("OPERATION_CONFLICT",
+        `turn ${turnId} is queued behind ${state.running[0]} on ${threadId}; interrupt the running turn instead`);
+    }
+    if (state?.running[0] === turnId) await this.options.host.interrupt(threadId);
     state?.terminalTurns.add(turnId);
     return {};
   }

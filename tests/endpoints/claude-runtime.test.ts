@@ -203,6 +203,10 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     this.transcripts.set(threadId, records);
   }
 
+  settleTurn(sessionId: string, uuid: string, status: "completed" | "failed" | "interrupted"): void {
+    this.settle(sessionId, uuid, status);
+  }
+
   private settle(sessionId: string, uuid: string, status: "completed" | "failed" | "interrupted"): void {
     this.emit({ type: "turn/completed", sessionId, origin: "human", uuid, status, at: this.clock += 1 });
   }
@@ -1399,4 +1403,90 @@ test("background work is announced as a status change the tool layer observes", 
 
   claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 0, descriptions: [], at: 2 });
   assert.deepEqual(seen.at(-1)?.params.status, { type: "idle" }, "and returns to idle when it settles");
+});
+
+// The SDK's interrupt aborts whatever is EXECUTING. Announcing a queued send as started
+// made it the tracked active turn, so an interrupt named the queued uuid, killed the
+// running turn instead, and marked the survivor terminal — the corruption this migration
+// exists to remove, reintroduced by queueing.
+test("only the executing turn is announced started, and the queue advances", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const started: string[] = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/started") started.push((params as any).turn.id);
+  });
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+  assert.deepEqual(started, ["ctx:a"], "the queued turn is not announced as running");
+
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  assert.deepEqual(started, ["ctx:a", "ctx:b"], "it is announced when it reaches the head");
+});
+
+test("interrupting a queued turn is refused rather than killing the running one", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+
+  await assert.rejects(
+    rt.request("turn/interrupt", { threadId: thread.id, turnId: "ctx:b" }),
+    (error: any) => {
+      assert.equal(error.code, "OPERATION_CONFLICT");
+      assert.match(error.message, /queued behind ctx:a/u);
+      return true;
+    });
+  assert.deepEqual(claude.interrupts, [], "the running turn was not aborted in its place");
+
+  await rt.request("turn/interrupt", { threadId: thread.id, turnId: "ctx:a" });
+  assert.deepEqual(claude.interrupts, [thread.id], "interrupting the running turn works");
+});
+
+// A steer names the turn it means. If that turn has finished and another is running,
+// appending redirects the message onto work the user never saw.
+test("a steer whose target turn already finished is refused", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+
+  await assert.rejects(
+    rt.request("turn/steer", {
+      threadId: thread.id, clientUserMessageId: "ctx:s",
+      input: [{ type: "text", text: "more" }], expectedTurnId: "ctx:gone",
+    }),
+    (error: any) => {
+      assert.equal(error.code, "OPERATION_CONFLICT");
+      assert.match(error.message, /no longer running/u);
+      return true;
+    });
+});
+
+// Adoption reads thread.status.type on a discovery row before resuming the thread, so a
+// row without it threw a TypeError and adopt_session failed outright — as did the adopt
+// leg of crash recovery. A discovery row has no live state, and thread/resume re-reads the
+// truth, so idle-with-no-turns is the honest placeholder.
+test("discovery rows carry the shape adoption reads", async () => {
+  const claude = new FakeClaude();
+  claude.seed("discoverable", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "hello there" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+
+  const page = await rt.request<{ data: Array<Record<string, unknown>> }>("thread/list", {});
+  const row = page.data.find((entry) => entry.id === "discoverable");
+  assert.ok(row, "the seeded session is discoverable");
+  assert.deepEqual(row!.status, { type: "idle" });
+  assert.deepEqual(row!.turns, []);
+  // The identity fields adoption then uses are still carried alongside.
+  assert.equal(typeof row!.cwd, "string");
+  assert.equal(typeof row!.preview, "string");
 });
