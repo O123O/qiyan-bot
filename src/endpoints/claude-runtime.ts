@@ -202,6 +202,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       case "thread/goal/get": return { goal: null } as T;
       case "thread/goal/set": return await this.goalSet(args) as T;
       case "thread/goal/clear": return await this.goalClear(args) as T;
+      // Claude's context compaction is its own `/compact` command, delivered like `/goal`.
+      case "thread/compact/start": {
+        await this.deliverGoalCommand(requireString(args.threadId, "threadId"), "/compact");
+        return {} as T;
+      }
       case "turn/steer": return await this.turnSteer(args) as T;
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
@@ -519,11 +524,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { goal: null };
   }
 
-  // The command must arrive as its own turn for the CLI to parse the leading slash, so it
-  // rides the same durable enqueue as steer rather than racing a running turn.
+  // A slash command must arrive as its own turn for the CLI to parse the leading slash, so
+  // it rides the same durable enqueue as steer rather than racing a running turn.
   private async deliverGoalCommand(threadId: string, command: string): Promise<void> {
     if (!this.options.steer) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no delivery queue for goal commands");
+      throw new AppError("UNSUPPORTED_CAPABILITY", "claude endpoint has no delivery queue for slash commands");
     }
     await this.options.steer(threadId, command);
   }

@@ -771,6 +771,18 @@ test("the manager's goal tools install and clear Claude's native goal", async ()
   assert.deepEqual(delivered.at(-1), { threadId: "t", message: "/goal clear" });
 });
 
+// Claude compacts through its own /compact command; QiYan drives no compaction of its own.
+test("compact_session drives Claude's native /compact", async () => {
+  const delivered: string[] = [];
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", runner: new FakeRunner(), launchFlags: {},
+    steer: async (_threadId, message) => { delivered.push(message); },
+  });
+  await rt.start();
+  await rt.request("thread/compact/start", { threadId: "t" });
+  assert.deepEqual(delivered, ["/compact"]);
+});
+
 // Native /goal has no pause/resume, and QiYan stores no objective to reinstate.
 test("a status-only goal change is refused rather than silently dropped", async () => {
   const rt = new ClaudeCodeRuntime({

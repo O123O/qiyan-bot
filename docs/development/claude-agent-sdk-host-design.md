@@ -69,6 +69,41 @@ wrapping the TypeScript Agent SDK. Beyond that, the governing decision is
    `claude_session_goals` is empty. The cutover therefore needs a precondition
    assertion, not a migration. Re-check immediately before switching.
 
+## Manager tool coverage
+
+Every manager tool that operates on a worker needs a working path under this design.
+Audited against `ASSISTANT_TOOL_SCHEMAS` in `src/assistant/tools.ts`:
+
+| Manager tool | Claude path |
+| --- | --- |
+| `create_session` | `thread/start` → `session/open` (create) with the caller-chosen UUID |
+| `adopt_session` | `thread/resume` → `session/open` (resume); proven not to fork |
+| `unadopt_session` | `thread/unsubscribe` → `session/close` |
+| `archive_session` | tombstone in `ClaudeArchiveStore` + `session/close` |
+| `discover_sessions` | `thread/list` → SDK `listSessions` (79 sessions in 112 ms) |
+| `send_to_session` | `turn/start` → `session/send` with an idempotency uuid |
+| `interrupt_session` | `turn/interrupt` → `session/interrupt` |
+| `get_session_status` | `session/status`: activity plus the background-task set |
+| `inspect_worker_conversation` | `thread/turns/list` → `ClaudeTranscriptHistory` (SDK helpers are branch-limited) |
+| `read_worker_message` | same bounded JSONL reader |
+| `collect_messages` | same bounded JSONL reader |
+| `list_models` | `model/list` → `supportedModels()` |
+| `set_session_model` | `session/setModel` |
+| `set_reasoning_effort` | `applyFlagSettings({ effortLevel })` |
+| `compact_session` | delivers Claude's native `/compact` |
+| `set_goal` | delivers `/goal <objective>` |
+| `cancel_goal` | delivers `/goal clear` |
+| `get_goal` | reports no goal — native goal state is not exposed to the SDK stream |
+| `pause_goal`, `resume_goal` | **unsupported**: native `/goal` has no pause, and QiYan keeps no objective to reinstate |
+| `rename_session` | **gap**: currently a silent no-op. SDK `renameSession()` is the equivalent and must run on the worker's host, so it lands with the host |
+| `update_session_notes`, `list_managed_sessions` | QiYan-side, provider-neutral |
+| `restart_endpoint`, `disconnect_endpoint` | endpoint manager, unchanged |
+| chat/attachment/Slack tools | provider-neutral, unchanged |
+
+Two gaps are deliberate rather than accidental: `pause_goal`/`resume_goal` have no
+native equivalent, and `rename_session` waits for the host because it must write on
+the worker's filesystem.
+
 ## Architecture
 
 ```text
