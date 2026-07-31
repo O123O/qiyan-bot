@@ -592,7 +592,7 @@ function requireItemsView(value: unknown): "full" | "summary" | "notLoaded" {
   return value;
 }
 
-// Render the Codex-shaped input items as text for `claude -p`. Text items pass through;
+// Render the Codex-shaped input items as the session's message text. Text items pass through;
 // file attachments become a path reference — the worker file bridge has already staged the
 // file at a path valid on THIS worker's host (local fs, or the remote runtime dir for a
 // remote worker), and `claude` reads files by path (its Read tool handles text and images).
@@ -612,7 +612,7 @@ function inputToText(input: unknown): string {
       parts.push(`[Attached image: ${record.url}]`);
     }
     // `skill` items are intentionally omitted: the worker send path never emits them (only text +
-    // localImage/mention from the file bridge), and a skill reference has no meaning for `claude -p`.
+    // localImage/mention from the file bridge), and a skill reference has no meaning to Claude.
   }
   return parts.join("\n");
 }
