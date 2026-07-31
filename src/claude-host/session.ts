@@ -173,11 +173,14 @@ export class ClaudeHostSession {
     return () => { this.listeners.delete(listener); };
   }
 
-  close(): void {
+  close(): void { this.markClosed(); }
+
+  private markClosed(): void {
     if (this.closed) return;
     this.closed = true;
     this.input.close();
     this.query.close();
+    this.emit({ type: "session/closed", sessionId: this.sessionId, at: this.now() });
   }
 
   private emit(event: HostEvent): void {
@@ -205,6 +208,11 @@ export class ClaudeHostSession {
           uuid: turn.uuid, status: "interrupted", at: this.now(),
         });
       }
+      // The query is gone whether it ended cleanly or the `claude` child died under it, and
+      // nothing closes the session in that second case. Retire it here — settling the
+      // in-flight turns first, since closing is what tells the host to drop it — so a later
+      // send fails loudly instead of disappearing into an input stream nobody reads.
+      this.markClosed();
     }
   }
 

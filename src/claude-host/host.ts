@@ -62,6 +62,11 @@ export class LocalClaudeHost implements ClaudeHost {
     this.unsubscribes.set(request.sessionId, session.subscribe((event) => {
       for (const listener of this.listeners) listener(event);
     }));
+    // A query can end without anyone closing the session — the `claude` child is killed, the
+    // CLI is replaced underneath it, the SDK transport fails. Retire the dead session once it
+    // has finished settling its in-flight turns, so the next open builds a live one instead
+    // of accepting sends nothing will ever run.
+    void session.drained.then(() => this.forget(request.sessionId, session));
     return session.status();
   }
 
@@ -111,6 +116,15 @@ export class LocalClaudeHost implements ClaudeHost {
 
   async shutdown(): Promise<void> {
     for (const sessionId of [...this.sessions.keys()]) await this.close(sessionId);
+  }
+
+  // Drop a session that retired itself. An explicit close() has already removed it and owns
+  // the unsubscribe, so this only fires for a query that ended on its own.
+  private forget(sessionId: string, session: ClaudeHostSession): void {
+    if (this.sessions.get(sessionId) !== session) return;
+    this.sessions.delete(sessionId);
+    this.unsubscribes.get(sessionId)?.();
+    this.unsubscribes.delete(sessionId);
   }
 
   private require(sessionId: string): ClaudeHostSession {

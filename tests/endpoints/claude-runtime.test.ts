@@ -130,6 +130,15 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     if (uuid !== undefined) this.settle(sessionId, uuid, status);
   }
 
+  // The `claude` child dies under a loaded session: the host settles whatever was running
+  // and retires the session, exactly as ClaudeHostSession.drain does.
+  killSession(sessionId: string): void {
+    const session = this.require(sessionId);
+    this.sessions.delete(sessionId);
+    for (const uuid of session.inFlight.splice(0)) this.settle(sessionId, uuid, "interrupted");
+    this.emit({ type: "session/closed", sessionId, at: this.clock += 1 });
+  }
+
   // A whole answered turn, the way a real session delivers one.
   answer(sessionId: string, text: string): string {
     const uuid = this.reply(sessionId, text);
@@ -425,6 +434,35 @@ test("a restarted local endpoint reopens the sessions its host dropped", async (
   assert.deepEqual(claude.opens.map((request) => request.mode), ["create", "resume"],
     "the reopened session resumes the native transcript rather than forking a new one");
   assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:before", "ctx:after"]);
+});
+
+// A query can end without QiYan asking: the `claude` child is killed, the CLI is replaced.
+// The host retires the session; the endpoint must believe it, or the thread is wedged.
+test("a session that dies under the endpoint is settled and reopened by the next turn", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:dying", input: [{ type: "text", text: "work" }],
+  });
+
+  claude.killSession(thread.id);
+  await delay(5);
+  assert.deepEqual(
+    notifications.filter((entry) => entry.method === "turn/completed").map((entry) => entry.params.turn),
+    [{ id: "ctx:dying", status: "interrupted" }], "the turn that died with the query is settled");
+  const read = await rt.request<{ thread: { status: unknown } }>("thread/read", { threadId: thread.id });
+  assert.deepEqual(read.thread.status, { type: "idle" });
+
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "ctx:next", input: [{ type: "text", text: "next" }],
+  });
+  assert.equal(claude.isLoaded(thread.id), true, "the next turn opens a live session");
+  assert.equal(claude.opens.length, 2);
+  assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:dying", "ctx:next"]);
 });
 
 // Stopping the remote host replaces the process that owned the sessions, so the same

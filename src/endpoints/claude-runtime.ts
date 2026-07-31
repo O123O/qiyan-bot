@@ -98,6 +98,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadId = event.sessionId;
     const state = this.threads.get(threadId);
     if (!state) return;
+    // The host no longer has this session — its query ended, or it was evicted. Its
+    // in-flight turns arrive settled just before this, so only the load belief is stale:
+    // drop it, or the next turn would send into a session that is gone.
+    if (event.type === "session/closed") {
+      state.loaded = false;
+      return;
+    }
     if (event.type === "content/assistant") {
       const turnId = state.running?.turnId;
       if (!turnId) return;

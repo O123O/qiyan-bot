@@ -200,10 +200,14 @@ var ClaudeHostSession = class {
     };
   }
   close() {
+    this.markClosed();
+  }
+  markClosed() {
     if (this.closed) return;
     this.closed = true;
     this.input.close();
     this.query.close();
+    this.emit({ type: "session/closed", sessionId: this.sessionId, at: this.now() });
   }
   emit(event) {
     for (const listener of this.listeners) listener(event);
@@ -231,6 +235,7 @@ var ClaudeHostSession = class {
           at: this.now()
         });
       }
+      this.markClosed();
     }
   }
   consume(message) {
@@ -353,6 +358,7 @@ var LocalClaudeHost = class {
     this.unsubscribes.set(request.sessionId, session.subscribe((event) => {
       for (const listener of this.listeners) listener(event);
     }));
+    void session.drained.then(() => this.forget(request.sessionId, session));
     return session.status();
   }
   async close(sessionId) {
@@ -405,6 +411,14 @@ var LocalClaudeHost = class {
   }
   async shutdown() {
     for (const sessionId of [...this.sessions.keys()]) await this.close(sessionId);
+  }
+  // Drop a session that retired itself. An explicit close() has already removed it and owns
+  // the unsubscribe, so this only fires for a query that ended on its own.
+  forget(sessionId, session) {
+    if (this.sessions.get(sessionId) !== session) return;
+    this.sessions.delete(sessionId);
+    this.unsubscribes.get(sessionId)?.();
+    this.unsubscribes.delete(sessionId);
   }
   require(sessionId) {
     const session = this.sessions.get(sessionId);

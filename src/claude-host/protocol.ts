@@ -44,6 +44,10 @@ interface HostEventBase {
 export type HostEvent =
   | (HostEventBase & { type: "session/init"; message: Record<string, unknown> })
   | (HostEventBase & { type: "session/error"; message: string })
+  // The session is gone and will never produce another event: its query ended (cleanly or
+  // because the `claude` child died), it was evicted, or it was closed outright. A consumer
+  // holding "this thread is loaded" state must drop it and reopen on the next turn.
+  | (HostEventBase & { type: "session/closed" })
   | (HostEventBase & { type: "turn/accepted"; uuid: string })
   | (HostEventBase & {
     type: "turn/completed";

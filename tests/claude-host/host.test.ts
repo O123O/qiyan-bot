@@ -27,6 +27,12 @@ class FakeQuery implements SessionQuery {
     else this.pending.push(message);
   }
 
+  // The query ends without anyone closing the session — what a killed `claude` child does.
+  end(): void {
+    this.ended = true;
+    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
+  }
+
   async interrupt(): Promise<unknown> { return undefined; }
   async setModel(): Promise<void> {}
   async setPermissionMode(): Promise<void> {}
@@ -123,6 +129,31 @@ test("closing a busy session still delivers its terminal turn event", async () =
   assert.equal(completed.length, 1, "the in-flight turn is settled, not dropped");
   assert.equal((completed[0] as any).uuid, "u1");
   assert.equal((completed[0] as any).status, "interrupted");
+});
+
+// The `claude` child can die under a loaded session (OOM kill, CLI replaced, transport
+// error) and nothing calls close() then. A session left registered would keep accepting
+// sends into an input stream nothing reads, so the turn would never settle at all.
+test("a session whose query ends on its own is retired instead of accepting more sends", async () => {
+  const { host, queries, events } = makeHost();
+  await host.open(request("s1"));
+  await host.send("s1", "u1", "hello");
+  await delay(5);
+  const dead = queries.get("s1")!;
+
+  dead.end();
+  await delay(5);
+  assert.deepEqual(
+    events.filter((event) => event.type === "turn/completed").map((event) => (event as any).status),
+    ["interrupted"], "the turn that died with the query is settled");
+  assert.equal(events.filter((event) => event.type === "session/closed").length, 1,
+    "the host announces the session is gone so a consumer can drop its load state");
+  await assert.rejects(host.send("s1", "u2", "again"), /not loaded: s1/u,
+    "a send into the dead session fails loudly rather than hanging forever");
+
+  await host.open(request("s1"));
+  assert.notEqual(queries.get("s1"), dead, "reopening builds a live query");
+  await host.shutdown();
 });
 
 // Eviction must never unload a session that can still produce output, or its result is
