@@ -6,7 +6,7 @@
 // sets no tool allow/deny list, and injects no MCP servers: scheduling, background tasks,
 // subagents, and goals are Claude's own. The only options passed are the ones required to
 // *be* a normal session.
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import type { EffortLevel, Options } from "@anthropic-ai/claude-agent-sdk";
 import type { OpenSessionRequest } from "./host.ts";
 import { permissionWarning, resolveClaudePermissions } from "./permissions.ts";
 import type { SessionInput, SessionQuery, SessionQueryFactory } from "./session.ts";
@@ -57,6 +57,7 @@ export async function buildLaunchOptions(
     // existing one. The SDK rejects both together unless forking, which QiYan never wants.
     ...(request.mode === "create" ? { sessionId: request.sessionId } : { resume: request.sessionId }),
     ...(request.model === undefined ? {} : { model: request.model }),
+    ...(request.effort === undefined ? {} : { effort: request.effort as EffortLevel }),
   };
 }
 

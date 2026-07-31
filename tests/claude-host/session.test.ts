@@ -10,6 +10,7 @@ import type { HostEvent } from "../../src/claude-host/protocol.ts";
 class FakeQuery implements SessionQuery {
   readonly received: SessionInput[] = [];
   readonly stopped: string[] = [];
+  readonly flagSettings: Array<{ effortLevel?: string | null }> = [];
   interrupts = 0;
   closed = false;
   private readonly pending: unknown[] = [];
@@ -34,6 +35,7 @@ class FakeQuery implements SessionQuery {
   async interrupt(): Promise<unknown> { this.interrupts += 1; return { still_queued: [] }; }
   async setModel(): Promise<void> { /* recorded via spies where needed */ }
   async setPermissionMode(): Promise<void> { /* not asserted here */ }
+  async applyFlagSettings(settings: { effortLevel?: string | null }): Promise<void> { this.flagSettings.push(settings); }
   async stopTask(taskId: string): Promise<void> { this.stopped.push(taskId); }
   async supportedModels(): Promise<unknown[]> { return [{ value: "opus" }]; }
   async initializationResult(): Promise<unknown> { return { model: "opus" }; }

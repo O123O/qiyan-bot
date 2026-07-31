@@ -106,6 +106,7 @@ export class ClaudeHostServer {
       case "interrupt": return await this.host.interrupt(request.params[0]);
       case "status": return await this.host.status(request.params[0]);
       case "setModel": return await this.host.setModel(request.params[0], request.params[1]);
+      case "setEffort": return await this.host.setEffort(request.params[0], request.params[1]);
       case "models": return await this.host.models(request.params[0]);
       case "stopTask": return await this.host.stopTask(request.params[0], request.params[1]);
       case "evictIdle": return await this.host.evictIdle(request.params[0]);
@@ -198,6 +199,10 @@ export class RemoteClaudeHost implements ClaudeHost {
 
   async setModel(sessionId: string, model?: string): Promise<void> {
     await this.call<void>({ method: "setModel", params: [sessionId, model] });
+  }
+
+  async setEffort(sessionId: string, effort?: string): Promise<void> {
+    await this.call<void>({ method: "setEffort", params: [sessionId, effort] });
   }
 
   async models(sessionId: string): Promise<unknown[]> {

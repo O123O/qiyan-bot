@@ -28,6 +28,7 @@ class FakeQuery implements SessionQuery {
   async interrupt(): Promise<unknown> { return undefined; }
   async setModel(): Promise<void> {}
   async setPermissionMode(): Promise<void> {}
+  async applyFlagSettings(): Promise<void> {}
   async stopTask(): Promise<void> {}
   async supportedModels(): Promise<unknown[]> { return [{ value: "opus" }]; }
   async initializationResult(): Promise<unknown> { return {}; }

@@ -22,6 +22,7 @@ export interface OpenSessionRequest {
   mode: "create" | "resume";
   cwd: string;
   model?: string;
+  effort?: string;
 }
 
 export interface ClaudeHost {
@@ -33,6 +34,7 @@ export interface ClaudeHost {
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<SessionStatus>;
   setModel(sessionId: string, model?: string): Promise<void>;
+  setEffort(sessionId: string, effort?: string): Promise<void>;
   models(sessionId: string): Promise<unknown[]>;
   stopTask(sessionId: string, taskId: string): Promise<void>;
   subscribe(listener: (event: HostEvent) => void): () => void;
@@ -66,10 +68,16 @@ export class LocalClaudeHost implements ClaudeHost {
   async close(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    this.sessions.delete(sessionId);
+    // Close and drain BEFORE dropping the subscription. Ending the query makes the actor
+    // settle its in-flight turns as interrupted, and that terminal event is the only one
+    // a waiting caller will ever get — unsubscribing first would swallow it and leave the
+    // turn hanging forever. Only then stop forwarding, so genuinely late output from a
+    // closed session is still not republished.
+    session.close();
+    await session.drained;
     this.unsubscribes.get(sessionId)?.();
     this.unsubscribes.delete(sessionId);
-    this.sessions.delete(sessionId);
-    session.close();
   }
 
   async send(sessionId: string, uuid: string, text: string): Promise<boolean> {
@@ -79,6 +87,7 @@ export class LocalClaudeHost implements ClaudeHost {
   async interrupt(sessionId: string): Promise<void> { await this.require(sessionId).interrupt(); }
   async status(sessionId: string): Promise<SessionStatus> { return this.require(sessionId).status(); }
   async setModel(sessionId: string, model?: string): Promise<void> { await this.require(sessionId).setModel(model); }
+  async setEffort(sessionId: string, effort?: string): Promise<void> { await this.require(sessionId).setEffort(effort); }
   async models(sessionId: string): Promise<unknown[]> { return await this.require(sessionId).supportedModels(); }
   async stopTask(sessionId: string, taskId: string): Promise<void> { await this.require(sessionId).stopTask(taskId); }
 

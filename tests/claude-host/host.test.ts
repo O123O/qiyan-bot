@@ -11,6 +11,7 @@ import type { SessionInput, SessionQuery } from "../../src/claude-host/session.t
 
 class FakeQuery implements SessionQuery {
   readonly received: SessionInput[] = [];
+  readonly flagSettings: Array<{ effortLevel?: string | null }> = [];
   closed = false;
   private readonly pending: unknown[] = [];
   private readonly waiters: Array<(value: IteratorResult<unknown>) => void> = [];
@@ -29,6 +30,7 @@ class FakeQuery implements SessionQuery {
   async interrupt(): Promise<unknown> { return undefined; }
   async setModel(): Promise<void> {}
   async setPermissionMode(): Promise<void> {}
+  async applyFlagSettings(settings: { effortLevel?: string | null }): Promise<void> { this.flagSettings.push(settings); }
   async stopTask(): Promise<void> {}
   async supportedModels(): Promise<unknown[]> { return [{ value: "opus" }]; }
   async initializationResult(): Promise<unknown> { return {}; }
@@ -104,6 +106,23 @@ test("closing a session stops forwarding its events", async () => {
   query.push({ type: "assistant", parent_tool_use_id: null, message: { content: [] } });
   await delay(5);
   assert.equal(events.length, before, "a closed session's late output is not republished");
+});
+
+// Closing a busy session must still settle its turn. The actor emits the interrupted
+// terminal event while draining, and that is the ONLY event a waiting caller ever gets —
+// dropping the subscription first would swallow it and hang the turn forever.
+test("closing a busy session still delivers its terminal turn event", async () => {
+  const { host, events } = makeHost();
+  await host.open(request("s1"));
+  await host.send("s1", "u1", "hello");
+  await delay(5);
+  assert.equal((await host.status("s1")).activity, "working");
+
+  await host.close("s1");
+  const completed = events.filter((event) => event.type === "turn/completed");
+  assert.equal(completed.length, 1, "the in-flight turn is settled, not dropped");
+  assert.equal((completed[0] as any).uuid, "u1");
+  assert.equal((completed[0] as any).status, "interrupted");
 });
 
 // Eviction must never unload a session that can still produce output, or its result is
@@ -188,6 +207,30 @@ test("an unconfigured workspace warns that tools will be denied", async () => {
   assert.equal(options.permissionMode, "default");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0]!, /denied/u);
+});
+
+// Reasoning effort has no dedicated SDK setter; it rides the flag-settings layer, and
+// dropping it would make set_reasoning_effort a silent no-op.
+test("effort reaches the launch options and the live session", async () => {
+  const { cwd, home } = await workspace("bypassPermissions");
+  const options = await buildLaunchOptions(
+    { sessionId: "abc", mode: "create", cwd, effort: "high" },
+    { claudeExecutable: "claude", home });
+  assert.equal(options.effort, "high");
+
+  const queries = new Map<string, FakeQuery>();
+  const host = new LocalClaudeHost(async (req) => (input) => {
+    const query = new FakeQuery(input);
+    queries.set(req.sessionId, query);
+    return query;
+  });
+  await host.open({ sessionId: "s1", mode: "create", cwd: "/tmp/x" });
+  await host.setEffort("s1", "xhigh");
+  assert.deepEqual(queries.get("s1")!.flagSettings, [{ effortLevel: "xhigh" }]);
+  await host.setEffort("s1", undefined);
+  assert.deepEqual(queries.get("s1")!.flagSettings.at(-1), { effortLevel: null },
+    "clearing falls back to the user's own settings rather than pinning a default");
+  await host.shutdown();
 });
 
 test("the preparer builds a query with the resolved options", async () => {

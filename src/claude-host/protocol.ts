@@ -69,6 +69,7 @@ export type HostRequest =
   | { method: "interrupt"; params: [string] }
   | { method: "status"; params: [string] }
   | { method: "setModel"; params: [string, string | undefined] }
+  | { method: "setEffort"; params: [string, string | undefined] }
   | { method: "models"; params: [string] }
   | { method: "stopTask"; params: [string, string] }
   | { method: "evictIdle"; params: [number] }
@@ -81,6 +82,7 @@ export interface OpenSessionRequestWire {
   mode: "create" | "resume";
   cwd: string;
   model?: string;
+  effort?: string;
 }
 
 export interface HostFrame {
