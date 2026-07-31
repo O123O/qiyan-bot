@@ -1,4 +1,5 @@
 import { basename, isAbsolute } from "node:path";
+import { AppError } from "../core/errors.ts";
 import type { WorkerNativeHistoryPage } from "../webui/worker-history-reader.ts";
 import type { NativeSessionView } from "./native-session-state.ts";
 
@@ -79,8 +80,21 @@ export function createCodexConversationHistoryRead(deps: {
   ): Promise<WorkerNativeHistoryPage> => {
     if (signal.aborted) throw signal.reason ?? new Error("worker history read cancelled");
     const location = deps.locations.get(endpointId, threadId);
-    if (!location) throw new Error(`rollout path is unavailable for thread ${threadId}`);
     const native = deps.nativeSession(endpointId, threadId, mappingId);
+    if (!location) {
+      // Rollout locations are learned only from a thread/read on the worker's own endpoint,
+      // and this map starts empty on every boot. So an endpoint QiYan cannot reach has no
+      // location yet — history is genuinely unavailable, but only until it reconnects, and
+      // reporting that as a bare error made a self-healing outage read as corruption.
+      if (native?.availability !== "ready") {
+        throw new AppError("ENDPOINT_UNAVAILABLE",
+          `${endpointId} is not connected, so this worker's history cannot be read yet; it loads once the endpoint reconnects`);
+      }
+      // Reachable endpoint, no location: the entry was evicted (the map is bounded) or the
+      // thread was never read. A read of the thread repopulates it.
+      throw new AppError("OPERATION_FAILED",
+        `no rollout location is known for thread ${threadId} on ${endpointId}; open the worker to re-read it`);
+    }
     const nativeStatus = native?.availability === "ready" ? native.status : "unknown";
     const activeTurnId = native?.availability === "ready" ? native.activeTurnId : null;
     const keyFor = (value: RolloutLocation): string => JSON.stringify([
