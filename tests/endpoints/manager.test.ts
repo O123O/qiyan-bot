@@ -688,10 +688,17 @@ test("lifecycle idle proof fails closed on an error native state", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
   remote.threadStatus = "systemError";
+  const shutdownsBefore = remote.runtimeStops;
   await assert.rejects(
     value.manager.disconnect("devbox"),
-    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+    // CONFLICT, not UNCERTAIN. The proof runs before the runtime is stopped and reopens the
+    // endpoint untouched, so the outcome is not in doubt — and only a proven-no-effect code
+    // lets the operation settle as failed. Reported as uncertain it stayed recoverable
+    // forever, and an unresolved earlier operation fences the next lifecycle action, so a
+    // worker whose status could not be read wedged every future restart of its endpoint.
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT",
   );
+  assert.equal(remote.runtimeStops, shutdownsBefore, "the runtime was never stopped");
 });
 
 test("lifecycle idle proof does not request native history", async () => {

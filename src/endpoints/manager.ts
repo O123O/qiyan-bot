@@ -560,7 +560,15 @@ export class EndpointManager {
       const state = this.options.managedThreadState?.(endpointId, threadId, generation);
       if (!state || state.availability !== "ready" || state.endpointGeneration !== generation
         || state.status === "unknown" || state.status === "error") {
-        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`);
+        // OPERATION_CONFLICT, not OPERATION_UNCERTAIN: this guard runs at the `draining`
+        // phase, before stopEndpointRuntime, and a failure here reopens the endpoint
+        // untouched — so nothing was dispatched and the outcome is not in doubt. Reporting
+        // it as uncertain left the operation permanently recoverable, and because an
+        // unresolved earlier operation fences the next lifecycle action, a worker whose
+        // status could not be read wedged every future restart of its endpoint: the repair
+        // was refused by the wreckage of its own last attempt. The sibling not-idle branch
+        // below has always used CONFLICT for exactly the same reason.
+        throw new AppError("OPERATION_CONFLICT", `could not prove managed thread idle on endpoint ${endpointId}`);
       }
       if (state.status !== "idle") {
         throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
