@@ -137,10 +137,6 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     return uuid;
   }
 
-  // The one-shot `claude -p` engine is retired: turns run on the host, never the runner,
-  // which survives only as the transcript/discovery source.
-  startTurn(): never { throw new Error("claude turns run through the host, not the runner"); }
-
   async readTranscriptChunk(threadId: string, _cwd: string, request: ClaudeTranscriptChunkRequest) {
     this.transcriptReadCount += 1;
     this.transcriptChunkLengths.push(request.length);

@@ -2824,7 +2824,7 @@ export async function buildProductionApp(
           host: localClaudeHost(localClaudeDef.command ?? "claude", (message) => reportOperationalSafely(report, {
             level: "warn", code: "claude_permission_mode", component: "claude_host", reason: message,
           })),
-          runner: new LocalClaudeCommandRunner({ command: localClaudeDef.command ?? "claude" }),
+          runner: new LocalClaudeCommandRunner(),
           launchFlags: {
             ...(localClaudeDef.model === undefined ? {} : { model: localClaudeDef.model }),
             ...(localClaudeDef.effort === undefined ? {} : { effort: localClaudeDef.effort }),
