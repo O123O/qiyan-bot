@@ -167,7 +167,11 @@ test("starting the remote runtime launches the host and reaches it over the prox
   ]);
   const started = invocations.find((item) => item.operation === "start-claude-host");
   assert.equal(started?.value.runtimeDir, runtimeDir);
-  assert.equal(started?.value.session, "qiyan-abcdef0123456789abcdef01");
+  // Distinct from the Codex app-server's `qiyan-<hash>` in the SAME runtime directory: an
+  // endpoint switched between providers must not read the other's live tmux session as its
+  // own unhealthy host, which would refuse activation until someone killed it by hand.
+  assert.equal(started?.value.session, "qiyan-claude-abcdef0123456789abcdef01");
+  assert.notEqual(started?.value.session, `qiyan-${runtimeDir.split("/").pop()}`);
   assert.equal(started?.value.shell, "/bin/bash");
   assert.match(String(started?.value.token), /^[0-9a-f]{32}$/u);
   // The channel really carries the protocol: the host answered with its own identity.

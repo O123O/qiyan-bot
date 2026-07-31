@@ -296,7 +296,9 @@ async function stopClaudeHost(value) {
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.claudeHostSocketPath, { force: true });
   await rm(paths.claudeHostIdentityPath, { force: true });
-  await rm(paths.tmuxSocketPath, { force: true });
+  // The tmux socket is deliberately left alone: one tmux server in this runtime directory
+  // may also be supervising the endpoint's Codex app-server session, and unlinking it would
+  // strand that generation. Codex's own stop() does not remove it either.
   return { stopped: true };
 }
 

@@ -216,10 +216,14 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
     );
   }
 
+  // The runtime directory is keyed by endpoint id, and the Codex app-server supervises its
+  // generation as `qiyan-<hash>` in the same directory. A Claude host must NOT answer to
+  // that name: an endpoint switched from codex to claude would find the app-server's live
+  // tmux session, read it as an unhealthy Claude host and refuse to activate for good.
   private runtimeRequest(): { runtimeDir: string; session: string; tmuxMode: "explicit" } {
     return {
       runtimeDir: this.options.host.remoteRuntimeDir,
-      session: `qiyan-${posix.basename(this.options.host.remoteRuntimeDir)}`,
+      session: `qiyan-claude-${posix.basename(this.options.host.remoteRuntimeDir)}`,
       tmuxMode: "explicit",
     };
   }

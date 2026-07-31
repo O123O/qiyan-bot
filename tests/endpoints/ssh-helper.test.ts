@@ -548,7 +548,10 @@ test("the remote Claude host serves proxied sessions from one supervised process
   ]));
   await chmod(xdg, 0o700);
   const runtimeDir = `${xdg}/qiyan-bot/${randomBytes(12).toString("hex")}`;
-  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  // The names QiYan derives for one endpoint: the Claude host and the Codex app-server share
+  // this runtime directory and its tmux server, so they must not answer to the same session.
+  const session = `qiyan-claude-${runtimeDir.slice(-24)}`;
+  const codexSession = `qiyan-${runtimeDir.slice(-24)}`;
   const helper = await readFile(helperPath);
   const launcher = await readFile(launcherPath);
   const claudeHost = await readFile(claudeHostPath);
@@ -632,6 +635,18 @@ test("the remote Claude host serves proxied sessions from one supervised process
     }
   };
 
+  // Stand in for the endpoint's Codex app-server generation: same runtime directory, same
+  // tmux server, the name SshRuntime derives. A Claude host that answered to it would read
+  // this live session as its own unhealthy host and refuse to activate for good.
+  const tmux = (...args: string[]): Promise<unknown> => runBoundedProcess(
+    "tmux", ["-S", join(runtimeDir, "tmux.sock"), "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 },
+  );
+  await tmux("new-session", "-d", "-s", codexSession, "sleep 120");
+  t.after(() => tmux("kill-session", "-t", codexSession).catch(() => undefined));
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent" },
+    "the co-resident Codex session is not mistaken for a Claude host");
+
   let identity: { token: string; pid: number } | undefined;
   t.after(async () => {
     if (identity) await invoke("stop-claude-host", { ...base, expected: identity }, 15_000).catch(() => undefined);
@@ -685,6 +700,11 @@ test("the remote Claude host serves proxied sessions from one supervised process
   identity = undefined;
   assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent" });
   await assert.rejects(stat(join(runtimeDir, "claude.sock")));
+  // Stopping the Claude host must leave the Codex generation — and the tmux socket serving
+  // it — alone; unlinking that socket would strand a live app-server QiYan can no longer
+  // reach or stop.
+  await tmux("has-session", "-t", codexSession);
+  assert.equal((await stat(join(runtimeDir, "tmux.sock"))).isSocket(), true);
 });
 
 async function waitFor<T>(read: () => T | undefined, timeoutMs = 10_000): Promise<T> {
