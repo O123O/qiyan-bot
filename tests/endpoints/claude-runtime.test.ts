@@ -1490,3 +1490,23 @@ test("discovery rows carry the shape adoption reads", async () => {
   assert.equal(typeof row!.cwd, "string");
   assert.equal(typeof row!.preview, "string");
 });
+
+// A full-transcript scan throws past its ~4 MiB budget, and swallowing that reported
+// "no goal" for exactly the long-running sessions most likely to have one. The goal is
+// read from a bounded tail instead, which is where the last marker always is.
+test("the native goal is found on a transcript too large to scan whole", async () => {
+  const claude = new FakeClaude();
+  const filler = { type: "assistant", uuid: "pad", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(4_000) }] } };
+  claude.seed("huge", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    ...Array.from({ length: 1_200 }, () => filler),           // well past the full-scan budget
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: ship it</local-command-stdout>" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "huge", cwd: "/w", excludeTurns: true });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "huge" });
+  assert.equal(read.goal?.objective, "ship it", "a goal on a large transcript is reported, not silently dropped");
+});

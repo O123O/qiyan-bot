@@ -13,6 +13,7 @@
 // agree on turn identity without QiYan writing a correlation marker into the transcript.
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
@@ -51,6 +52,11 @@ interface ThreadState {
 
 // Enough for the handful of workers one endpoint drives at a time, small enough that an
 // endpoint touched by dozens of threads does not keep a `claude` process for each.
+// Bounded tail scanned for the native goal marker. Generous enough that an active goal —
+// which writes a Stop-hook row per continuation — always falls inside it, while never
+// transferring a whole transcript over ssh on a status poll.
+const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
+
 const DEFAULT_LOADED_SESSION_BUDGET = 8;
 
 export interface ClaudePersistentRuntime {
@@ -687,9 +693,6 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return tasks && (tasks.backgroundTasks > 0 || tasks.subagents > 0) ? tasks : undefined;
   }
 
-  // Reads the goal from the transcript rather than a QiYan row. An unmaterialized or
-  // unreadable session simply has no goal to report — never an error, because a goal read
-  // rides along in get_session_status and must not fail it.
   // Announce the turn now executing. Called when a send is accepted into an empty queue,
   // and again each time the head settles and the next send takes over.
   private announceHead(threadId: string, turnId: string): void {
@@ -699,11 +702,32 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
   }
 
+  // Reads the goal from the TAIL of the transcript, not the whole file. A full scan throws
+  // past its ~4 MiB budget, and swallowing that reported "no goal" for exactly the
+  // long-running sessions most likely to have one — a silent lie rather than a limit.
+  //
+  // The tail is also the correct place to look: the last marker wins, and Claude's Stop hook
+  // writes a row on every continuation while a goal runs, so an active goal always leaves
+  // recent traces. An unmaterialized or unreadable session simply has no goal to report,
+  // never an error, because this read rides along inside get_session_status.
   private async readNativeGoal(threadId: string): Promise<{ objective: string; status: string } | null> {
     const state = this.threads.get(threadId);
     if (!state?.materialized) return null;
-    const records = await this.history.fullRecords(threadId, state.cwd).catch(() => undefined);
-    const goal = records ? claudeNativeGoal(records) : null;
+    const chunk = await this.options.runner
+      .readTranscriptChunk(threadId, state.cwd, { offset: "tail", length: GOAL_SCAN_TAIL_BYTES })
+      .catch(() => undefined);
+    if (!chunk) return null;
+    const text = Buffer.from(chunk.bytes).toString("utf8");
+    // A tail read can start mid-line; that partial first line is not valid JSON and would
+    // be dropped by the parser anyway, but skip it explicitly when the window was clipped.
+    const lines = text.split("\n");
+    if (chunk.offset > 0) lines.shift();
+    const records: unknown[] = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try { records.push(JSON.parse(line)); } catch { /* partial or non-JSON line */ }
+    }
+    const goal = claudeNativeGoal(records);
     // Claude drives its own goal to completion, so an installed goal is by definition still
     // being pursued; there is no paused or blocked state to distinguish.
     return goal ? { ...goal, status: "active" } : null;
