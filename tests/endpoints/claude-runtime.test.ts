@@ -641,6 +641,65 @@ test("the first turn creates the native session and the next resumes it; the cal
   assert.deepEqual(claude.sends.at(-1), { sessionId: threadId, uuid: "ctx:call-2", text: "again" });
 });
 
+// A loaded session never forgets a uuid it accepted, so a refused send says nothing about
+// whether that turn is still running. A scheduled fire re-armed from the outbox after a
+// crash reuses its single-fire key: adopting a reservation for a turn the host already
+// finished would wedge the thread as SESSION_BUSY and drop the message with no trace.
+test("retrying a send whose turn already finished reports it terminal instead of wedging the thread", async () => {
+  const claude = new FakeClaude();
+  const before = makeRuntime(claude);
+  await before.start();
+  const { thread } = await before.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const threadId = thread.id;
+  await before.request("turn/start", {
+    threadId, clientUserMessageId: "fire:1", input: [{ type: "text", text: "scheduled work" }],
+  });
+  claude.answer(threadId, "did the work");
+  await delay(5);
+
+  // QiYan restarts; the host and its session survive, so it still remembers the uuid.
+  const after = makeRuntime(claude);
+  await after.start();
+  await after.request("thread/resume", { threadId, cwd: "/w", excludeTurns: true });
+  const notifications: Array<{ method: string; params: any }> = [];
+  after.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  const retried = await after.request<{ turn: { id: string; status: string } }>("turn/start", {
+    threadId, clientUserMessageId: "fire:1", input: [{ type: "text", text: "scheduled work" }],
+  });
+
+  assert.deepEqual(retried.turn, { id: "fire:1", status: "completed" });
+  assert.deepEqual(notifications, [{ method: "turn/completed", params: { threadId, turn: { id: "fire:1" } } }],
+    "the terminal is republished so the response QiYan missed is still delivered");
+  const read = await after.request<{ thread: { status: unknown } }>("thread/read", { threadId });
+  assert.deepEqual(read.thread.status, { type: "idle" }, "no phantom turn is left running");
+  const next = await after.request<{ turn: { id: string } }>("turn/start", {
+    threadId, clientUserMessageId: "fire:2", input: [{ type: "text", text: "next" }],
+  });
+  assert.equal(next.turn.id, "fire:2", "the thread still accepts new turns");
+});
+
+// The same refusal while the turn genuinely IS still running must keep the reservation:
+// the host will settle it, and dropping it here would orphan a running response.
+test("retrying a send whose turn is still running keeps the turn in progress", async () => {
+  const claude = new FakeClaude();
+  const before = makeRuntime(claude);
+  await before.start();
+  const { thread } = await before.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await before.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "fire:1", input: [{ type: "text", text: "long job" }],
+  });
+
+  const after = makeRuntime(claude);
+  await after.start();
+  await after.request("thread/resume", { threadId: thread.id, cwd: "/w", excludeTurns: true });
+  const retried = await after.request<{ turn: { id: string; status: string } }>("turn/start", {
+    threadId: thread.id, clientUserMessageId: "fire:1", input: [{ type: "text", text: "long job" }],
+  });
+  assert.deepEqual(retried.turn, { id: "fire:1", status: "inProgress" });
+  const read = await after.request<{ thread: { status: unknown } }>("thread/read", { threadId: thread.id });
+  assert.deepEqual(read.thread.status, { type: "active" });
+});
+
 test("a live agentMessage carries the same item id thread/read later reports for that block", async () => {
   // The Web UI keys rows by (turnId, itemId). If the live id and the reconstructed id
   // diverge, every answer renders twice after a reload.

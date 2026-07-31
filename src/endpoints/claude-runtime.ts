@@ -472,6 +472,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const current = (): boolean =>
       this.lifecycleGeneration === generation && this.threads.get(threadId) === state;
     let accepted: boolean;
+    let alreadySettled = false;
     try {
       // Lazily load the session. `materialized` distinguishes creating the caller-chosen
       // native session id from resuming one that already exists on disk.
@@ -500,6 +501,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // the live stream and reconstructed history agree without a correlation marker.
       accepted = await this.options.host.send(threadId, clientId, message);
       if (!current()) await this.abandonStartingTurn(threadId, state);
+      // A refused send only says the host has seen this uuid before; it never forgets one.
+      // That means "still running" only while the host still has it in flight — a retry
+      // whose turn already ran (a scheduled fire re-armed from the outbox after a crash,
+      // reusing its single-fire key) would otherwise adopt a reservation no event can ever
+      // clear, wedging the thread as SESSION_BUSY and dropping the message silently.
+      if (!accepted) {
+        const status = await this.options.host.status(threadId);
+        if (!current()) await this.abandonStartingTurn(threadId, state);
+        alreadySettled = !status.inFlightTurns.includes(clientId);
+      }
     } catch (error) {
       if (state.running?.turnId === clientId) delete state.running;
       throw error;
@@ -519,8 +530,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
           content: [{ type: "text", text: message, text_elements: [] }],
         },
       });
+      return { turn: { id: clientId, status: "inProgress" } };
     }
-    return { turn: { id: clientId, status: "inProgress" } };
+    if (!alreadySettled) return { turn: { id: clientId, status: "inProgress" } };
+    // The duplicate's turn is over. Release the reservation and republish its terminal, so
+    // the response it produced while QiYan was away is still delivered instead of lost.
+    if (state.running?.turnId === clientId) delete state.running;
+    state.materialized = true;
+    this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
+    return { turn: { id: clientId, status: "completed" } };
   }
 
   // A turn whose endpoint changed mid-start must not be left running on the host: closing
