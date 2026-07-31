@@ -68,7 +68,7 @@ test("a remote turn survives losing the QiYan client", { skip: !enabled, timeout
 // round-trip on the remote filesystem proves it both runs remotely and maps the exit code.
 test("a remote monitor check runs on the remote host over ssh", { skip: !enabled, timeout: 60_000 }, async () => {
   const prepared = await remoteHost("claude-remote-check");
-  const runner = new SshClaudeCommandRunner({ plan: prepared.plan, host: prepared.host });
+  const runner = new SshClaudeCommandRunner({ plan: prepared.plan });
   // Exit code → boolean mapping.
   assert.equal(await runner.runShellCheck("true"), true);
   assert.equal(await runner.runShellCheck("false"), false);

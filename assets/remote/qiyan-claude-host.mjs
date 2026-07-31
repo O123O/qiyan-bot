@@ -34,8 +34,6 @@ var package_default = {
     "assets/remote/qiyan-app-server-launcher.sh",
     "assets/remote/qiyan-claude-host.mjs",
     "assets/remote/qiyan-claude-host-launcher.sh",
-    "assets/remote/qiyan-claude.mjs",
-    "assets/remote/qiyan-claude-runtime-launcher.sh",
     "assets/remote/qiyan-ssh-helper.mjs",
     "assets/slack/manifest.yaml",
     "docs/chat-apps/wechat.md",

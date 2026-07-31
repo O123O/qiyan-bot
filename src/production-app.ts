@@ -2869,10 +2869,7 @@ export async function buildProductionApp(
                 endpointId: definition.id,
                 host: { ...host, remote },
               });
-              const claudeRemoteRunner = new SshClaudeCommandRunner({
-                plan: generation.plan,
-                host: { ...host, remote },
-              });
+              const claudeRemoteRunner = new SshClaudeCommandRunner({ plan: generation.plan });
               // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
               monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({

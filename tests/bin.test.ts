@@ -38,8 +38,6 @@ test("packed qiyan-bot runs without source files or installed dependencies", asy
     "package/assets/remote/qiyan-app-server-launcher.sh",
     "package/assets/remote/qiyan-claude-host.mjs",
     "package/assets/remote/qiyan-claude-host-launcher.sh",
-    "package/assets/remote/qiyan-claude.mjs",
-    "package/assets/remote/qiyan-claude-runtime-launcher.sh",
     "package/assets/remote/qiyan-ssh-helper.mjs",
     "package/dist/qiyan-bot",
     "package/package.json",
