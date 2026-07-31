@@ -120,6 +120,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       state.loaded = false;
       return;
     }
+    // Claude's own background work — backgrounded Bash and Task-tool subagents — is never
+    // conversation: when it finishes the agent reports and that report is an ordinary
+    // end-of-turn. It is republished only as a live activity indicator, so the Web UI can
+    // show "2 background tasks, 1 subagent running" while a panel is open.
+    if (event.type === "task/set") {
+      this.emitter.emit("notification", "thread/tasks/updated", {
+        threadId,
+        background: event.background,
+        subagents: event.subagents,
+        descriptions: event.descriptions,
+      });
+      return;
+    }
     if (event.type === "content/assistant") {
       // Top-level assistant text with no turn running is a native background task reporting
       // in after its parent turn. Claude writes those rows after the last turn's rows, and

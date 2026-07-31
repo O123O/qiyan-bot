@@ -107,6 +107,9 @@ var InputStream = class {
     };
   }
 };
+function classifyTask(record) {
+  return typeof record.subagent_type === "string" && record.subagent_type.length > 0 ? "subagent" : "background";
+}
 var ClaudeHostSession = class {
   constructor(sessionId, createQuery, options = {}) {
     this.sessionId = sessionId;
@@ -179,7 +182,8 @@ var ClaudeHostSession = class {
       inFlightTurns: this.inFlight.map((turn) => turn.uuid),
       backgroundTasks: [...this.backgroundTasks.entries()].map(([id, task]) => ({
         taskId: id,
-        ...task.type === void 0 ? {} : { taskType: task.type },
+        kind: task.kind,
+        ...task.description === void 0 ? {} : { description: task.description },
         startedAt: task.startedAt
       }))
     };
@@ -212,6 +216,19 @@ var ClaudeHostSession = class {
   }
   // Everything the session does — an accepted send, streamed content, a task change, a
   // settled turn — passes through here, so this is the one place activity is observed.
+  // One event carrying the whole live set, so a consumer renders "2 background tasks,
+  // 1 subagent" from a single payload instead of maintaining its own counters.
+  emitTaskSet() {
+    const tasks = [...this.backgroundTasks.values()];
+    this.emit({
+      type: "task/set",
+      sessionId: this.sessionId,
+      background: tasks.filter((task) => task.kind === "background").length,
+      subagents: tasks.filter((task) => task.kind === "subagent").length,
+      descriptions: tasks.map((task) => task.description).filter((text) => text !== void 0),
+      at: this.now()
+    });
+  }
   emit(event) {
     this.lastActiveAt = this.now();
     for (const listener of this.listeners) listener(event);
@@ -268,19 +285,17 @@ var ClaudeHostSession = class {
     const subtype = String(message.subtype ?? "");
     const taskId = typeof message.task_id === "string" ? message.task_id : void 0;
     if (subtype === "task_started" && taskId) {
-      this.backgroundTasks.set(taskId, { startedAt: this.now() });
-      this.emit({ type: "task/started", sessionId: this.sessionId, taskId, at: this.now() });
+      this.backgroundTasks.set(taskId, {
+        kind: classifyTask(message),
+        ...typeof message.description === "string" && message.description.length > 0 ? { description: message.description } : {},
+        startedAt: this.now()
+      });
+      this.emitTaskSet();
       return;
     }
     if (subtype === "task_notification" && taskId) {
       this.backgroundTasks.delete(taskId);
-      this.emit({
-        type: "task/settled",
-        sessionId: this.sessionId,
-        taskId,
-        status: String(message.status ?? "completed"),
-        at: this.now()
-      });
+      this.emitTaskSet();
       return;
     }
     if (subtype === "background_tasks_changed") {
@@ -290,17 +305,15 @@ var ClaudeHostSession = class {
         const id = typeof task.task_id === "string" ? task.task_id : void 0;
         if (!id) continue;
         live.add(id);
-        if (!this.backgroundTasks.has(id)) {
-          this.backgroundTasks.set(id, {
-            startedAt: this.now(),
-            ...typeof task.task_type === "string" ? { type: task.task_type } : {}
-          });
-        }
+        const existing = this.backgroundTasks.get(id);
+        this.backgroundTasks.set(id, {
+          kind: existing?.kind ?? classifyTask(task),
+          ...typeof task.description === "string" && task.description.length > 0 ? { description: task.description } : existing?.description === void 0 ? {} : { description: existing.description },
+          startedAt: existing?.startedAt ?? this.now()
+        });
       }
-      for (const id of [...this.backgroundTasks.keys()]) {
-        if (!live.has(id)) this.backgroundTasks.delete(id);
-      }
-      this.emit({ type: "task/set", sessionId: this.sessionId, taskIds: [...this.backgroundTasks.keys()], at: this.now() });
+      for (const id of [...this.backgroundTasks.keys()]) if (!live.has(id)) this.backgroundTasks.delete(id);
+      this.emitTaskSet();
       return;
     }
     if (subtype === "init") {

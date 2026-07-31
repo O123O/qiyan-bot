@@ -12,7 +12,10 @@ export type SessionActivity = "idle" | "working" | "background";
 
 export interface BackgroundTaskView {
   taskId: string;
-  taskType?: string;
+  // Task-tool subagents are distinguished from anything else Claude backgrounded, because
+  // the Web UI reports them separately.
+  kind: "subagent" | "background";
+  description?: string;
   startedAt: number;
 }
 
@@ -62,9 +65,8 @@ export type HostEvent =
   })
   | (HostEventBase & { type: "content/assistant"; message: Record<string, unknown> })
   | (HostEventBase & { type: "content/nested"; message: Record<string, unknown> })
-  | (HostEventBase & { type: "task/started"; taskId: string })
-  | (HostEventBase & { type: "task/settled"; taskId: string; status: string })
-  | (HostEventBase & { type: "task/set"; taskIds: string[] });
+  // The whole live set after any change, so a consumer never maintains its own counters.
+  | (HostEventBase & { type: "task/set"; background: number; subagents: number; descriptions: string[] });
 
 // One request per ClaudeHost method, so the server's dispatch is mechanical and the wire
 // cannot drift from the interface. `params` is the method's argument tuple.

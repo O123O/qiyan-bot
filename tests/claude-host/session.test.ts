@@ -213,3 +213,43 @@ test("sending to a closed session fails rather than silently dropping", async ()
   session.close();
   assert.throws(() => session.send("uuid-a", "hello"), /closed/);
 });
+
+// Claude's own background work is NOT conversation: when it finishes the agent reports and
+// that report is an ordinary end-of-turn. The set is tracked only to drive a live
+// "2 background tasks, 1 subagent running" indicator beside the composer.
+test("subagents and background tasks are counted separately for the activity indicator", async () => {
+  const { session, query, events } = makeSession();
+  query.push({ type: "system", subtype: "task_started", task_id: "bash-1", description: "npm test" });
+  query.push({ type: "system", subtype: "task_started", task_id: "agent-1", subagent_type: "Explore", description: "survey" });
+  await delay(5);
+
+  const latest = () => events.filter((event) => event.type === "task/set").at(-1) as any;
+  assert.equal(latest().background, 1, "a backgrounded Bash counts as a background task");
+  assert.equal(latest().subagents, 1, "a Task-tool subagent is counted separately");
+  assert.deepEqual(latest().descriptions.sort(), ["npm test", "survey"]);
+
+  query.push({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+  await delay(5);
+  assert.equal(latest().subagents, 0, "a settled subagent leaves the indicator");
+  assert.equal(latest().background, 1);
+  session.close();
+});
+
+// The SDK documents background_tasks_changed as REPLACE semantics, so it is authoritative
+// over the deltas — otherwise a missed notification pins a task on screen forever.
+test("the authoritative task set replaces tracked tasks rather than merging them", async () => {
+  const { session, query, events } = makeSession();
+  query.push({ type: "system", subtype: "task_started", task_id: "stale", description: "gone" });
+  await delay(5);
+  query.push({
+    type: "system", subtype: "background_tasks_changed",
+    tasks: [{ task_id: "live", task_type: "bash", description: "still going" }],
+  });
+  await delay(5);
+
+  const latest = events.filter((event) => event.type === "task/set").at(-1) as any;
+  assert.equal(latest.background, 1);
+  assert.deepEqual(latest.descriptions, ["still going"], "the vanished task is dropped");
+  assert.deepEqual(session.status().backgroundTasks.map((task) => task.taskId), ["live"]);
+  session.close();
+});

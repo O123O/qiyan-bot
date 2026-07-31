@@ -11,8 +11,11 @@
 //     user_message_uuid, so uuid correlation alone would hang the turn forever.
 //   - `session_state_changed` never fires, so idle is derived here: no in-flight turn
 //     and an empty background-task set.
-//   - Background tasks outlive their parent turn and report through
-//     `system/task_*` and `system/background_tasks_changed`.
+//   - Background work Claude starts for itself — backgrounded Bash and Task-tool
+//     subagents — outlives the turn that started it. It is NOT conversation: when the
+//     work finishes the agent reports, and that report is an ordinary end-of-turn. The
+//     set is tracked only so a live "2 background tasks, 1 subagent" indicator can be
+//     shown, and so a session that can still speak is never evicted.
 //   - Subagent content carries `parent_tool_use_id`; it is nested, never top-level.
 //   - Re-sending an accepted uuid is a no-op in the CLI, so retry after an ambiguous
 //     transport failure is safe and must not enqueue a second message here either.
@@ -85,6 +88,20 @@ interface AcceptedTurn {
   startedAt: number;
 }
 
+interface LiveTask {
+  // The SDK sets subagent_type only for Task-tool subagents; anything else Claude
+  // backgrounded (a long Bash command, a workflow) counts as a background task.
+  kind: "subagent" | "background";
+  description?: string;
+  startedAt: number;
+}
+
+function classifyTask(record: Record<string, unknown>): LiveTask["kind"] {
+  return typeof record.subagent_type === "string" && record.subagent_type.length > 0
+    ? "subagent"
+    : "background";
+}
+
 export class ClaudeHostSession {
   private readonly input = new InputStream();
   private readonly query: SessionQuery;
@@ -93,7 +110,7 @@ export class ClaudeHostSession {
   // queued messages in order, so the head is the turn a uuid-less result belongs to.
   private readonly inFlight: AcceptedTurn[] = [];
   private readonly acceptedUuids = new Set<string>();
-  private readonly backgroundTasks = new Map<string, { type?: string; startedAt: number }>();
+  private readonly backgroundTasks = new Map<string, LiveTask>();
   private closed = false;
   private lastActiveAt = 0;
   readonly drained: Promise<void>;
@@ -154,7 +171,8 @@ export class ClaudeHostSession {
       inFlightTurns: this.inFlight.map((turn) => turn.uuid),
       backgroundTasks: [...this.backgroundTasks.entries()].map(([id, task]) => ({
         taskId: id,
-        ...(task.type === undefined ? {} : { taskType: task.type }),
+        kind: task.kind,
+        ...(task.description === undefined ? {} : { description: task.description }),
         startedAt: task.startedAt,
       })),
     };
@@ -187,6 +205,20 @@ export class ClaudeHostSession {
 
   // Everything the session does — an accepted send, streamed content, a task change, a
   // settled turn — passes through here, so this is the one place activity is observed.
+  // One event carrying the whole live set, so a consumer renders "2 background tasks,
+  // 1 subagent" from a single payload instead of maintaining its own counters.
+  private emitTaskSet(): void {
+    const tasks = [...this.backgroundTasks.values()];
+    this.emit({
+      type: "task/set",
+      sessionId: this.sessionId,
+      background: tasks.filter((task) => task.kind === "background").length,
+      subagents: tasks.filter((task) => task.kind === "subagent").length,
+      descriptions: tasks.map((task) => task.description).filter((text): text is string => text !== undefined),
+      at: this.now(),
+    });
+  }
+
   private emit(event: HostEvent): void {
     this.lastActiveAt = this.now();
     for (const listener of this.listeners) listener(event);
@@ -246,40 +278,42 @@ export class ClaudeHostSession {
     const subtype = String(message.subtype ?? "");
     const taskId = typeof message.task_id === "string" ? message.task_id : undefined;
     if (subtype === "task_started" && taskId) {
-      this.backgroundTasks.set(taskId, { startedAt: this.now() });
-      this.emit({ type: "task/started", sessionId: this.sessionId, taskId, at: this.now() });
+      // skip_transcript marks ambient housekeeping the SDK asks consumers to hide from the
+      // conversation. It still belongs in a task indicator, which is all this set feeds.
+      this.backgroundTasks.set(taskId, {
+        kind: classifyTask(message),
+        ...(typeof message.description === "string" && message.description.length > 0
+          ? { description: message.description } : {}),
+        startedAt: this.now(),
+      });
+      this.emitTaskSet();
       return;
     }
     if (subtype === "task_notification" && taskId) {
       this.backgroundTasks.delete(taskId);
-      this.emit({
-        type: "task/settled",
-        sessionId: this.sessionId,
-        taskId,
-        status: String(message.status ?? "completed"),
-        at: this.now(),
-      });
+      this.emitTaskSet();
       return;
     }
     if (subtype === "background_tasks_changed") {
-      // Authoritative set — reconcile rather than trusting only the deltas above.
+      // REPLACE semantics per the SDK: this payload is the authoritative live set, so
+      // reconcile against it rather than trusting the task_started/notification deltas.
       const tasks = Array.isArray(message.tasks) ? message.tasks as Array<Record<string, unknown>> : [];
       const live = new Set<string>();
       for (const task of tasks) {
         const id = typeof task.task_id === "string" ? task.task_id : undefined;
         if (!id) continue;
         live.add(id);
-        if (!this.backgroundTasks.has(id)) {
-          this.backgroundTasks.set(id, {
-            startedAt: this.now(),
-            ...(typeof task.task_type === "string" ? { type: task.task_type } : {}),
-          });
-        }
+        const existing = this.backgroundTasks.get(id);
+        this.backgroundTasks.set(id, {
+          kind: existing?.kind ?? classifyTask(task),
+          ...(typeof task.description === "string" && task.description.length > 0
+            ? { description: task.description }
+            : existing?.description === undefined ? {} : { description: existing.description }),
+          startedAt: existing?.startedAt ?? this.now(),
+        });
       }
-      for (const id of [...this.backgroundTasks.keys()]) {
-        if (!live.has(id)) this.backgroundTasks.delete(id);
-      }
-      this.emit({ type: "task/set", sessionId: this.sessionId, taskIds: [...this.backgroundTasks.keys()], at: this.now() });
+      for (const id of [...this.backgroundTasks.keys()]) if (!live.has(id)) this.backgroundTasks.delete(id);
+      this.emitTaskSet();
       return;
     }
     if (subtype === "init") {

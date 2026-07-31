@@ -25,7 +25,10 @@ export type WorkerChatEvent =
   | { kind: "turn-started"; turnId: string; status?: string }
   | { kind: "turn-completed"; turnId: string; status?: string }
   | { kind: "item-started" | "item-completed"; turnId: string; item: WorkerChatItem; atMs?: number }
-  | { kind: "agent-message-delta"; turnId: string; itemId: string; delta: string };
+  | { kind: "agent-message-delta"; turnId: string; itemId: string; delta: string }
+  // Claude's own background work, shown as a live indicator beside the composer rather
+  // than as conversation. Providers that report none simply never send this.
+  | { kind: "tasks-updated"; background: number; subagents: number; descriptions: string[] };
 
 export interface WorkerEventEnvelope {
   type: "worker/event";
@@ -71,6 +74,9 @@ export interface WorkerStreamState {
   reconcilePending: boolean;
   recoveredTurnIds: string[];
   observedTurnIds: string[];
+  // Live count of the work Claude started for itself. Session-scoped, not turn-scoped: it
+  // outlives the turn that began it, so it is not part of the message list.
+  tasks?: { background: number; subagents: number; descriptions: string[] };
   terminalTurns: Array<{ turnId: string; status: string }>;
   historyInFlight: boolean;
   historyLoaded: boolean;
@@ -316,6 +322,12 @@ function compareMessages(left: WorkerChatMessage, right: WorkerChatMessage): num
 function applyEvent(state: WorkerStreamState, envelope: WorkerEventEnvelope): WorkerStreamState {
   const event = envelope.event;
   if (event.kind === "stream-discontinuity") return { ...state, reconcilePending: true };
+  if (event.kind === "tasks-updated") {
+    // An empty set clears the indicator rather than leaving a stale "1 subagent running".
+    return event.background === 0 && event.subagents === 0
+      ? { ...state, tasks: undefined }
+      : { ...state, tasks: { background: event.background, subagents: event.subagents, descriptions: event.descriptions } };
+  }
   if (event.kind === "turn-started") return state.observedTurnIds.includes(event.turnId)
     ? state
     : { ...state, observedTurnIds: [...state.observedTurnIds, event.turnId].slice(-MAX_TRACKED_TURN_IDS) };
