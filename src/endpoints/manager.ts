@@ -603,10 +603,10 @@ export class EndpointManager {
   }
 
   private scheduleReconnect(endpointId: string, record: EndpointRecord, generation: number, _kind: EndpointLossKind): void {
-    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation
-        || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
+        || record.gate.desiredState !== "automatic" || record.reconnect) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -617,8 +617,7 @@ export class EndpointManager {
       });
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
-        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic"
-          || record.recoveryPause) return;
+        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic") return;
         void this.activate(endpointId, false).catch((error) => {
           if (!this.pauseForRecovery(endpointId, record, generation, error)) {
             this.scheduleReconnect(endpointId, record, generation, "connection-lost");
@@ -631,11 +630,11 @@ export class EndpointManager {
   private scheduleActivationRetry(endpointId: string, record: EndpointRecord): void {
     const generation = record.generation;
     if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect
-      || record.endpoint?.state === "ready" || record.recoveryPause) return;
+      || record.endpoint?.state === "ready") return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.generation !== generation
         || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic"
-        || record.reconnect || record.recoveryPause) return;
+        || record.reconnect) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -664,6 +663,13 @@ export class EndpointManager {
     delete record.reconnect;
   }
 
+  // Records that recovery is blocked on a human (an ssh host with no fresh channel — MFA)
+  // and notifies once. It deliberately does NOT stop the reconnect backoff: the backoff
+  // already escalates to hourly and gives up after ~48h, which is the right cadence for a
+  // host waiting on a person, whereas stopping entirely meant nothing ever retried after
+  // the person acted. The pause was cleared only by a successful publish, and no publish
+  // could happen while every scheduler refused to run — so an endpoint stayed unreachable
+  // to QiYan long after it was reachable again.
   private pauseForRecovery(
     endpointId: string,
     record: EndpointRecord,
@@ -672,7 +678,6 @@ export class EndpointManager {
   ): boolean {
     const recovery = endpointRecoveryPause(error);
     if (!recovery || record.generation !== attemptedGeneration) return false;
-    this.cancelReconnect(record);
     if (record.recoveryPause?.reason !== recovery.reason || record.recoveryPause.sshHost !== recovery.sshHost) {
       record.recoveryPause = { ...recovery, notificationPrepared: false };
     }
