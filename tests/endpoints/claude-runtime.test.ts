@@ -29,6 +29,7 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   readonly transcriptChunkLengths: number[] = [];
   // Held open by a test that needs to act while a turn is still starting.
   openGate?: Promise<void>;
+  sendGate?: Promise<void> | undefined;
   private readonly listeners = new Set<(event: HostEvent) => void>();
   private readonly sessions = new Map<string, { cwd: string; inFlight: string[]; accepted: Set<string> }>();
   private readonly transcripts = new Map<string, unknown[]>();
@@ -54,6 +55,7 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   }
 
   async send(sessionId: string, uuid: string, text: string): Promise<boolean> {
+    if (this.sendGate) await this.sendGate;
     const session = this.require(sessionId);
     this.sends.push({ sessionId, uuid, text });
     if (session.accepted.has(uuid)) return false;
@@ -698,6 +700,35 @@ test("a settled turn unloads idle sessions above the budget, and a later turn re
   assert.equal(claude.isLoaded(first), true, "an unloaded thread reopens on its next turn");
   assert.deepEqual(claude.opens.map((request) => [request.sessionId, request.mode]),
     [[first, "create"], [second, "create"], [first, "resume"]]);
+});
+
+// A session is idle on the host between being opened and taking its message, so a sweep
+// triggered by another thread's turn completing could unload it out from under the send.
+test("eviction never unloads a session whose turn is still being started", async () => {
+  const claude = new FakeClaude();
+  let release!: () => void;
+  claude.sendGate = new Promise<void>((resolve) => { release = resolve; });
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", host: claude, runner: claude, launchFlags: {}, loadedSessionBudget: 1,
+  });
+  await rt.start();
+  const starting = (await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" })).thread.id;
+  const other = (await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" })).thread.id;
+
+  // Opened first, so it is the sweep's first eviction candidate, and still gated in send.
+  const pending = rt.request("turn/start", {
+    threadId: starting, clientUserMessageId: "s:1", input: [{ type: "text", text: "slow" }],
+  });
+  await delay(0);
+  claude.sendGate = undefined;
+  await rt.request("turn/start", { threadId: other, clientUserMessageId: "o:1", input: [{ type: "text", text: "quick" }] });
+  claude.answer(other, "quick answer");
+  await delay(5);
+
+  release();
+  const started = await pending as { turn: { id: string; status: string } };
+  assert.deepEqual(started.turn, { id: "s:1", status: "inProgress" });
+  assert.deepEqual(claude.sends.map((send) => send.uuid), ["o:1", "s:1"]);
 });
 
 // Native background tasks are the design: Claude owns them, and one settles after its

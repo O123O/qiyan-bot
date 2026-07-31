@@ -73,6 +73,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private readonly hostSubscription: () => void;
   private lifecycleGeneration = 0;
   private evicting?: Promise<void>;
+  private startingTurns = 0;
 
   constructor(private readonly options: {
     id: string;
@@ -169,7 +170,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // session/closed, which is what clears `loaded` above. Best effort: an unreachable host
   // has bigger problems than its session count, and the next turn tries again.
   private sweepIdleSessions(): void {
-    if (this.endpointState !== "ready" || this.evicting) return;
+    if (this.endpointState !== "ready" || this.evicting || this.startingTurns > 0) return;
     this.evicting = this.options.host
       .evictIdle(this.options.loadedSessionBudget ?? DEFAULT_LOADED_SESSION_BUDGET)
       .then(() => undefined, () => undefined)
@@ -511,6 +512,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       this.lifecycleGeneration === generation && this.threads.get(threadId) === state;
     let accepted: boolean;
     let alreadySettled = false;
+    // A session is idle on the host between being opened and taking this message, so an
+    // eviction sweep racing that window would unload it out from under the send.
+    this.startingTurns += 1;
     try {
       // Lazily load the session. `materialized` distinguishes creating the caller-chosen
       // native session id from resuming one that already exists on disk.
@@ -552,6 +556,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     } catch (error) {
       if (state.running?.turnId === clientId) delete state.running;
       throw error;
+    } finally {
+      this.startingTurns -= 1;
     }
     if (accepted) {
       this.emitter.emit("notification", "turn/started", {
