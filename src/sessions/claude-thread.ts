@@ -23,7 +23,9 @@ export type ClaudeTurnStatus = "completed" | "interrupted" | "failed" | "inProgr
 export type ClaudeMessagePhase = "final_answer" | "commentary";
 
 export interface ClaudeThreadItem {
-  type: "userMessage" | "agentMessage";
+  // contextCompaction is a marker, not content: compact_session correlates against it to
+  // know the native /compact took effect, and it carries no text.
+  type: "userMessage" | "agentMessage" | "contextCompaction";
   id: string;
   clientId?: string | null;
   content?: Array<{ type: "text"; text: string; text_elements: unknown[] }>;
@@ -121,6 +123,16 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
         terminal: false,
       };
       assistantRecordSeq = 0;
+      continue;
+    }
+
+    // Claude writes its compaction boundary into the transcript, so a turn reconstructed
+    // after a restart still carries the item compact_session correlates against.
+    if (type === "system" && record.subtype === "compact_boundary" && current) {
+      current.turn.items.push({
+        type: "contextCompaction",
+        id: `${idOf(record) ?? current.turn.id}:compaction`,
+      });
       continue;
     }
 

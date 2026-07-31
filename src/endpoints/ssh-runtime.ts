@@ -22,7 +22,7 @@ import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } fro
 
 export const REMOTE_HELPER_SHA256 = "885b9ecbdfa60c1e92013fc04c32dfef81528e4657d450ba7345ff9226877ab7";
 export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
-export const REMOTE_CLAUDE_HOST_SHA256 = "232aa562ea2a3186c088be0ab5bd212919c76af22efec4b9c5f912cfa516a785";
+export const REMOTE_CLAUDE_HOST_SHA256 = "4cc66e510703a9d04424f180595f63e79610d52310baebc84d40ddf9aa0d0585";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 export const REMOTE_CLAUDE_HOST_PROXY_READY = Buffer.from("qiyan-claude-host-proxy-v1-ready\n");

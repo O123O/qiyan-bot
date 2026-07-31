@@ -158,6 +158,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       });
       return;
     }
+    // compact_session waits for a contextCompaction item and times out without one, which
+    // left the manager's turn blocked on a reconciliation that never terminated. Claude
+    // reports its own boundary, so publish that as the item the tool is waiting for.
+    if (event.type === "session/compacted") {
+      const turnId = state.running[0] ?? state.lastTurnId;
+      if (!turnId) return;
+      this.emitter.emit("notification", "item/completed", {
+        threadId,
+        turnId,
+        item: { type: "contextCompaction", id: `${turnId}:compaction:${event.at}` },
+      });
+      return;
+    }
     if (event.type === "content/assistant") {
       // Top-level assistant text with no turn running is a native background task reporting
       // in after its parent turn. Claude writes those rows after the last turn's rows, and

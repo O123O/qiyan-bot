@@ -168,3 +168,15 @@ test("the phase rule is shared between the live path and reconstruction", () => 
     view.turns[0]!.items.filter((item) => item.type === "agentMessage").map((item) => [item.text, item.phase]),
     [["checking", "commentary"], ["done", "final_answer"]]);
 });
+
+// The transcript records the boundary too, so a turn reconstructed after a restart still
+// carries the item compact_session correlates against.
+test("a reconstructed turn carries its compaction boundary", () => {
+  const view = reconstructClaudeThread({ threadId: "s1", cwd: "/w", records: [
+    { type: "user", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "/compact" } },
+    { type: "system", subtype: "compact_boundary", uuid: "cb1", compactMetadata: { trigger: "manual" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } },
+  ] });
+  const kinds = view.turns[0]!.items.map((item) => item.type);
+  assert.ok(kinds.includes("contextCompaction"), `expected a compaction item, got ${kinds.join(",")}`);
+});

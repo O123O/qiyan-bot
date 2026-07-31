@@ -316,6 +316,16 @@ export class ClaudeHostSession {
       this.emitTaskSet();
       return;
     }
+    if (subtype === "compact_boundary") {
+      const metadata = (message.compact_metadata ?? {}) as Record<string, unknown>;
+      this.emit({
+        type: "session/compacted",
+        sessionId: this.sessionId,
+        trigger: typeof metadata.trigger === "string" ? metadata.trigger : "manual",
+        at: this.now(),
+      });
+      return;
+    }
     if (subtype === "init") {
       this.emit({ type: "session/init", sessionId: this.sessionId, message, at: this.now() });
     }

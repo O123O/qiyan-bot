@@ -1510,3 +1510,22 @@ test("the native goal is found on a transcript too large to scan whole", async (
   const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "huge" });
   assert.equal(read.goal?.objective, "ship it", "a goal on a large transcript is reported, not silently dropped");
 });
+
+// compact_session waits for a contextCompaction item and times out without one, which left
+// the manager's turn blocked on a reconciliation that never terminated. Claude reports its
+// own boundary; that IS the item the tool correlates against.
+test("a native compaction publishes the item compact_session waits for", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "/compact" }] });
+  const items: any[] = [];
+  rt.onNotification((method, params) => { if (method === "item/completed") items.push((params as any).item); });
+
+  claude.emit({ type: "session/compacted", sessionId: thread.id, trigger: "manual", at: 7 });
+
+  const compaction = items.find((item) => item.type === "contextCompaction");
+  assert.ok(compaction, "the boundary reaches the tool as a contextCompaction item");
+  assert.match(String(compaction.id), /ctx:a:compaction/u, "keyed to the turn that ran /compact");
+});

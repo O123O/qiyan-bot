@@ -50,6 +50,9 @@ interface HostEventBase {
 export type HostEvent =
   | (HostEventBase & { type: "session/init"; message: Record<string, unknown> })
   | (HostEventBase & { type: "session/error"; message: string })
+  // Claude compacted its own context. QiYan drives compaction through native /compact and
+  // needs the boundary to know the command actually took effect.
+  | (HostEventBase & { type: "session/compacted"; trigger: string })
   // The session is gone and will never produce another event: its query ended (cleanly or
   // because the `claude` child died), it was evicted, or it was closed outright. A consumer
   // holding "this thread is loaded" state must drop it and reopen on the next turn.
