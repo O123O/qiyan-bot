@@ -2,56 +2,145 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { ClaudeCodeRuntime } from "../../src/endpoints/claude-runtime.ts";
+import { ClaudeCodeRuntime, type ClaudePersistentRuntime } from "../../src/endpoints/claude-runtime.ts";
 import { CLAUDE_PAGE_WINDOW_BYTES, ClaudeTranscriptHistory } from "../../src/endpoints/claude-history.ts";
-import {
-  buildClaudeArgs,
-  type ClaudeCommandRunner,
-  type ClaudeTranscriptChunkRequest,
-  type ClaudeTurnRequest,
-  type ClaudeTurnStatus,
-} from "../../src/endpoints/claude-command-runner.ts";
+import type { ClaudeCommandRunner, ClaudeTranscriptChunkRequest } from "../../src/endpoints/claude-command-runner.ts";
+import type { ClaudeHost, OpenSessionRequest } from "../../src/claude-host/host.ts";
+import type { HostEvent, SessionStatus } from "../../src/claude-host/protocol.ts";
+import { ClaudeArchiveStore } from "../../src/sessions/claude-archives.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
-// A fake runner that simulates the transcript `claude -p` writes. Realistic: the
-// turn-start user row is written when the turn begins, but the terminal assistant
-// (end_turn) row appears only on genuine completion — an interrupted turn has none.
-class FakeRunner implements ClaudeCommandRunner {
-  readonly requests: ClaudeTurnRequest[] = [];
+// One fake standing in for both halves of a Claude endpoint: the host that runs turns
+// (one long-lived session per thread) and the native transcript Claude writes while they
+// run. They are one object because the invariant under test spans both — a QiYan turn id
+// IS the uuid handed to the host, and Claude preserves that uuid as the transcript user
+// row's own uuid, so live events and reconstructed history agree on identity.
+class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
+  readonly opens: OpenSessionRequest[] = [];
+  readonly sends: Array<{ sessionId: string; uuid: string; text: string }> = [];
+  readonly setModels: Array<{ sessionId: string; model?: string }> = [];
+  readonly setEfforts: Array<{ sessionId: string; effort?: string }> = [];
+  readonly interrupts: string[] = [];
+  readonly closes: string[] = [];
+  shutdowns = 0;
   transcriptReadCount = 0;
   readonly transcriptChunkLengths: number[] = [];
+  // Held open by a test that needs to act while a turn is still starting.
+  openGate?: Promise<void>;
+  private readonly listeners = new Set<(event: HostEvent) => void>();
+  private readonly sessions = new Map<string, { cwd: string; inFlight: string[]; accepted: Set<string> }>();
   private readonly transcripts = new Map<string, unknown[]>();
-  private readonly pending: Array<{ threadId: string; turnId: string; settle: (s: ClaudeTurnStatus) => void; settled: boolean }> = [];
+  private clock = 0;
+  private replies = 0;
 
-  startTurn(request: ClaudeTurnRequest) {
-    this.requests.push(request);
-    const recs = this.transcripts.get(request.threadId) ?? [];
-    const turnId = `prompt-${recs.length}`;
-    const userItemId = `u-${recs.length}`;
-    recs.push({ type: "user", cwd: request.cwd, promptSource: "sdk", promptId: turnId, uuid: userItemId, message: { role: "user", content: request.message } });
-    this.transcripts.set(request.threadId, recs);
-    let settle!: (s: ClaudeTurnStatus) => void;
-    const done = new Promise<ClaudeTurnStatus>((r) => { settle = r; });
-    const entry = { threadId: request.threadId, turnId, settle, settled: false };
-    this.pending.push(entry);
+  async open(request: OpenSessionRequest): Promise<SessionStatus> {
+    this.opens.push(request);
+    if (this.openGate) await this.openGate;
+    if (!this.sessions.has(request.sessionId)) {
+      this.sessions.set(request.sessionId, { cwd: request.cwd, inFlight: [], accepted: new Set() });
+    }
+    return await this.status(request.sessionId);
+  }
+
+  async close(sessionId: string): Promise<void> {
+    this.closes.push(sessionId);
+    const session = this.sessions.get(sessionId);
+    this.sessions.delete(sessionId);
+    // Ending a session's query settles whatever it was still running, which is the only
+    // terminal event a caller waiting on that turn will ever get.
+    for (const uuid of session?.inFlight.splice(0) ?? []) this.settle(sessionId, uuid, "interrupted");
+  }
+
+  async send(sessionId: string, uuid: string, text: string): Promise<boolean> {
+    const session = this.require(sessionId);
+    this.sends.push({ sessionId, uuid, text });
+    if (session.accepted.has(uuid)) return false;
+    session.accepted.add(uuid);
+    session.inFlight.push(uuid);
+    // Claude writes the user row as the turn begins, carrying the uuid it was handed.
+    this.append(sessionId, {
+      type: "user", cwd: session.cwd, promptSource: "sdk", uuid,
+      message: { role: "user", content: text },
+    });
+    return true;
+  }
+
+  async interrupt(sessionId: string): Promise<void> {
+    this.interrupts.push(sessionId);
+    // interrupt() ends only the active response; the session stays loaded and usable.
+    const session = this.require(sessionId);
+    for (const uuid of session.inFlight.splice(0)) this.settle(sessionId, uuid, "interrupted");
+  }
+
+  async status(sessionId: string): Promise<SessionStatus> {
+    const session = this.sessions.get(sessionId);
     return {
-      materialization: Promise.resolve({ turnId, userItemId }),
-      done,
-      interrupt: () => { if (!entry.settled) { entry.settled = true; entry.settle("failed"); } },
+      sessionId,
+      activity: (session?.inFlight.length ?? 0) > 0 ? "working" : "idle",
+      inFlightTurns: [...(session?.inFlight ?? [])],
+      backgroundTasks: [],
     };
   }
-  complete(status: ClaudeTurnStatus = "completed") {
-    const entry = this.pending.find((p) => !p.settled);
-    if (!entry) return;
-    entry.settled = true;
-    if (status === "completed") {
-      const recs = this.transcripts.get(entry.threadId)!;
-      recs.push({ type: "assistant", uuid: `a-${recs.length}`, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `reply to ${entry.turnId}` }] } });
-    }
-    entry.settle(status);
+
+  async setModel(sessionId: string, model?: string): Promise<void> {
+    this.require(sessionId);
+    this.setModels.push({ sessionId, ...(model === undefined ? {} : { model }) });
   }
+
+  async setEffort(sessionId: string, effort?: string): Promise<void> {
+    this.require(sessionId);
+    this.setEfforts.push({ sessionId, ...(effort === undefined ? {} : { effort }) });
+  }
+
+  async models(): Promise<unknown[]> { return []; }
+  async stopTask(): Promise<void> {}
+
+  subscribe(listener: (event: HostEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  async evictIdle(): Promise<string[]> { return []; }
+
+  async shutdown(): Promise<void> {
+    this.shutdowns += 1;
+    for (const sessionId of [...this.sessions.keys()]) await this.close(sessionId);
+  }
+
+  isLoaded(sessionId: string): boolean { return this.sessions.has(sessionId); }
+  inFlight(sessionId: string): string[] { return [...(this.sessions.get(sessionId)?.inFlight ?? [])]; }
+
+  // Claude answers. The SDK streams the assistant message and Claude writes the matching
+  // transcript row under the SAME uuid — that identity is what keeps the live item id and
+  // the reconstructed one equal, so the Web UI merges them instead of rendering both.
+  reply(sessionId: string, text: string): string {
+    const session = this.require(sessionId);
+    const uuid = `agent-${this.replies++}`;
+    const message = { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text }] };
+    this.append(sessionId, { type: "assistant", cwd: session.cwd, uuid, message });
+    this.emit({ type: "content/assistant", sessionId, message: { uuid, message }, at: this.clock += 1 });
+    return uuid;
+  }
+
+  // The turn's terminal result, settling the oldest accepted send (SDK ordering).
+  complete(sessionId: string, status: "completed" | "failed" = "completed"): void {
+    const uuid = this.require(sessionId).inFlight.shift();
+    if (uuid !== undefined) this.settle(sessionId, uuid, status);
+  }
+
+  // A whole answered turn, the way a real session delivers one.
+  answer(sessionId: string, text: string): string {
+    const uuid = this.reply(sessionId, text);
+    this.complete(sessionId);
+    return uuid;
+  }
+
+  // The one-shot `claude -p` engine is retired: turns run on the host, never the runner,
+  // which survives only as the transcript/discovery source.
+  startTurn(): never { throw new Error("claude turns run through the host, not the runner"); }
+
   async readTranscriptChunk(threadId: string, _cwd: string, request: ClaudeTranscriptChunkRequest) {
     this.transcriptReadCount += 1;
     this.transcriptChunkLengths.push(request.length);
@@ -63,19 +152,53 @@ class FakeRunner implements ClaudeCommandRunner {
     const offset = request.offset === "tail" ? Math.max(0, all.length - request.length) : request.offset;
     return { snapshot, offset, bytes: all.subarray(offset, Math.min(all.length, offset + request.length)) };
   }
+
   seed(threadId: string, records: unknown[]): void { this.transcripts.set(threadId, records); }
   async transcriptPath(threadId: string) { return this.transcripts.has(threadId) ? `/fake/${threadId}.jsonl` : undefined; }
   async listThreads(cwd?: string) {
     return [...this.transcripts.keys()].map((id) => ({ id, cwd: cwd ?? "/fake", updatedAt: 0, preview: "" }));
   }
+
+  private append(threadId: string, record: unknown): void {
+    const records = this.transcripts.get(threadId) ?? [];
+    records.push(record);
+    this.transcripts.set(threadId, records);
+  }
+
+  private settle(sessionId: string, uuid: string, status: "completed" | "failed" | "interrupted"): void {
+    this.emit({ type: "turn/completed", sessionId, origin: "human", uuid, status, at: this.clock += 1 });
+  }
+
+  private emit(event: HostEvent): void { for (const listener of this.listeners) listener(event); }
+
+  private require(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`claude session is not loaded: ${sessionId}`);
+    return session;
+  }
 }
 
-function makeRuntime(runner: ClaudeCommandRunner) {
-  return new ClaudeCodeRuntime({ id: "claude-local", runner, launchFlags: { model: "claude-opus-4-8" } });
+function makeRuntime(claude: FakeClaude, launchFlags: { model?: string; effort?: string } = { model: "claude-opus-4-8" }) {
+  return new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags });
+}
+
+// A remote endpoint: the host outlives QiYan, so lifecycle runs through the persistent
+// runtime rather than the in-process host.
+function persistentRuntime(overrides: Partial<ClaudePersistentRuntime> = {}): ClaudePersistentRuntime {
+  return {
+    async start() {},
+    async closeConnection() {},
+    async shutdownRuntime() {},
+    async runtimeIdentity() { return undefined; },
+    onUnavailable() { return () => undefined; },
+    async recoverTurn() { return undefined; },
+    async releaseThread() {},
+    ...overrides,
+  };
 }
 
 test("a persistent Claude backend owns endpoint lifecycle without killing an in-flight turn on detach", async () => {
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   const identity = {
     kind: "ssh" as const,
     token: "0123456789abcdef0123456789abcdef",
@@ -83,33 +206,27 @@ test("a persistent Claude backend owns endpoint lifecycle without killing an in-
     linuxStartTime: "456",
     processGroupId: 123,
   };
-  const listeners = new Set<(kind: "connection-lost" | "runtime-lost") => void>();
-  const persistent = {
-    starts: 0,
-    closes: 0,
-    stops: [] as unknown[],
-    async start() { this.starts += 1; },
-    async closeConnection() { this.closes += 1; },
-    async shutdownRuntime(expected: unknown) { this.stops.push(expected); },
+  const stops: unknown[] = [];
+  let starts = 0;
+  let closes = 0;
+  const persistent = persistentRuntime({
+    async start() { starts += 1; },
+    async closeConnection() { closes += 1; },
+    async shutdownRuntime(expected) { stops.push(expected); },
     async runtimeIdentity() { return identity; },
-    onUnavailable(listener: (kind: "connection-lost" | "runtime-lost") => void) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    async recoverTurn() { return undefined; },
-    async releaseThread() {},
-  };
+  });
   const rt = new ClaudeCodeRuntime({
     id: "claude-remote",
-    runner,
+    host: claude,
+    runner: claude,
     launchFlags: {},
     persistentRuntime: persistent,
-  } as any);
+  });
 
   assert.equal(rt.daemonless, false);
   await rt.start();
-  assert.equal(persistent.starts, 1);
-  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  assert.equal(starts, 1);
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
   await rt.request("turn/start", {
     threadId: thread.id,
     clientUserMessageId: "ctx:persist",
@@ -117,57 +234,48 @@ test("a persistent Claude backend owns endpoint lifecycle without killing an in-
   });
 
   await rt.closeConnection();
-  assert.equal(persistent.closes, 1);
-  assert.equal((runner as any).pending[0]?.settled, false, "detach must not interrupt the remote process");
+  assert.equal(closes, 1);
+  assert.equal(claude.shutdowns, 0, "detaching must not shut down the remote host");
+  assert.deepEqual(claude.inFlight(thread.id), ["ctx:persist"], "the remote turn keeps running");
   assert.deepEqual(await rt.runtimeIdentity(), identity);
   await rt.shutdownRuntime(identity);
-  assert.deepEqual(persistent.stops, [identity]);
+  assert.deepEqual(stops, [identity]);
 });
 
-test("cold resume restores an active remote Claude turn from the persistent pane", async () => {
-  const runner = new FakeRunner();
-  runner.seed("remote-live", [
-    {
-      type: "user",
-      cwd: "/remote/work",
-      promptSource: "sdk",
-      promptId: "prompt-live",
-      uuid: "user-live",
-      message: { role: "user", content: "work\n\n<!-- qiyan-cid:ctx:live -->" },
-    },
-  ]);
-  let settle!: (status: ClaudeTurnStatus) => void;
-  const recoveredHandle = {
-    done: new Promise<ClaudeTurnStatus>((resolve) => { settle = resolve; }),
-    interrupt() {},
-  };
-  const persistent = {
-    async start() {},
-    async closeConnection() {},
-    async shutdownRuntime() {},
-    async runtimeIdentity() { return undefined; },
-    onUnavailable() { return () => undefined; },
-    async recoverTurn(threadId: string) {
-      return threadId === "remote-live"
-        ? { turnId: "ctx:live", handle: recoveredHandle }
-        : undefined;
-    },
-    async releaseThread() {},
-  };
+test("cold resume adopts the turn the persistent host reports still running", async () => {
+  const claude = new FakeClaude();
+  claude.seed("remote-live", [{
+    type: "user",
+    cwd: "/remote/work",
+    promptSource: "sdk",
+    uuid: "ctx:live",
+    message: { role: "user", content: "work" },
+  }]);
   const rt = new ClaudeCodeRuntime({
     id: "claude-remote",
-    runner,
+    host: claude,
+    runner: claude,
     launchFlags: {},
-    persistentRuntime: persistent,
-  } as any);
+    persistentRuntime: persistentRuntime({
+      async recoverTurn(threadId: string) {
+        return threadId === "remote-live" ? { turnId: "ctx:live" } : undefined;
+      },
+    }),
+  });
   await rt.start();
 
-  const resumed = await rt.request<{ thread: any }>("thread/resume", {
+  const resumed = await rt.request<{ thread: { status: unknown } }>("thread/resume", {
     threadId: "remote-live",
     cwd: "/remote/work",
     excludeTurns: true,
   });
   assert.deepEqual(resumed.thread.status, { type: "active" });
+  // The adopted turn is still in progress, not silently reported interrupted like a
+  // trailing row left behind by a dead process.
+  const read = await rt.request<{ thread: { turns: Array<{ id: string; status: string }> } }>(
+    "thread/read", { threadId: "remote-live", includeTurns: true },
+  );
+  assert.deepEqual(read.thread.turns.map((turn) => [turn.id, turn.status]), [["ctx:live", "inProgress"]]);
   await assert.rejects(
     rt.request("turn/start", {
       threadId: "remote-live",
@@ -176,42 +284,33 @@ test("cold resume restores an active remote Claude turn from the persistent pane
     }),
     /already running/u,
   );
-  settle("failed");
 });
 
 test("concurrent cold resumes share one state load and one persistent turn recovery", async () => {
-  const runner = new FakeRunner();
-  runner.seed("remote-shared", [{
+  const claude = new FakeClaude();
+  claude.seed("remote-shared", [{
     type: "user",
     cwd: "/remote/work",
     promptSource: "sdk",
-    promptId: "prompt-shared",
-    uuid: "user-shared",
-    message: { role: "user", content: "work\n\n<!-- qiyan-cid:ctx:shared -->" },
+    uuid: "ctx:shared",
+    message: { role: "user", content: "work" },
   }]);
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let recoveries = 0;
-  const recoveredHandle = { done: new Promise<ClaudeTurnStatus>(() => undefined), interrupt() {} };
-  const persistent = {
-    async start() {},
-    async closeConnection() {},
-    async shutdownRuntime() {},
-    async runtimeIdentity() { return undefined; },
-    onUnavailable() { return () => undefined; },
-    async recoverTurn() {
-      recoveries += 1;
-      await gate;
-      return { turnId: "ctx:shared", handle: recoveredHandle };
-    },
-    async releaseThread() {},
-  };
   const rt = new ClaudeCodeRuntime({
     id: "claude-remote",
-    runner,
+    host: claude,
+    runner: claude,
     launchFlags: {},
-    persistentRuntime: persistent,
-  } as any);
+    persistentRuntime: persistentRuntime({
+      async recoverTurn() {
+        recoveries += 1;
+        await gate;
+        return { turnId: "ctx:shared" };
+      },
+    }),
+  });
   await rt.start();
 
   const first = rt.request("thread/resume", {
@@ -233,21 +332,15 @@ test("concurrent cold resumes share one state load and one persistent turn recov
 
 test("cold archive and unsubscribe always release persistent remote materialization", async () => {
   const released: string[] = [];
-  const persistent = {
-    async start() {},
-    async closeConnection() {},
-    async shutdownRuntime() {},
-    async runtimeIdentity() { return undefined; },
-    onUnavailable() { return () => undefined; },
-    async recoverTurn() { return undefined; },
-    async releaseThread(threadId: string) { released.push(threadId); },
-  };
   const rt = new ClaudeCodeRuntime({
     id: "claude-remote",
-    runner: new FakeRunner(),
+    host: new FakeClaude(),
+    runner: new FakeClaude(),
     launchFlags: {},
-    persistentRuntime: persistent,
-  } as any);
+    persistentRuntime: persistentRuntime({
+      async releaseThread(threadId: string) { released.push(threadId); },
+    }),
+  });
   await rt.start();
 
   await rt.request("thread/archive", { threadId: "cold-archive" });
@@ -255,22 +348,11 @@ test("cold archive and unsubscribe always release persistent remote materializat
   assert.deepEqual(released, ["cold-archive", "cold-unsubscribe"]);
 });
 
-test("a Claude thread reserves its start before asynchronous turn preparation", async () => {
-  const delegate = new FakeRunner();
+test("a Claude thread reserves its start before the session finishes opening", async () => {
+  const claude = new FakeClaude();
   let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  let starts = 0;
-  const runner: ClaudeCommandRunner = {
-    async startTurn(request) {
-      starts += 1;
-      await gate;
-      return delegate.startTurn(request);
-    },
-    readTranscriptChunk: (...args) => delegate.readTranscriptChunk(...args),
-    transcriptPath: (threadId) => delegate.transcriptPath(threadId),
-    listThreads: (...args) => delegate.listThreads(...args),
-  };
-  const rt = makeRuntime(runner);
+  claude.openGate = new Promise<void>((resolve) => { release = resolve; });
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
   const first = rt.request("turn/start", {
@@ -291,22 +373,18 @@ test("a Claude thread reserves its start before asynchronous turn preparation", 
   release();
   const [firstOutcome, secondOutcome] = await Promise.all([Promise.allSettled([first]).then((items) => items[0]!), second]);
 
-  assert.equal(starts, 1);
+  assert.equal(claude.opens.length, 1, "the second turn must not open a second session");
   assert.equal(firstOutcome.status, "fulfilled");
   assert.equal(secondOutcome.status, "rejected");
   assert.match(String(secondOutcome.status === "rejected" ? secondOutcome.reason : ""), /already running/u);
+  assert.deepEqual(claude.sends.map((send) => send.uuid), ["ctx:first"]);
 });
 
-test("shutdown fences a local turn before an asynchronous preparation can spawn it", async () => {
-  const runner = new FakeRunner();
+test("a close racing a session open fences the turn and unloads the session it opened", async () => {
+  const claude = new FakeClaude();
   let release!: () => void;
-  const gate = new Promise<string | undefined>((resolve) => { release = () => resolve(undefined); });
-  const rt = new ClaudeCodeRuntime({
-    id: "claude-local",
-    runner,
-    launchFlags: {},
-    workerMcpConfigPath: () => gate,
-  });
+  claude.openGate = new Promise<void>((resolve) => { release = resolve; });
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
   const pending = rt.request("turn/start", {
@@ -319,94 +397,28 @@ test("shutdown fences a local turn before an asynchronous preparation can spawn 
   release();
 
   await assert.rejects(pending, /endpoint changed while its turn was starting/u);
-  assert.equal(runner.requests.length, 0);
+  // The session that finished opening after the shutdown swept the host must not be left
+  // loaded: nothing would ever observe or interrupt a turn running inside it.
+  assert.deepEqual(claude.sends, []);
+  assert.equal(claude.isLoaded(thread.id), false);
   assert.equal(rt.state, "stopped");
-});
-
-test("closing a local endpoint interrupts a child waiting for native JSONL materialization", async () => {
-  let interrupted = false;
-  const runner = new FakeRunner();
-  const blocked: ClaudeCommandRunner = {
-    startTurn() {
-      return {
-        materialization: new Promise(() => undefined),
-        done: new Promise(() => undefined),
-        interrupt() { interrupted = true; },
-      };
-    },
-    readTranscriptChunk: (...args) => runner.readTranscriptChunk(...args),
-    transcriptPath: (threadId) => runner.transcriptPath(threadId),
-    listThreads: (...args) => runner.listThreads(...args),
-  };
-  const rt = makeRuntime(blocked);
-  await rt.start();
-  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
-  const pending = rt.request("turn/start", {
-    threadId: thread.id,
-    clientUserMessageId: "ctx:materializing",
-    input: [{ type: "text", text: "wait for JSONL" }],
-  });
-  await delay(0);
-
-  await rt.closeConnection();
-
-  assert.equal(interrupted, true);
-  await Promise.race([pending.catch(() => undefined), delay(10)]);
-});
-
-test("closing a local endpoint interrupts a handle returned after asynchronous runner preparation", async () => {
-  let release!: () => void;
-  const startGate = new Promise<void>((resolve) => { release = resolve; });
-  let interrupted = false;
-  const delegate = new FakeRunner();
-  const runner: ClaudeCommandRunner = {
-    async startTurn() {
-      await startGate;
-      return {
-        materialization: new Promise(() => undefined),
-        done: new Promise(() => undefined),
-        interrupt() { interrupted = true; },
-      };
-    },
-    readTranscriptChunk: (...args) => delegate.readTranscriptChunk(...args),
-    transcriptPath: (threadId) => delegate.transcriptPath(threadId),
-    listThreads: (...args) => delegate.listThreads(...args),
-  };
-  const rt = makeRuntime(runner);
-  await rt.start();
-  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
-  const pending = rt.request("turn/start", {
-    threadId: thread.id,
-    clientUserMessageId: "ctx:late-handle",
-    input: [{ type: "text", text: "wait for runner" }],
-  });
-  await delay(0);
-
-  await rt.closeConnection();
-  release();
-  await assert.rejects(pending, /endpoint changed while its turn was starting/u);
-  assert.equal(interrupted, true);
 });
 
 test("a close racing persistent startup cannot republish the endpoint as ready", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let closes = 0;
-  const persistent = {
-    async start() { await gate; },
-    async closeConnection() { closes += 1; },
-    async shutdownRuntime() {},
-    async runtimeIdentity() { return undefined; },
-    onUnavailable() { return () => undefined; },
-    async recoverTurn() { return undefined; },
-    async releaseThread() {},
-  };
+  const claude = new FakeClaude();
   const rt = new ClaudeCodeRuntime({
     id: "claude-remote",
-    runner: new FakeRunner(),
+    host: claude,
+    runner: claude,
     launchFlags: {},
-    persistentRuntime: persistent,
-  } as any);
+    persistentRuntime: persistentRuntime({
+      async start() { await gate; },
+      async closeConnection() { closes += 1; },
+    }),
+  });
   const starting = rt.start();
   await delay(0);
   await rt.closeConnection();
@@ -417,9 +429,9 @@ test("a close racing persistent startup cannot republish the endpoint as ready",
   assert.ok(closes >= 1);
 });
 
-test("thread/start reserves an idle empty thread without spawning", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+test("thread/start reserves an idle empty thread without loading a session", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   assert.equal(rt.state, "ready");
   const started = await rt.request<{ thread: any; model?: string }>(
@@ -433,15 +445,11 @@ test("thread/start reserves an idle empty thread without spawning", async () => 
   assert.deepEqual(thread.status, { type: "idle" });
   assert.deepEqual(thread.turns, []);
   assert.equal(started.model, "claude-opus-4-8");
-  assert.equal(runner.requests.length, 0); // no subprocess yet
+  assert.deepEqual(claude.opens, [], "no session is loaded until a turn runs");
 });
 
 test("an unpinned Claude endpoint reports its catalog model and effort defaults", async () => {
-  const rt = new ClaudeCodeRuntime({
-    id: "claude-default",
-    runner: new FakeRunner(),
-    launchFlags: {},
-  });
+  const rt = makeRuntime(new FakeClaude(), {});
   await rt.start();
 
   const started = await rt.request<{ model?: string; reasoningEffort?: string }>(
@@ -456,12 +464,12 @@ test("an unpinned Claude endpoint reports its catalog model and effort defaults"
 });
 
 test("managed cold resume recreates an unmaterialized thread and accepts its first turn", async () => {
-  const runner = new FakeRunner();
-  const original = makeRuntime(runner);
+  const claude = new FakeClaude();
+  const original = makeRuntime(claude);
   await original.start();
-  const { thread } = await original.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const { thread } = await original.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
 
-  const recovered = makeRuntime(runner);
+  const recovered = makeRuntime(claude);
   await recovered.start();
   const resumed = await recovered.request<{ thread: any; model?: string }>("thread/resume", {
     threadId: thread.id,
@@ -477,13 +485,14 @@ test("managed cold resume recreates an unmaterialized thread and accepts its fir
     clientUserMessageId: "ctx:recovered",
     input: [{ type: "text", text: "continue" }],
   });
-  assert.equal(runner.requests.at(-1)?.threadId, thread.id);
-  assert.equal(runner.requests.at(-1)?.resume, false);
+  // Nothing was ever written for this id, so the session is still created (reserving the
+  // caller's uuid as the native session id), not resumed.
+  assert.deepEqual(claude.opens.at(-1), { sessionId: thread.id, mode: "create", cwd: "/w", model: "claude-opus-4-8" });
 });
 
-test("first turn uses --session-id, resumes after; turn/completed fires; thread/read is authoritative", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+test("the first turn creates the native session and the next resumes it; the caller's id is the turn id", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   const notifications: Array<{ method: string; params: any }> = [];
   rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
@@ -492,54 +501,99 @@ test("first turn uses --session-id, resumes after; turn/completed fires; thread/
   const threadId = thread.id;
 
   const started = await rt.request<{ turn: any }>("turn/start", { threadId, clientUserMessageId: "ctx:call-1", input: [{ type: "text", text: "hello" }] });
-  assert.deepEqual(started.turn, { id: "prompt-0", status: "inProgress" });
-  assert.equal(runner.requests[0]?.message, "hello", "QiYan must not append correlation metadata to Claude input");
-  assert.equal(runner.requests[0]?.resume, false); // --session-id on the first turn
+  assert.deepEqual(started.turn, { id: "ctx:call-1", status: "inProgress" });
+  assert.deepEqual(claude.opens, [{ sessionId: threadId, mode: "create", cwd: "/w", model: "claude-opus-4-8" }]);
+  assert.deepEqual(claude.sends, [{ sessionId: threadId, uuid: "ctx:call-1", text: "hello" }],
+    "QiYan must not append correlation metadata to Claude input");
 
-  runner.complete("completed");
+  const agentUuid = claude.answer(threadId, "reply to hello");
   await delay(5);
   assert.deepEqual(notifications, [
-    { method: "turn/started", params: { threadId, turn: { id: "prompt-0", status: "inProgress" } } },
+    { method: "turn/started", params: { threadId, turn: { id: "ctx:call-1", status: "inProgress" } } },
     {
       method: "item/started",
       params: {
         threadId,
-        turnId: "prompt-0",
+        turnId: "ctx:call-1",
         item: {
           type: "userMessage",
-          id: "u-0",
-          clientId: null,
+          id: "ctx:call-1",
+          clientId: "ctx:call-1",
           content: [{ type: "text", text: "hello", text_elements: [] }],
         },
       },
     },
-    { method: "turn/completed", params: { threadId, turn: { id: "prompt-0" } } },
+    {
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId: "ctx:call-1",
+        item: { type: "agentMessage", id: `${agentUuid}:0`, text: "reply to hello" },
+      },
+    },
+    { method: "turn/completed", params: { threadId, turn: { id: "ctx:call-1" } } },
   ]);
 
   const read = await rt.request<{ thread: any }>("thread/read", { threadId, includeTurns: true });
   assert.equal(read.thread.turns.length, 1);
   const turn = read.thread.turns[0];
-  assert.equal(turn.id, "prompt-0");
+  assert.equal(turn.id, "ctx:call-1", "the reconstructed turn id is the id the live stream reported");
   assert.equal(turn.status, "completed");
   assert.equal(turn.itemsView, "full");
   assert.equal(turn.items[0].type, "userMessage");
-  assert.equal(turn.items[0].clientId, null);
   const final = turn.items.find((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
-  assert.equal(final.text, "reply to prompt-0");
+  assert.equal(final.text, "reply to hello");
 
-  // second turn resumes
+  // The second turn resumes the native session rather than recreating it.
   await rt.request("turn/start", { threadId, clientUserMessageId: "ctx:call-2", input: [{ type: "text", text: "again" }] });
-  assert.equal(runner.requests[1]?.resume, true); // --resume after materialization
+  assert.equal(claude.opens.length, 1, "a loaded session is reused without reopening");
+  assert.deepEqual(claude.sends.at(-1), { sessionId: threadId, uuid: "ctx:call-2", text: "again" });
+});
+
+test("a live agentMessage carries the same item id thread/read later reports for that block", async () => {
+  // The Web UI keys rows by (turnId, itemId). If the live id and the reconstructed id
+  // diverge, every answer renders twice after a reload.
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const live: Array<{ id: string; text: string }> = [];
+  rt.onNotification((method, params) => {
+    const item = (params as { item?: { type?: string; id: string; text: string } }).item;
+    if (method === "item/completed" && item?.type === "agentMessage") live.push({ id: item.id, text: item.text });
+  });
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:ids", input: "hi" });
+  claude.answer(thread.id, "the answer");
+  await delay(5);
+
+  const read = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
+  const historical = read.thread.turns[0].items
+    .filter((item: any) => item.type === "agentMessage")
+    .map((item: any) => ({ id: item.id, text: item.text }));
+  assert.deepEqual(live, historical);
+});
+
+test("a session that resumes an on-disk transcript opens in resume mode", async () => {
+  const claude = new FakeClaude();
+  claude.seed("prior", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "ctx:prior", message: { role: "user", content: "earlier" } },
+    { type: "assistant", cwd: "/w", uuid: "prior-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "prior", cwd: "/w", excludeTurns: true });
+  await rt.request("turn/start", { threadId: "prior", clientUserMessageId: "ctx:next", input: "more" });
+  assert.deepEqual(claude.opens, [{ sessionId: "prior", mode: "resume", cwd: "/w", model: "claude-opus-4-8" }]);
 });
 
 test("Claude paging uses bounded native transcript windows without backend retention", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   for (const clientId of ["ctx:one", "ctx:two"]) {
     await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: clientId, input: [{ type: "text", text: clientId }] });
-    runner.complete("completed");
+    claude.answer(thread.id, `reply to ${clientId}`);
     await delay(5);
   }
 
@@ -548,61 +602,60 @@ test("Claude paging uses bounded native transcript windows without backend reten
     threadId: thread.id, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
   } as any);
   assert.deepEqual(latest.data.map((turn: any) => ({ id: turn.id, itemsView: turn.itemsView, items: turn.items })), [
-    { id: "prompt-2", itemsView: "notLoaded", items: [] },
+    { id: "ctx:two", itemsView: "notLoaded", items: [] },
   ]);
   assert.equal(typeof latest.nextCursor, "string");
 
   const older = await history.turnsPage(thread.id, {
     cursor: latest.nextCursor!, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
   });
-  assert.deepEqual(older.data.map((turn: any) => turn.id), ["prompt-0"]);
+  assert.deepEqual(older.data.map((turn: any) => turn.id), ["ctx:one"]);
   assert.equal(older.nextCursor, null);
 
-  const exact = await history.exactTurnItems(thread.id, "prompt-2", {
+  const exact = await history.exactTurnItems(thread.id, "ctx:two", {
     budget: createHistoryScanBudget(),
   });
   assert.equal(exact.items[0]?.type, "userMessage");
-  assert.equal(exact.items[0]?.clientId, null);
   assert.equal(exact.turn.itemsView, "full");
-  assert.equal(runner.transcriptReadCount, 4);
-  assert.ok(runner.transcriptChunkLengths.every((length) => length <= 4 * 1024 * 1024));
+  assert.equal(claude.transcriptReadCount, 4);
+  assert.ok(claude.transcriptChunkLengths.every((length) => length <= 4 * 1024 * 1024));
 
   const metadata = await rt.request<any>("thread/read", { threadId: thread.id, includeTurns: false });
   assert.deepEqual(metadata.thread.turns, []);
   assert.deepEqual((await rt.request<any>("thread/read", { threadId: thread.id })).thread.turns, []);
   assert.equal(metadata.thread.status.type, "idle");
-  assert.equal(runner.transcriptReadCount, 4);
+  assert.equal(claude.transcriptReadCount, 4);
   const resumed = await rt.request<any>("thread/resume", { threadId: thread.id, excludeTurns: true });
   assert.deepEqual(resumed.thread.turns, []);
-  assert.equal(runner.transcriptReadCount, 4);
+  assert.equal(claude.transcriptReadCount, 4);
   const afterResume = new ThreadHistoryReader((method, params) => rt.request(method, params));
   const stillPersisted = await afterResume.turnsPage(thread.id, { limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
-  assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["prompt-0", "prompt-2"]);
-  const persisted = await afterResume.exactTurnItems(thread.id, "prompt-2", {
+  assert.deepEqual(stillPersisted.data.map((turn: any) => turn.id), ["ctx:one", "ctx:two"]);
+  const persisted = await afterResume.exactTurnItems(thread.id, "ctx:two", {
     budget: createHistoryScanBudget(),
   });
   assert.equal(persisted.items[0]?.type, "userMessage");
-  assert.equal(runner.transcriptReadCount, 7);
+  assert.equal(claude.transcriptReadCount, 7);
 });
 
 test("descending Claude paging preserves a turn exactly aligned with the prior window boundary", async () => {
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   const threadId = "aligned-history";
   const cwd = "/w";
   const prefix = { type: "system", cwd, value: "prefix" };
-  const older = { type: "user", cwd, promptSource: "sdk", promptId: "older", uuid: "older-user", message: { role: "user", content: "older" } };
+  const older = { type: "user", cwd, promptSource: "sdk", uuid: "older", message: { role: "user", content: "older" } };
   const olderEndBase = { type: "assistant", cwd, uuid: "older-agent", padding: "", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "older reply" }] } };
   const lineBytes = (record: unknown): number => Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8");
   const paddingBytes = CLAUDE_PAGE_WINDOW_BYTES - lineBytes(older) - lineBytes(olderEndBase);
   assert.ok(paddingBytes > 0);
   const olderEnd = { ...olderEndBase, padding: "x".repeat(paddingBytes) };
-  const newer = { type: "user", cwd, promptSource: "sdk", promptId: "newer", uuid: "newer-user", message: { role: "user", content: "newer" } };
+  const newer = { type: "user", cwd, promptSource: "sdk", uuid: "newer", message: { role: "user", content: "newer" } };
   const newerEnd = { type: "assistant", cwd, uuid: "newer-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "newer reply" }] } };
   const records = [prefix, older, olderEnd, newer, newerEnd];
   assert.equal(lineBytes(older) + lineBytes(olderEnd), CLAUDE_PAGE_WINDOW_BYTES);
-  runner.seed(threadId, records);
+  claude.seed(threadId, records);
 
-  const history = new ClaudeTranscriptHistory(runner);
+  const history = new ClaudeTranscriptHistory(claude);
   const latest = await history.turnsPage(threadId, cwd, { limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
   assert.deepEqual(latest.data.map((turn) => turn.id), ["newer"]);
   assert.equal(typeof latest.nextCursor, "string");
@@ -613,18 +666,18 @@ test("descending Claude paging preserves a turn exactly aligned with the prior w
 });
 
 test("descending Claude paging finds a latest turn boundary beyond one transcript window", async () => {
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   const threadId = "large-latest-turn";
   const cwd = "/w";
-  runner.seed(threadId, [
-    { type: "user", cwd, promptSource: "sdk", promptId: "older", uuid: "older-user", message: { role: "user", content: "older" } },
+  claude.seed(threadId, [
+    { type: "user", cwd, promptSource: "sdk", uuid: "older", message: { role: "user", content: "older" } },
     { type: "assistant", cwd, uuid: "older-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "older reply" }] } },
-    { type: "user", cwd, promptSource: "sdk", promptId: "latest", uuid: "latest-user", message: { role: "user", content: "latest" } },
+    { type: "user", cwd, promptSource: "sdk", uuid: "latest", message: { role: "user", content: "latest" } },
     ...Array.from({ length: 4 }, (_, index) => ({ type: "progress", uuid: `progress-${index}`, padding: "x".repeat(80 * 1024) })),
     { type: "assistant", cwd, uuid: "latest-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "latest reply" }] } },
   ]);
 
-  const history = new ClaudeTranscriptHistory(runner);
+  const history = new ClaudeTranscriptHistory(claude);
   const latest = await history.turnsPage(threadId, cwd, {
     limit: 1,
     sortDirection: "desc",
@@ -644,26 +697,26 @@ test("descending Claude paging finds a latest turn boundary beyond one transcrip
   });
   assert.deepEqual(older.data.map((turn) => turn.id), ["older"]);
   assert.equal(older.nextCursor, null);
-  assert.equal(runner.transcriptReadCount, 3);
+  assert.equal(claude.transcriptReadCount, 3);
 });
 
 test("bounded exact-turn reconstruction keeps agent item IDs stable when the tail window shifts", async () => {
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   const threadId = "stable-item-ids";
   const cwd = "/w";
   const turn = (id: string, paddingBytes: number) => [
-    { type: "user", cwd, promptSource: "sdk", promptId: id, uuid: `${id}-user`, message: { role: "user", content: id } },
+    { type: "user", cwd, promptSource: "sdk", uuid: id, message: { role: "user", content: id } },
     { type: "assistant", cwd, uuid: `${id}-agent`, padding: "x".repeat(paddingBytes), message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `${id} reply` }] } },
   ];
   const before = Array.from({ length: 10 }, (_, index) => turn(`before-${index}`, 200 * 1024)).flat();
   const target = turn("target", 0);
-  runner.seed(threadId, [...before, ...target]);
-  const history = new ClaudeTranscriptHistory(runner);
+  claude.seed(threadId, [...before, ...target]);
+  const history = new ClaudeTranscriptHistory(claude);
   const first = await history.itemsPage(threadId, cwd, { turnId: "target", limit: 10, sortDirection: "asc" });
   const firstAgentIds = first.data.filter((item) => item.type === "agentMessage").map((item) => item.id);
 
   const after = Array.from({ length: 15 }, (_, index) => turn(`after-${index}`, 200 * 1024)).flat();
-  runner.seed(threadId, [...before, ...target, ...after]);
+  claude.seed(threadId, [...before, ...target, ...after]);
   const shifted = await history.itemsPage(threadId, cwd, { turnId: "target", limit: 10, sortDirection: "asc" });
   assert.deepEqual(
     shifted.data.filter((item) => item.type === "agentMessage").map((item) => item.id),
@@ -672,21 +725,27 @@ test("bounded exact-turn reconstruction keeps agent item IDs stable when the tai
   assert.deepEqual(firstAgentIds, ["target-agent:0"]);
 });
 
-test("turn/interrupt kills the running turn and marks it interrupted (terminal)", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+test("turn/interrupt ends the running response, marks the turn terminal, and leaves the session usable", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c1", input: [{ type: "text", text: "go" }] });
   const res = await rt.request("turn/interrupt", { threadId: thread.id, turnId: "ctx:c1" });
   assert.deepEqual(res, {});
   await delay(5);
+  assert.deepEqual(claude.interrupts, [thread.id]);
   const read = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
   assert.equal(read.thread.turns[0].status, "interrupted");
+  // Interrupting ends the response, never the session: the next turn reuses it.
+  assert.equal(claude.isLoaded(thread.id), true);
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c2", input: [{ type: "text", text: "again" }] });
+  assert.equal(claude.opens.length, 1);
+  assert.deepEqual(claude.sends.at(-1)?.uuid, "ctx:c2");
 });
 
 test("reading an unknown thread with no transcript reproduces the exact Codex no-rollout error", async () => {
-  const rt = makeRuntime(new FakeRunner());
+  const rt = makeRuntime(new FakeClaude());
   await rt.start();
   await assert.rejects(
     rt.request("thread/read", { threadId: "nope", includeTurns: true }),
@@ -695,54 +754,56 @@ test("reading an unknown thread with no transcript reproduces the exact Codex no
 });
 
 test("a cold-started session (on disk, not in memory) is rehydrated from the transcript, not reported gone", async () => {
-  // runtime A runs a turn, materializing a transcript in the shared runner.
-  const runner = new FakeRunner();
-  const a = makeRuntime(runner);
+  // runtime A runs a turn, materializing a transcript in the shared transcript store.
+  const claude = new FakeClaude();
+  const a = makeRuntime(claude);
   await a.start();
   const { thread } = await a.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await a.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:c1", input: [{ type: "text", text: "hi" }] });
-  runner.complete("completed");
+  claude.answer(thread.id, "hello back");
   await delay(5);
 
   // runtime B (fresh in-memory state, e.g. after a QiYan restart) reads the same id.
-  const b = makeRuntime(runner);
+  const b = makeRuntime(claude);
   await b.start();
   const read = await b.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
   assert.equal(read.thread.turns.length, 1);
-  assert.equal(read.thread.turns[0].id, "prompt-0");
+  assert.equal(read.thread.turns[0].id, "ctx:c1");
   assert.equal(read.thread.turns[0].status, "completed");
 });
 
 test("cold recovery reads cwd from bounded head metadata when the final transcript row exceeds a turn page", async () => {
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   const threadId = "large-final-row";
-  runner.seed(threadId, [
-    { type: "user", cwd: "/expected", promptSource: "sdk", promptId: "prompt", uuid: "user", message: { role: "user", content: "hello" } },
+  claude.seed(threadId, [
+    { type: "user", cwd: "/expected", promptSource: "sdk", uuid: "ctx:cold", message: { role: "user", content: "hello" } },
     { type: "assistant", cwd: "/expected", uuid: "agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "x".repeat(300 * 1024) }] } },
     { type: "mode", mode: "default" },
   ]);
-  const runtime = makeRuntime(runner);
+  const runtime = makeRuntime(claude);
   await runtime.start();
 
   const read = await runtime.request<{ thread: any }>("thread/read", { threadId, includeTurns: false });
   assert.equal(read.thread.cwd, "/expected");
   assert.equal(read.thread.status.type, "idle");
   assert.deepEqual(read.thread.turns, []);
-  assert.equal(Math.max(...runner.transcriptChunkLengths), 256 * 1024);
+  assert.equal(Math.max(...claude.transcriptChunkLengths), 256 * 1024);
 });
 
-test("a cold incomplete transcript is terminal because no tracked Claude child is running", async () => {
-  const runner = new FakeRunner();
-  const a = makeRuntime(runner);
+test("a cold incomplete transcript is terminal on a daemonless endpoint, which lost its sessions", async () => {
+  const claude = new FakeClaude();
+  const a = makeRuntime(claude);
   await a.start();
   const { thread } = await a.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await a.request("turn/start", {
     threadId: thread.id,
-    clientUserMessageId: "ctx:orphaned-child",
+    clientUserMessageId: "ctx:orphaned",
     input: [{ type: "text", text: "work" }],
   });
 
-  const b = makeRuntime(runner);
+  // A local host lives in the QiYan process, so a restart really did end that turn.
+  const b = makeRuntime(claude);
+  assert.equal(b.daemonless, true);
   await b.start();
   const read = await b.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: true });
   assert.equal(read.thread.status.type, "idle");
@@ -753,8 +814,9 @@ test("a cold incomplete transcript is terminal because no tracked Claude child i
 // goal, and QiYan stores no goal row of its own.
 test("the manager's goal tools install and clear Claude's native goal", async () => {
   const delivered: Array<{ threadId: string; message: string }> = [];
+  const claude = new FakeClaude();
   const rt = new ClaudeCodeRuntime({
-    id: "claude-local", runner: new FakeRunner(), launchFlags: {},
+    id: "claude-local", host: claude, runner: claude, launchFlags: {},
     steer: async (threadId, message) => { delivered.push({ threadId, message }); },
   });
   await rt.start();
@@ -774,8 +836,9 @@ test("the manager's goal tools install and clear Claude's native goal", async ()
 // Claude compacts through its own /compact command; QiYan drives no compaction of its own.
 test("compact_session drives Claude's native /compact", async () => {
   const delivered: string[] = [];
+  const claude = new FakeClaude();
   const rt = new ClaudeCodeRuntime({
-    id: "claude-local", runner: new FakeRunner(), launchFlags: {},
+    id: "claude-local", host: claude, runner: claude, launchFlags: {},
     steer: async (_threadId, message) => { delivered.push(message); },
   });
   await rt.start();
@@ -785,8 +848,9 @@ test("compact_session drives Claude's native /compact", async () => {
 
 // Native /goal has no pause/resume, and QiYan stores no objective to reinstate.
 test("a status-only goal change is refused rather than silently dropped", async () => {
+  const claude = new FakeClaude();
   const rt = new ClaudeCodeRuntime({
-    id: "claude-local", runner: new FakeRunner(), launchFlags: {}, steer: async () => {},
+    id: "claude-local", host: claude, runner: claude, launchFlags: {}, steer: async () => {},
   });
   await rt.start();
   await assert.rejects(rt.request("thread/goal/set", { threadId: "t", status: "paused" }), /pause\/resume/u);
@@ -794,7 +858,11 @@ test("a status-only goal change is refused rather than silently dropped", async 
 
 test("turn/steer durably enqueues the message (never aborts the running turn)", async () => {
   const steered: Array<{ threadId: string; message: string }> = [];
-  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner: new FakeRunner(), launchFlags: {}, steer: async (threadId, message) => { steered.push({ threadId, message }); } });
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", host: claude, runner: claude, launchFlags: {},
+    steer: async (threadId, message) => { steered.push({ threadId, message }); },
+  });
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   // a turn is running
@@ -802,29 +870,12 @@ test("turn/steer durably enqueues the message (never aborts the running turn)", 
   const res = await rt.request<{ turnId: string }>("turn/steer", { threadId: thread.id, clientUserMessageId: "ctx:steer1", input: [{ type: "text", text: "also do X" }], expectedTurnId: "ctx:c1" });
   assert.equal(res.turnId, "ctx:steer1");
   assert.deepEqual(steered, [{ threadId: thread.id, message: "also do X" }]);
-});
-
-test("buildClaudeArgs emits stable, byte-identical flags", () => {
-  const base: ClaudeTurnRequest = {
-    threadId: "sid-1", cwd: "/w", message: "hi", resume: false,
-    flags: { appendSystemPrompt: "SP", allowedTools: ["WebFetch", "WebSearch"], disallowedTools: ["Monitor", "ScheduleWakeup"], mcpConfig: ["/tmp/m.json"], model: "claude-opus-4-8", effort: "high" },
-  };
-  assert.deepEqual(buildClaudeArgs(base), [
-    "-p", "--output-format", "stream-json", "--verbose",
-    "--session-id", "sid-1",
-    "--append-system-prompt", "SP",
-    "--allowedTools", "WebFetch WebSearch",
-    "--disallowedTools", "Monitor ScheduleWakeup",
-    "--mcp-config", "/tmp/m.json", "--strict-mcp-config",
-    "--model", "claude-opus-4-8",
-    "--effort", "high",
-  ]);
-  assert.equal(buildClaudeArgs({ ...base, resume: true }).includes("--resume"), true);
-  assert.equal(buildClaudeArgs(base).includes("hi"), false); // prompt goes over stdin, never argv
+  assert.deepEqual(claude.interrupts, [], "steer must never abort the running response");
+  assert.deepEqual(claude.inFlight(thread.id), ["ctx:c1"]);
 });
 
 test("model/list returns the curated catalog in Codex {data,nextCursor} shape with efforts", async () => {
-  const rt = makeRuntime(new FakeRunner());
+  const rt = makeRuntime(new FakeClaude());
   await rt.start();
   const result = await rt.request<{ data: any[]; nextCursor: null }>("model/list", {});
   assert.equal(result.nextCursor, null);
@@ -834,40 +885,58 @@ test("model/list returns the curated catalog in Codex {data,nextCursor} shape wi
 });
 
 test("turn/start applies per-session model + effort over the endpoint defaults", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude, { model: "claude-opus-4-8", effort: "medium" });
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c1", input: "hi", model: "haiku", effort: "high" });
-  const req = runner.requests.at(-1)!;
-  assert.equal(req.flags.model, "haiku", "per-session --model overrides launchFlags.model");
-  assert.equal(req.flags.effort, "high", "per-session --effort applied");
-  runner.complete();
+
+  // The launch carries them, and so does the live session — a second turn changes both
+  // without relaunching, which is the whole point of a long-lived query.
+  assert.deepEqual(claude.opens, [{ sessionId: thread.id, mode: "create", cwd: "/w", model: "haiku", effort: "high" }]);
+  assert.deepEqual(claude.setModels, [{ sessionId: thread.id, model: "haiku" }]);
+  assert.deepEqual(claude.setEfforts, [{ sessionId: thread.id, effort: "high" }]);
+  claude.complete(thread.id);
+  await delay(5);
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c2", input: "hi", model: "sonnet", effort: "low" });
+  assert.equal(claude.opens.length, 1);
+  assert.deepEqual(claude.setModels.at(-1), { sessionId: thread.id, model: "sonnet" });
+  assert.deepEqual(claude.setEfforts.at(-1), { sessionId: thread.id, effort: "low" });
 });
 
-test("thread/read reports active while the subprocess runs, idle after", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+test("an endpoint with no per-turn override launches its session with the endpoint defaults", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude, { model: "claude-opus-4-8", effort: "xhigh" });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c1", input: "hi" });
+  assert.deepEqual(claude.opens, [{ sessionId: thread.id, mode: "create", cwd: "/w", model: "claude-opus-4-8", effort: "xhigh" }]);
+  assert.deepEqual(claude.setModels, []);
+  assert.deepEqual(claude.setEfforts, []);
+});
+
+test("thread/read reports active while a turn runs, idle after", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "c1", input: "hi" });
   const running = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
   assert.equal(running.thread.status.type, "active");
-  runner.complete();
+  claude.complete(thread.id);
   await new Promise((resolve) => setImmediate(resolve)); // let the completion handler clear state.running
   const idle = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
   assert.equal(idle.thread.status.type, "idle");
 });
 
 test("thread/list splits archived tombstones and hides them from the default page", async () => {
-  const { createTestDatabase } = await import("../../src/storage/database.ts");
-  const { ClaudeArchiveStore } = await import("../../src/sessions/claude-archives.ts");
-  const runner = new FakeRunner();
+  const claude = new FakeClaude();
   // Two discoverable threads via the runner's listThreads.
-  runner.seed("t-keep", [{ cwd: "/w" }]);
-  runner.seed("t-gone", [{ cwd: "/w" }]);
+  claude.seed("t-keep", [{ cwd: "/w" }]);
+  claude.seed("t-gone", [{ cwd: "/w" }]);
   const archives = new ClaudeArchiveStore(createTestDatabase());
-  const rt = new ClaudeCodeRuntime({ id: "claude-local", runner, launchFlags: {}, archives });
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, archives });
   await rt.start();
   archives.add("claude-local", "t-gone");
   const live = await rt.request<{ data: any[] }>("thread/list", { cwd: "/w", archived: false });
@@ -879,20 +948,20 @@ test("thread/list splits archived tombstones and hides them from the default pag
   assert.equal(archives.has("claude-local", "t-gone"), false, "resume cleared the tombstone");
 });
 
-test("turn input renders file attachments as readable paths for `claude -p`", async () => {
-  const runner = new FakeRunner();
-  const rt = makeRuntime(runner);
+test("turn input renders file attachments as readable paths for Claude", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   // The worker file bridge stages each attachment as a localImage/mention item whose path is
   // valid on the worker's host; the Claude adapter must forward that path (not drop it) so
-  // `claude` can read the file.
+  // Claude can read the file.
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:att", input: [
     { type: "text", text: "look at these" },
     { type: "localImage", path: "/runtime/files/abc.png" },
     { type: "mention", name: "report.pdf", path: "/runtime/files/def" },
   ] });
-  const message = runner.requests[0]!.message;
+  const message = claude.sends[0]!.text;
   assert.match(message, /look at these/u);
   assert.match(message, /\/runtime\/files\/abc\.png/u, "image attachment path forwarded");
   assert.match(message, /report\.pdf/u, "mention display name forwarded");
