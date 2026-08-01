@@ -24,6 +24,7 @@ export type OperationalEventCode =
   | "endpoint_recovery_paused"
   | "endpoint_reconnect_gave_up"
   | "endpoint_connection_lost"
+  | "endpoint_runtime_reclaimed"
   | "background_task_failed";
 
 export interface OperationalEvent {

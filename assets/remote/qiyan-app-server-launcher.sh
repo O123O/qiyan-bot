@@ -33,7 +33,11 @@ esac
 
 QIYAN_RUNTIME_TOKEN=$token
 export QIYAN_RUNTIME_TOKEN
-RUST_LOG='off,codex_app_server::app_server_tracing=info,codex_app_server::transport=info'
+# Errors only. This log lives in the runtime directory, which is /run/user — tmpfs, i.e.
+# RAM — and is rotated only when the launcher next STARTS, so nothing caps it while the
+# app-server runs. At info level every JSON-RPC request logs an enter and an exit span of
+# ~600 bytes: one runtime wrote 3.1 GB in under five minutes and was killed for it.
+RUST_LOG='error'
 export RUST_LOG
 
 if [ -L "$log_path" ]; then

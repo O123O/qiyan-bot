@@ -993,7 +993,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (!live || live.overflowed) {
       return status === "completed" ? { id: turnId } : { id: turnId, status };
     }
-    return { id: turnId, status, itemsView: "full", items: live.items };
+    return { id: turnId, status, itemsView: "full", items: finalAnswerResolved(live.items, status) };
   }
 
   private retainLiveItem(
@@ -1135,6 +1135,25 @@ function cheapestEffort(efforts: readonly string[]): string {
   return CLAUDE_REASONING_EFFORTS.find((level) => efforts.includes(level))
     ?? efforts[0]
     ?? CLAUDE_DEFAULT_REASONING_EFFORT;
+}
+
+// The stream carries an assistant message before its stop reason is settled — the transcript row
+// gets it later — so a turn's last message can still look like commentary when the turn has
+// plainly ended. Delivery selects on `final_answer`, so a terminal carrying only commentary
+// delivers nothing AND reports `completed`, which suppresses the warning too: the worker answers
+// and the answer is dropped in silence.
+//
+// The endpoint does not have to guess here. It knows the turn completed, and the last thing a
+// completed turn said is its answer. An interrupted turn never reached one, so it promotes
+// nothing.
+function finalAnswerResolved(
+  items: ReadonlyArray<{ type: string; id: string; text: string; phase: string }>,
+  status: "completed" | "interrupted",
+): Array<{ type: string; id: string; text: string; phase: string }> {
+  if (status !== "completed" || items.some((item) => item.phase === "final_answer")) return [...items];
+  const last = items.map((item, index) => ({ item, index })).filter(({ item }) => item.type === "agentMessage").at(-1);
+  if (!last) return [...items];
+  return items.map((item, index) => (index === last.index ? { ...item, phase: "final_answer" } : item));
 }
 
 function requireString(value: unknown, field: string): string {

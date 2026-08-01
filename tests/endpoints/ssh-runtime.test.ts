@@ -52,13 +52,24 @@ class FakeRemote implements RemoteRuntimeClient {
   readonly calls: Array<{ operation: string; args: string[] }> = [];
   status: "absent" | "healthy" | "unhealthy" = "absent";
   exposeIdentity = true;
+  // Whether the runtime's tmux session still exists. Undefined models a helper that predates
+  // the field; false is a runtime whose supervisor is gone and whose leftovers are reclaimable.
+  supervised: boolean | undefined;
+  ownedGroup: number[] | undefined;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
   async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
     this.calls.push({ operation, args: [...args] });
     if (operation === "preflight") return { uid: 1000, home: "/home/test", shell: "/bin/bash", runtimeBase: "/tmp/qiyan-1000" } as T;
-    if (operation === "inspect") return { status: this.status, ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}) } as T;
+    if (operation === "inspect") {
+      return {
+        status: this.status,
+        ...(this.supervised === undefined ? {} : { supervised: this.supervised }),
+        ...(this.ownedGroup === undefined ? {} : { ownedGroup: this.ownedGroup, groupSize: this.ownedGroup.length }),
+        ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}),
+      } as T;
+    }
     if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
     throw new Error(`unexpected operation ${operation}`);
@@ -507,6 +518,70 @@ test("starts and stops only its endpoint runtime and refuses unhealthy replaceme
   assert.deepEqual(await runtime.runtimeIdentity(), remote.identity);
   await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1);
+});
+
+// A runtime whose SUPERVISOR is gone is dead, whatever it left behind. What keeps it reading
+// unhealthy is its own leftovers — a socket, an identity file, or a process it spawned that
+// outlived it and still holds its process group. `start` will not touch an unhealthy runtime, so
+// nothing ever clears them and the endpoint cannot come back without a human on the worker's
+// machine. Observed with a `git` a dead app-server had spawned, still running hours later.
+test("a dead supervisor's leftovers are reclaimed instead of dead-ending the endpoint", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = false;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  const identity = await runtime.ensureStarted();
+
+  assert.deepEqual(identity, remote.identity, "the endpoint comes back on its own");
+  const stops = remote.calls.filter((call) => call.operation === "stop");
+  assert.equal(stops.length, 1, "the dead runtime's leftovers were cleared first");
+  assert.deepEqual(
+    JSON.parse(stops[0]!.args[0]!).expected,
+    remote.identity,
+    "and the stop proved the recorded identity before signalling anything",
+  );
+  assert.equal(remote.calls.filter((call) => call.operation === "start").length, 1);
+});
+
+// A runtime that is still supervised is a live thing this build does not understand. Killing it
+// to make room is exactly what the refusal exists to prevent.
+// Reclaiming kills processes the worker's user started. Doing that silently leaves whoever
+// owned the long-running command with no way to learn it was killed — the probe already counts
+// the survivors, so the only thing missing was saying so.
+test("a reclaim reports how many surviving processes it killed", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = false;
+  remote.ownedGroup = [4242, 4243];
+  const reclaimed: Array<{ endpointId: string; survivors: number }> = [];
+  const runtime = new SshRuntime({ endpointId: "devbox", remote, onReclaimed: (info) => reclaimed.push(info) });
+
+  await runtime.ensureStarted();
+
+  assert.deepEqual(reclaimed, [{ endpointId: "devbox", survivors: 2 }]);
+});
+
+test("a supervised unhealthy runtime is still refused rather than reclaimed", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = true;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
+  assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 0);
+});
+
+// A helper that predates the field says nothing about its supervisor, and an unproven guess is
+// not grounds for killing anything.
+test("an unhealthy runtime that does not report its supervisor is refused", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = undefined;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
+  assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 0);
 });
 
 test("does not report an unhealthy runtime with missing identity metadata as absent", async () => {

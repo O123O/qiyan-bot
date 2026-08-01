@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -14,6 +14,9 @@ const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
 const MAX_ARGUMENT_BYTES = 96 * 1024;
+// Declared up here with the other constants because the operation dispatch below runs at
+// module top level: a const defined further down is still in its temporal dead zone by then.
+const RUNTIME_LOG_CAP_BYTES = 64 * 1024 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
@@ -118,8 +121,31 @@ async function bootstrap(value) {
   return { installed: true };
 }
 
+// The launcher rotates the runtime log only when it STARTS: it moves the old file aside,
+// keeps its last MiB, and begins a fresh one. Then it execs the server, so no launcher process
+// remains and nothing rotates a log that is already running — which is how one grew to 3.1 GB
+// in under five minutes, in /run/user, which is RAM.
+//
+// Truncating in place is safe rather than clever: the launcher redirects with `>>`, so the
+// server's descriptor is O_APPEND and every write atomically seeks to end-of-file. After a
+// truncate the next write lands at offset 0 — no sparse file, no interleaving, and no
+// intermediary process between tmux and the server, which is what the identity checks rely on.
+// Keeping a tail instead WOULD race the appender, so the whole file goes.
+
+async function capRuntimeLog(logPath) {
+  try {
+    const current = await stat(logPath);
+    if (!current.isFile() || current.size <= RUNTIME_LOG_CAP_BYTES) return;
+    await truncate(logPath, 0);
+    // Leave a record. A log that simply becomes small is indistinguishable from a quiet one,
+    // and whoever reads it next has no way to know bytes were dropped.
+    await writeFile(logPath, `--- qiyan: capped ${current.size} bytes at ${new Date().toISOString()} ---\n`, { flag: "a", mode: 0o600 });
+  } catch { /* the log is absent or unreadable: nothing to cap, and never a probe failure */ }
+}
+
 async function inspect(value) {
   const paths = runtimePaths(value, true);
+  await capRuntimeLog(join(paths.runtimeDir, "app-server.log"));
   const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
   const identityFile = await stat(paths.identityPath).catch(() => undefined);
   const socketFile = await stat(paths.socketPath).catch(() => undefined);
@@ -127,15 +153,19 @@ async function inspect(value) {
   const group = identity ? membersOfGroup(identity.processGroupId) : [];
   const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
   const groupAlive = group.length > 0;
-  if (tmux.code !== 0) {
-    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
-    return { status: "absent" };
+  // Whether the supervisor is still there. A caller cannot otherwise tell a runtime whose tmux
+  // session is GONE — dead, and its leftovers reclaimable — from one that is alive but failing a
+  // check, which must be left alone.
+  const supervised = tmux.code === 0;
+  if (!supervised) {
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "absent", supervised };
   }
-  if (!identity || !identityMatches(identity)) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+  if (!identity || !identityMatches(identity)) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
   }
-  return { status: "healthy", identity };
+  return { status: "healthy", identity, supervised };
 }
 
 async function start(value) {
@@ -166,11 +196,15 @@ async function start(value) {
 
 async function stop(value) {
   const paths = runtimePaths(value);
-  const inspected = await inspect(value);
   const identity = await readIdentity(paths.identityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
   if (identity) {
+    // This gate is the protection against a RECYCLED pgid, not a redundant liveness check:
+    // the signal below goes to the whole process group, and only a surviving member still
+    // carrying our token proves the group is still ours. If every member had died and the
+    // kernel handed that pgid to something else, no member carries the token and nothing is
+    // signalled. Removing this would make the kill reuse-unsafe and silently so.
     let members = ownedGroupMembers(identity);
     if (members.length > 0) {
       try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
@@ -196,6 +230,7 @@ async function stop(value) {
 // private — so the two providers cannot drift into different liveness semantics.
 async function inspectClaudeHost(value) {
   const paths = claudeRuntimePaths(value, true);
+  await capRuntimeLog(join(paths.runtimeDir, "claude-host.log"));
   const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
   const identityFile = await stat(paths.claudeHostIdentityPath).catch(() => undefined);
   const socketFile = await stat(paths.claudeHostSocketPath).catch(() => undefined);
@@ -203,19 +238,20 @@ async function inspectClaudeHost(value) {
   const group = identity ? membersOfGroup(identity.processGroupId) : [];
   const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
   const groupAlive = group.length > 0;
-  if (tmux.code !== 0) {
-    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
-    return { status: "absent" };
+  const supervised = tmux.code === 0;
+  if (!supervised) {
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "absent", supervised };
   }
   // The launcher exports QIYAN_RUNTIME_TOKEN before exec, so the environ check proves the
   // live process is the one we started rather than a recycled pid that matches by accident.
   if (!identity || !identityMatches(identity) || !processHasToken(identity.pid, identity.token)) {
-    return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
   }
-  return { status: "healthy", identity };
+  return { status: "healthy", identity, supervised };
 }
 
 async function startClaudeHost(value) {

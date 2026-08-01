@@ -151,6 +151,23 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     this.transcripts.get(sessionId)?.pop();
   }
 
+  // Measured in production: the stream carries the assistant message before its stop reason is
+  // settled, and the transcript row is written with it later. The live item therefore looks
+  // like commentary while its reconstructed twin is the final answer.
+  replyWithSettledStopReasonOnlyOnDisk(sessionId: string, text: string): string {
+    const session = this.require(sessionId);
+    const uuid = `agent-${this.replies++}`;
+    const content = [{ type: "text", text }];
+    this.append(sessionId, { type: "assistant", cwd: session.cwd, uuid, message: { role: "assistant", stop_reason: "end_turn", content } });
+    this.emit({
+      type: "content/assistant",
+      sessionId,
+      message: { uuid, message: { role: "assistant", stop_reason: null, content } },
+      at: this.clock += 1,
+    });
+    return uuid;
+  }
+
   // The turn's terminal result, settling the oldest accepted send (SDK ordering).
   complete(sessionId: string, status: "completed" | "failed" = "completed"): void {
     const uuid = this.require(sessionId).inFlight.shift();
@@ -1885,6 +1902,53 @@ test("renaming a Claude session is refused rather than silently dropped", async 
     rt.request("thread/name/set", { threadId: thread.id, name: "new name" }),
     (error: unknown) => (error as any).code === "UNSUPPORTED_CAPABILITY",
   );
+});
+
+// The terminal carries what the endpoint streamed — but the stream delivers an assistant message
+// before its stop reason is settled, so every live item can look like commentary while the turn
+// has plainly ended. Delivery selects on `final_answer`, so a terminal carrying only commentary
+// delivers NOTHING, and reports `completed`, so no warning fires either: the worker answers and
+// the answer is silently dropped. Three turns in a row were lost this way in production.
+test("a completed turn's answer is delivered even when the stream never settled its stop reason", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const terminals: any[] = [];
+  rt.onNotification((method, params) => { if (method === "turn/completed") terminals.push(params); });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  claude.replyWithSettledStopReasonOnlyOnDisk(thread.id, "thinking out loud");
+  claude.replyWithSettledStopReasonOnlyOnDisk(thread.id, "the actual answer");
+  claude.complete(thread.id);
+  await delay(5);
+
+  const turn = terminals.at(-1)?.turn;
+  const agents = (turn.items ?? []).filter((i: any) => i.type === "agentMessage");
+  assert.deepEqual(
+    agents.map((i: any) => [i.text, i.phase]),
+    [["thinking out loud", "commentary"], ["the actual answer", "final_answer"]],
+    "the last thing a completed turn said is its answer, whatever the stream had settled by then",
+  );
+});
+
+// An interrupted turn never reached an answer, so nothing may be promoted into one.
+test("an interrupted turn promotes nothing into a final answer", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const terminals: any[] = [];
+  rt.onNotification((method, params) => { if (method === "turn/completed") terminals.push(params); });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  claude.replyWithSettledStopReasonOnlyOnDisk(thread.id, "partway through");
+  claude.settleTurn(thread.id, "ctx:a", "interrupted");
+  await delay(5);
+
+  const turn = terminals.at(-1)?.turn;
+  const finals = (turn.items ?? []).filter((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
+  assert.deepEqual(finals, [], "an interrupted turn has no final answer to deliver");
 });
 
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.

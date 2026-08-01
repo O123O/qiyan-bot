@@ -194,7 +194,16 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
     const current = await this.inspect();
     if (current.status === "healthy") return current.identity;
     if (current.status === "unhealthy") {
-      throw new AppError("ENDPOINT_UNAVAILABLE", `existing remote Claude host is unhealthy: ${this.options.endpointId}`);
+      // Same reclaim as the Codex runtime, for the same dead end: a host whose supervisor is
+      // gone is dead, and what keeps it reading unhealthy is its own leftovers — a socket, an
+      // identity file, or something it spawned that outlived it still holding its process group.
+      // Nothing else ever clears those, so the endpoint could not come back without a human on
+      // the worker's machine. `stop` proves the recorded identity first and signals only
+      // processes carrying its token; a host that is still SUPERVISED is left alone.
+      if (current.supervised !== false || !current.identity) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `existing remote Claude host is unhealthy: ${this.options.endpointId}`);
+      }
+      await this.invoke("stop-claude-host", { ...this.runtimeRequest(), expected: current.identity });
     }
     const result = await this.invoke<{ identity: unknown }>("start-claude-host", {
       ...this.runtimeRequest(),
@@ -206,14 +215,15 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
 
   private async inspect(): Promise<
     { status: "absent" }
-    | { status: "unhealthy"; identity?: RuntimeIdentity }
+    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean }
     | { status: "healthy"; identity: RuntimeIdentity }
   > {
-    const raw = await this.invoke<{ status?: unknown; identity?: unknown }>("inspect-claude-host", this.runtimeRequest());
+    const raw = await this.invoke<{ status?: unknown; identity?: unknown; supervised?: unknown }>("inspect-claude-host", this.runtimeRequest());
     if (raw?.status === "absent") return { status: "absent" };
     if (raw?.status === "unhealthy") {
       return {
         status: "unhealthy",
+        ...(typeof raw.supervised === "boolean" ? { supervised: raw.supervised } : {}),
         ...(raw.identity === undefined ? {} : { identity: parseRuntimeIdentity(raw.identity) }),
       };
     }

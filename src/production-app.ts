@@ -2940,7 +2940,23 @@ export async function buildProductionApp(
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
-            const remoteRuntime = new SshRuntime({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
+            const remoteRuntime = new SshRuntime({
+              endpointId: definition.id,
+              remote,
+              assetRoot: remoteAssetRoot,
+              // Reclaiming a dead runtime kills processes the worker's user started. Say so:
+              // otherwise whoever owned the long-running command that got killed has no way
+              // to learn it happened.
+              onReclaimed: ({ endpointId, survivors }) => reportOperationalSafely(report, {
+                level: "warn",
+                code: "endpoint_runtime_reclaimed",
+                component: "ssh_runtime",
+                endpoint: endpointId,
+                reason: survivors > 0
+                  ? `cleared a dead runtime whose supervisor was gone; killed ${survivors} surviving process(es) it had started`
+                  : "cleared a dead runtime whose supervisor was gone",
+              }),
+            });
             const remoteEndpoint = new ManagedAppServerEndpoint({
               id: definition.id,
               runtime: new SshAppServerRuntime({
