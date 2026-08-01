@@ -21,6 +21,7 @@ import { claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type Cla
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
+  CLAUDE_REASONING_EFFORTS,
   claudeModelCatalog,
 } from "./claude-models.ts";
 import type { ClaudeCommandRunner } from "./claude-command-runner.ts";
@@ -853,7 +854,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         // nobody asked for.
         defaultReasoningEffort: match.efforts.includes(entry.defaultReasoningEffort)
           ? entry.defaultReasoningEffort
-          : match.efforts[0]!,
+          : cheapestEffort(match.efforts),
       };
     });
     const known = new Set(catalog.map((entry) => entry.id));
@@ -868,7 +869,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         supportedReasoningEfforts: match.efforts.map((reasoningEffort) => ({ reasoningEffort })),
         defaultReasoningEffort: match.efforts.includes(CLAUDE_DEFAULT_REASONING_EFFORT)
           ? CLAUDE_DEFAULT_REASONING_EFFORT
-          : match.efforts[0]!,
+          : cheapestEffort(match.efforts),
         isDefault: false,
       });
     }
@@ -1124,6 +1125,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     (this.threads.get(threadId) ?? state)?.terminalTurns.add(turnId);
     return {};
   }
+}
+
+// Ranked against the known levels rather than trusting the reported order: taking the first
+// element assumes the provider lists levels ascending, and a descending list would silently
+// default a model to its most expensive level — the exact outcome choosing a cheapest default
+// exists to prevent. An unrecognised level cannot be ranked, so it is only reached for.
+function cheapestEffort(efforts: readonly string[]): string {
+  return CLAUDE_REASONING_EFFORTS.find((level) => efforts.includes(level))
+    ?? efforts[0]
+    ?? CLAUDE_DEFAULT_REASONING_EFFORT;
 }
 
 function requireString(value: unknown, field: string): string {

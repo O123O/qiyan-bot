@@ -1854,6 +1854,26 @@ test("model/list overlays Claude's real efforts without dropping what the catalo
   assert.deepEqual(again.data.map((m: any) => m.id), listed.data.map((m: any) => m.id));
 });
 
+// The reported order is the provider's, not ours. Taking the first element assumes ascending,
+// and a descending list would silently default a model to its MOST expensive level — the exact
+// outcome choosing a cheapest default exists to prevent.
+test("a model that offers no configured default takes its cheapest level, whatever the order", async () => {
+  const claude = new FakeClaude();
+  claude.reportModels([
+    { value: "claude-sonnet-5", displayName: "Sonnet 5", supportedEffortLevels: ["max", "xhigh", "low"] },
+  ]);
+  const rt = makeRuntime(claude, {});
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  const listed = await rt.request<{ data: any[] }>("model/list", {});
+  const sonnet = listed.data.find((model: any) => model.id === "claude-sonnet-5");
+
+  assert.deepEqual(sonnet.supportedReasoningEfforts.map((e: any) => e.reasoningEffort), ["max", "xhigh", "low"]);
+  assert.equal(sonnet.defaultReasoningEffort, "low", "the cheapest it offers, not the first it listed");
+});
+
 // Returning {} reported a rename that never happened. A caller cannot tell that from success.
 test("renaming a Claude session is refused rather than silently dropped", async () => {
   const claude = new FakeClaude();
