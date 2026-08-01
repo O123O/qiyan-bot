@@ -142,6 +142,13 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     return uuid;
   }
 
+  // Production behaviour: `claude` reports a turn finished over its stream before it has
+  // appended that turn's last row. Dropping the newest row reproduces a transcript that the
+  // terminal has outrun.
+  withholdTranscriptTail(sessionId: string): void {
+    this.transcripts.get(sessionId)?.pop();
+  }
+
   // The turn's terminal result, settling the oldest accepted send (SDK ordering).
   complete(sessionId: string, status: "completed" | "failed" = "completed"): void {
     const uuid = this.require(sessionId).inFlight.shift();
@@ -689,7 +696,22 @@ test("the first turn creates the native session and the next resumes it; the cal
         item: { type: "agentMessage", id: `${agentUuid}:0`, text: "reply to hello", phase: "final_answer" },
       },
     },
-    { method: "turn/completed", params: { threadId, turn: { id: "ctx:call-1" } } },
+    {
+      method: "turn/completed",
+      params: {
+        threadId,
+        // The terminal carries the answer it just streamed. `claude` reports a turn finished
+        // before it has written that turn's last transcript row, so a terminal that sends the
+        // relay to the transcript races the write — and losing reads as an interrupted turn
+        // with no final response, which is delivered as a warning instead of the answer.
+        turn: {
+          id: "ctx:call-1",
+          status: "completed",
+          itemsView: "full",
+          items: [{ type: "agentMessage", id: `${agentUuid}:0`, text: "reply to hello", phase: "final_answer" }],
+        },
+      },
+    },
   ]);
 
   const read = await rt.request<{ thread: any }>("thread/read", { threadId, includeTurns: true });
@@ -795,7 +817,25 @@ test("a background task's report is published on the turn history folds it into"
         item: { type: "agentMessage", id: `${backgroundUuid}:0`, text: "the background job finished: 42 files", phase: "final_answer" },
       },
     },
-    { method: "turn/completed", params: { threadId, turn: { id: "ctx:1" } } },
+    {
+      method: "turn/completed",
+      params: {
+        threadId,
+        // The terminal carries the text rather than sending the relay to the transcript,
+        // which `claude` has not necessarily written yet. Re-publishing the parent turn's
+        // own answer alongside the report is harmless: both are keyed by item id, and the
+        // one already delivered dedups.
+        turn: {
+          id: "ctx:1",
+          status: "completed",
+          itemsView: "full",
+          items: [
+            { type: "agentMessage", id: "agent-0:0", text: "started it", phase: "final_answer" },
+            { type: "agentMessage", id: `${backgroundUuid}:0`, text: "the background job finished: 42 files", phase: "final_answer" },
+          ],
+        },
+      },
+    },
   ]);
 
   // The relay resolves a published turn through thread/turns/list. Every id above has to be
@@ -1695,6 +1735,53 @@ test("learning the host lost a session also drops the belief that it is loaded",
   // The next turn re-opens the session instead of sending into one the host does not have.
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "again" }] });
   assert.equal(claude.sends.at(-1)?.text, "again", "the turn reached a session the host actually holds");
+});
+
+// Measured in production: `claude` reports a turn finished over its stream BEFORE appending
+// that turn's last row to the transcript. A terminal that sends the relay to the transcript
+// therefore races the write, and losing is silent and total — with the final row missing, the
+// turn has no terminal record, so reconstruction reads it `interrupted` and phases every
+// message `commentary`. The relay finds no final answer, delivers nothing, and warns that the
+// turn was interrupted without a final response while the answer sits complete on screen.
+test("a terminal carries the answer even when the transcript has not caught up", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const terminals: any[] = [];
+  rt.onNotification((method, params) => { if (method === "turn/completed") terminals.push(params); });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  // The answer streams, and the turn settles, with the transcript still a row behind.
+  claude.reply(thread.id, "the complete answer");
+  claude.withholdTranscriptTail(thread.id);
+  claude.complete(thread.id);
+  await delay(5);
+
+  const turn = terminals.at(-1)?.turn;
+  assert.equal(turn.status, "completed", "not interrupted: the endpoint saw the turn finish");
+  assert.equal(turn.itemsView, "full");
+  const finals = (turn.items ?? []).filter((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
+  assert.deepEqual(finals.map((i: any) => i.text), ["the complete answer"],
+    "and the answer travels with it rather than being read back off disk");
+});
+
+// A turn too large to hold is not truncated into a partial answer — the terminal falls back to
+// the id alone, and the relay hydrates from the transcript as it always did.
+test("an oversized turn falls back to the transcript instead of delivering part of it", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const terminals: any[] = [];
+  rt.onNotification((method, params) => { if (method === "turn/completed") terminals.push(params); });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  claude.reply(thread.id, "x".repeat(600 * 1024));
+  claude.complete(thread.id);
+  await delay(5);
+
+  assert.deepEqual(terminals.at(-1)?.turn, { id: "ctx:a" }, "no items, so the relay reads the turn itself");
 });
 
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.

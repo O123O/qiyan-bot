@@ -48,6 +48,18 @@ interface ThreadState {
   // agree on for it.
   lastTurnId?: string;
   terminalTurns: Set<string>;            // turn ids known interrupted/failed
+  // Assistant text this endpoint streamed, per turn, in the exact shape the terminal
+  // notification carries. See LIVE_TURN_ITEM_BYTES for why it is kept at all.
+  liveItems: Map<string, LiveTurnItems>;
+}
+
+interface LiveTurnItems {
+  items: Array<{ type: string; id: string; text: string; phase: string }>;
+  bytes: number;
+  // Past the byte cap this turn stops being retained and the terminal falls back to reading
+  // the transcript. Truncated items would be worse than a slow read: they would deliver a
+  // partial answer as if it were the whole one.
+  overflowed: boolean;
 }
 
 // Enough for the handful of workers one endpoint drives at a time, small enough that an
@@ -63,6 +75,22 @@ const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
 // deadline. They are issued concurrently and skipped entirely when nothing is running, so an
 // interrupt of an ordinary turn pays one round trip rather than this budget.
 const TASK_STOP_CONFIRMATION_MS = 5_000;
+
+// Why the endpoint keeps a turn's assistant text at all, having already streamed it:
+//
+// `claude` reports a turn finished over its stream BEFORE it has appended that turn's last
+// row to the transcript. A terminal that sends the relay to the transcript therefore races
+// the write, and losing the race is silent and total — the turn reads as having no terminal
+// row, which reconstruction can only interpret as `interrupted`, and every message in it is
+// phased `commentary` because the row that would have been the final answer is not there yet.
+// The relay then delivers nothing and warns that the turn was interrupted without a final
+// response, while the worker's answer sits complete on screen.
+//
+// Streaming it is the same data, arriving earlier and from the process that produced it, so
+// the terminal carries what it already knows instead of asking the disk to catch up. Item ids
+// match the ones reconstruction assigns, so a later re-read dedups against these rather than
+// double-delivering.
+const LIVE_TURN_ITEM_BYTES = 512 * 1024;
 
 const DEFAULT_LOADED_SESSION_BUDGET = 8;
 
@@ -202,10 +230,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // Web UI merges them by id.
       const phase = claudeMessagePhase(event.message);
       for (const [index, text] of assistantTextBlocks(event.message).entries()) {
+        const item = { type: "agentMessage", id: `${messageUuid(event.message) ?? turnId}:${index}`, text, phase };
+        this.retainLiveItem(state, turnId, item);
         this.emitter.emit("notification", "item/completed", {
           threadId,
           turnId,
-          item: { type: "agentMessage", id: `${messageUuid(event.message) ?? turnId}:${index}`, text, phase },
+          item,
         });
       }
       return;
@@ -220,7 +250,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     if (event.origin === "task-notification") {
       // A running turn will carry the folded output through its own completion.
       if (state.running.length > 0 || state.lastTurnId === undefined) return;
-      this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: state.lastTurnId } });
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: this.terminalTurnPayload(state, state.lastTurnId, "completed"),
+      });
       return;
     }
     const turnId = event.uuid ?? state.running[0];
@@ -237,8 +270,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     else state.lastTurnId = turnId;
     this.emitter.emit("notification", "turn/completed", {
       threadId,
-      turn: event.status === "completed" ? { id: turnId } : { id: turnId, status: "interrupted" },
+      turn: this.terminalTurnPayload(state, turnId, event.status === "completed" ? "completed" : "interrupted"),
     });
+    // Keep only what a later terminal can still refer to: the turns still running, and the
+    // last completed one, which a background task's report republishes.
+    for (const id of [...state.liveItems.keys()]) {
+      if (!state.running.includes(id) && id !== state.lastTurnId) state.liveItems.delete(id);
+    }
     // A completed turn means idle to every consumer, and that is wrong when the turn left a
     // subagent or backgrounded command behind: it will speak again unprompted. Restate the
     // session's real activity here, because the task/set that started the work fired while
@@ -414,7 +452,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const threadSource = typeof params.threadSource === "string" ? params.threadSource : undefined;
     const id = randomUUID();
     this.threads.set(id, {
-      cwd, materialized: false, recoveryChecked: true, loaded: false, running: [], terminalTurns: new Set(),
+      cwd, materialized: false, recoveryChecked: true, loaded: false, running: [], terminalTurns: new Set(), liveItems: new Map(),
       ...(threadSource === undefined ? {} : { threadSource }),
     });
     return this.withCurrentSettings({
@@ -488,6 +526,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       loaded: false,
       running: [],
       terminalTurns: new Set(),
+      liveItems: new Map(),
     };
     this.threads.set(threadId, state);
     return state;
@@ -843,6 +882,39 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       status: { type: activity ? "active" : "idle" },
       ...(activity ? { nativeActivity: activity } : {}),
     });
+  }
+
+  // The terminal the relay acts on. Carries the turn's assistant text when this endpoint
+  // streamed the whole turn, so delivery reads what Claude actually said instead of racing
+  // `claude` to the transcript; falls back to the id alone when it did not, and the relay
+  // then hydrates from the transcript as before — a reattached turn, or one too large to hold.
+  private terminalTurnPayload(
+    state: ThreadState,
+    turnId: string,
+    status: "completed" | "interrupted",
+  ): Record<string, unknown> {
+    const live = state.liveItems.get(turnId);
+    if (!live || live.overflowed) {
+      return status === "completed" ? { id: turnId } : { id: turnId, status };
+    }
+    return { id: turnId, status, itemsView: "full", items: live.items };
+  }
+
+  private retainLiveItem(
+    state: ThreadState,
+    turnId: string,
+    item: { type: string; id: string; text: string; phase: string },
+  ): void {
+    const live = state.liveItems.get(turnId) ?? { items: [], bytes: 0, overflowed: false };
+    state.liveItems.set(turnId, live);
+    if (live.overflowed) return;
+    live.bytes += Buffer.byteLength(item.text, "utf8");
+    if (live.bytes > LIVE_TURN_ITEM_BYTES) {
+      live.overflowed = true;
+      live.items = [];
+      return;
+    }
+    live.items.push(item);
   }
 
   // Announce the turn now executing. Called when a send is accepted into an empty queue,
