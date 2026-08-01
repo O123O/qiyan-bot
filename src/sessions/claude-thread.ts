@@ -286,6 +286,21 @@ export function claudeNativeGoal(records: readonly unknown[]): { objective: stri
   return goal;
 }
 
+// The same marker test claudeNativeGoal applies, without deciding which goal wins: "this window
+// answers the question". A raw text search does not do — ordinary prose quoting `Goal set:` is
+// not a marker, and treating it as one reports no goal for a session that has one.
+export function claudeGoalMarkerPresent(records: readonly unknown[]): boolean {
+  for (const raw of records) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    if (record.type !== "user") continue;
+    const text = messageTextOf(record.message);
+    if (!text.includes("<local-command-stdout>")) continue;
+    if (/Goal set:\s*[^<\n]+/u.test(text) || /Goal cleared/u.test(text)) return true;
+  }
+  return false;
+}
+
 function messageTextOf(message: unknown): string {
   if (!message || typeof message !== "object") return "";
   const content = (message as Record<string, unknown>).content;

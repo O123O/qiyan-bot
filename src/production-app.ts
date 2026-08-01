@@ -4103,6 +4103,10 @@ export async function buildProductionApp(
   }
 
   function observeGoal(nickname: string, response: any, observedAt = Date.now()): void {
+    // A provider that bounds its own goal read reports whether the answer is authoritative.
+    // "I did not find one" must never overwrite a goal the panel is already showing: that is
+    // how a live goal vanished from the panel and stayed gone.
+    if (response && typeof response === "object" && response.known === false) return;
     const goal = response && typeof response === "object" && "goal" in response ? response.goal : response;
     const sequence = dashboardStore.allocateObservationSequence();
     if (goal == null) {

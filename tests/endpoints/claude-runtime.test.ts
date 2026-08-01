@@ -1225,7 +1225,7 @@ test("the manager's goal tools install and clear Claude's native goal", async ()
 
   // Reading stays graceful so a provider-neutral get_session_status still works: native
   // goal state is not exposed to the SDK stream, so there is nothing to report.
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: t }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: t }), { goal: null, known: true });
 
   const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: t, objective: "finish phase 2" });
   assert.equal(set.goal.objective, "finish phase 2");
@@ -1428,6 +1428,31 @@ test("get_goal reads the objective Claude's native /goal recorded", async () => 
   assert.equal(read.goal?.status, "active");
 });
 
+// A goal read walks the transcript backwards in windows. It used to stop as soon as a window's
+// raw text contained "Goal set:" ANYWHERE -- so an assistant that merely discussed the words, or
+// a tool result quoting them, hid the real marker behind it and the session reported no goal.
+// The panel then wrote that down as authoritative and the goal disappeared.
+test("prose quoting the goal marker does not hide the real goal behind it", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-prose", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1",
+      message: { role: "user", content: "<local-command-stdout>Goal set: ship the fix</local-command-stdout>" } },
+    // Push the real marker out of the tail window, so the walk has to step back past the prose.
+    { type: "assistant", cwd: "/w", uuid: "pad",
+      message: { role: "assistant", content: [{ type: "text", text: "x".repeat(300_000) }] } },
+    { type: "assistant", cwd: "/w", uuid: "a1",
+      message: { role: "assistant", content: [{ type: "text", text: "I ran `/goal` and it printed Goal set: ship the fix" }] } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2", message: { role: "user", content: "carry on" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-prose", cwd: "/w", excludeTurns: true });
+
+  const read = await rt.request<{ goal: any; known: boolean }>("thread/goal/get", { threadId: "thread-prose" });
+  assert.equal(read.goal?.objective, "ship the fix");
+  assert.equal(read.known, true);
+});
+
 test("a cleared native goal reports none, and the last marker wins", async () => {
   const claude = new FakeClaude();
   claude.seed("thread-cleared", [
@@ -1440,7 +1465,7 @@ test("a cleared native goal reports none, and the last marker wins", async () =>
   const rt = makeRuntime(claude);
   await rt.start();
   await rt.request("thread/resume", { threadId: "thread-cleared", cwd: "/w", excludeTurns: true });
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "thread-cleared" }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "thread-cleared" }), { goal: null, known: true });
 });
 
 // A session whose background task outlives its parent turn will speak again unprompted.

@@ -79,6 +79,7 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
     const info = dashboard.sessions[nickname]?.auto_session_info;
     const native = deps.nativeSession(session.endpoint, session.thread_id, session.mapping_id);
     const goal = info?.goal ?? null;
+    const historyReadable = deps.historyReadable?.(session.endpoint, session.thread_id) !== false;
     return {
       nickname,
       mappingId: session.mapping_id,
@@ -90,10 +91,13 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       // resting, it is unusable. Report what it is rather than what its status field says.
       nativeStatus: native?.availability !== "ready"
         ? null
-        : deps.historyReadable?.(session.endpoint, session.thread_id) === false
-          ? "unavailable"
-          : native.status,
-      activeTurnId: native?.availability === "ready" ? native.activeTurnId : null,
+        : historyReadable
+          ? native.status
+          : "unavailable",
+      // Withheld with the status it belongs to. A reader that trusts an active turn id over the
+      // status — the panel does, so that a turn in flight always reads as working — would
+      // otherwise render a session we just called unusable as working on a turn we cannot locate.
+      activeTurnId: native?.availability === "ready" && historyReadable ? native.activeTurnId : null,
       model: info?.model.current ?? null,
       effort: info?.reasoning_effort.current ?? null,
       host: deps.host(session.endpoint),

@@ -17,7 +17,7 @@ import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
+import { claudeGoalMarkerPresent, claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
@@ -34,6 +34,11 @@ interface ThreadState {
   cwd: string;
   threadSource?: string;
   materialized: boolean;                 // has at least one turn been run (transcript exists)?
+  // What an earlier goal scan already proved about this transcript: bytes in [floor, top) hold
+  // no goal marker. The transcript only grows, so the next scan reads the new tail and jumps
+  // straight over this span. Without it, every status read of a long-lived worker with no goal
+  // re-walked the whole budget — on a remote endpoint, one ssh spawn per window, every time.
+  goalScan?: { floor: number; top: number };
   recoveryChecked: boolean;
   recovery?: Promise<void>;
   loaded: boolean;                       // is the session open on the host?
@@ -446,7 +451,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // records it — so an installed goal is reported without a duplicate goal row, and it
       // survives a restart because the transcript does. Only a running goal's PROGRESS
       // (iterations, tokens) is unavailable; the SDK does not surface it.
-      case "thread/goal/get": return { goal: await this.readNativeGoal(requireString(args.threadId, "threadId")) } as T;
+      case "thread/goal/get": return await this.readNativeGoal(requireString(args.threadId, "threadId")) as T;
       case "thread/goal/set": return await this.goalSet(args) as T;
       case "thread/goal/clear": return await this.goalClear(args) as T;
       // Claude's context compaction is its own `/compact` command, delivered like `/goal`.
@@ -1041,22 +1046,48 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // Bounded, not unbounded: each step reads one window and stops at the first marker found
   // walking back — which IS the last marker in the file, and the last marker wins. A transcript
   // with no goal at all costs the whole budget once, which is why the budget is modest.
-  private async readNativeGoal(threadId: string): Promise<{ objective: string; status: string } | null> {
+  // `known: false` means the walk ran out of budget or could not read: no goal was FOUND, which
+  // is not the same as there being none. Reporting the two as one value is what erased a live
+  // goal from the panel — a bounded read wrote its own limitation down as an authoritative fact.
+  private async readNativeGoal(threadId: string): Promise<{
+    goal: { objective: string; status: string } | null;
+    known: boolean;
+  }> {
     const state = this.threads.get(threadId);
-    if (!state?.materialized) return null;
+    if (!state?.materialized) return { goal: null, known: true };
+    // A marker anywhere resolves the question: `claudeNativeGoal` returns null both for "no
+    // marker here" and for "the last marker was a clear", and walking past a clear would
+    // resurrect a goal the user cancelled.
+    const settle = (goal: { objective: string } | null): { goal: { objective: string; status: string } | null; known: true } => {
+      delete state.goalScan;
+      // Claude drives its own goal to completion, so an installed goal is by definition still
+      // being pursued; there is no paused or blocked state to distinguish.
+      return { goal: goal ? { ...goal, status: "active" } : null, known: true };
+    };
+    const cached = state.goalScan;
+    let top: number | undefined;
     let end: number | undefined;
-    for (let scanned = 0; scanned < GOAL_SCAN_MAX_BYTES; scanned += GOAL_SCAN_TAIL_BYTES) {
+    let scanned = 0;
+    while (scanned < GOAL_SCAN_MAX_BYTES) {
+      // Jump the span an earlier scan already proved clean, rather than re-reading it.
+      if (end !== undefined && cached && end <= cached.top && end > cached.floor) end = cached.floor;
+      if (end === 0) return settle(null);
       const chunk = await this.options.runner
         .readTranscriptChunk(threadId, state.cwd, {
           offset: end === undefined ? "tail" : Math.max(0, end - GOAL_SCAN_TAIL_BYTES),
           length: GOAL_SCAN_TAIL_BYTES,
         })
         .catch(() => undefined);
-      if (!chunk || chunk.bytes.length === 0) return null;
-      const text = Buffer.from(chunk.bytes).toString("utf8");
+      if (!chunk) return { goal: null, known: false };
+      if (chunk.bytes.length === 0) return settle(null);
+      if (top === undefined) {
+        top = chunk.offset + chunk.bytes.length;
+        // A transcript that shrank was rewritten, so cached offsets no longer mean anything.
+        if (cached && top < cached.top) delete state.goalScan;
+      }
       // A window can start mid-line; that partial first line is not valid JSON and would be
       // dropped by the parser anyway, but skip it explicitly when the window was clipped.
-      const lines = text.split("\n");
+      const lines = Buffer.from(chunk.bytes).toString("utf8").split("\n");
       if (chunk.offset > 0) lines.shift();
       const records: unknown[] = [];
       for (const line of lines) {
@@ -1064,17 +1095,21 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         try { records.push(JSON.parse(line)); } catch { /* partial or non-JSON line */ }
       }
       const goal = claudeNativeGoal(records);
-      // Claude drives its own goal to completion, so an installed goal is by definition still
-      // being pursued; there is no paused or blocked state to distinguish.
-      if (goal) return { ...goal, status: "active" };
-      // claudeNativeGoal reports null both for "no marker here" and for "the last marker was a
-      // clear". Walking further back would then resurrect a goal the user cancelled, so stop as
-      // soon as this window held any marker at all.
-      if (/Goal (set:|cleared)/u.test(text)) return null;
-      if (chunk.offset === 0) return null;
+      if (goal) return settle(goal);
+      // Match the marker the way the parser does — on a `/goal` command's own stdout record.
+      // Testing the raw window text instead stopped the walk on any prose containing the words,
+      // which reported "no goal" for a session whose goal was one window further back.
+      if (claudeGoalMarkerPresent(records)) return settle(null);
+      if (chunk.offset === 0) return settle(null);
+      scanned += chunk.bytes.length;
       end = chunk.offset;
     }
-    return null;
+    // Out of budget with the question open. Remember how far down it is clean so the next read
+    // resumes here instead of starting over.
+    if (end !== undefined && top !== undefined) {
+      state.goalScan = { floor: end, top: Math.max(top, state.goalScan?.top ?? 0) };
+    }
+    return { goal: null, known: false };
   }
 
   private async goalClear(params: Record<string, unknown>): Promise<{ goal: null }> {

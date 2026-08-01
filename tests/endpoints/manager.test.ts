@@ -67,7 +67,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
 function queuedFixture(
   candidates: FakeEndpoint[],
   managedThreadIds: readonly string[] = [],
-  schedule?: (delayMs: number, run: () => void) => { cancel(): void },
+  cleanupTimeoutMs?: number,
 ) {
   const local = new FakeEndpoint("local");
   const endpoints = new Map<string, FakeEndpoint>([["local", local]]);
@@ -96,7 +96,7 @@ function queuedFixture(
         endpointGeneration: generation,
       };
     },
-    ...schedule ? { schedule } : {},
+    ...cleanupTimeoutMs === undefined ? {} : { cleanupTimeoutMs },
   });
   return { manager, local, candidateCount: () => index };
 }
@@ -1031,34 +1031,25 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
 });
 
-test("a failed restart reopens admission without waiting for the abandoned endpoint to close", async () => {
+test("a close that never answers cannot leave the endpoint draining", async () => {
   const first = new FakeEndpoint("devbox");
   const abandoned = new FakeEndpoint("devbox");
   abandoned.identityToken = "b".repeat(32);
   let closes = 0;
   // A close that never answers: an SSH channel whose peer is gone accepts the request and
-  // returns nothing. Awaiting it before reopening the gate left the endpoint permanently
-  // `draining`, which failed every read and refused the restart that was the only repair.
+  // returns nothing. Awaiting it unbounded left the gate `draining` for good, which failed every
+  // read of the endpoint's sessions AND refused the restart that was the only repair -- the
+  // endpoint was locked out by the wreckage of its own last attempt.
   abandoned.closeConnection = async () => { closes += 1; await new Promise<never>(() => {}); };
   const spare = new FakeEndpoint("devbox");
-  const expiries: Array<() => void> = [];
-  const { manager } = queuedFixture([first, abandoned, spare], [], (_delay, run) => {
-    expiries.push(run);
-    return { cancel: () => undefined };
-  });
+  const { manager } = queuedFixture([first, abandoned, spare], [], 5);
   await manager.ensureReady("devbox");
   first.onRuntimeIdentity = () => { throw new Error("SSH process failed (exit 1)"); };
 
-  const restarting = assert.rejects(manager.restart("devbox"), /exit 1/u);
-  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(manager.restart("devbox"), /exit 1/u);
   assert.equal(closes, 1, "the abandoned candidate is still discarded");
-  assert.equal(manager.desiredState("devbox"), "automatic", "admission reopens before the discard is awaited");
-
-  assert.equal(expiries.length, 1, "the discard is bounded rather than awaited forever");
-  expiries.shift()!();
-  await restarting;
-  // The lifecycle queue must be free: a hung discard that blocked it wedged every later restart,
-  // so the repair for a broken endpoint was refused by the wreckage of its own last attempt.
+  assert.equal(manager.desiredState("devbox"), "automatic", "admission reopens once the discard is bounded out");
+  // The lifecycle queue must be free too: a discard that blocked it wedged every later restart.
   await assert.rejects(manager.restart("devbox"), /exit 1/u);
 });
 
