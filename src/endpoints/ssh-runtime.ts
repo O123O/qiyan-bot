@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "a71fb530df2f519249987f9abd51cbc67e070483fc5aadcdb9d0dab1a2328e3b";
+export const REMOTE_HELPER_SHA256 = "a1e68c56ce720132fe7ebc583ef28be21acd894088a8412a69b08192c06eda33";
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "e8e32d34ad7a1447016d3ef73db90d53fce3b918fd253e903b10840a8c9e0c5a";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -244,13 +244,17 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       if (current.supervised !== false || !current.identity) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
-      await this.options.remote.invoke("stop", [JSON.stringify({
+      const reclaimed = await this.options.remote.invoke("stop", [JSON.stringify({
         runtimeDir: prepared.runtimeDir,
         session: prepared.session,
         tmuxMode: prepared.tmuxMode,
         expected: current.identity,
-      })], prepared.host.remoteHelperPath);
-      this.options.onReclaimed?.({ endpointId: this.options.endpointId, survivors: current.survivors ?? 0 });
+      })], prepared.host.remoteHelperPath) as { survivors?: unknown } | undefined;
+      // What `stop` actually left behind, not what `inspect` saw before it ran: a reclaim that
+      // could not reap a process wedged in uninterruptible I/O still succeeds, and the count of
+      // what outlived it is the part worth reporting.
+      const survivors = typeof reclaimed?.survivors === "number" ? reclaimed.survivors : current.survivors ?? 0;
+      this.options.onReclaimed?.({ endpointId: this.options.endpointId, survivors });
     }
     if (prepared.tmuxMode === "legacy") {
       // Re-preparing moves a legacy runtime into the shared directory. Reclaiming made this

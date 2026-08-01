@@ -1,4 +1,5 @@
 import { AppError } from "../core/errors.ts";
+import { JsonRpcResponseError } from "./rpc-client.ts";
 import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint } from "../endpoints/types.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "./thread-history.ts";
 
@@ -13,6 +14,24 @@ export interface TurnCapacityClaim {
   endpointId: string;
   threadId: string;
   generation: number;
+}
+
+// "That turn is no longer steerable." The two providers report it in different shapes, and only
+// one of them crosses a wire: Claude's runtime throws it in process as an AppError, while Codex's
+// app-server answers the JSON-RPC call with `activeTurnNotSteerable`. Checking only the AppError
+// form meant a Codex worker still dropped what the user typed, which is where the bug was seen.
+export function turnNoLongerSteerable(error: unknown): boolean {
+  // A turn-identity conflict is NOT this: it says the start response named a different turn than
+  // the caller claimed. Falling back to "send it as its own turn" there is the one case that
+  // really would create a second turn.
+  if (error instanceof TurnIdentityConflictError) return false;
+  if (error instanceof AppError) return error.code === "SESSION_IDLE" || error.code === "OPERATION_CONFLICT";
+  if (!(error instanceof JsonRpcResponseError) || !error.data || typeof error.data !== "object") return false;
+  const data = error.data as Record<string, unknown>;
+  const info = data.codexErrorInfo && typeof data.codexErrorInfo === "object"
+    ? data.codexErrorInfo as Record<string, unknown>
+    : data;
+  return Object.hasOwn(info, "activeTurnNotSteerable");
 }
 
 export class TurnIdentityConflictError extends AppError {

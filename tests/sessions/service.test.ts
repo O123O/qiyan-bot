@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
-import { AppServerPool } from "../../src/app-server/pool.ts";
+import { AppServerPool, TurnIdentityConflictError } from "../../src/app-server/pool.ts";
+import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
@@ -42,6 +43,8 @@ class ServiceEndpoint implements AppServerEndpoint {
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
   compactDelayMs = 0;
+  failSteer: Error | undefined;
+  failTurnsList = false;
   // What this endpoint answers for thread/tasks/stop. Undefined models a provider that does
   // not implement it at all — a Codex app-server, where an active turn with no id really is
   // an identity still being refreshed.
@@ -70,8 +73,12 @@ class ServiceEndpoint implements AppServerEndpoint {
       this.status = "active";
       return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
-    if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
+    if (method === "turn/steer") {
+      if (this.failSteer) throw this.failSteer;
+      return { turnId: params.expectedTurnId } as T;
+    }
     if (method === "thread/turns/list") {
+      if (this.failTurnsList) throw new AppError("OPERATION_UNCERTAIN", "native history scan budget was exhausted");
       const source = params.sortDirection === "desc" ? [...this.historyTurns()].reverse() : this.historyTurns();
       const offset = params.cursor === undefined ? 0 : Number(params.cursor);
       const limit = Number(params.limit);
@@ -484,6 +491,102 @@ test("a provider with no background work is probed as before and never asked to 
   });
   assert.equal(value.endpoint.calls.some((call) => call.method === "thread/tasks/stop"), false,
     "no stop is dispatched to a provider that never reported background work");
+});
+
+// Someone typing a message means "send this to the worker", not "append to turn X". When the
+// turn chosen to steer finishes between choosing it and dispatching, the provider refuses to
+// redirect into work the sender never saw — right for a caller that meant one specific turn,
+// and wrong here: it drops what they wrote and hands them a turn-identity conflict to act on.
+test("a send that races a turn boundary becomes its own turn instead of an error", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("OPERATION_CONFLICT", "turn started-1 is no longer running (other is)");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  const result = await value.service.send("payments", "another thought", { clientUserMessageId: "web:1" });
+
+  assert.equal(result.mode, "start", "the message is sent rather than refused");
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/start" && call.params.clientUserMessageId === "web:1"),
+    "and carries the same id, so a steer that landed after all reconciles instead of doubling");
+});
+
+// The AppError above is Claude's in-process shape. Codex — where this was actually reported —
+// refuses over JSON-RPC, and a check that only understood AppError still dropped the message on
+// exactly the provider the bug came from.
+test("a Codex steer refusal over JSON-RPC also becomes its own turn", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new JsonRpcResponseError(-32600, "turn is no longer steerable", {
+    codexErrorInfo: { activeTurnNotSteerable: { turnId: "started-1" } },
+  });
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  const result = await value.service.send("payments", "another thought", { clientUserMessageId: "web:2" });
+
+  assert.equal(result.mode, "start", "the message is sent rather than refused");
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/start" && call.params.clientUserMessageId === "web:2"));
+});
+
+// A turn-identity conflict is a different thing wearing the same error code: it says the START
+// response named a turn the caller did not claim. Retrying THAT as a new turn is the one case
+// that really can produce a second turn, so it must still surface.
+test("a turn-identity conflict is not mistaken for a steer refusal", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new TurnIdentityConflictError("returned-9", "started-1");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(value.service.send("payments", "another thought", { clientUserMessageId: "web:3" }),
+    (error: unknown) => error instanceof TurnIdentityConflictError);
+});
+
+// An explicit steer names one turn on purpose. Redirecting THAT into a different turn is the
+// silent misdelivery the refusal exists to prevent, so it still stands.
+test("an explicit steer whose turn has moved on is still refused", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("OPERATION_CONFLICT", "turn started-1 is no longer running");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(
+    value.service.send("payments", "append this", { mode: "steer", clientUserMessageId: "web:1" }),
+    (error: unknown) => (error as { code?: string }).code === "OPERATION_CONFLICT",
+  );
+});
+
+// The steer-failure proof scans history for the turn. On a long-lived worker that scan can run
+// out of budget — especially when the turn was never written. A proof that could not run proves
+// nothing, and reporting its own exhaustion replaced the real error with an internal one.
+test("a proof that cannot run reports the original failure, not its own", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("SESSION_DETACHED", "steer transport died");
+  value.endpoint.failTurnsList = true;
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(
+    value.service.send("payments", "another thought", { clientUserMessageId: "web:1" }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "SESSION_DETACHED");
+      assert.match(String((error as Error).message), /transport died/u);
+      return true;
+    },
+  );
 });
 
 test("interrupt recovery resumes the exact native active turn when runtime cache is empty", async () => {

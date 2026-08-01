@@ -17,7 +17,7 @@ import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
 import { JsonRpcResponseError } from "../app-server/rpc-client.ts";
 import type { PermissionBlockedEvent } from "../app-server/managed-endpoint.ts";
-import { claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
+import { claudeGoalMarkerPresent, claudeMessagePhase, claudeNativeGoal, reconstructClaudeThread, type ClaudeThreadView } from "../sessions/claude-thread.ts";
 import type { ClaudeArchiveStore } from "../sessions/claude-archives.ts";
 import {
   CLAUDE_DEFAULT_REASONING_EFFORT,
@@ -34,6 +34,11 @@ interface ThreadState {
   cwd: string;
   threadSource?: string;
   materialized: boolean;                 // has at least one turn been run (transcript exists)?
+  // What an earlier goal scan already proved about this transcript: bytes in [floor, top) hold
+  // no goal marker. The transcript only grows, so the next scan reads the new tail and jumps
+  // straight over this span. Without it, every status read of a long-lived worker with no goal
+  // re-walked the whole budget — on a remote endpoint, one ssh spawn per window, every time.
+  goalScan?: { floor: number; top: number };
   recoveryChecked: boolean;
   recovery?: Promise<void>;
   loaded: boolean;                       // is the session open on the host?
@@ -69,6 +74,9 @@ interface LiveTurnItems {
 // which writes a Stop-hook row per continuation — always falls inside it, while never
 // transferring a whole transcript over ssh on a status poll.
 const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
+// How far back readNativeGoal will walk in total. A goal that scrolled out of one window is
+// still a goal; a transcript with none pays this once per status read, so it stays modest.
+const GOAL_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
 // How long the DRAIN POLL waits for the host to confirm the tasks are gone — long enough to
 // cover a stop that has to cross ssh and unwind a tool call. It does not bound the whole stop:
@@ -443,7 +451,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // records it — so an installed goal is reported without a duplicate goal row, and it
       // survives a restart because the transcript does. Only a running goal's PROGRESS
       // (iterations, tokens) is unavailable; the SDK does not surface it.
-      case "thread/goal/get": return { goal: await this.readNativeGoal(requireString(args.threadId, "threadId")) } as T;
+      case "thread/goal/get": return await this.readNativeGoal(requireString(args.threadId, "threadId")) as T;
       case "thread/goal/set": return await this.goalSet(args) as T;
       case "thread/goal/clear": return await this.goalClear(args) as T;
       // Claude's context compaction is its own `/compact` command, delivered like `/goal`.
@@ -586,7 +594,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const state = knownState ?? await this.ensureState(threadId);
     const records = state.materialized === false
       ? []
-      : await this.history.fullRecords(threadId, state.cwd) ?? [];
+      : await this.history.recentRecords(threadId, state.cwd) ?? [];
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,
@@ -1022,35 +1030,120 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     });
   }
 
-  // Reads the goal from the TAIL of the transcript, not the whole file. A full scan throws
-  // past its ~4 MiB budget, and swallowing that reported "no goal" for exactly the
-  // long-running sessions most likely to have one — a silent lie rather than a limit.
+  // Reads the goal from the END of the transcript, walking backwards in windows.
   //
-  // The tail is also the correct place to look: the last marker wins, and Claude's Stop hook
-  // writes a row on every continuation while a goal runs, so an active goal always leaves
-  // recent traces. An unmaterialized or unreadable session simply has no goal to report,
-  // never an error, because this read rides along inside get_session_status.
-  private async readNativeGoal(threadId: string): Promise<{ objective: string; status: string } | null> {
+  // A single tail window was not enough. The marker only has to be one byte further back than
+  // the window for the goal to read as ABSENT — measured in production at 269,759 bytes from
+  // the end against a 262,144-byte window, a miss of 3% — and the session then reports no goal
+  // while Claude is still pursuing one. That silence is not harmless: the restart resume asks
+  // this before deciding whether to restart a parked worker, so a goal that scrolled out of the
+  // window is a worker that never gets going again.
+  //
+  // The assumption it replaces was that an active goal always leaves recent traces, because the
+  // Stop hook writes a row per continuation. Those rows exist, but a verbose turn can bury the
+  // objective far enough back that a fixed window misses it.
+  //
+  // Bounded, not unbounded: each step reads one window and stops at the first marker found
+  // walking back — which IS the last marker in the file, and the last marker wins. A transcript
+  // with no goal at all costs the whole budget once, which is why the budget is modest.
+  private static parsesAsRecord(line: string): boolean {
+    if (!line.trim()) return false;
+    try { JSON.parse(line); return true; } catch { return false; }
+  }
+
+  // `known: false` means the walk ran out of budget or could not read: no goal was FOUND, which
+  // is not the same as there being none. Reporting the two as one value is what erased a live
+  // goal from the panel — a bounded read wrote its own limitation down as an authoritative fact.
+  private async readNativeGoal(threadId: string): Promise<{
+    goal: { objective: string; status: string } | null;
+    known: boolean;
+  }> {
     const state = this.threads.get(threadId);
-    if (!state?.materialized) return null;
-    const chunk = await this.options.runner
-      .readTranscriptChunk(threadId, state.cwd, { offset: "tail", length: GOAL_SCAN_TAIL_BYTES })
-      .catch(() => undefined);
-    if (!chunk) return null;
-    const text = Buffer.from(chunk.bytes).toString("utf8");
-    // A tail read can start mid-line; that partial first line is not valid JSON and would
-    // be dropped by the parser anyway, but skip it explicitly when the window was clipped.
-    const lines = text.split("\n");
-    if (chunk.offset > 0) lines.shift();
-    const records: unknown[] = [];
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try { records.push(JSON.parse(line)); } catch { /* partial or non-JSON line */ }
+    if (!state?.materialized) return { goal: null, known: true };
+    // A marker anywhere resolves the question: `claudeNativeGoal` returns null both for "no
+    // marker here" and for "the last marker was a clear", and walking past a clear would
+    // resurrect a goal the user cancelled.
+    // An answer also PROVES a span clean: everything above the window that answered holds no
+    // marker, or that window would not have been the last one. Recording it is what makes a
+    // repeat read cost one window; discarding it made the cache never apply to any transcript
+    // small enough to finish inside the budget, which is most of them.
+    const settle = (
+      goal: { objective: string } | null,
+      proven?: { floor: number; top: number },
+    ): { goal: { objective: string; status: string } | null; known: true } => {
+      if (proven) state.goalScan = proven; else delete state.goalScan;
+      // Claude drives its own goal to completion, so an installed goal is by definition still
+      // being pursued; there is no paused or blocked state to distinguish.
+      return { goal: goal ? { ...goal, status: "active" } : null, known: true };
+    };
+    let cached = state.goalScan;
+    let top: number | undefined;
+    let end: number | undefined;
+    let carry: string | undefined;
+    let scanned = 0;
+    while (scanned < GOAL_SCAN_MAX_BYTES) {
+      // Jump the span an earlier scan already proved clean, rather than re-reading it.
+      if (end !== undefined && cached && end <= cached.top && end > cached.floor) {
+        end = cached.floor;
+        // The fragment only means anything for the window IMMEDIATELY below the last one. After
+        // a jump the next window is somewhere else entirely, and splicing an unrelated fragment
+        // onto its last line can forge a record that concatenates two unrelated messages.
+        carry = undefined;
+      }
+      if (end === 0) return settle(null, top === undefined ? undefined : { floor: 0, top });
+      const chunk = await this.options.runner
+        .readTranscriptChunk(threadId, state.cwd, {
+          offset: end === undefined ? "tail" : Math.max(0, end - GOAL_SCAN_TAIL_BYTES),
+          length: GOAL_SCAN_TAIL_BYTES,
+        })
+        .catch(() => undefined);
+      if (!chunk) return { goal: null, known: false };
+      if (chunk.bytes.length === 0) return settle(null);
+      if (top === undefined) {
+        top = chunk.offset + chunk.bytes.length;
+        // A transcript that shrank was rewritten, so cached offsets no longer mean anything.
+        // Clearing only the field would leave this walk still jumping by the stale span below.
+        if (cached && top < cached.top) { delete state.goalScan; cached = undefined; }
+      }
+      // A window can start mid-line. That leading fragment is the TAIL of a record whose head
+      // lives in the next window down, and the next window's own last line is that record's
+      // head, truncated. Dropping both — which is what parsing each window in isolation does —
+      // loses any record that straddles a boundary, marker included. Carry the fragment down
+      // and rejoin it instead; windows are always visited in descending order.
+      const lines = Buffer.from(chunk.bytes).toString("utf8").split("\n");
+      const fragment = chunk.offset > 0 ? lines.shift() ?? "" : undefined;
+      // Rejoin only when the last line is genuinely incomplete. A window can begin exactly after
+      // a newline, and then BOTH lines are whole records — appending would destroy two valid
+      // records where isolation only ever lost one.
+      if (carry !== undefined && carry !== "" && lines.length > 0 && !ClaudeCodeRuntime.parsesAsRecord(lines[lines.length - 1]!)) {
+        lines[lines.length - 1] += carry;
+      }
+      carry = fragment;
+      const records: unknown[] = [];
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { records.push(JSON.parse(line)); } catch { /* partial or non-JSON line */ }
+      }
+      // What this window proves clean is everything ABOVE it: had a marker been up there, an
+      // earlier window would have answered first. Recording the window's own start instead
+      // would make the next read jump straight over the marker this one just found.
+      const proven = { floor: chunk.offset + chunk.bytes.length, top };
+      const goal = claudeNativeGoal(records);
+      if (goal) return settle(goal, proven);
+      // Match the marker the way the parser does — on a `/goal` command's own stdout record.
+      // Testing the raw window text instead stopped the walk on any prose containing the words,
+      // which reported "no goal" for a session whose goal was one window further back.
+      if (claudeGoalMarkerPresent(records)) return settle(null, proven);
+      if (chunk.offset === 0) return settle(null, { floor: 0, top });
+      scanned += chunk.bytes.length;
+      end = chunk.offset;
     }
-    const goal = claudeNativeGoal(records);
-    // Claude drives its own goal to completion, so an installed goal is by definition still
-    // being pursued; there is no paused or blocked state to distinguish.
-    return goal ? { ...goal, status: "active" } : null;
+    // Out of budget with the question open. Remember how far down it is clean so the next read
+    // resumes here instead of starting over.
+    if (end !== undefined && top !== undefined) {
+      state.goalScan = { floor: end, top: Math.max(top, state.goalScan?.top ?? 0) };
+    }
+    return { goal: null, known: false };
   }
 
   private async goalClear(params: Record<string, unknown>): Promise<{ goal: null }> {

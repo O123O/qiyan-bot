@@ -1225,7 +1225,7 @@ test("the manager's goal tools install and clear Claude's native goal", async ()
 
   // Reading stays graceful so a provider-neutral get_session_status still works: native
   // goal state is not exposed to the SDK stream, so there is nothing to report.
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: t }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: t }), { goal: null, known: true });
 
   const set = await rt.request<{ goal: any }>("thread/goal/set", { threadId: t, objective: "finish phase 2" });
   assert.equal(set.goal.objective, "finish phase 2");
@@ -1428,6 +1428,31 @@ test("get_goal reads the objective Claude's native /goal recorded", async () => 
   assert.equal(read.goal?.status, "active");
 });
 
+// A goal read walks the transcript backwards in windows. It used to stop as soon as a window's
+// raw text contained "Goal set:" ANYWHERE -- so an assistant that merely discussed the words, or
+// a tool result quoting them, hid the real marker behind it and the session reported no goal.
+// The panel then wrote that down as authoritative and the goal disappeared.
+test("prose quoting the goal marker does not hide the real goal behind it", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-prose", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1",
+      message: { role: "user", content: "<local-command-stdout>Goal set: ship the fix</local-command-stdout>" } },
+    // Push the real marker out of the tail window, so the walk has to step back past the prose.
+    { type: "assistant", cwd: "/w", uuid: "pad",
+      message: { role: "assistant", content: [{ type: "text", text: "x".repeat(300_000) }] } },
+    { type: "assistant", cwd: "/w", uuid: "a1",
+      message: { role: "assistant", content: [{ type: "text", text: "I ran `/goal` and it printed Goal set: ship the fix" }] } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2", message: { role: "user", content: "carry on" } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-prose", cwd: "/w", excludeTurns: true });
+
+  const read = await rt.request<{ goal: any; known: boolean }>("thread/goal/get", { threadId: "thread-prose" });
+  assert.equal(read.goal?.objective, "ship the fix");
+  assert.equal(read.known, true);
+});
+
 test("a cleared native goal reports none, and the last marker wins", async () => {
   const claude = new FakeClaude();
   claude.seed("thread-cleared", [
@@ -1440,7 +1465,7 @@ test("a cleared native goal reports none, and the last marker wins", async () =>
   const rt = makeRuntime(claude);
   await rt.start();
   await rt.request("thread/resume", { threadId: "thread-cleared", cwd: "/w", excludeTurns: true });
-  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "thread-cleared" }), { goal: null });
+  assert.deepEqual(await rt.request("thread/goal/get", { threadId: "thread-cleared" }), { goal: null, known: true });
 });
 
 // A session whose background task outlives its parent turn will speak again unprompted.
@@ -1949,6 +1974,93 @@ test("an interrupted turn promotes nothing into a final answer", async () => {
   const turn = terminals.at(-1)?.turn;
   const finals = (turn.items ?? []).filter((i: any) => i.type === "agentMessage" && i.phase === "final_answer");
   assert.deepEqual(finals, [], "an interrupted turn has no final answer to deliver");
+});
+
+// A transcript only grows. Reading it from offset 0 and refusing anything past the window meant
+// a thread stopped being reconstructible the moment it outgrew one — a deadline every long-lived
+// worker eventually passes, after which the read threw instead of returning what it could.
+test("a transcript larger than the read window reconstructs its recent turns instead of failing", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  // Older than the window: padded far beyond it, so a head-anchored read could never reach the end.
+  const filler = Array.from({ length: 400 }, (_, index) => ({
+    type: "assistant",
+    uuid: `old-${index}`,
+    cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "x".repeat(12_000) }] },
+  }));
+  claude.seed("cold-big", [
+    { type: "user", uuid: "ctx:old", sessionId: "cold-big", cwd: "/w", promptSource: "sdk", message: { role: "user", content: "ancient" } },
+    ...filler,
+    { type: "user", uuid: "ctx:recent", sessionId: "cold-big", cwd: "/w", promptSource: "sdk", message: { role: "user", content: "recent question" } },
+    { type: "assistant", uuid: "agent-recent", cwd: "/w", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "recent answer" }] } },
+  ]);
+
+  const read = await rt.request<{ thread: any }>("thread/read", { threadId: "cold-big", includeTurns: true });
+
+  const turns = read.thread.turns as Array<{ id: string; items: Array<{ type: string; text?: string }> }>;
+  assert.ok(turns.length > 0, "a transcript past the window still reconstructs");
+  assert.equal(turns.at(-1)?.id, "ctx:recent", "and the newest turn is the one it reaches");
+  assert.ok(
+    turns.at(-1)?.items.some((item) => item.type === "agentMessage" && item.text === "recent answer"),
+    "with its answer intact",
+  );
+});
+
+// Measured in production: the goal marker sat 269,759 bytes from the end against a 262,144-byte
+// window — a miss of 3% — and the session reported NO goal while Claude was still pursuing one.
+// The restart resume asks this before deciding whether to restart a parked worker, so a goal
+// that scrolled out of one window is a worker that never gets going again.
+test("a goal that scrolled past one window is still found", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const filler = Array.from({ length: 60 }, (_, index) => ({
+    type: "assistant", uuid: `chatter-${index}`, cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "y".repeat(9_000) }] },
+  }));
+  claude.seed("goal-buried", [
+    { type: "user", uuid: "ctx:goal", sessionId: "goal-buried", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal set: finish the proof</local-command-stdout>" } },
+    ...filler,
+  ]);
+
+  // The runtime only reads a goal for a thread it holds, as it does for a managed session.
+  await rt.request("thread/read", { threadId: "goal-buried" });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "goal-buried" });
+
+  assert.deepEqual(read.goal, { objective: "finish the proof", status: "active" });
+});
+
+// Walking back must not resurrect a goal the user cancelled: the newest marker wins, so a clear
+// found on the way back ends the search rather than being skipped over.
+test("a cleared goal is not resurrected by walking further back", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const filler = Array.from({ length: 60 }, (_, index) => ({
+    type: "assistant", uuid: `chatter-${index}`, cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "y".repeat(9_000) }] },
+  }));
+  // The clear must land in a LATER window than the set, or both are read at once and the guard
+  // is never exercised: filler on both sides puts them in different steps of the walk.
+  claude.seed("goal-cleared", [
+    { type: "user", uuid: "ctx:goal", sessionId: "goal-cleared", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal set: finish the proof</local-command-stdout>" } },
+    ...filler,
+    { type: "user", uuid: "ctx:clear", sessionId: "goal-cleared", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal cleared</local-command-stdout>" } },
+    ...filler,
+  ]);
+
+  // The runtime only reads a goal for a thread it holds, as it does for a managed session.
+  await rt.request("thread/read", { threadId: "goal-cleared" });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "goal-cleared" });
+
+  assert.equal(read.goal, null);
 });
 
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.

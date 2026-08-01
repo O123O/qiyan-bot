@@ -74,7 +74,7 @@ import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, ToolReadinessGate } from "./mcp/server.ts";
 import { SessionRegistry, type RegistrySession } from "./registry/session-registry.ts";
-import { SessionDiscovery } from "./sessions/discovery.ts";
+import { DISCOVERY_SOURCE_KINDS, SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import {
   currentSessionSettings,
@@ -168,6 +168,10 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
+// How long an endpoint-lifecycle operation may stay unreconcilable before it is retired. It is
+// a give-up, not a proof — the outcome stays unknown — and it exists because the alternative is
+// an endpoint that no operator action can reach for as long as its host stays down.
+const LIFECYCLE_RECOVERY_MAX_AGE_MS = 15 * 60_000;
 const recoveryTurnWindowLimit = 64;
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
@@ -872,6 +876,20 @@ export async function settleEarlierEndpointOperations(options: {
     && options.operations.get(lastEarlier.id)?.state === "succeeded"
     ? "satisfied"
     : "proceed";
+}
+
+// Whether an endpoint-lifecycle operation has been unreconcilable long enough to retire. Only
+// `uncertain` qualifies: a `dispatched` operation is genuinely in flight and no amount of elapsed
+// time makes it safe to retire one.
+export function lifecycleRecoveryExhausted(options: {
+  policy: string;
+  state: string | undefined;
+  createdAt: number;
+  now: number;
+  maxAgeMs?: number;
+}): boolean {
+  if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
+  return options.now - options.createdAt > (options.maxAgeMs ?? LIFECYCLE_RECOVERY_MAX_AGE_MS);
 }
 
 // A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
@@ -2352,10 +2370,72 @@ export async function buildProductionApp(
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
+  // Sessions whose rollout location is being relearned, so a panel that retries does not
+  // stack reconciles for the same thread.
+  const relearningLocations = new Set<string>();
   const readCodexWorkerTurns = createCodexConversationHistoryRead({
     locations: codexRolloutLocations,
     nativeSession: (endpointId, threadId, mappingId) =>
       nativeSessions.view({ endpointId, threadId, mappingId }),
+    // A rollout location is just the thread's path on disk, and `thread/list` reports it. Ask
+    // for exactly that.
+    //
+    // It was previously learned by RECONCILING the session, which is a mutation dressed as a
+    // read: it takes a lease, re-issues `thread/resume` against a thread the app-server already
+    // has loaded and may be running a turn on, bumps the session's lifecycle revision (so a
+    // concurrent send loses its turn id), and on an unrestorable thread ends the epoch and
+    // unregisters the session outright. None of that belongs behind opening a panel.
+    //
+    // Debounced per session: each failed history read asks again, and a panel retries.
+    relearnLocation: (endpointId, threadId, mappingId) => {
+      const key = managedRetryKey(endpointId, threadId, mappingId);
+      if (relearningLocations.has(key)) return;
+      relearningLocations.add(key);
+      runBackground(
+        async () => {
+          try {
+            const session = Object.values(registry.snapshot().sessions).find((item) =>
+              item.endpoint === endpointId && item.thread_id === threadId && item.mapping_id === mappingId);
+            // Same request shape the lifecycle's own "find this thread in thread/list" uses,
+            // except for `useStateDbOnly`: the state-DB path does not carry the on-disk path,
+            // which is the only thing being asked for here.
+            //
+            // Paged, not one page: a worker that is not among the most recently updated threads
+            // for its cwd would otherwise never be found, and the panel would sit on "being
+            // re-read and will load shortly" forever -- the never-resolving promise this call
+            // replaced in the first place.
+            let cursor: string | undefined;
+            for (let page = 0; page < 16; page += 1) {
+              const listed = await pool.request<{
+                data: Array<{ id?: unknown; path?: unknown; preview?: unknown }>;
+                nextCursor?: string | null;
+              }>(endpointId, "thread/list", {
+                ...cursor === undefined ? {} : { cursor },
+                limit: 100,
+                sortKey: "updated_at",
+                sortDirection: "desc",
+                sourceKinds: [...DISCOVERY_SOURCE_KINDS],
+                archived: false,
+                useStateDbOnly: false,
+                ...session?.project_dir ? { cwd: session.project_dir } : {},
+              });
+              const row = listed.data.find((candidate) => String(candidate.id ?? "") === threadId);
+              if (row) {
+                codexRolloutLocations.observe(endpointId, {
+                  id: threadId,
+                  path: typeof row.path === "string" ? row.path : "",
+                  preview: String(row.preview ?? ""),
+                });
+                break;
+              }
+              cursor = listed.nextCursor ?? undefined;
+              if (cursor === undefined) break;
+            }
+          } finally { relearningLocations.delete(key); }
+        },
+        () => recordBackgroundFailure("rollout location relearn"),
+      );
+    },
     readPage: async ({ endpointId, allowMissing, ...input }, signal) => {
       const context = remoteContexts.get(endpointId);
       return readCodexRolloutHistoryPage({
@@ -3089,6 +3169,10 @@ export async function buildProductionApp(
             if (!registered || registered.session.mapping_id !== identity.mapping_id) {
               throw new AppError("OPERATION_CONFLICT", "managed goal mapping changed during recovery");
             }
+            // A bounded read that found nothing proves nothing. Treating it as "this session has
+            // no goal" un-armed goal control and erased the displayed goal for a session that
+            // still had one.
+            if ((currentGoal as { known?: boolean }).known === false) return;
             const active = restoredGoalControlIsActive(currentGoal);
             const hasGoal = currentGoal.goal !== null;
             if (!control.known) setGoalControlled(registered.nickname, hasGoal);
@@ -3443,6 +3527,12 @@ export async function buildProductionApp(
         readWorkerTurns,
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
+        // Codex history is read from a rollout whose location the provider has to tell us. A
+        // thread that resumes without one is only nominally available: its history cannot be
+        // read, and in practice it is not working either. Claude reads its own transcript, so
+        // it has no such dependency.
+        historyReadable: (endpointId, threadId) => sessionProvider(endpointId) !== "codex"
+          || codexRolloutLocations.get(endpointId, threadId) !== undefined,
         host: (id) => {
           if (isLocalEndpointId(id, localClaudeEndpointId)) return localHostName;
           return endpointCatalog.definitions().find((definition) => definition.id === id)?.host ?? id;
@@ -3517,7 +3607,7 @@ export async function buildProductionApp(
       get_session_status: async (args) => {
         if (args.nickname === "assistant") return assistantSessionStatus(true);
         const live = await sessions.status(args.nickname) as any;
-        observeGoal(args.nickname, live.goal);
+        observeGoal(args.nickname, live.goalKnown === false ? { goal: null, known: false } : live.goal);
         await renderDashboardSafely();
         const facts = dashboard.status(args.nickname);
         return {
@@ -4073,6 +4163,10 @@ export async function buildProductionApp(
   }
 
   function observeGoal(nickname: string, response: any, observedAt = Date.now()): void {
+    // A provider that bounds its own goal read reports whether the answer is authoritative.
+    // "I did not find one" must never overwrite a goal the panel is already showing: that is
+    // how a live goal vanished from the panel and stayed gone.
+    if (response && typeof response === "object" && response.known === false) return;
     const goal = response && typeof response === "object" && "goal" in response ? response.goal : response;
     const sequence = dashboardStore.allocateObservationSequence();
     if (goal == null) {
@@ -4999,7 +5093,9 @@ export async function buildProductionApp(
           const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
-                : goal == null && cancelInterruptProven;
+                // `cancel_goal` is proven only by an ANSWER of "no goal", never by a read that
+                // merely failed to find one.
+                : goal == null && (current as { known?: boolean })?.known !== false && cancelInterruptProven;
           if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")) {
             restoredGoalControlIsActive(current);
             setGoalControlled(args.nickname, false);
@@ -5074,7 +5170,31 @@ export async function buildProductionApp(
           transientTargets.set(operation.id, target);
         }
         else if (disposition === "wait_for_endpoint") waitingForEndpoint = true;
-        // Leave the operation uncertain unless authoritative state proves its exact outcome.
+        // Leave the operation uncertain unless authoritative state proves its exact outcome —
+        // but not forever. An uncertain endpoint-lifecycle operation fences every later
+        // lifecycle action on its endpoint, and the only thing that can settle it is reaching
+        // that endpoint. So an endpoint that stays unreachable makes the fence permanent, and
+        // the disconnect that would end the situation is refused by the wreckage of the restart
+        // that could not happen. Nothing else retires it: the postcondition supersede fires only
+        // when a LATER lifecycle action subsumes it, which a disconnect after a restart
+        // deliberately does not.
+        //
+        // Giving up is safe because the ledger is not what prevents a second runtime. The
+        // runtime attests its identity on the remote host, and a start refuses over a live
+        // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
+        // is recorded as exactly that: the outcome is unknown, and said so.
+        if (lifecycleRecoveryExhausted({
+          policy: target.policy,
+          state: operations.get(operation.id)?.state,
+          createdAt: operation.createdAt,
+          now: Date.now(),
+        })) {
+          operations.fail(operation.id, {
+            message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
+              + `${Math.round(LIFECYCLE_RECOVERY_MAX_AGE_MS / 60_000)} minutes; its outcome is unknown `
+              + "and it no longer blocks later lifecycle actions",
+          });
+        }
       }
       const current = operations.get(operation.id);
       return current?.state === "dispatched" || current?.state === "uncertain";
@@ -5154,6 +5274,38 @@ export async function buildProductionApp(
     if (requireAcknowledged) requireManagedRecoveryAcknowledged(outcome, endpointId);
   }
 
+  // A Codex goal lives in the app-server and drives its own continuations, so a restart resumes
+  // the work by itself. A Claude goal is Claude's own `/goal`, advanced by its Stop hook — which
+  // fires only when a TURN ENDS, inside a live session. A local Claude host dies with QiYan, and
+  // an interrupted turn never reaches the hook, so after a restart the worker sits idle with an
+  // active goal and nothing to advance it. Nothing in memory survives to notice: the interrupted
+  // set is rebuilt per process from a runtime-lost event that a restart never produces.
+  //
+  // The goal itself is the durable evidence — it is read from the session's own transcript — so
+  // one message restarts the loop, and the Stop hook carries it from there.
+  async function resumeGoalDrivenClaudeWorker(nickname: string, session: RegistrySession): Promise<void> {
+    if (sessionProvider(session.endpoint) !== "claude") return;
+    const live = nativeSessions.view({
+      endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
+    });
+    // Only a settled session needs starting; one already working will reach its Stop hook.
+    if (live?.availability !== "ready" || live.status !== "idle") return;
+    const goal = await sessions.getGoal(nickname).catch(() => undefined) as { goal?: { status?: unknown } } | undefined;
+    if (goal === undefined) return;
+    // Refresh what the panel shows from what was just read. The displayed goal is a durable
+    // fact, and a read that could not find the marker writes null STRAIGHT INTO IT — so one
+    // status check taken while the goal was out of view erased it from the panel for good,
+    // even after the read itself was fixed. Every live read is a chance to correct that.
+    observeGoal(nickname, goal);
+    if (goal?.goal?.status !== "active") return;
+    scheduling?.enqueueRuntimeRecovery({
+      nickname,
+      endpointId: session.endpoint,
+      threadId: session.thread_id,
+      mappingId: session.mapping_id,
+    }, RUNTIME_RESTART_RESUME_MESSAGE);
+  }
+
   async function resumeManagedSessions(endpointFilter?: string, options: {
     unavailableOnly?: boolean;
     keys?: readonly ManagedRetryKey[];
@@ -5198,6 +5350,10 @@ export async function buildProductionApp(
         });
         if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         restoredKeys.push(key);
+        runBackground(
+          () => resumeGoalDrivenClaudeWorker(nickname, session),
+          () => recordBackgroundFailure("claude goal resume"),
+        );
       } catch (error) {
         if (options.isCurrent && !options.isCurrent()) throw error;
         const current = registry.get(nickname);

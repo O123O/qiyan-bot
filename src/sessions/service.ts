@@ -1,4 +1,4 @@
-import type { AppServerPool } from "../app-server/pool.ts";
+import { turnNoLongerSteerable, type AppServerPool } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
 import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
@@ -87,14 +87,35 @@ export class SessionService {
           return { mode: "steer" as const, turnId: response.turnId };
         } catch (error) {
           if (!options.clientUserMessageId) throw error;
+          // Best-effort proof that the message landed despite the failure. It scans history for
+          // the turn, and on a long-lived worker that scan can run out of budget — especially
+          // when the turn it is looking for was never written, which is exactly the case where
+          // the steer failed because that turn had already finished.
+          //
+          // A proof that could not be carried out proves nothing, so the ORIGINAL failure stands.
+          // Reporting the scan's own exhaustion instead replaced an actionable message ("that
+          // turn is no longer running; send it as a new turn") with an internal one about a
+          // budget, for a send the user simply needs to retry.
           const items = await this.pool.historyReader(session.endpoint, lease).exactTurnItems(
             session.thread_id, activeTurn, { budget: createHistoryScanBudget() },
-          );
-          const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
-          if (!proven) throw error;
-          options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
-          this.onTurnAccepted(session, activeTurn);
-          return { mode: "steer" as const, turnId: activeTurn };
+          ).catch(() => undefined);
+          const proven = items?.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId) ?? false;
+          if (proven) {
+            options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
+            this.onTurnAccepted(session, activeTurn);
+            return { mode: "steer" as const, turnId: activeTurn };
+          }
+          // The turn this steered into has moved on: it finished between choosing it and
+          // dispatching, and the provider refuses to redirect the message into work the sender
+          // never saw. That refusal is right for a caller that meant one SPECIFIC turn, and
+          // wrong for someone typing a message — their intent is "send this to the worker", and
+          // handing them a turn-identity conflict to act on drops what they wrote for a race
+          // they cannot see. Send it as its own turn instead.
+          //
+          // Safe to retry with the same id: the endpoint drops a duplicate message uuid rather
+          // than starting a second turn, so if the steer did land after all, this reconciles
+          // against it instead of doubling it.
+          if (mode === "steer" || !turnNoLongerSteerable(error)) throw error;
         }
       }
       const settings = options.settings ?? this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);
@@ -319,6 +340,10 @@ export class SessionService {
         nativeStatus,
         activeTurnId,
         goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
+        // Whether that goal reading is an answer or merely the absence of one. A provider whose
+        // goal read is bounded says so, and dropping the distinction here is what let a status
+        // poll -- the most frequent reader there is -- overwrite a live goal with "none".
+        ...goal && typeof goal === "object" && "known" in goal ? { goalKnown: (goal as any).known === true } : {},
       };
     };
     return this.endpoints
@@ -419,7 +444,10 @@ export class SessionService {
     try { return await this.pool.request(session.endpoint, "thread/goal/clear", { threadId: session.thread_id }); }
     catch (error) {
       const current = await this.getGoal(nickname).catch(() => undefined) as any;
-      if (current && current.goal == null) return current;
+      // Only an ANSWER proves the clear landed. A read that merely failed to find a goal is not
+      // evidence that there is none, and accepting it reported success for a clear that may not
+      // have happened.
+      if (current && current.goal == null && current.known !== false) return current;
       throw error;
     }
   }

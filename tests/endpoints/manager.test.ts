@@ -64,7 +64,11 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   fail(kind: EndpointLossKind = "connection-lost") { this.state = "unavailable"; this.events.emit("unavailable", kind); }
 }
 
-function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly string[] = []) {
+function queuedFixture(
+  candidates: FakeEndpoint[],
+  managedThreadIds: readonly string[] = [],
+  cleanupTimeoutMs?: number,
+) {
   const local = new FakeEndpoint("local");
   const endpoints = new Map<string, FakeEndpoint>([["local", local]]);
   let index = 0;
@@ -92,6 +96,7 @@ function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly st
         endpointGeneration: generation,
       };
     },
+    ...cleanupTimeoutMs === undefined ? {} : { cleanupTimeoutMs },
   });
   return { manager, local, candidateCount: () => index };
 }
@@ -1024,6 +1029,28 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.deepEqual(publications, [{ automatic: true, checkpointed: true }]);
   assert.deepEqual(await Promise.all(admissions), [true]);
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
+test("a close that never answers cannot leave the endpoint draining", async () => {
+  const first = new FakeEndpoint("devbox");
+  const abandoned = new FakeEndpoint("devbox");
+  abandoned.identityToken = "b".repeat(32);
+  let closes = 0;
+  // A close that never answers: an SSH channel whose peer is gone accepts the request and
+  // returns nothing. Awaiting it unbounded left the gate `draining` for good, which failed every
+  // read of the endpoint's sessions AND refused the restart that was the only repair -- the
+  // endpoint was locked out by the wreckage of its own last attempt.
+  abandoned.closeConnection = async () => { closes += 1; await new Promise<never>(() => {}); };
+  const spare = new FakeEndpoint("devbox");
+  const { manager } = queuedFixture([first, abandoned, spare], [], 5);
+  await manager.ensureReady("devbox");
+  first.onRuntimeIdentity = () => { throw new Error("SSH process failed (exit 1)"); };
+
+  await assert.rejects(manager.restart("devbox"), /exit 1/u);
+  assert.equal(closes, 1, "the abandoned candidate is still discarded");
+  assert.equal(manager.desiredState("devbox"), "automatic", "admission reopens once the discard is bounded out");
+  // The lifecycle queue must be free too: a discard that blocked it wedged every later restart.
+  await assert.rejects(manager.restart("devbox"), /exit 1/u);
 });
 
 test("restart after disconnect starts a fresh runtime without proving stopped threads idle", async () => {

@@ -149,6 +149,26 @@ export function openReadyProcessStream(
   });
 }
 
+const SSH_FAILURE_REASON_MAX = 400;
+// The remote helper's own failure channel. ONLY text it deliberately wrote under this prefix is
+// carried back; everything else a remote command prints is dropped unread, because this runs
+// arbitrary commands over SSH and their output can hold credentials.
+const HELPER_FAILURE_PREFIX = "qiyan remote helper failed";
+
+// What the remote helper said about its OWN failure, reduced to one line fit for an error
+// message. Kept short and single-line because it is concatenated into an AppError message that
+// ends up in operation records and the chat panel.
+export function describeSshFailure(stderr: Buffer): string {
+  const reason = stderr.toString("utf8")
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(HELPER_FAILURE_PREFIX))
+    .map((line) => line.slice(HELPER_FAILURE_PREFIX.length).replace(/^:\s*/u, "").trim())
+    .filter((line) => line.length > 0)
+    .join("; ");
+  return reason.length > SSH_FAILURE_REASON_MAX ? `${reason.slice(0, SSH_FAILURE_REASON_MAX - 1)}\u2026` : reason;
+}
+
 export function runBoundedProcess(
   command: string,
   args: readonly string[],
@@ -189,11 +209,18 @@ export function runBoundedProcess(
       if (!exitOutcome || !inputSettled || !stdoutClosed || !stderrClosed) return;
       if (terminalError) { finish(terminalError); return; }
       if (exitOutcome.code === 0) finish();
-      else finish(new AppError(
-        "ENDPOINT_UNAVAILABLE",
-        `SSH process failed (${exitOutcome.signal ? "signal" : `exit ${exitOutcome.code ?? "unknown"}`})`,
-        exitOutcome.code === null ? undefined : { exitCode: exitOutcome.code },
-      ));
+      else {
+        // Carry what the far side said. Reporting only the exit code turned every remote failure
+        // into the same opaque line: a runtime that refused to start because a four-hour-old
+        // orphan still held its process group, and one whose sqlite state lived on a stalled
+        // filesystem, were indistinguishable — and neither reason ever left the remote host.
+        const reason = describeSshFailure(Buffer.concat(stderr));
+        finish(new AppError(
+          "ENDPOINT_UNAVAILABLE",
+          `SSH process failed (${exitOutcome.signal ? "signal" : `exit ${exitOutcome.code ?? "unknown"}`})${reason ? `: ${reason}` : ""}`,
+          exitOutcome.code === null ? undefined : { exitCode: exitOutcome.code },
+        ));
+      }
     };
     const stop = (error: Error) => {
       if (settled || terminalError) return;

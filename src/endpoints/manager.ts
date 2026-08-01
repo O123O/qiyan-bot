@@ -49,6 +49,7 @@ export interface EndpointRecoveryPause {
 // explicit ensureReady still makes a single direct attempt, so a recovered endpoint reconnects on next
 // use — it just doesn't restart the background ramp. Indexed by the record's reconnectAttempt, which
 // resets to 0 only when acknowledgeReadyRecovery confirms the published generation recovered fully.
+const ENDPOINT_CLEANUP_TIMEOUT_MS = 15_000; // bound on closing an endpoint a failed lifecycle action abandons
 const RECONNECT_BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 120_000]; // ramp: 5s, 10s, 30s, 1m, 2m
 const RECONNECT_STEADY_MS = 3_600_000; // then every 1h once the ramp is exhausted
 const RECONNECT_MAX_ATTEMPTS = RECONNECT_BACKOFF_MS.length + 48; // 5 ramp + 48 hourly ≈ 48h, then give up
@@ -79,6 +80,8 @@ export class EndpointManager {
       endpointGeneration: number,
     ): { availability: "ready" | "unavailable"; status: "unknown" | "idle" | "active" | "error"; endpointGeneration: number } | undefined;
     schedule?(delayMs: number, run: () => void): ScheduledWork;
+    // Bound on closing an endpoint a lifecycle action is abandoning or stopping (default 15s).
+    cleanupTimeoutMs?: number;
     // Called once (latched until the next completed ready recovery) when the automatic reconnect loop
     // gives up on a persistently-unreachable endpoint (~48h of failed retries, e.g. a cluster in
     // extended maintenance). The background loop then stays stopped until ready-owner recovery or a bot
@@ -270,7 +273,7 @@ export class EndpointManager {
         candidateWasNew = record.endpoint !== candidate.endpoint;
         const actual = await candidate.endpoint.runtimeIdentity();
         if (!actual) {
-          await candidate.endpoint.closeConnection();
+          await this.requireClosed(candidate.endpoint, id);
           if (phase !== "runtime_stopped") checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           drain.disconnect();
           return;
@@ -289,7 +292,7 @@ export class EndpointManager {
         drain.disconnect();
       } catch (error) {
         if (candidateWasNew && !startedForProof && candidateEndpoint?.state !== "stopped") {
-          await candidateEndpoint?.closeConnection().catch(() => undefined);
+          await this.discardEndpoint(candidateEndpoint);
         }
         this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && startedForProof ? proofEndpoint : undefined);
         throw error;
@@ -339,7 +342,7 @@ export class EndpointManager {
         const target = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
         if (target.endpoint.daemonless) {
           // No runtime identity to reconcile: close the old adapter, re-ready a fresh one.
-          await target.endpoint.closeConnection().catch(() => undefined);
+          await this.requireClosed(target.endpoint, id);
           checkpoint?.({ phase: "runtime_stopped", identity: undefined });
           runtimeStopped = true;
           const started = await this.startCandidate(replacement);
@@ -350,7 +353,7 @@ export class EndpointManager {
         }
         const actual = await target.endpoint.runtimeIdentity();
         if (!actual) {
-          await target.endpoint.closeConnection();
+          await this.requireClosed(target.endpoint, id);
           checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           runtimeStopped = true;
           const started = await this.startCandidate(replacement);
@@ -365,7 +368,7 @@ export class EndpointManager {
           // before the restart operation checkpoints runtime_stopped. A different attested
           // identity is the restart's desired postcondition, not an ownership conflict.
           runtimeStopped = true;
-          await target.endpoint.closeConnection();
+          await this.requireClosed(target.endpoint, id);
           const endpoint = await this.startCandidate(replacement);
           replacementEndpoint = endpoint;
           const replacementIdentity = await this.requireRuntimeIdentity(endpoint);
@@ -393,7 +396,7 @@ export class EndpointManager {
         this.publishAfterReopen(record, drain, started);
       } catch (error) {
         if (runtimeStopped && replacementEndpoint && replacementEndpoint.state !== "stopped") {
-          await replacementEndpoint.closeConnection().catch(() => undefined);
+          await this.discardEndpoint(replacementEndpoint);
         }
         this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && proofStarted ? proofEndpoint : undefined);
         throw error;
@@ -415,7 +418,7 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, replacement);
       } catch (error) {
-        if (replacement?.state !== "stopped") await replacement?.closeConnection().catch(() => undefined);
+        if (replacement?.state !== "stopped") await this.discardEndpoint(replacement);
         this.reopenAfterLifecycleFailure(record, drain);
         throw error;
       }
@@ -441,9 +444,9 @@ export class EndpointManager {
       this.publishAfterReopen(record, drain, replacement);
     } catch (error) {
       if (runtimeStopped && replacement && replacement.state !== "stopped") {
-        await replacement.closeConnection().catch(() => undefined);
+        await this.discardEndpoint(replacement);
       } else if (!runtimeStopped && record.endpoint !== preparedReplacement.endpoint) {
-        await preparedReplacement.endpoint.closeConnection().catch(() => undefined);
+        await this.discardEndpoint(preparedReplacement.endpoint);
       }
       this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
       throw error;
@@ -513,7 +516,7 @@ export class EndpointManager {
         await this.options.commitBinding(candidate.pendingBinding, await this.options.hasIdentityReferences(candidate.endpoint.id));
       }
     } catch (error) {
-      await candidate.endpoint.closeConnection().catch(() => undefined);
+      await this.discardEndpoint(candidate.endpoint);
       throw error;
     }
     return candidate.endpoint;
@@ -534,6 +537,46 @@ export class EndpointManager {
     this.publish(record, endpoint);
   }
 
+  // Cleanup for an endpoint a failed lifecycle action is abandoning. It is deliberately bounded:
+  // closing a connection whose transport is already gone can block forever — an SSH channel that
+  // accepts the close and never answers it — and this runs on the per-endpoint lifecycle queue,
+  // which admits no further action until it settles. An unbounded close therefore did not merely
+  // leak a connection; it wedged every future restart of the endpoint behind a promise that would
+  // never resolve. The connection is discarded either way, so waiting past the bound buys nothing.
+  private async discardEndpoint(endpoint: ManagedAppServerEndpoint | undefined): Promise<void> {
+    if (!endpoint) return;
+    let expire: ScheduledWork | undefined;
+    await Promise.race([
+      endpoint.closeConnection().catch(() => undefined),
+      new Promise<void>((resolve) => { expire = this.expireAfterCleanupTimeout(resolve); }),
+    ]).finally(() => expire?.cancel());
+  }
+
+  // Closing an endpoint as the lifecycle action's own effect, rather than as cleanup. Same bound,
+  // opposite reporting: a close that never answers cannot be recorded as a completed stop, so it
+  // is raised as uncertainty. That still reopens the gate through the caller's catch, which is the
+  // point — an unbounded await here holds the endpoint `draining` forever and refuses the restart
+  // that is the only repair, whereas an uncertain operation stays recoverable.
+  private async requireClosed(endpoint: ManagedAppServerEndpoint, endpointId: string): Promise<void> {
+    let expire: ScheduledWork | undefined;
+    const closed = await Promise.race([
+      endpoint.closeConnection().then(() => true, () => true),
+      new Promise<false>((resolve) => { expire = this.expireAfterCleanupTimeout(() => resolve(false)); }),
+    ]).finally(() => expire?.cancel());
+    if (!closed) throw new AppError("OPERATION_UNCERTAIN", `endpoint connection did not close: ${endpointId}`);
+  }
+
+  // Deliberately NOT options.schedule: that scheduler is the reconnect backoff clock, and a
+  // cleanup bound firing on it would count as a reconnect attempt.
+  private expireAfterCleanupTimeout(resolve: () => void): ScheduledWork {
+    const timer = setTimeout(resolve, this.options.cleanupTimeoutMs ?? ENDPOINT_CLEANUP_TIMEOUT_MS);
+    timer.unref?.();
+    return { cancel: () => clearTimeout(timer) };
+  }
+
+  // Restores admission after a failed lifecycle action. The gate is closed from `beginDrain`
+  // onwards, so every await between the failure and this call holds the endpoint shut: they all
+  // go through discardEndpoint/requireClosed, which are bounded for exactly that reason.
   private reopenAfterLifecycleFailure(
     record: EndpointRecord,
     drain: { reopen(): void },
@@ -738,7 +781,7 @@ export class EndpointManager {
     try {
       return { endpoint, identity: await this.requireRuntimeIdentity(endpoint), startedForProof: true };
     } catch (error) {
-      await endpoint.closeConnection().catch(() => undefined);
+      await this.discardEndpoint(endpoint);
       throw error;
     }
   }
@@ -746,7 +789,7 @@ export class EndpointManager {
   // Stop an endpoint's runtime: prove-and-shutdown a daemon, or just close a daemonless one.
   private async stopEndpointRuntime(target: ShutdownTarget): Promise<void> {
     if (target.identity) await target.endpoint.shutdownRuntime(target.identity);
-    else await target.endpoint.closeConnection();
+    else await this.requireClosed(target.endpoint, target.endpoint.id);
   }
 
   private record(id: string): EndpointRecord {
