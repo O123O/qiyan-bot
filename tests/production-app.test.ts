@@ -20,6 +20,7 @@ import {
   managedRetryKey,
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
+  lifecycleRecoveryExhausted,
   settleEarlierEndpointOperations,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
@@ -1373,6 +1374,30 @@ test("a restart still refuses to race an earlier dispatched operation", async ()
   (harness.earlier as { state: string }).state = "dispatched";
   await assert.rejects(harness.run(), (error: any) => error.code === "OPERATION_CONFLICT");
   assert.deepEqual(harness.stillFencing(), ["restart-wedged"], "an in-flight operation is never retired");
+});
+
+// The postcondition supersede only fires when a LATER lifecycle action subsumes the stuck one,
+// and a disconnect after a restart deliberately does not subsume it. So an endpoint whose host
+// stays down had nothing that could ever retire its uncertain restart: it fenced every later
+// lifecycle action forever, including the disconnect that would have ended the situation. An
+// operation the system cannot reconcile has to stop being an obstacle on its own.
+test("an unreconcilable lifecycle operation is retired rather than fencing forever", async () => {
+  const created = 1_000_000;
+  const exhausted = (over: boolean, state = "uncertain"): boolean => lifecycleRecoveryExhausted({
+    policy: "endpoint_lifecycle",
+    state,
+    createdAt: created,
+    now: created + (over ? 60_001 : 59_999),
+    maxAgeMs: 60_000,
+  });
+
+  assert.equal(exhausted(false), false, "inside the budget it stays recoverable");
+  assert.equal(exhausted(true), true, "past it the operation stops blocking later lifecycle actions");
+  // Elapsed time never makes retiring an in-flight operation safe: it is genuinely running.
+  assert.equal(exhausted(true, "dispatched"), false, "a dispatched operation is never retired on age");
+  assert.equal(lifecycleRecoveryExhausted({
+    policy: "ready_endpoint", state: "uncertain", createdAt: created, now: created + 10 * 60_000, maxAgeMs: 60_000,
+  }), false, "only endpoint-lifecycle operations are retired this way — a send's effect is not superseded");
 });
 
 // The settle retires the WHOLE list, so checking only the oldest would retire a dispatched

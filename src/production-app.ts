@@ -168,6 +168,10 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
+// How long an endpoint-lifecycle operation may stay unreconcilable before it is retired. It is
+// a give-up, not a proof — the outcome stays unknown — and it exists because the alternative is
+// an endpoint that no operator action can reach for as long as its host stays down.
+const LIFECYCLE_RECOVERY_MAX_AGE_MS = 15 * 60_000;
 const recoveryTurnWindowLimit = 64;
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
@@ -872,6 +876,20 @@ export async function settleEarlierEndpointOperations(options: {
     && options.operations.get(lastEarlier.id)?.state === "succeeded"
     ? "satisfied"
     : "proceed";
+}
+
+// Whether an endpoint-lifecycle operation has been unreconcilable long enough to retire. Only
+// `uncertain` qualifies: a `dispatched` operation is genuinely in flight and no amount of elapsed
+// time makes it safe to retire one.
+export function lifecycleRecoveryExhausted(options: {
+  policy: string;
+  state: string | undefined;
+  createdAt: number;
+  now: number;
+  maxAgeMs?: number;
+}): boolean {
+  if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
+  return options.now - options.createdAt > (options.maxAgeMs ?? LIFECYCLE_RECOVERY_MAX_AGE_MS);
 }
 
 // A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
@@ -5152,7 +5170,31 @@ export async function buildProductionApp(
           transientTargets.set(operation.id, target);
         }
         else if (disposition === "wait_for_endpoint") waitingForEndpoint = true;
-        // Leave the operation uncertain unless authoritative state proves its exact outcome.
+        // Leave the operation uncertain unless authoritative state proves its exact outcome —
+        // but not forever. An uncertain endpoint-lifecycle operation fences every later
+        // lifecycle action on its endpoint, and the only thing that can settle it is reaching
+        // that endpoint. So an endpoint that stays unreachable makes the fence permanent, and
+        // the disconnect that would end the situation is refused by the wreckage of the restart
+        // that could not happen. Nothing else retires it: the postcondition supersede fires only
+        // when a LATER lifecycle action subsumes it, which a disconnect after a restart
+        // deliberately does not.
+        //
+        // Giving up is safe because the ledger is not what prevents a second runtime. The
+        // runtime attests its identity on the remote host, and a start refuses over a live
+        // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
+        // is recorded as exactly that: the outcome is unknown, and said so.
+        if (lifecycleRecoveryExhausted({
+          policy: target.policy,
+          state: operations.get(operation.id)?.state,
+          createdAt: operation.createdAt,
+          now: Date.now(),
+        })) {
+          operations.fail(operation.id, {
+            message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
+              + `${Math.round(LIFECYCLE_RECOVERY_MAX_AGE_MS / 60_000)} minutes; its outcome is unknown `
+              + "and it no longer blocks later lifecycle actions",
+          });
+        }
       }
       const current = operations.get(operation.id);
       return current?.state === "dispatched" || current?.state === "uncertain";
