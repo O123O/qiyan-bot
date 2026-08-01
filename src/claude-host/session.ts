@@ -356,10 +356,28 @@ export class ClaudeHostSession {
     if (uuid) {
       const index = this.inFlight.findIndex((turn) => turn.uuid === uuid);
       if (index >= 0) settled = this.inFlight.splice(index, 1)[0];
-    } else if (this.inFlight.length > 0) {
-      // Measured: an interrupted turn's result carries no user_message_uuid. Attribute
-      // it to the oldest in-flight turn — the one the SDK was executing.
+    } else if (message.subtype === "error_during_execution" && this.inFlight.length > 0) {
+      // Measured: an INTERRUPTED turn's result carries no user_message_uuid, so it can only
+      // be attributed by position — the oldest in flight is the one the SDK was executing.
+      //
+      // Nothing else may claim a turn that way. Claude emits other uncorrelated results of
+      // its own — a task notification whose origin was not stamped, an auto-continuation —
+      // and treating those as terminal settled the running human turn before it had
+      // answered. The relay then read a turn with no final answer yet and reported it
+      // "interrupted without a final response" while the worker was still writing one.
       settled = this.inFlight.shift();
+    } else if (!uuid) {
+      // A top-level end-of-turn that belongs to no accepted send. It is still delivered —
+      // that is how a background task's report reaches chat — but it settles nothing.
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "task-notification",
+        status: failed ? "failed" : "completed",
+        result: message,
+        at: this.now(),
+      });
+      return;
     }
 
     this.emit({

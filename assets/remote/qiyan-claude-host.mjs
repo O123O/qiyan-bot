@@ -350,8 +350,18 @@ var ClaudeHostSession = class {
     if (uuid) {
       const index = this.inFlight.findIndex((turn) => turn.uuid === uuid);
       if (index >= 0) settled = this.inFlight.splice(index, 1)[0];
-    } else if (this.inFlight.length > 0) {
+    } else if (message.subtype === "error_during_execution" && this.inFlight.length > 0) {
       settled = this.inFlight.shift();
+    } else if (!uuid) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "task-notification",
+        status: failed ? "failed" : "completed",
+        result: message,
+        at: this.now()
+      });
+      return;
     }
     this.emit({
       type: "turn/completed",

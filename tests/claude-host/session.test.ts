@@ -253,3 +253,32 @@ test("the authoritative task set replaces tracked tasks rather than merging them
   assert.deepEqual(session.status().backgroundTasks.map((task) => task.taskId), ["live"]);
   session.close();
 });
+
+// Claude emits top-level results of its own — a task notification whose origin was not
+// stamped, an auto-continuation. Treating any uncorrelated result as terminal settled the
+// RUNNING human turn before it had answered, and the relay then read a turn with no final
+// answer yet and reported it "interrupted without a final response" while the worker was
+// still writing one. Only an interrupt may claim a turn by position.
+test("an uncorrelated success does not settle the running human turn", async () => {
+  const { session, query, events } = makeSession();
+  session.send("uuid-a", "long task");
+  await delay(5);
+
+  // Claude finishes an internal turn of its own: success, no user_message_uuid, no origin.
+  query.push({ type: "result", subtype: "success", is_error: false, result: "internal" });
+  await delay(5);
+
+  assert.deepEqual(session.status().inFlightTurns, ["uuid-a"], "the human turn is still running");
+  const claimed = events.filter((event) => event.type === "turn/completed" && (event as any).uuid === "uuid-a");
+  assert.equal(claimed.length, 0, "nothing settled it");
+  // It is still delivered, because a background task's report reaches chat this way.
+  const unattributed = events.filter((event) => event.type === "turn/completed" && (event as any).origin === "task-notification");
+  assert.equal(unattributed.length, 1);
+
+  query.push(successResult("uuid-a"));
+  await delay(5);
+  const settled = events.filter((event) => event.type === "turn/completed" && (event as any).uuid === "uuid-a");
+  assert.equal(settled.length, 1, "its own result settles it");
+  assert.equal((settled[0] as any).status, "completed");
+  session.close();
+});
