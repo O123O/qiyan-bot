@@ -139,6 +139,19 @@ export class SessionService {
       let active = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
       if (!active && current.status === "active" && options.recoverExactTurn && turnId) active = turnId;
       if (current.status === "active" && !active) {
+        // Active with no turn to name means the work belongs to no turn: a Claude worker
+        // running a background task or subagent after its parent turn ended. Stopping that
+        // is the only way back to idle, and therefore the only way to archive or restart the
+        // session — refusing here left it permanently busy with nothing able to end it.
+        // A provider without that concept reports UNSUPPORTED_CAPABILITY, and the original
+        // refusal stands: for Codex this state really is an identity still being refreshed.
+        const stopped = await this.pool.request<{ stopped: number }>(
+          session.endpoint, "thread/tasks/stop", { threadId: session.thread_id }, undefined, lease,
+        ).catch((error: unknown) => {
+          if (error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY") return undefined;
+          throw error;
+        });
+        if (stopped) return turnId ?? "";
         throw new AppError("SESSION_BUSY", `${nickname} has an active turn whose identity is still being refreshed`);
       }
       if (!active && options.recoverExactTurn && turnId) {

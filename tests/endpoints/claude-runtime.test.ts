@@ -82,7 +82,7 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
       sessionId,
       activity: (session?.inFlight.length ?? 0) > 0 ? "working" : "idle",
       inFlightTurns: [...(session?.inFlight ?? [])],
-      backgroundTasks: [],
+      backgroundTasks: (this.tasks.get(sessionId) ?? []).map((taskId) => ({ taskId, kind: "background" as const, startedAt: 0 })),
     };
   }
 
@@ -97,7 +97,6 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   }
 
   async models(): Promise<unknown[]> { return []; }
-  async stopTask(): Promise<void> {}
 
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
@@ -212,6 +211,14 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   }
 
   emit(event: HostEvent): void { for (const listener of this.listeners) listener(event); }
+
+  readonly stoppedTasks: string[] = [];
+  private readonly tasks = new Map<string, string[]>();
+  setBackgroundTasks(sessionId: string, taskIds: string[]): void { this.tasks.set(sessionId, taskIds); }
+  async stopTask(sessionId: string, taskId: string): Promise<void> {
+    this.stoppedTasks.push(taskId);
+    this.tasks.set(sessionId, (this.tasks.get(sessionId) ?? []).filter((id) => id !== taskId));
+  }
 
   private require(sessionId: string) {
     const session = this.sessions.get(sessionId);
@@ -1528,4 +1535,35 @@ test("a native compaction publishes the item compact_session waits for", async (
   const compaction = items.find((item) => item.type === "contextCompaction");
   assert.ok(compaction, "the boundary reaches the tool as a contextCompaction item");
   assert.match(String(compaction.id), /ctx:a:compaction/u, "keyed to the turn that ran /compact");
+});
+
+// A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
+// Without a way to stop it the session stays active forever — unarchivable and
+// unrestartable — with nothing left that could ever end it.
+test("background work can be stopped so the session returns to idle", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.setBackgroundTasks(thread.id, ["bash-1", "agent-1"]);
+
+  const result = await rt.request<{ stopped: number }>("thread/tasks/stop", { threadId: thread.id });
+  assert.equal(result.stopped, 2);
+  assert.deepEqual(claude.stoppedTasks.sort(), ["agent-1", "bash-1"], "each task was stopped by id");
+});
+
+// Interrupting a turn stops what that turn set running too — otherwise a subagent outlives
+// its interrupted parent and pins the session non-idle.
+test("interrupting a turn also stops the work it spawned", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.setBackgroundTasks(thread.id, ["agent-1"]);
+
+  await rt.request("turn/interrupt", { threadId: thread.id, turnId: "ctx:a" });
+  assert.deepEqual(claude.interrupts, [thread.id], "the response was interrupted");
+  assert.deepEqual(claude.stoppedTasks, ["agent-1"], "and its subagent was stopped, not left running");
 });

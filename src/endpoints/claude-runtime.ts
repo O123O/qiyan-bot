@@ -369,6 +369,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         await this.deliverGoalCommand(requireString(args.threadId, "threadId"), "/compact");
         return {} as T;
       }
+      // Background work belongs to no turn, so turn/interrupt cannot name it. Stopping it is
+      // what lets a session that is only running a subagent return to idle and be restarted.
+      case "thread/tasks/stop": return await this.stopBackgroundWork(requireString(args.threadId, "threadId")) as T;
       case "turn/steer": return await this.turnSteer(args) as T;
       default: throw new AppError("UNSUPPORTED_CAPABILITY", `claude endpoint does not implement ${method}`);
     }
@@ -706,6 +709,18 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return tasks && (tasks.backgroundTasks > 0 || tasks.subagents > 0) ? tasks : undefined;
   }
 
+  // Stops every background task and subagent the session still has running. The SDK gives
+  // each one an id and a targeted stopTask, so this is exact rather than a session teardown.
+  // Returns how many were stopped so the caller can tell "nothing was running" from "stopped
+  // three things".
+  private async stopBackgroundWork(threadId: string): Promise<{ stopped: number }> {
+    const state = this.threads.get(threadId);
+    if (!state?.loaded) return { stopped: 0 };
+    const status = await this.options.host.status(threadId);
+    for (const task of status.backgroundTasks) await this.options.host.stopTask(threadId, task.taskId);
+    return { stopped: status.backgroundTasks.length };
+  }
+
   // Announce the turn now executing. Called when a send is accepted into an empty queue,
   // and again each time the head settles and the next send takes over.
   private announceHead(threadId: string, turnId: string): void {
@@ -804,6 +819,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         `turn ${turnId} is queued behind ${state.running[0]} on ${threadId}; interrupt the running turn instead`);
     }
     if (state?.running[0] === turnId) await this.options.host.interrupt(threadId);
+    // Interrupting a turn stops what that turn set running too. Leaving a subagent alive
+    // after its parent was interrupted keeps the session non-idle — and therefore
+    // unarchivable and unrestartable — with nothing left that could ever stop it.
+    await this.stopBackgroundWork(threadId).catch(() => undefined);
     state?.terminalTurns.add(turnId);
     return {};
   }
