@@ -79,6 +79,21 @@ test("reports a nonzero process exit structurally without returning diagnostic o
   );
 });
 
+// The helper's own failure line IS carried back, while everything else the child prints is
+// not. Reporting nothing at all made every remote failure the same opaque `exit 1`: a runtime
+// refusing to start behind a stale process group and one whose state directory sat on a stalled
+// filesystem read identically, and neither reason ever left the remote host.
+test("carries the remote helper's own failure line but no other child output", async () => {
+  const secret = "REMOTE_CREDENTIAL_OUTPUT";
+  const script = `process.stderr.write(${JSON.stringify(`${secret}\nqiyan remote helper failed: existing runtime is unhealthy\n`)}); process.exit(1)`;
+  await assert.rejects(
+    runBoundedProcess(process.execPath, ["-e", script], { timeoutMs: 1_000, maxOutputBytes: 1024 }),
+    (error: unknown) => error instanceof AppError
+      && error.message.includes("existing runtime is unhealthy")
+      && !error.message.includes(secret),
+  );
+});
+
 test("rejects pre-aborted work without spawning and handles an early stdin close", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-ssh-process-"));
   t.after(() => rm(root, { recursive: true, force: true }));

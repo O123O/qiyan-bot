@@ -50,8 +50,12 @@ try {
     }
     process.stdout.write(`\n${RESPONSE_PREFIX}${JSON.stringify(result)}\n`);
   }
-} catch {
-  process.stderr.write("qiyan remote helper failed\n");
+} catch (error) {
+  // Say what went wrong. Swallowing it left the caller with nothing but `exit 1` for every
+  // remote failure alike — a refused start, a missing dependency, a runtime whose state
+  // directory was on a stalled filesystem — and the reason never left this host.
+  const detail = String(error?.message ?? error ?? "").replace(/\s+/gu, " ").trim().slice(0, 300);
+  process.stderr.write(`qiyan remote helper failed${detail ? `: ${detail}` : ""}\n`);
   process.exitCode = 1;
 }
 
@@ -178,7 +182,10 @@ async function start(value) {
   if (capability.status !== 0 || capabilityPaths.slice(-3).length !== 3) throw new Error("codex, tmux, and tail are required to start a remote runtime");
   const before = await inspect(value);
   if (before.status === "healthy") return { identity: before.identity };
-  if (before.status === "unhealthy") throw new Error("existing runtime is unhealthy");
+  // A live supervisor means a runtime is genuinely there, and a second one must not be started
+  // against its socket. Without one there is nothing to protect -- see reclaimUnsupervised.
+  if (before.status === "unhealthy" && before.supervised) throw new Error("existing runtime is unhealthy");
+  if (before.status === "unhealthy") await reclaimUnsupervised(paths, before.identity);
   await unlink(paths.socketPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   await unlink(paths.identityPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   const inner = `exec ${paths.launcherPath} ${value.token} ${paths.socketPath} ${paths.identityPath}`;
@@ -191,7 +198,39 @@ async function start(value) {
     if (state.status === "absent") break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error("runtime did not become healthy");
+  // Say why. The app-server writes its own startup failure to this log and then exits, and
+  // without it the caller sees only that the runtime never appeared -- the reason (a state
+  // directory on an unresponsive filesystem, say) stays on this host.
+  throw new Error(`runtime did not become healthy${await launcherFailureDetail(paths)}`);
+}
+
+// An unsupervised runtime is debris: its tmux session is gone, so no server is left to protect.
+// Signal whatever still carries our token, since a child that outlives the server inherits the
+// server's process group AND its environment -- which is why "a member of the group owns our
+// token" cannot mean "the runtime is alive". Reading it that way locked an endpoint out for
+// hours behind one `git` wedged in an unresponsive filesystem, which no signal can reap.
+//
+// Survivors are therefore left behind deliberately rather than failing the start: the
+// replacement gets a new pid, process group and token, so old debris cannot be mistaken for it.
+async function reclaimUnsupervised(paths, identity) {
+  if (identity && ownedGroupMembers(identity).length > 0) {
+    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+    await waitForEmptyGroup(identity.processGroupId, 2_000);
+    if (ownedGroupMembers(identity).length > 0) {
+      try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+      await waitForEmptyGroup(identity.processGroupId, 2_000);
+    }
+  }
+  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
+}
+
+async function launcherFailureDetail(paths) {
+  try {
+    const log = await readFile(join(paths.runtimeDir, "app-server.log"), "utf8");
+    const lines = log.replace(/\u001b\[[0-9;]*m/gu, "").split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+    const detail = lines.slice(-2).join("; ").slice(0, 300);
+    return detail ? `: ${detail}` : "";
+  } catch { return ""; }
 }
 
 async function stop(value) {
