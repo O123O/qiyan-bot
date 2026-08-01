@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, truncate, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -137,6 +137,9 @@ async function capRuntimeLog(logPath) {
     const current = await stat(logPath);
     if (!current.isFile() || current.size <= RUNTIME_LOG_CAP_BYTES) return;
     await truncate(logPath, 0);
+    // Leave a record. A log that simply becomes small is indistinguishable from a quiet one,
+    // and whoever reads it next has no way to know bytes were dropped.
+    await writeFile(logPath, `--- qiyan: capped ${current.size} bytes at ${new Date().toISOString()} ---\n`, { flag: "a", mode: 0o600 });
   } catch { /* the log is absent or unreadable: nothing to cap, and never a probe failure */ }
 }
 
@@ -193,11 +196,15 @@ async function start(value) {
 
 async function stop(value) {
   const paths = runtimePaths(value);
-  const inspected = await inspect(value);
   const identity = await readIdentity(paths.identityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
   if (identity) {
+    // This gate is the protection against a RECYCLED pgid, not a redundant liveness check:
+    // the signal below goes to the whole process group, and only a surviving member still
+    // carrying our token proves the group is still ours. If every member had died and the
+    // kernel handed that pgid to something else, no member carries the token and nothing is
+    // signalled. Removing this would make the kill reuse-unsafe and silently so.
     let members = ownedGroupMembers(identity);
     if (members.length > 0) {
       try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }

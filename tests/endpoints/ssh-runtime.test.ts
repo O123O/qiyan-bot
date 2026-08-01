@@ -55,6 +55,7 @@ class FakeRemote implements RemoteRuntimeClient {
   // Whether the runtime's tmux session still exists. Undefined models a helper that predates
   // the field; false is a runtime whose supervisor is gone and whose leftovers are reclaimable.
   supervised: boolean | undefined;
+  ownedGroup: number[] | undefined;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
@@ -65,6 +66,7 @@ class FakeRemote implements RemoteRuntimeClient {
       return {
         status: this.status,
         ...(this.supervised === undefined ? {} : { supervised: this.supervised }),
+        ...(this.ownedGroup === undefined ? {} : { ownedGroup: this.ownedGroup, groupSize: this.ownedGroup.length }),
         ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}),
       } as T;
     }
@@ -544,6 +546,22 @@ test("a dead supervisor's leftovers are reclaimed instead of dead-ending the end
 
 // A runtime that is still supervised is a live thing this build does not understand. Killing it
 // to make room is exactly what the refusal exists to prevent.
+// Reclaiming kills processes the worker's user started. Doing that silently leaves whoever
+// owned the long-running command with no way to learn it was killed — the probe already counts
+// the survivors, so the only thing missing was saying so.
+test("a reclaim reports how many surviving processes it killed", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = false;
+  remote.ownedGroup = [4242, 4243];
+  const reclaimed: Array<{ endpointId: string; survivors: number }> = [];
+  const runtime = new SshRuntime({ endpointId: "devbox", remote, onReclaimed: (info) => reclaimed.push(info) });
+
+  await runtime.ensureStarted();
+
+  assert.deepEqual(reclaimed, [{ endpointId: "devbox", survivors: 2 }]);
+});
+
 test("a supervised unhealthy runtime is still refused rather than reclaimed", async () => {
   const remote = new FakeRemote();
   remote.status = "unhealthy";

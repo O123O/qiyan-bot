@@ -499,12 +499,14 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   await writeFile(runtimeLog, Buffer.alloc(65 * 1024 * 1024, 0x61));
   const capped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
   assert.deepEqual(parseRemoteHelperResponse(capped.stdout, "inspect"), { status: "absent", supervised: false });
-  assert.equal((await stat(runtimeLog)).size, 0, "an oversized runtime log is emptied, not left to fill the tmpfs");
+  const cappedLog = await readFile(runtimeLog, "utf8");
+  assert.match(cappedLog, /^--- qiyan: capped 68157440 bytes at .+ ---\n$/u,
+    "an oversized log is emptied, and says so: one that merely became small is indistinguishable from a quiet one");
 
   await writeFile(runtimeLog, "recent errors worth keeping");
   const kept = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.deepEqual(parseRemoteHelperResponse(kept.stdout, "inspect"), { status: "absent", supervised: false });
-  assert.equal((await stat(runtimeLog)).size, 27, "a log under the cap is left alone");
+  assert.equal(await readFile(runtimeLog, "utf8"), "recent errors worth keeping", "a log under the cap is left alone");
 
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");

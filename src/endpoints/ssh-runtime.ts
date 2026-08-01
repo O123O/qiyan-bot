@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "7821889fe3d24ef5f683788b3b1613e5455dd7e6e18e6a82dcf92196ba335e39";
+export const REMOTE_HELPER_SHA256 = "a71fb530df2f519249987f9abd51cbc67e070483fc5aadcdb9d0dab1a2328e3b";
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "e8e32d34ad7a1447016d3ef73db90d53fce3b918fd253e903b10840a8c9e0c5a";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -187,7 +187,15 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     tmuxMode: "explicit" | "legacy";
   };
 
-  constructor(private readonly options: { endpointId: string; remote: RemoteRuntimeClient; assetRoot?: string }) {
+  constructor(private readonly options: {
+    endpointId: string;
+    remote: RemoteRuntimeClient;
+    assetRoot?: string;
+    // Called when a dead runtime's leftovers are cleared. Reclaiming kills processes the
+    // worker's user started, so it must not be silent: without this, whoever owned the
+    // four-hour `git` that got killed has no way to find out that it was.
+    onReclaimed?(info: { endpointId: string; survivors: number }): void;
+  }) {
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(options.endpointId)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint ID");
   }
 
@@ -209,22 +217,30 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   }
   get remote(): RemoteRuntimeClient { return this.options.remote; }
 
-  async ensureStarted(): Promise<RuntimeIdentity> {
+  async ensureStarted(retried = false): Promise<RuntimeIdentity> {
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
     if (current.status === "healthy") return current.identity;
     if (current.status === "unhealthy") {
-      // A runtime whose SUPERVISOR is gone is dead, whatever it left behind. What keeps it
-      // reading "unhealthy" rather than "absent" is its own leftovers — a socket, an identity
-      // file, or a process it spawned that outlived it and still carries our runtime token.
+      // `supervised: false` means the TMUX SESSION is gone — a statement about the supervisor,
+      // not proof the server died. Either way the runtime is unusable: the probe refuses an
+      // unsupervised runtime however healthy its socket looks, so its sessions are lost from
+      // that moment. What keeps it reading "unhealthy" rather than "absent" is its own
+      // leftovers — a socket, an identity file, or a process it spawned that outlived it.
       // Refusing there is a dead end: `start` will not touch an unhealthy runtime, so nothing
       // ever clears the leftovers and the endpoint can never come back without a human on the
       // worker's machine. Observed with a `git` a dead app-server had spawned, still running
       // hours later and holding its process group open.
       //
-      // Reclaiming is safe precisely here: `stop` proves the recorded identity before it acts,
-      // and only signals processes carrying that identity's token. A runtime that is still
-      // SUPERVISED is a live thing this build does not understand, and is still left alone.
+      // What makes reclaiming safe is NOT that the kill is token-scoped — `stop` signals the
+      // whole process group. It is that group membership implies descent: POSIX setpgid can
+      // only join a group inside the caller's session, so every member is our own descendant,
+      // including a child that scrubbed its environment and fails the token check. The token
+      // is what protects against a RECYCLED pgid, and it does so through the gate in `stop`,
+      // which only signals when a surviving member still carries the identity's token.
+      //
+      // A runtime that is still SUPERVISED is a live thing this build does not understand,
+      // and is still left alone.
       if (current.supervised !== false || !current.identity) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
@@ -234,10 +250,15 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
         tmuxMode: prepared.tmuxMode,
         expected: current.identity,
       })], prepared.host.remoteHelperPath);
+      this.options.onReclaimed?.({ endpointId: this.options.endpointId, survivors: current.survivors ?? 0 });
     }
     if (prepared.tmuxMode === "legacy") {
+      // Re-preparing moves a legacy runtime into the shared directory. Reclaiming made this
+      // newly reachable from an unhealthy state, and it is plain recursion — bounded here so a
+      // case nobody has thought of cannot turn into a stack overflow.
+      if (retried) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH runtime could not be prepared: ${this.options.endpointId}`);
       delete this.prepared;
-      return this.ensureStarted();
+      return this.ensureStarted(true);
     }
     const result = await this.options.remote.invoke<{ identity: unknown }>("start", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
@@ -322,7 +343,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<
     { status: "absent" }
-    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean }
+    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean; survivors?: number }
     | { status: "healthy"; identity: RuntimeIdentity }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
@@ -332,6 +353,8 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       return {
         status: "unhealthy",
         ...(parsed.supervised === undefined ? {} : { supervised: parsed.supervised }),
+        // The probe already counts what survived; dropping it is what made the kill invisible.
+        ...(parsed.ownedGroup === undefined ? {} : { survivors: parsed.ownedGroup.length }),
         ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }),
       };
     }
