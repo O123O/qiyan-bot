@@ -16,6 +16,10 @@ export interface WebReadsDeps {
   // relays, notices), oldest → newest.
   listOwnerConversation(before: number | undefined, limit: number): OwnerConversationMessage[];
   provider(endpointId: string): "codex" | "claude";
+  // Whether this worker's durable history can actually be read. A session can resume — and so
+  // report a perfectly healthy status — while the provider never says where its rollout is, and
+  // it is then only nominally available: its history cannot be read and it does not work.
+  historyReadable?(endpointId: string, threadId: string): boolean;
   // Lease-free display label: local process hostname or configured SSH alias.
   host(endpointId: string): string;
 }
@@ -82,7 +86,13 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       provider: deps.provider(session.endpoint),
       projectDir: session.project_dir,
       lifecycleState: session.lifecycle_state,
-      nativeStatus: native?.availability === "ready" ? native.status : null,
+      // `idle` on a session whose history cannot be located is a comfortable lie: it is not
+      // resting, it is unusable. Report what it is rather than what its status field says.
+      nativeStatus: native?.availability !== "ready"
+        ? null
+        : deps.historyReadable?.(session.endpoint, session.thread_id) === false
+          ? "unavailable"
+          : native.status,
       activeTurnId: native?.availability === "ready" ? native.activeTurnId : null,
       model: info?.model.current ?? null,
       effort: info?.reasoning_effort.current ?? null,

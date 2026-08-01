@@ -3467,6 +3467,12 @@ export async function buildProductionApp(
         readWorkerTurns,
         listOwnerConversation: (before, limit) => conversations.listOwnerConversation(before, limit),
         provider: (id) => sessionProvider(id),
+        // Codex history is read from a rollout whose location the provider has to tell us. A
+        // thread that resumes without one is only nominally available: its history cannot be
+        // read, and in practice it is not working either. Claude reads its own transcript, so
+        // it has no such dependency.
+        historyReadable: (endpointId, threadId) => sessionProvider(endpointId) !== "codex"
+          || codexRolloutLocations.get(endpointId, threadId) !== undefined,
         host: (id) => {
           if (isLocalEndpointId(id, localClaudeEndpointId)) return localHostName;
           return endpointCatalog.definitions().find((definition) => definition.id === id)?.host ?? id;

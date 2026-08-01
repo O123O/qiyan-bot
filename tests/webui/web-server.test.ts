@@ -6,7 +6,7 @@ import test from "node:test";
 import { WebSocket } from "ws";
 import { WebBus } from "../../src/webui/web-bus.ts";
 import { createWebServer } from "../../src/webui/web-server.ts";
-import { assistantTranscript, workerDeliveryNickname, type WebReadsDeps } from "../../src/webui/web-reads.ts";
+import { assistantTranscript, listSessions, workerDeliveryNickname, type WebReadsDeps } from "../../src/webui/web-reads.ts";
 import type { WebGoalControlInput } from "../../src/webui/web-goal-control.ts";
 
 const TOKEN = "test-token-abc";
@@ -45,6 +45,30 @@ const reads: WebReadsDeps = {
   provider: () => "codex",
   host: () => "test-host",
 };
+
+// A Codex session reads its history from a rollout whose location the provider has to report.
+// One that resumes WITHOUT a location keeps a healthy-looking status while its history cannot be
+// read and it does not actually work — and "idle" then reads as a session at rest rather than a
+// session that is unusable, which is the opposite of what the reader needs to know.
+test("a codex session whose history cannot be located is reported unavailable, not idle", () => {
+  const unreadable: WebReadsDeps = { ...reads, historyReadable: () => false };
+  const readable: WebReadsDeps = { ...reads, historyReadable: () => true };
+
+  const hidden = listSessions(unreadable).find((session) => session.nickname === "payments");
+  const shown = listSessions(readable).find((session) => session.nickname === "payments");
+
+  assert.equal(hidden?.nativeStatus, "unavailable");
+  assert.equal(shown?.nativeStatus, "idle", "a locatable session still reports its real status");
+});
+
+// Which providers the check applies to is decided by the wiring, not here: Claude reads its own
+// transcript and is never asked. A reader given no opinion must therefore report the plain
+// status rather than inventing one.
+test("a session with no readability opinion reports its plain status", () => {
+  const session = listSessions(reads).find((entry) => entry.nickname === "payments");
+
+  assert.equal(session?.nativeStatus, "idle");
+});
 
 interface ServerCalls {
   inputs: Array<{ text: string; target?: string; clientInputId?: string; echoInAssistant?: boolean }>;
