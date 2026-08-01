@@ -10,6 +10,15 @@ export interface NativeSessionView {
   availability: "ready" | "unavailable";
   status: NativeSessionStatus;
   activeTurnId: string | null;
+  // The session is busy with work that belongs to no turn — a Claude background command or
+  // subagent still running after the turn that started it ended.
+  //
+  // This exists because `status: "active", activeTurnId: null` otherwise means two opposite
+  // things: "busy, and there is genuinely no turn to name" versus "busy, and we have not
+  // established which turn yet". The second is repaired by probing history for the active
+  // turn and, failing that, declaring the state unknown — which for the first is both wrong
+  // and unrecoverable, since no history read can ever reveal a turn that does not exist.
+  backgroundWork: boolean;
   endpointGeneration: number;
   lifecycleRevision: number;
   receiveSequence: number;
@@ -40,6 +49,15 @@ function nativeStatus(value: unknown): NativeSessionStatus {
   return "unknown";
 }
 
+// Counts the provider reports alongside an active status for work that belongs to no turn.
+// Absent for a provider that has no such concept, which is why absence means "no background
+// work" rather than "unknown".
+function hasNativeActivity(value: unknown): boolean {
+  const activity = record(value);
+  if (!activity) return false;
+  return Object.values(activity).some((count) => typeof count === "number" && count > 0);
+}
+
 const keyOf = (identity: NativeSessionIdentity): string =>
   `${identity.endpointId}\u0000${identity.threadId}\u0000${identity.mappingId}`;
 
@@ -67,6 +85,7 @@ export class NativeSessionState {
       availability: "ready",
       status: "unknown",
       activeTurnId: null,
+      backgroundWork: false,
       endpointGeneration,
       lifecycleRevision: existing?.endpointGeneration === endpointGeneration ? existing.lifecycleRevision + 1 : 0,
       receiveSequence: this.currentSequence(identity.endpointId, endpointGeneration),
@@ -93,6 +112,7 @@ export class NativeSessionState {
       availability: "unavailable",
       status: "unknown",
       activeTurnId: null,
+      backgroundWork: false,
       lifecycleRevision: existing.lifecycleRevision + 1,
       observedAt: this.now(),
     }, existing);
@@ -123,13 +143,24 @@ export class NativeSessionState {
     return this.captureRefresh(identity, endpointGeneration);
   }
 
-  applyRefresh(token: NativeRefreshToken, observation: { status: unknown; activeTurnId?: string | null }): boolean {
+  // `nativeActivity` is the same payload the notification carries, read here so a thread VIEW
+  // establishes background work exactly as an event does. A reconnect settles state through
+  // this path, not through notifications: without it the flag reverted to false on every
+  // resume, and the identity repair that false enables then recorded the session as unknown.
+  applyRefresh(
+    token: NativeRefreshToken,
+    observation: { status: unknown; activeTurnId?: string | null; nativeActivity?: unknown },
+  ): boolean {
     const current = this.views.get(keyOf(token));
     if (!current || current.endpointGeneration !== token.endpointGeneration
       || current.lifecycleRevision !== token.lifecycleRevision || current.availability !== "ready") return false;
     const status = nativeStatus(observation.status);
     const activeTurnId = status === "active" ? observation.activeTurnId ?? current.activeTurnId : null;
-    this.apply(current, { status, activeTurnId });
+    this.apply(current, {
+      status,
+      activeTurnId,
+      backgroundWork: status === "active" && hasNativeActivity(observation.nativeActivity),
+    });
     return true;
   }
 
@@ -192,10 +223,16 @@ export class NativeSessionState {
       }
       if (method === "thread/status/changed") {
         const status = nativeStatus(values?.status);
-        if (status === "active" && current.activeTurnId === null) refreshRequired = true;
+        const backgroundWork = status === "active" && hasNativeActivity(values?.nativeActivity);
+        // Background work is a complete explanation for an active session that names no turn,
+        // so it must NOT request the identity refresh: there is no turn for the refresh to
+        // find, and its failure to find one is recorded as an unknown state that fails every
+        // later operation on the session.
+        if (status === "active" && current.activeTurnId === null && !backgroundWork) refreshRequired = true;
         this.apply(current, {
           status,
           activeTurnId: status === "active" ? current.activeTurnId : null,
+          backgroundWork,
           receiveSequence: sequence,
         });
       }
@@ -212,6 +249,7 @@ export class NativeSessionState {
         availability: "unavailable",
         status: "unknown",
         activeTurnId: null,
+        backgroundWork: false,
         receiveSequence: sequence,
       });
     }
@@ -226,13 +264,17 @@ export class NativeSessionState {
     return current;
   }
 
-  private apply(current: NativeSessionSnapshot, change: Partial<Pick<NativeSessionView, "availability" | "status" | "activeTurnId" | "receiveSequence">>): void {
+  private apply(current: NativeSessionSnapshot, change: Partial<Pick<NativeSessionView, "availability" | "status" | "activeTurnId" | "backgroundWork" | "receiveSequence">>): void {
     const next: NativeSessionSnapshot = {
       ...current,
       ...change,
       lifecycleRevision: current.lifecycleRevision + 1,
       observedAt: this.now(),
     };
+    // Background work is a KIND of busy, so it cannot outlive being busy. A turn completing is
+    // the ordinary way this state goes idle without any task event, and a flag left true there
+    // suppresses identity repair for the mapping from then on.
+    if (next.status !== "active") next.backgroundWork = false;
     this.views.set(keyOf(next), next);
     this.publish(next, current);
   }
@@ -246,6 +288,7 @@ export class NativeSessionState {
       availability: view.availability,
       status: view.status,
       activeTurnId: view.activeTurnId,
+      backgroundWork: view.backgroundWork,
       endpointGeneration: view.endpointGeneration,
       lifecycleRevision: view.lifecycleRevision,
       receiveSequence: view.receiveSequence,

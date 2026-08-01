@@ -24,6 +24,11 @@ export async function repairActiveTurnIdentity(input: {
 }): Promise<NativeSessionView | undefined> {
   const before = input.native.view(input.identity);
   if (!before || before.availability !== "ready" || before.endpointGeneration !== input.endpointGeneration) return before;
+  // Nothing to repair: the session is busy with work that belongs to no turn, and no history
+  // read can produce a turn id for it. Probing anyway finds no active turn and concludes the
+  // state is unknown, which is how a worker with a live subagent came to fail every operation
+  // as if its endpoint were unavailable.
+  if (before.status === "active" && before.backgroundWork && before.activeTurnId === null) return before;
   if (input.expectedLifecycleRevision !== undefined) {
     if (before.lifecycleRevision !== input.expectedLifecycleRevision) return before;
   } else if (before.status !== "active" || before.activeTurnId !== null) {

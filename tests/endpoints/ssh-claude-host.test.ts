@@ -35,7 +35,15 @@ class FakeQuery implements SessionQuery {
   }
 
   settle(uuid: string): void {
-    const message = { type: "result", subtype: "success", user_message_uuid: uuid };
+    this.push({ type: "result", subtype: "success", user_message_uuid: uuid });
+  }
+
+  // The SDK's own signal that a Task-tool subagent is now running detached from any turn.
+  startSubagent(taskId: string): void {
+    this.push({ type: "system", subtype: "task_started", task_id: taskId, subagent_type: "explore" });
+  }
+
+  private push(message: unknown): void {
     const waiter = this.waiters.shift();
     if (waiter) waiter({ value: message, done: false });
     else this.pending.push(message);
@@ -194,6 +202,28 @@ test("a turn left running on the host is recovered by id after the client reconn
   queries.get("thread-1")!.settle("turn-1");
   await delay(20);
   assert.equal(await runtime.recoverTurn("thread-1"), undefined);
+});
+
+// A subagent outliving its turn is the case with NO in-flight turn, so reporting only turns
+// left the reattached endpoint believing the session idle. Archive then closes the session —
+// and the SDK query the subagent is running inside — on the strength of that belief.
+test("background work still running on the host is recovered as well as a turn", async (t) => {
+  const { runtime, queries, streams } = await harness(t);
+  await runtime.start();
+  await runtime.host.open({ sessionId: "thread-1", mode: "create", cwd: "/work" });
+  assert.equal(await runtime.host.send("thread-1", "turn-1", "spawn a subagent"), true);
+  queries.get("thread-1")!.startSubagent("agent-1");
+  await delay(20);
+  // The turn finishes; the subagent it started does not.
+  queries.get("thread-1")!.settle("turn-1");
+  await delay(20);
+
+  streams[0]!.output.destroy();
+  await delay(20);
+
+  assert.deepEqual(await runtime.recoverTurn("thread-1"), {
+    activity: { backgroundTasks: 0, subagents: 1 },
+  }, "no turn to adopt, but the session is still busy and says so");
 });
 
 test("a thread the host never loaded has no turn to recover", async (t) => {

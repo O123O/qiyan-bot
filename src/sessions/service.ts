@@ -61,7 +61,10 @@ export class SessionService {
         throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
       }
       const activeTurn = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
-      if (current.status === "active" && !activeTurn) {
+      // Busy on background work is not an unresolved turn identity: there is no turn, and the
+      // provider queues a new message behind the work rather than colliding with it. Refusing
+      // here made a worker unreachable for as long as its subagent ran.
+      if (current.status === "active" && !activeTurn && !current.backgroundWork) {
         throw new AppError("SESSION_BUSY", `${nickname} has an active turn whose identity is still being refreshed`);
       }
       const mode = options.mode ?? "auto";
@@ -127,31 +130,62 @@ export class SessionService {
     });
   }
 
+  // Returns the interrupted turn's id, or — when the session was busy with work that belongs
+  // to no turn — a report of the background work stopped instead. The caller has to be able
+  // to tell those apart: there is no turn id to name in the second case, and inventing one
+  // would put a turn that never ran into the operation receipt.
   async interrupt(nickname: string, turnId?: string, options: {
     existingLease?: EndpointWorkLease;
     recoverExactTurn?: boolean;
     onBeforeNativeDispatch?(turnId: string): void;
-  } = {}): Promise<string> {
+    onBeforeBackgroundStop?(): void;
+  } = {}): Promise<string | { stoppedBackgroundWork: number }> {
     const expected = this.registeredControl(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactRegisteredControl(nickname, expected.mapping_id);
       const current = await this.currentNative(session, lease);
       let active = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
       if (!active && current.status === "active" && options.recoverExactTurn && turnId) active = turnId;
-      if (current.status === "active" && !active) {
-        // Active with no turn to name means the work belongs to no turn: a Claude worker
-        // running a background task or subagent after its parent turn ended. Stopping that
-        // is the only way back to idle, and therefore the only way to archive or restart the
-        // session — refusing here left it permanently busy with nothing able to end it.
-        // A provider without that concept reports UNSUPPORTED_CAPABILITY, and the original
-        // refusal stands: for Codex this state really is an identity still being refreshed.
-        const stopped = await this.pool.request<{ stopped: number }>(
+      if (current.status === "active" && !active && current.backgroundWork) {
+        // The session is busy with work that belongs to no turn: a Claude background command
+        // or subagent still running after the turn that started it ended. Stopping that is the
+        // only way back to idle, and therefore the only way to archive or restart the session —
+        // there is no turn to interrupt, so refusing here left it busy with nothing able to
+        // end it.
+        //
+        // Only a Claude endpoint ever reports background work, so this is not a capability
+        // probe and a failure here is a real failure — reported as OPERATION_UNCERTAIN
+        // rather than a "busy" code, because those are all classified as proving no effect
+        // and would discard the checkpoint written a line above. Tasks may well have been
+        // stopped before the response was lost.
+        options.onBeforeBackgroundStop?.();
+        const response = await this.pool.request<unknown>(
           session.endpoint, "thread/tasks/stop", { threadId: session.thread_id }, undefined, lease,
-        ).catch((error: unknown) => {
-          if (error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY") return undefined;
-          throw error;
-        });
-        if (stopped) return turnId ?? "";
+        ).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+        if (response instanceof Error) {
+          throw new AppError("OPERATION_UNCERTAIN", `${nickname} background work may or may not have stopped`, { cause: response });
+        }
+        // An answer without the counts has not told us what the endpoint did.
+        const stopped = backgroundStopReport(response);
+        if (!stopped) throw new AppError("OPERATION_UNCERTAIN", `${nickname} reported no usable result for its background work`);
+        if (stopped.remaining > 0) {
+          // Some stopped and some did not: an effect was applied, so this must not be recorded
+          // as a failure that proves nothing happened.
+          if (stopped.stopped > 0) {
+            throw new AppError("OPERATION_UNCERTAIN",
+              `${nickname} stopped ${stopped.stopped} background task(s); ${stopped.remaining} did not stop`);
+          }
+          throw new AppError("SESSION_BUSY", `${nickname} has ${stopped.remaining} background task(s) that did not stop`);
+        }
+        // Nothing was running after all — the active belief was stale, and the endpoint has
+        // just corrected it. There was no work to interrupt, which is SESSION_IDLE, not a
+        // success reporting an interrupt that never happened.
+        if (stopped.stopped === 0) throw new AppError("SESSION_IDLE", `${nickname} has no active turn`);
+        return { stoppedBackgroundWork: stopped.stopped };
+      }
+      // Active, no turn named, and no background work to explain it: the identity really is
+      // unresolved. This is the Codex case, and the refusal it has always given.
+      if (current.status === "active" && !active) {
         throw new AppError("SESSION_BUSY", `${nickname} has an active turn whose identity is still being refreshed`);
       }
       if (!active && options.recoverExactTurn && turnId) {
@@ -530,7 +564,8 @@ export class SessionService {
     if (!current || current.availability !== "ready" || current.endpointGeneration !== generation) {
       throw new AppError("ENDPOINT_UNAVAILABLE", `native session generation is unavailable: ${session.endpoint}/${session.thread_id}`);
     }
-    const repaired = current.status === "active" && current.activeTurnId === null
+    // Background work names no turn by design, so it is not a missing identity to repair.
+    const repaired = current.status === "active" && current.activeTurnId === null && !current.backgroundWork
       ? await this.repairNative(session, lease)
       : current;
     if (repaired.status === "unknown") {
@@ -579,6 +614,16 @@ export function requireCompactionItemIds(thread: { turns?: any[] }): string[] {
 function isTerminalStatus(status: unknown): boolean {
   const type = typeof status === "string" ? status : String((status as any)?.type ?? "");
   return new Set(["completed", "failed", "interrupted"]).has(type);
+}
+
+// A background-work stop is only believable when the endpoint reports both counts: how many
+// stopped, and — the one that decides whether the session may now be archived or restarted —
+// how many are still running. Anything else is an endpoint that does not implement this.
+export function backgroundStopReport(value: unknown): { stopped: number; remaining: number } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { stopped, remaining } = value as { stopped?: unknown; remaining?: unknown };
+  if (!Number.isInteger(stopped) || !Number.isInteger(remaining)) return undefined;
+  return { stopped: stopped as number, remaining: remaining as number };
 }
 
 const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);

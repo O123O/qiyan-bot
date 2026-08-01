@@ -8,6 +8,7 @@ import type { ClaudeCommandRunner, ClaudeTranscriptChunkRequest } from "../../sr
 import type { ClaudeHost, OpenSessionRequest } from "../../src/claude-host/host.ts";
 import type { HostEvent, SessionStatus } from "../../src/claude-host/protocol.ts";
 import { ClaudeArchiveStore } from "../../src/sessions/claude-archives.ts";
+import { AppError } from "../../src/core/errors.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
@@ -77,7 +78,9 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   }
 
   async status(sessionId: string): Promise<SessionStatus> {
-    const session = this.sessions.get(sessionId);
+    // Faithful to the real host, which raises UNKNOWN_SESSION rather than reporting an idle
+    // status for a session it does not hold. Tolerating it here hid the branch that reacts.
+    const session = this.require(sessionId);
     return {
       sessionId,
       activity: (session?.inFlight.length ?? 0) > 0 ? "working" : "idle",
@@ -213,18 +216,26 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   emit(event: HostEvent): void { for (const listener of this.listeners) listener(event); }
 
   readonly stoppedTasks: string[] = [];
+  // Tasks that accept the stop call and keep running — what a real stopTask does until the
+  // SDK emits the task_notification that actually retires the task.
+  readonly ignoreStopFor = new Set<string>();
   private readonly tasks = new Map<string, string[]>();
   setBackgroundTasks(sessionId: string, taskIds: string[]): void { this.tasks.set(sessionId, taskIds); }
   async stopTask(sessionId: string, taskId: string): Promise<void> {
     this.stoppedTasks.push(taskId);
+    if (this.ignoreStopFor.has(taskId)) return;
     this.tasks.set(sessionId, (this.tasks.get(sessionId) ?? []).filter((id) => id !== taskId));
   }
 
   private require(sessionId: string) {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`claude session is not loaded: ${sessionId}`);
+    // Same error the real host raises, so callers that discriminate on it are exercised.
+    if (!session) throw new AppError("UNKNOWN_SESSION", `claude session is not loaded: ${sessionId}`);
     return session;
   }
+
+  // The host was replaced underneath us: its sessions are gone, with no loss report.
+  dropSessions(): void { this.sessions.clear(); }
 }
 
 function makeRuntime(claude: FakeClaude, launchFlags: { model?: string; effort?: string } = { model: "claude-opus-4-8" }) {
@@ -1382,6 +1393,9 @@ test("a session with background work reports active, with what is running", asyn
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
   claude.emit({ type: "task/set", sessionId: thread.id, background: 2, subagents: 1, descriptions: ["npm test"], at: 1 });
+  // The turn ends and the work does not: this is the state where the activity IS the reason
+  // the session is busy, and so the only state where the thread view reports it.
+  claude.settleTurn(thread.id, "ctx:a", "completed");
 
   const read = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
   assert.deepEqual(read.thread.status, { type: "active" });
@@ -1410,6 +1424,31 @@ test("background work is announced as a status change the tool layer observes", 
 
   claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 0, descriptions: [], at: 2 });
   assert.deepEqual(seen.at(-1)?.params.status, { type: "idle" }, "and returns to idle when it settles");
+});
+
+// The ordinary ordering: Claude spawns the subagent DURING a turn, so the task/set arrives
+// while a turn still owns the session and is not published as a status. If the turn's own
+// completion is then the last word, the session reads idle with its subagent still running —
+// and every idle proof (archive, unadopt, restart) waves it through.
+test("a turn that ends leaving a subagent behind does not report the session idle", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const seen: any[] = [];
+  rt.onNotification((method, params) => { if (method === "thread/status/changed") seen.push(params); });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 1, descriptions: [], at: 1 });
+  assert.equal(seen.length, 0, "nothing is published while the turn still owns the session");
+
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+
+  assert.deepEqual(seen.at(-1)?.status, { type: "active" }, "the surviving subagent keeps it active");
+  assert.deepEqual(seen.at(-1)?.nativeActivity, { backgroundTasks: 0, subagents: 1 },
+    "and says what is running, so the consumer knows this is not a turn it failed to identify");
+  const read = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(read.thread.status.type, "active");
 });
 
 // The SDK's interrupt aborts whatever is EXECUTING. Announcing a queued send as started
@@ -1537,6 +1576,127 @@ test("a native compaction publishes the item compact_session waits for", async (
   assert.match(String(compaction.id), /ctx:a:compaction/u, "keyed to the turn that ran /compact");
 });
 
+// After a QiYan restart the runtime knows no threads, while a remote host has outlived the
+// restart and is still running the work. task/set events report only CHANGES, so work that
+// merely continued across the restart is announced by nothing — the session would read idle to
+// every archive and restart check, and archiving it closes the query the subagent runs in.
+test("background work that outlived a restart is adopted, not re-learned as idle", async () => {
+  const claude = new FakeClaude();
+  claude.seed("remote-busy", [{
+    type: "user", uuid: "ctx:old", sessionId: "remote-busy", cwd: "/remote/work", timestamp: "2026-01-01T00:00:00Z",
+    message: { role: "user", content: "work" },
+  }]);
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    host: claude,
+    runner: claude,
+    launchFlags: {},
+    persistentRuntime: persistentRuntime({
+      async recoverTurn(threadId: string) {
+        if (threadId !== "remote-busy") return undefined;
+        await claude.open({ sessionId: threadId, mode: "resume", cwd: "/remote/work" });
+        // No turn is in flight — only a subagent the previous turn left behind.
+        return { activity: { backgroundTasks: 0, subagents: 1 } };
+      },
+    }),
+  });
+  await rt.start();
+
+  const resumed = await rt.request<{ thread: { status: unknown; nativeActivity?: unknown } }>("thread/resume", {
+    threadId: "remote-busy",
+    cwd: "/remote/work",
+    excludeTurns: true,
+  });
+
+  assert.deepEqual(resumed.thread.status, { type: "active" }, "the reattached session is busy, not idle");
+  // Carried on the thread view, because a reconnect settles state through the view rather than
+  // through notifications — and a consumer that cannot see WHY it is active treats an active
+  // session naming no turn as one whose identity it failed to establish.
+  assert.deepEqual(resumed.thread.nativeActivity, { backgroundTasks: 0, subagents: 1 });
+});
+
+// A reconnect settles state from this view, and it is requested with the turns stripped. So
+// activity reported BESIDE a running turn is indistinguishable from activity reported INSTEAD
+// of one — and a consumer that reads it as "busy with no turn" stops looking for the turn's
+// identity, leaving a runaway turn that interrupt can no longer name.
+test("a thread view does not report background activity while a turn owns the session", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 1, descriptions: [], at: 1 });
+
+  const during = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(during.thread.status.type, "active", "the running turn makes it active either way");
+  assert.equal(during.thread.nativeActivity, undefined,
+    "and the turn, not the subagent, is what the reconnect must go looking for");
+
+  // Once the turn settles, the subagent is the only thing left holding the session — and now
+  // saying so is exactly what a reconnect needs.
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  const after = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(after.thread.status.type, "active");
+  assert.deepEqual(after.thread.nativeActivity, { backgroundTasks: 0, subagents: 1 });
+});
+
+// Finding out what is running is real I/O — a transcript read and a reattach RPC over ssh —
+// and a hung remote host is the likeliest way it fails. Reading that failure as "nothing is
+// running" would retract a true active and hand the next archive the go-ahead to close a
+// session whose work is still going: the same hole, re-entered through the error path.
+test("a stop that cannot find out what is running does not retract a live session", async () => {
+  const claude = new FakeClaude();
+  claude.seed("cold-busy", [{
+    type: "user", uuid: "ctx:old", sessionId: "cold-busy", cwd: "/remote/work", timestamp: "2026-01-01T00:00:00Z",
+    message: { role: "user", content: "work" },
+  }]);
+  let failReattach!: (error: Error) => void;
+  const reattach = new Promise<never>((_resolve, reject) => { failReattach = reject; });
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-remote",
+    host: claude,
+    runner: claude,
+    launchFlags: {},
+    persistentRuntime: persistentRuntime({ async recoverTurn() { return await reattach; } }),
+  });
+  await rt.start();
+  const statuses: any[] = [];
+  rt.onNotification((method, params) => { if (method === "thread/status/changed") statuses.push(params); });
+
+  // A stop arrives for a thread this endpoint has not loaded yet, so it must go and find out.
+  const stopping = rt.request("thread/tasks/stop", { threadId: "cold-busy" });
+  await delay(10);
+  // While it is still finding out, the host reports live work on that session.
+  claude.emit({ type: "task/set", sessionId: "cold-busy", background: 1, subagents: 0, descriptions: [], at: 1 });
+  failReattach(new Error("ssh channel is gone"));
+
+  await assert.rejects(stopping, "the stop reports that it could not find out, rather than a clean zero");
+  assert.equal(statuses.some((params) => params.status?.type === "idle"), false,
+    "and nothing published idle over work that was never shown to have stopped");
+});
+
+// "The host does not hold this session" is a whole answer, and the load belief is half of it.
+// Nothing else retracts that belief — session/closed cannot arrive for a session the host does
+// not have — so a thread left marked loaded sends every later turn into nothing.
+test("learning the host lost a session also drops the belief that it is loaded", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 1, subagents: 0, descriptions: [], at: 1 });
+  // The host was replaced while QiYan was not looking, and reported no loss.
+  claude.dropSessions();
+
+  const result = await rt.request<{ stopped: number; remaining: number }>("thread/tasks/stop", { threadId: thread.id });
+  assert.deepEqual({ ...result }, { stopped: 0, remaining: 0 });
+
+  // The next turn re-opens the session instead of sending into one the host does not have.
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "again" }] });
+  assert.equal(claude.sends.at(-1)?.text, "again", "the turn reached a session the host actually holds");
+});
+
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
 // Without a way to stop it the session stays active forever — unarchivable and
 // unrestartable — with nothing left that could ever end it.
@@ -1545,12 +1705,66 @@ test("background work can be stopped so the session returns to idle", async () =
   const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
-  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  const turn = await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  void turn;
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 1, subagents: 1, descriptions: [], at: 1 });
   claude.setBackgroundTasks(thread.id, ["bash-1", "agent-1"]);
+  const before = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(before.thread.status.type, "active", "background work holds the session active");
 
-  const result = await rt.request<{ stopped: number }>("thread/tasks/stop", { threadId: thread.id });
-  assert.equal(result.stopped, 2);
+  const result = await rt.request<{ stopped: number; remaining: number }>("thread/tasks/stop", { threadId: thread.id });
+
+  assert.deepEqual({ ...result }, { stopped: 2, remaining: 0 });
   assert.deepEqual(claude.stoppedTasks.sort(), ["agent-1", "bash-1"], "each task was stopped by id");
+  const after = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(after.thread.status.type, "idle", "and the session is observably idle afterwards");
+});
+
+// The SDK acknowledges stopTask immediately and retires the task later, so counting the
+// accepted calls would report a drained session while a subagent is still running — and the
+// caller's next move is an archive that would close the session out from under it.
+test("a task that refuses to stop is reported as still running, not as stopped", async () => {
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({
+    id: "claude-local", host: claude, runner: claude, launchFlags: {}, taskStopConfirmationMs: 20,
+  });
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 0, subagents: 1, descriptions: [], at: 1 });
+  claude.setBackgroundTasks(thread.id, ["agent-1"]);
+  claude.ignoreStopFor.add("agent-1");
+
+  const result = await rt.request<{ stopped: number; remaining: number }>("thread/tasks/stop", { threadId: thread.id });
+
+  assert.deepEqual({ ...result }, { stopped: 0, remaining: 1 }, "the stop was attempted but did not take");
+  const after = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(after.thread.status.type, "active", "so the session is still reported busy");
+});
+
+// The session's query is gone: no task/set will ever arrive to retire its tasks. Keeping the
+// counts reported the thread active for good, and a thread that never goes idle can never be
+// archived, unadopted, or restarted.
+test("a closed session does not stay active on the background work that died with it", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  claude.emit({ type: "task/set", sessionId: thread.id, background: 2, subagents: 0, descriptions: [], at: 1 });
+  assert.equal(
+    (await rt.request<{ thread: any }>("thread/read", { threadId: thread.id })).thread.status.type,
+    "active",
+  );
+
+  claude.emit({ type: "session/closed", sessionId: thread.id, at: 2 });
+
+  const after = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(after.thread.status.type, "idle", "the dead session's tasks do not pin it active");
+  assert.equal(after.thread.nativeActivity, undefined, "and nothing is reported still running");
 });
 
 // Interrupting a turn stops what that turn set running too — otherwise a subagent outlives

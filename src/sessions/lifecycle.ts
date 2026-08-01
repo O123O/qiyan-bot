@@ -614,7 +614,11 @@ export class SessionLifecycle {
     const activeTurnId = thread.status.type === "active"
       ? knownActiveTurnId ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
       : null;
-    this.native.applyRefresh(token, { status: thread.status.type, activeTurnId });
+    this.native.applyRefresh(token, {
+      status: thread.status.type,
+      activeTurnId,
+      nativeActivity: nativeActivityOf(thread),
+    });
     return this.native.captureRefresh(nativeIdentity, generation);
   }
 
@@ -635,6 +639,7 @@ export class SessionLifecycle {
     return this.native.applyRefresh(token, {
       status: thread.status.type,
       ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      nativeActivity: nativeActivityOf(thread),
     });
   }
 
@@ -660,6 +665,12 @@ export class SessionLifecycle {
       step,
     };
   }
+}
+
+// A provider that has background work reports it on the thread view beside the status. Read
+// structurally: the shared ThreadView is the Codex shape, which has no such concept.
+function nativeActivityOf(thread: ThreadView): unknown {
+  return (thread as { nativeActivity?: unknown }).nativeActivity;
 }
 
 function sameMapping(left: RegistrySession, right: MappingIdentity): boolean {

@@ -57,7 +57,21 @@ interface ThreadState {
 // transferring a whole transcript over ssh on a status poll.
 const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
 
+// How long the DRAIN POLL waits for the host to confirm the tasks are gone — long enough to
+// cover a stop that has to cross ssh and unwind a tool call. It does not bound the whole stop:
+// the status read and the stop calls are transport requests with their own (much longer)
+// deadline. They are issued concurrently and skipped entirely when nothing is running, so an
+// interrupt of an ordinary turn pays one round trip rather than this budget.
+const TASK_STOP_CONFIRMATION_MS = 5_000;
+
 const DEFAULT_LOADED_SESSION_BUDGET = 8;
+
+// What a host that outlived QiYan still has for a thread: a turn mid-response, background work
+// that belongs to no turn, or both. Absent entirely when the host does not hold the session.
+export interface ClaudeReattachment {
+  turnId?: string;
+  activity?: { backgroundTasks: number; subagents: number };
+}
 
 export interface ClaudePersistentRuntime {
   start(): Promise<void>;
@@ -65,10 +79,9 @@ export interface ClaudePersistentRuntime {
   shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
-  // Reconnect-time reattach. The host already knows whether a response is still running,
-  // so this only has to report the turn id it belongs to — no process handles, PID
-  // markers, or transcript materialization scans.
-  recoverTurn(threadId: string, cwd: string): Promise<{ turnId: string } | undefined>;
+  // Reconnect-time reattach. The host already knows what is still running, so this only has
+  // to report it — no process handles, PID markers, or transcript materialization scans.
+  recoverTurn(threadId: string, cwd: string): Promise<ClaudeReattachment | undefined>;
   releaseThread(threadId: string): Promise<void>;
 }
 
@@ -78,8 +91,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private endpointState: "starting" | "ready" | "unavailable" | "stopped" = "starting";
   private readonly emitter = new EventEmitter();
   private readonly threads = new Map<string, ThreadState>();
-  // Live background/subagent counts per session, fed by the host's task/set events. Purely
-  // observational: it drives what the manager and Web UI can see, never any lifecycle rule.
+  // Live background/subagent counts per session, fed by the host's task/set events and by
+  // reattachment after a restart. Authoritative, not decorative: this is what makes a session
+  // report active with no turn, and therefore what refuses its archive, unadopt, and restart.
+  // A count lost here is a session archived on top of live work, so every path that ends the
+  // work — session close, endpoint shutdown, archive, unsubscribe, a proven stop — clears it.
   private readonly taskActivity = new Map<string, { backgroundTasks: number; subagents: number }>();
   private readonly stateLoads = new Map<string, Promise<ThreadState>>();
   private readonly history: ClaudeTranscriptHistory;
@@ -109,6 +125,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // `claude` child behind it, so without a ceiling a long-running QiYan holds one process
     // per thread it has ever driven.
     loadedSessionBudget?: number;
+    // How long a stop waits for the host to confirm the tasks are gone. Overridden only by
+    // tests that want the give-up path without waiting out the real bound.
+    taskStopConfirmationMs?: number;
   }) {
     this.id = options.id;
     this.daemonless = options.persistentRuntime === undefined;
@@ -129,6 +148,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // drop it, or the next turn would send into a session that is gone.
     if (event.type === "session/closed") {
       state.loaded = false;
+      // Its background work went with it. Nothing will ever emit the task/set that retires
+      // those counts, so leaving them behind reports the thread active forever — and a
+      // thread that never returns to idle can never be archived, unadopted, or restarted.
+      if (this.taskActivity.delete(threadId)) this.publishActivityStatus(threadId);
       return;
     }
     // Claude's own background work — backgrounded Bash and Task-tool subagents — is never
@@ -144,12 +167,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // without it left get_session_status and the idle proof still calling the session
       // idle, so a worker with a live subagent read as finished and archive would close the
       // session out from under it.
-      if (state.running.length === 0) {
-        this.emitter.emit("notification", "thread/status/changed", {
-          threadId,
-          status: { type: running > 0 ? "active" : "idle" },
-        });
-      }
+      if (state.running.length === 0) this.publishActivityStatus(threadId);
       this.emitter.emit("notification", "thread/tasks/updated", {
         threadId,
         background: event.background,
@@ -221,6 +239,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       threadId,
       turn: event.status === "completed" ? { id: turnId } : { id: turnId, status: "interrupted" },
     });
+    // A completed turn means idle to every consumer, and that is wrong when the turn left a
+    // subagent or backgrounded command behind: it will speak again unprompted. Restate the
+    // session's real activity here, because the task/set that started the work fired while
+    // the turn was still running and was therefore not published as a status.
+    if (state.running.length === 0 && this.nativeActivityOf(threadId)) this.publishActivityStatus(threadId);
     this.sweepIdleSessions();
   }
 
@@ -301,6 +324,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // host event, so leaving the reservation would wedge the thread as SESSION_BUSY.
       state.running = [];
     }
+    // The background work died with the sessions, and no task/set will ever arrive to retire
+    // it. Keeping the counts would report every one of those threads active for good.
+    this.taskActivity.clear();
   }
 
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
@@ -341,6 +367,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         if (id && this.options.persistentRuntime) await this.options.persistentRuntime.releaseThread(id);
         if (id && state?.loaded) await this.options.host.close(id);
         this.threads.delete(id);
+        this.taskActivity.delete(id);
         // Claude has no native archive: tombstone the thread so discover hides it (Codex parity).
         if (id) this.options.archives?.add(this.id, id, this.options.now?.());
         return {} as T;
@@ -350,6 +377,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         if (this.threads.get(id)?.loaded) await this.options.host.close(id);
         if (this.options.persistentRuntime) await this.options.persistentRuntime.releaseThread(id);
         this.threads.delete(id);
+        this.taskActivity.delete(id);
         return { status: "unsubscribed" } as T;
       }
       case "thread/name/set": return {} as T;
@@ -472,8 +500,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // The host kept running while QiYan was away; adopt its in-flight turn so the
       // relay still settles it when the host reports completion.
       if (recovered) {
-        state.running = [recovered.turnId];
+        if (recovered.turnId !== undefined) state.running = [recovered.turnId];
         state.loaded = true;
+        // And adopt its background work. Nothing else rebuilds this: task/set events only
+        // report CHANGES, so work that merely continued across the restart would otherwise be
+        // invisible, and the session would read idle to every archive and restart check.
+        if (recovered.activity) {
+          this.taskActivity.set(threadId, recovered.activity);
+          this.publishActivityStatus(threadId);
+        }
       }
     } finally {
       delete state.recovery;
@@ -528,6 +563,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   }
 
   private stateOnlyThread(threadId: string, state: ThreadState): ClaudeThreadView {
+    // Reported only when no turn owns the session — the same rule publishActivityStatus
+    // follows, and for the same reason. This view is what a reconnect settles state from, and
+    // it is sent with its turns stripped: activity beside a running turn is therefore
+    // indistinguishable from activity INSTEAD of one, and the consumer stops looking for the
+    // turn's identity. It is still reported active here, by the turn.
+    const activity = state.running.length > 0 ? undefined : this.nativeActivityOf(threadId);
     return {
       id: threadId,
       cwd: state.cwd,
@@ -535,7 +576,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // the manager cares about: it will speak again without being prompted. Reporting it
       // as plain idle invited concluding the work was finished.
       status: { type: state.running.length > 0 || this.nativeActivityOf(threadId) ? "active" : "idle" },
-      ...(this.nativeActivityOf(threadId) === undefined ? {} : { nativeActivity: this.nativeActivityOf(threadId)! }),
+      ...(activity === undefined ? {} : { nativeActivity: activity }),
       itemsView: "full",
       turns: [],
       ...(state.threadSource === undefined ? {} : { threadSource: state.threadSource }),
@@ -709,16 +750,99 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return tasks && (tasks.backgroundTasks > 0 || tasks.subagents > 0) ? tasks : undefined;
   }
 
-  // Stops every background task and subagent the session still has running. The SDK gives
-  // each one an id and a targeted stopTask, so this is exact rather than a session teardown.
-  // Returns how many were stopped so the caller can tell "nothing was running" from "stopped
-  // three things".
-  private async stopBackgroundWork(threadId: string): Promise<{ stopped: number }> {
-    const state = this.threads.get(threadId);
-    if (!state?.loaded) return { stopped: 0 };
-    const status = await this.options.host.status(threadId);
-    for (const task of status.backgroundTasks) await this.options.host.stopTask(threadId, task.taskId);
-    return { stopped: status.backgroundTasks.length };
+  // Stops every background task and subagent the session still has running, and proves it.
+  // The SDK gives each one an id and a targeted stopTask, so this is exact rather than a
+  // session teardown.
+  //
+  // `remaining` is the point of the return, not `stopped`: the caller's next move is an archive
+  // or a restart, and both are only safe once the work is gone. It counts the session's WHOLE
+  // live set, not just the tasks this call targeted, so a task that started while the stop was
+  // in flight still holds the session busy instead of being certified away.
+  private async stopBackgroundWork(threadId: string): Promise<{ stopped: number; remaining: number }> {
+    // ensureState, not a bare map lookup: after a QiYan restart this endpoint object is new and
+    // knows no threads, while a REMOTE host has outlived the restart and is still running the
+    // work. Reading the map alone answered "nothing to stop" without ever asking the host —
+    // which is exactly when a caller most needs the real answer.
+    //
+    // Its failures are NOT caught. This does real I/O — a transcript read, and a reattach RPC
+    // over ssh — and a hung remote host is the most likely way it fails. Treating "I could not
+    // find out" as "nothing is running" would retract a true active and hand the next archive
+    // the go-ahead to close a session whose work is still going.
+    const state = await this.ensureState(threadId);
+    // The host affirmatively has no session for this thread, so there is no live work whatever
+    // this endpoint last published. Correct the record rather than only reporting zero: a stale
+    // "active" that nothing ever retracts is a session that can never be archived or restarted.
+    if (!state.loaded) {
+      if (this.taskActivity.delete(threadId)) this.publishActivityStatus(threadId);
+      return { stopped: 0, remaining: 0 };
+    }
+    // UNKNOWN_SESSION is the host saying it does not hold this session, which is an answer:
+    // nothing is running. Any other failure is not an answer and must not be read as one.
+    const status = await this.options.host.status(threadId).catch((error: unknown) => {
+      if (error instanceof AppError && error.code === "UNKNOWN_SESSION") return undefined;
+      throw error;
+    });
+    if (!status) {
+      // Act on the whole answer. The session is not merely idle — it is GONE, and nothing else
+      // will say so: session/closed cannot arrive for a session the host does not have. Leaving
+      // it marked loaded makes every later turn skip host.open and send into nothing, failing
+      // UNKNOWN_SESSION over and over until the endpoint generation changes.
+      state.loaded = false;
+      if (this.taskActivity.delete(threadId)) this.publishActivityStatus(threadId);
+      return { stopped: 0, remaining: 0 };
+    }
+    const targets = status.backgroundTasks.map((task) => task.taskId);
+    // Nothing running: skip the drain wait entirely. turn/interrupt calls this on every
+    // interrupt, and an interrupt of an ordinary turn must not pay for a poll it cannot need.
+    if (targets.length === 0) {
+      if (this.taskActivity.delete(threadId)) this.publishActivityStatus(threadId);
+      return { stopped: 0, remaining: 0 };
+    }
+    // Concurrently, and one refusal must not hide the others: every target gets its attempt,
+    // and the drain below — not the call that threw — decides the outcome. Sequentially, a
+    // degraded ssh link multiplied one transport timeout by the number of tasks.
+    await Promise.all(targets.map((taskId) => this.options.host.stopTask(threadId, taskId).catch(() => undefined)));
+    const live = await this.drainedTasks(threadId);
+    // Only when the session has NO live work at all — not merely none of the tasks this call
+    // targeted. A task that started while the stop was in flight is live work, and claiming
+    // idle over it is what would let the following archive close the session on top of it.
+    if (live.size === 0) {
+      this.taskActivity.delete(threadId);
+      this.publishActivityStatus(threadId);
+    }
+    return { stopped: targets.filter((taskId) => !live.has(taskId)).length, remaining: live.size };
+  }
+
+  // stopTask is acknowledged the moment the CLI accepts it; the task only retires when the
+  // SDK emits its task_notification. Counting the accepted calls would therefore report a
+  // session idle while its subagent is still running — the exact lie that let archive close
+  // a session out from under live work. Poll the host's own set until it is empty, and return
+  // whatever is still there when the wait runs out.
+  private async drainedTasks(threadId: string): Promise<Set<string>> {
+    const deadline = Date.now() + (this.options.taskStopConfirmationMs ?? TASK_STOP_CONFIRMATION_MS);
+    let delayMs = 25;
+    while (true) {
+      const live = new Set((await this.options.host.status(threadId)).backgroundTasks.map((task) => task.taskId));
+      const remainingMs = deadline - Date.now();
+      if (live.size === 0 || remainingMs <= 0) return live;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remainingMs)));
+      delayMs = Math.min(delayMs * 2, 250);
+    }
+  }
+
+  // Publishes what the session is doing when no turn owns it: active on its own background
+  // work, or idle. The activity travels WITH the status because "active with no turn id" is
+  // otherwise indistinguishable from a turn whose identity has not been established yet —
+  // and the consumer's repair for that case concludes the session state is unknowable, which
+  // failed every operation on a worker that merely had a subagent running.
+  private publishActivityStatus(threadId: string): void {
+    if ((this.threads.get(threadId)?.running.length ?? 0) > 0) return;
+    const activity = this.nativeActivityOf(threadId);
+    this.emitter.emit("notification", "thread/status/changed", {
+      threadId,
+      status: { type: activity ? "active" : "idle" },
+      ...(activity ? { nativeActivity: activity } : {}),
+    });
   }
 
   // Announce the turn now executing. Called when a send is accepted into an empty queue,
@@ -819,11 +943,18 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         `turn ${turnId} is queued behind ${state.running[0]} on ${threadId}; interrupt the running turn instead`);
     }
     if (state?.running[0] === turnId) await this.options.host.interrupt(threadId);
-    // Interrupting a turn stops what that turn set running too. Leaving a subagent alive
-    // after its parent was interrupted keeps the session non-idle — and therefore
-    // unarchivable and unrestartable — with nothing left that could ever stop it.
+    // And then stop the session's background work — all of it, not only what this turn
+    // started, because the host records no parentage and interrupt is what QiYan offers for
+    // "stop and let me restart it". Leaving a subagent alive keeps the session non-idle,
+    // therefore unarchivable and unrestartable, with nothing left that could ever stop it.
+    //
+    // Best-effort: the turn IS interrupted by this point, and failing the call over the
+    // cleanup would report otherwise. A stop that did not take leaves the session active,
+    // which is the honest state and what the next interrupt acts on.
     await this.stopBackgroundWork(threadId).catch(() => undefined);
-    state?.terminalTurns.add(turnId);
+    // Re-read: the stop rehydrates a thread this endpoint did not know, so the local captured
+    // above can be undefined for a thread that exists by now — and the turn would go unrecorded.
+    (this.threads.get(threadId) ?? state)?.terminalTurns.add(turnId);
     return {};
   }
 }

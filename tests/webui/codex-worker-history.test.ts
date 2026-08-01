@@ -20,6 +20,7 @@ test("Codex worker history reuses a bounded page until a native event changes th
     nativeSession: () => ({
       availability: "ready",
       status: "idle",
+      backgroundWork: false,
       activeTurnId: null,
       endpointGeneration: 1,
       lifecycleRevision: receiveSequence,

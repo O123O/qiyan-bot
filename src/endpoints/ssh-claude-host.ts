@@ -12,7 +12,7 @@ import { posix } from "node:path";
 import { AppError } from "../core/errors.ts";
 import { CLAUDE_HOST_PROTOCOL_VERSION } from "../claude-host/protocol.ts";
 import { RemoteClaudeHost, type HostChannel } from "../claude-host/transport.ts";
-import type { ClaudePersistentRuntime } from "./claude-runtime.ts";
+import type { ClaudePersistentRuntime, ClaudeReattachment } from "./claude-runtime.ts";
 import type { ReadyProcessStream } from "./ssh-process.ts";
 import type { RemoteHost } from "./ssh-runtime.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
@@ -114,18 +114,31 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
 
   // Reconnect-time reattach. The host is authoritative about what is still running, so this
   // is one status call — no PID marker, no transcript materialization scan.
-  async recoverTurn(threadId: string): Promise<{ turnId: string } | undefined> {
+  //
+  // A turn is not the only thing worth adopting. A session whose turn ended while a subagent
+  // kept running has no in-flight turn and is still busy; reporting nothing for it made every
+  // restart re-learn the session as idle, so archive would close it — and close the SDK query
+  // the subagent was running in — on the strength of that.
+  async recoverTurn(threadId: string): Promise<ClaudeReattachment | undefined> {
     let status;
     try { status = await this.host.status(threadId); }
     catch (error) {
       // The host never loaded this session (it was replaced, or the thread has not run a
-      // turn on this generation), so there is nothing in flight to adopt.
+      // turn on this generation), so there is nothing to adopt.
       if (error instanceof AppError && error.code === "UNKNOWN_SESSION") return undefined;
       throw error;
     }
-    if (status.activity !== "working") return undefined;
-    const turnId = status.inFlightTurns[0];
-    return turnId === undefined ? undefined : { turnId };
+    const turnId = status.activity === "working" ? status.inFlightTurns[0] : undefined;
+    const activity = {
+      backgroundTasks: status.backgroundTasks.filter((task) => task.kind !== "subagent").length,
+      subagents: status.backgroundTasks.filter((task) => task.kind === "subagent").length,
+    };
+    const running = activity.backgroundTasks + activity.subagents > 0;
+    if (turnId === undefined && !running) return undefined;
+    return {
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(running ? { activity } : {}),
+    };
   }
 
   // Unloading the session IS the release: Claude's transcript is durable and stays, and the

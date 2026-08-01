@@ -85,7 +85,7 @@ import { CodexRolloutLocations, createCodexConversationHistoryRead } from "./ses
 import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
 import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
-import { SessionService } from "./sessions/service.ts";
+import { backgroundStopReport, SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
 import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
@@ -3705,12 +3705,19 @@ export async function buildProductionApp(
         : sessions.collect(args.nickname, args.count),
       interrupt_session: async (args, context) => {
         if (args.nickname === "assistant") throw new AppError("UNSUPPORTED_CAPABILITY", "the assistant cannot interrupt its own active tool turn");
-        const turnId = await sessions.interrupt(args.nickname, args.turn_id, {
+        const outcome = await sessions.interrupt(args.nickname, args.turn_id, {
           onBeforeNativeDispatch: (resolvedTurnId) => context.checkpoint({ turnId: resolvedTurnId }),
+          // No turn id to checkpoint when the session is busy with work that belongs to no
+          // turn. Record that this is what was dispatched, so recovery after a crash can
+          // settle the operation instead of leaving it unresolved forever — an unresolved
+          // operation is itself what blocks the restart this interrupt was clearing the way for.
+          onBeforeBackgroundStop: () => context.checkpoint({ backgroundStop: true }),
         });
         dashboardStore.markDirty();
         await renderDashboardSafely();
-        return { interrupted: true, turnId };
+        return typeof outcome === "string"
+          ? { interrupted: true, turnId: outcome }
+          : { interrupted: true, stoppedBackgroundWork: outcome.stoppedBackgroundWork };
       },
       compact_session: async (args, context) => {
         if (args.nickname === "assistant") {
@@ -4976,8 +4983,42 @@ export async function buildProductionApp(
         } else if (operation.kind === "interrupt_session") {
           const session = registry.get(args.nickname);
           if (!session) return;
-          const turnId = args.turn_id ?? (operation.receipt as { turnId?: string } | undefined)?.turnId;
-          if (!turnId) return;
+          const receipt = operation.receipt as { turnId?: string; backgroundStop?: boolean } | undefined;
+          const turnId = args.turn_id ?? receipt?.turnId;
+          // An interrupt that was stopping background work has no turn to prove terminal, and
+          // the session's own status is a belief this process lost across the crash. Re-issue
+          // the stop: it is idempotent, it finishes the job if the crash landed mid-dispatch,
+          // and the endpoint answers from the host, which outlived the restart.
+          //
+          // The re-issue is unscoped — the receipt records no task ids — so it stops whatever
+          // is running now, which may include work started after the crash.
+          if (!turnId) {
+            if (!receipt?.backgroundStop) return;
+            const stopped = backgroundStopReport(await pool.request<unknown>(
+              session.endpoint, "thread/tasks/stop", { threadId: session.thread_id }, undefined, recoveryLease,
+            ));
+            // No usable answer proves nothing either way; leave it for the next pass.
+            if (!stopped) return;
+            if (stopped.remaining === 0) {
+              await succeedRecovered(operation, { interrupted: true, stoppedBackgroundWork: stopped.stopped }, () => {
+                dashboardStore.markDirty();
+              });
+              return;
+            }
+            // Work survived the stop. Resolve the operation as failed rather than leaving it
+            // open: an unresolved operation blocks every later restart of its endpoint, and a
+            // restart is the only remaining way to kill a task that will not stop — the
+            // operation would be holding the door shut on its own escape route. Refusing the
+            // restart is the live idle check's job, and that clears itself when the work ends.
+            // Records what the stop DID as well as what it failed to do — the ledger's only
+            // account of an effect that was applied.
+            operations.failAndUnbind(operation.id, {
+              message: `${args.nickname} stopped ${stopped.stopped} background task(s); `
+                + `${stopped.remaining} kept running`,
+            });
+            await renderDashboardSafely();
+            return;
+          }
           const turn = await pool.historyReader(session.endpoint, recoveryLease).findTurn(
             session.thread_id, turnId, createHistoryScanBudget(),
           );
