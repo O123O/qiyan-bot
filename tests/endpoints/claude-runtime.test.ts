@@ -1983,6 +1983,61 @@ test("a transcript larger than the read window reconstructs its recent turns ins
   );
 });
 
+// Measured in production: the goal marker sat 269,759 bytes from the end against a 262,144-byte
+// window — a miss of 3% — and the session reported NO goal while Claude was still pursuing one.
+// The restart resume asks this before deciding whether to restart a parked worker, so a goal
+// that scrolled out of one window is a worker that never gets going again.
+test("a goal that scrolled past one window is still found", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const filler = Array.from({ length: 60 }, (_, index) => ({
+    type: "assistant", uuid: `chatter-${index}`, cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "y".repeat(9_000) }] },
+  }));
+  claude.seed("goal-buried", [
+    { type: "user", uuid: "ctx:goal", sessionId: "goal-buried", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal set: finish the proof</local-command-stdout>" } },
+    ...filler,
+  ]);
+
+  // The runtime only reads a goal for a thread it holds, as it does for a managed session.
+  await rt.request("thread/read", { threadId: "goal-buried" });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "goal-buried" });
+
+  assert.deepEqual(read.goal, { objective: "finish the proof", status: "active" });
+});
+
+// Walking back must not resurrect a goal the user cancelled: the newest marker wins, so a clear
+// found on the way back ends the search rather than being skipped over.
+test("a cleared goal is not resurrected by walking further back", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const filler = Array.from({ length: 60 }, (_, index) => ({
+    type: "assistant", uuid: `chatter-${index}`, cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "y".repeat(9_000) }] },
+  }));
+  // The clear must land in a LATER window than the set, or both are read at once and the guard
+  // is never exercised: filler on both sides puts them in different steps of the walk.
+  claude.seed("goal-cleared", [
+    { type: "user", uuid: "ctx:goal", sessionId: "goal-cleared", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal set: finish the proof</local-command-stdout>" } },
+    ...filler,
+    { type: "user", uuid: "ctx:clear", sessionId: "goal-cleared", cwd: "/w", promptSource: "sdk",
+      message: { role: "user", content: "<local-command-stdout>Goal cleared</local-command-stdout>" } },
+    ...filler,
+  ]);
+
+  // The runtime only reads a goal for a thread it holds, as it does for a managed session.
+  await rt.request("thread/read", { threadId: "goal-cleared" });
+
+  const read = await rt.request<{ goal: any }>("thread/goal/get", { threadId: "goal-cleared" });
+
+  assert.equal(read.goal, null);
+});
+
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
 // Without a way to stop it the session stays active forever — unarchivable and
 // unrestartable — with nothing left that could ever end it.
