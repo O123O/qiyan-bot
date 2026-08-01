@@ -159,8 +159,9 @@ test("native Web UI paging wraps one stable turn cursor without head-relative me
 test("native Web UI paging stops walking at its page budget", async () => {
   let requests = 0;
   const page = await readReadyWorkerTurns({
-    withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
-    request: async (_endpoint, _method, params) => {
+    withReadyWorkLease: async (_endpoint: string, run: (lease: never) => unknown) =>
+      run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
+    request: async (_endpoint: string, _method: string, params: unknown) => {
       requests += 1;
       assert.equal((params as any).limit, 12, "message count must not expand the bounded native turn page");
       return {
@@ -229,8 +230,9 @@ test("a large turn no longer starves the requested message count", async () => {
   };
   let served = 0;
   const page = await readReadyWorkerTurns({
-    withReadyWorkLease: async (_endpoint, run) => run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
-    request: async (_endpoint, _method, params) => {
+    withReadyWorkLease: async (_endpoint: string, run: (lease: never) => unknown) =>
+      run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
+    request: async (_endpoint: string, _method: string, params: unknown) => {
       served += 1;
       // Each bounded page holds only this one big turn — exactly the starving case.
       return {
