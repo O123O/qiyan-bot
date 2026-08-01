@@ -100,10 +100,22 @@ export class SessionService {
             session.thread_id, activeTurn, { budget: createHistoryScanBudget() },
           ).catch(() => undefined);
           const proven = items?.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId) ?? false;
-          if (!proven) throw error;
-          options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
-          this.onTurnAccepted(session, activeTurn);
-          return { mode: "steer" as const, turnId: activeTurn };
+          if (proven) {
+            options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
+            this.onTurnAccepted(session, activeTurn);
+            return { mode: "steer" as const, turnId: activeTurn };
+          }
+          // The turn this steered into has moved on: it finished between choosing it and
+          // dispatching, and the provider refuses to redirect the message into work the sender
+          // never saw. That refusal is right for a caller that meant one SPECIFIC turn, and
+          // wrong for someone typing a message — their intent is "send this to the worker", and
+          // handing them a turn-identity conflict to act on drops what they wrote for a race
+          // they cannot see. Send it as its own turn instead.
+          //
+          // Safe to retry with the same id: the endpoint drops a duplicate message uuid rather
+          // than starting a second turn, so if the steer did land after all, this reconciles
+          // against it instead of doubling it.
+          if (mode === "steer" || !(error instanceof AppError && error.code === "OPERATION_CONFLICT")) throw error;
         }
       }
       const settings = options.settings ?? this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);

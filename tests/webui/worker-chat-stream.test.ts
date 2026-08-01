@@ -60,6 +60,30 @@ test("a Claude message stays visible while an active turn delays native acceptan
   ]);
 });
 
+// The stream carries an assistant message before its stop reason is settled; the transcript row
+// is written with it. So the same text arrives live as `commentary` and reloads as
+// `final_answer`. When the ids also diverge, the content fallback is the only thing that can
+// reunite them — and comparing phase made it fail on exactly the messages it exists for, so the
+// reader saw the worker say the same thing twice.
+test("a reloaded message rejoins its live twin even when their phases disagree", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({
+    kind: "item-completed",
+    turnId: "turn",
+    item: { type: "agent-message", id: "live-uuid:0", text: "Yes — and it should unify more cleanly.", phase: "commentary" },
+  }));
+
+  state = applyWorkerSnapshot(state, {
+    messages: [{
+      id: "a:turn:disk-uuid:0", turnId: "turn", body: "Yes — and it should unify more cleanly.", completedAt: 5,
+      terminalStatus: "completed", role: "worker", phase: "final_answer", turnOrder: 100, itemOrder: 100,
+    }],
+    hasOlder: false, terminalTurnIds: ["turn"], openTurnIds: [],
+  }, ids.requestId);
+
+  assert.deepEqual(state.messages.map((message) => message.body), ["Yes — and it should unify more cleanly."]);
+});
+
 test("a native Claude user event replaces the oldest exact pending message without a client marker", () => {
   let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
   state = addOptimisticWorkerMessage(state, "to:web:first", "repeat", 10);

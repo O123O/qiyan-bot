@@ -229,9 +229,15 @@ function mergeSnapshotMessage(messages: WorkerChatMessage[], snapshot: WorkerCha
     index = messages.findIndex((candidate) => candidate.clientId === snapshot.clientId && candidate.role === snapshot.role);
   }
   if (index < 0) {
+    // Deliberately NOT comparing phase. This fallback exists to reunite a live message with its
+    // reloaded twin when their ids diverge, and phase is the one field the two are known to
+    // disagree on: the stream carries an assistant message before its stop reason is settled,
+    // while the transcript row is written with it — so the same text arrives live as
+    // `commentary` and reloads as `final_answer`. Requiring them to match made the fallback
+    // fail on exactly the messages it exists for, and the reader saw the message twice.
     const matches = messages.map((candidate, candidateIndex) => ({ candidate, candidateIndex })).filter(({ candidate }) => (
       candidate.turnId === snapshot.turnId && candidate.role === snapshot.role
-      && candidate.body === snapshot.body && (candidate.phase ?? "") === (snapshot.phase ?? "")
+      && candidate.body === snapshot.body
     ));
     if (matches.length === 1) index = matches[0]!.candidateIndex;
   }

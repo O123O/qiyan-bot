@@ -492,14 +492,50 @@ test("a provider with no background work is probed as before and never asked to 
     "no stop is dispatched to a provider that never reported background work");
 });
 
-// The steer-failure proof scans history for the turn. On a long-lived worker that scan can run
-// out of budget — especially when the turn was never written, which is the very case where the
-// steer failed because it had already finished. A proof that could not run proves nothing, and
-// reporting its own exhaustion replaced an actionable error with an internal one about a budget.
-test("a proof that cannot run reports the original failure, not its own", async () => {
+// Someone typing a message means "send this to the worker", not "append to turn X". When the
+// turn chosen to steer finishes between choosing it and dispatching, the provider refuses to
+// redirect into work the sender never saw — right for a caller that meant one specific turn,
+// and wrong here: it drops what they wrote and hands them a turn-identity conflict to act on.
+test("a send that races a turn boundary becomes its own turn instead of an error", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("OPERATION_CONFLICT", "turn started-1 is no longer running (other is)");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  const result = await value.service.send("payments", "another thought", { clientUserMessageId: "web:1" });
+
+  assert.equal(result.mode, "start", "the message is sent rather than refused");
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/start" && call.params.clientUserMessageId === "web:1"),
+    "and carries the same id, so a steer that landed after all reconciles instead of doubling");
+});
+
+// An explicit steer names one turn on purpose. Redirecting THAT into a different turn is the
+// silent misdelivery the refusal exists to prevent, so it still stands.
+test("an explicit steer whose turn has moved on is still refused", async () => {
   const value = await fixture();
   value.endpoint.status = "active";
   value.endpoint.failSteer = new AppError("OPERATION_CONFLICT", "turn started-1 is no longer running");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(
+    value.service.send("payments", "append this", { mode: "steer", clientUserMessageId: "web:1" }),
+    (error: unknown) => (error as { code?: string }).code === "OPERATION_CONFLICT",
+  );
+});
+
+// The steer-failure proof scans history for the turn. On a long-lived worker that scan can run
+// out of budget — especially when the turn was never written. A proof that could not run proves
+// nothing, and reporting its own exhaustion replaced the real error with an internal one.
+test("a proof that cannot run reports the original failure, not its own", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("SESSION_DETACHED", "steer transport died");
   value.endpoint.failTurnsList = true;
   value.native.observe("local", value.nativeGeneration, "turn/started", {
     threadId: "thread",
@@ -509,8 +545,8 @@ test("a proof that cannot run reports the original failure, not its own", async 
   await assert.rejects(
     value.service.send("payments", "another thought", { clientUserMessageId: "web:1" }),
     (error: unknown) => {
-      assert.equal((error as { code?: string }).code, "OPERATION_CONFLICT");
-      assert.match(String((error as Error).message), /no longer running/u);
+      assert.equal((error as { code?: string }).code, "SESSION_DETACHED");
+      assert.match(String((error as Error).message), /transport died/u);
       return true;
     },
   );
