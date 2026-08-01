@@ -64,7 +64,11 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   fail(kind: EndpointLossKind = "connection-lost") { this.state = "unavailable"; this.events.emit("unavailable", kind); }
 }
 
-function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly string[] = []) {
+function queuedFixture(
+  candidates: FakeEndpoint[],
+  managedThreadIds: readonly string[] = [],
+  schedule?: (delayMs: number, run: () => void) => { cancel(): void },
+) {
   const local = new FakeEndpoint("local");
   const endpoints = new Map<string, FakeEndpoint>([["local", local]]);
   let index = 0;
@@ -92,6 +96,7 @@ function queuedFixture(candidates: FakeEndpoint[], managedThreadIds: readonly st
         endpointGeneration: generation,
       };
     },
+    ...schedule ? { schedule } : {},
   });
   return { manager, local, candidateCount: () => index };
 }
@@ -1024,6 +1029,37 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.deepEqual(publications, [{ automatic: true, checkpointed: true }]);
   assert.deepEqual(await Promise.all(admissions), [true]);
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
+});
+
+test("a failed restart reopens admission without waiting for the abandoned endpoint to close", async () => {
+  const first = new FakeEndpoint("devbox");
+  const abandoned = new FakeEndpoint("devbox");
+  abandoned.identityToken = "b".repeat(32);
+  let closes = 0;
+  // A close that never answers: an SSH channel whose peer is gone accepts the request and
+  // returns nothing. Awaiting it before reopening the gate left the endpoint permanently
+  // `draining`, which failed every read and refused the restart that was the only repair.
+  abandoned.closeConnection = async () => { closes += 1; await new Promise<never>(() => {}); };
+  const spare = new FakeEndpoint("devbox");
+  const expiries: Array<() => void> = [];
+  const { manager } = queuedFixture([first, abandoned, spare], [], (_delay, run) => {
+    expiries.push(run);
+    return { cancel: () => undefined };
+  });
+  await manager.ensureReady("devbox");
+  first.onRuntimeIdentity = () => { throw new Error("SSH process failed (exit 1)"); };
+
+  const restarting = assert.rejects(manager.restart("devbox"), /exit 1/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closes, 1, "the abandoned candidate is still discarded");
+  assert.equal(manager.desiredState("devbox"), "automatic", "admission reopens before the discard is awaited");
+
+  assert.equal(expiries.length, 1, "the discard is bounded rather than awaited forever");
+  expiries.shift()!();
+  await restarting;
+  // The lifecycle queue must be free: a hung discard that blocked it wedged every later restart,
+  // so the repair for a broken endpoint was refused by the wreckage of its own last attempt.
+  await assert.rejects(manager.restart("devbox"), /exit 1/u);
 });
 
 test("restart after disconnect starts a fresh runtime without proving stopped threads idle", async () => {

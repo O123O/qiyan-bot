@@ -49,6 +49,7 @@ export interface EndpointRecoveryPause {
 // explicit ensureReady still makes a single direct attempt, so a recovered endpoint reconnects on next
 // use — it just doesn't restart the background ramp. Indexed by the record's reconnectAttempt, which
 // resets to 0 only when acknowledgeReadyRecovery confirms the published generation recovered fully.
+const ENDPOINT_CLEANUP_TIMEOUT_MS = 15_000; // bound on closing an endpoint a failed lifecycle action abandons
 const RECONNECT_BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 120_000]; // ramp: 5s, 10s, 30s, 1m, 2m
 const RECONNECT_STEADY_MS = 3_600_000; // then every 1h once the ramp is exhausted
 const RECONNECT_MAX_ATTEMPTS = RECONNECT_BACKOFF_MS.length + 48; // 5 ramp + 48 hourly ≈ 48h, then give up
@@ -288,10 +289,9 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_stopped", identity: actual });
         drain.disconnect();
       } catch (error) {
-        if (candidateWasNew && !startedForProof && candidateEndpoint?.state !== "stopped") {
-          await candidateEndpoint?.closeConnection().catch(() => undefined);
-        }
+        const stale = candidateWasNew && !startedForProof ? candidateEndpoint : undefined;
         this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && startedForProof ? proofEndpoint : undefined);
+        await this.discardEndpoint(stale);
         throw error;
       }
     });
@@ -392,10 +392,10 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, started);
       } catch (error) {
-        if (runtimeStopped && replacementEndpoint && replacementEndpoint.state !== "stopped") {
-          await replacementEndpoint.closeConnection().catch(() => undefined);
-        }
-        this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && proofStarted ? proofEndpoint : undefined);
+        const readyTarget = !runtimeStopped && proofStarted ? proofEndpoint : undefined;
+        const stale = runtimeStopped && replacementEndpoint !== readyTarget ? replacementEndpoint : undefined;
+        this.reopenAfterLifecycleFailure(record, drain, readyTarget);
+        await this.discardEndpoint(stale);
         throw error;
       }
     });
@@ -415,8 +415,8 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, replacement);
       } catch (error) {
-        if (replacement?.state !== "stopped") await replacement?.closeConnection().catch(() => undefined);
         this.reopenAfterLifecycleFailure(record, drain);
+        await this.discardEndpoint(replacement);
         throw error;
       }
       return;
@@ -440,12 +440,12 @@ export class EndpointManager {
       checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       this.publishAfterReopen(record, drain, replacement);
     } catch (error) {
-      if (runtimeStopped && replacement && replacement.state !== "stopped") {
-        await replacement.closeConnection().catch(() => undefined);
-      } else if (!runtimeStopped && record.endpoint !== preparedReplacement.endpoint) {
-        await preparedReplacement.endpoint.closeConnection().catch(() => undefined);
-      }
-      this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
+      const readyTarget = !runtimeStopped && target?.startedForProof ? target.endpoint : undefined;
+      const stale = runtimeStopped
+        ? replacement
+        : record.endpoint !== preparedReplacement.endpoint ? preparedReplacement.endpoint : undefined;
+      this.reopenAfterLifecycleFailure(record, drain, readyTarget);
+      await this.discardEndpoint(stale === readyTarget ? undefined : stale);
       throw error;
     }
   }
@@ -534,6 +534,33 @@ export class EndpointManager {
     this.publish(record, endpoint);
   }
 
+  // Cleanup for an endpoint a failed lifecycle action is abandoning. It is deliberately bounded:
+  // closing a connection whose transport is already gone can block forever — an SSH channel that
+  // accepts the close and never answers it — and this runs on the per-endpoint lifecycle queue,
+  // which admits no further action until it settles. An unbounded close therefore did not merely
+  // leak a connection; it wedged every future restart of the endpoint behind a promise that would
+  // never resolve. The connection is discarded either way, so waiting past the bound buys nothing.
+  private async discardEndpoint(endpoint: ManagedAppServerEndpoint | undefined): Promise<void> {
+    if (!endpoint) return;
+    let expire: ScheduledWork | undefined;
+    await Promise.race([
+      endpoint.closeConnection().catch(() => undefined),
+      new Promise<void>((resolve) => { expire = this.schedule(ENDPOINT_CLEANUP_TIMEOUT_MS, resolve); }),
+    ]).finally(() => expire?.cancel());
+  }
+
+  private schedule(delayMs: number, run: () => void): ScheduledWork {
+    if (this.options.schedule) return this.options.schedule(delayMs, run);
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return { cancel: () => clearTimeout(timer) };
+  }
+
+  // Restores admission after a failed lifecycle action. Callers must invoke this BEFORE any
+  // awaited cleanup: the gate is closed from `beginDrain` onwards, so anything that can block
+  // between the failure and this call holds every read and every repair on the endpoint shut.
+  // A hung close left `lyris` reporting `endpoint is draining` indefinitely, which failed each
+  // status read and refused the restart that was the only way out.
   private reopenAfterLifecycleFailure(
     record: EndpointRecord,
     drain: { reopen(): void },
