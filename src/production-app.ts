@@ -5195,6 +5195,12 @@ export async function buildProductionApp(
     // Only a settled session needs starting; one already working will reach its Stop hook.
     if (live?.availability !== "ready" || live.status !== "idle") return;
     const goal = await sessions.getGoal(nickname).catch(() => undefined) as { goal?: { status?: unknown } } | undefined;
+    if (goal === undefined) return;
+    // Refresh what the panel shows from what was just read. The displayed goal is a durable
+    // fact, and a read that could not find the marker writes null STRAIGHT INTO IT — so one
+    // status check taken while the goal was out of view erased it from the panel for good,
+    // even after the read itself was fixed. Every live read is a chance to correct that.
+    observeGoal(nickname, goal);
     if (goal?.goal?.status !== "active") return;
     scheduling?.enqueueRuntimeRecovery({
       nickname,
