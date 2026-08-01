@@ -2356,6 +2356,13 @@ export async function buildProductionApp(
     locations: codexRolloutLocations,
     nativeSession: (endpointId, threadId, mappingId) =>
       nativeSessions.view({ endpointId, threadId, mappingId }),
+    // A rollout location is learned by reconciling the thread, which is what hydrateThreadOrder
+    // does with the resulting view. Arming the existing retry is enough: it reconciles the exact
+    // session and the next read finds the location, instead of the reader being told to repeat
+    // the action that just failed.
+    relearnLocation: (endpointId, threadId, mappingId) => {
+      managedRecoveryOwner?.recordFailure(managedRetryKey(endpointId, threadId, mappingId), "retry");
+    },
     readPage: async ({ endpointId, allowMissing, ...input }, signal) => {
       const context = remoteContexts.get(endpointId);
       return readCodexRolloutHistoryPage({

@@ -76,7 +76,7 @@ test("a reloaded message rejoins its live twin even when their phases disagree",
   state = applyWorkerSnapshot(state, {
     messages: [{
       id: "a:turn:disk-uuid:0", turnId: "turn", body: "Yes — and it should unify more cleanly.", completedAt: 5,
-      terminalStatus: "completed", role: "worker", phase: "final_answer", turnOrder: 100, itemOrder: 100,
+      terminalStatus: "completed", phase: "final_answer", turnOrder: 100, itemOrder: 100,
     }],
     hasOlder: false, terminalTurnIds: ["turn"], openTurnIds: [],
   }, ids.requestId);

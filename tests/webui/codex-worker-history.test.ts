@@ -125,10 +125,15 @@ test("an unreachable endpoint reports history as unavailable, not as a defect", 
 
 // A reachable endpoint with no location is a different situation: the bounded map evicted
 // the entry, or the thread was never read. That is not an outage and must not claim to be.
-test("a reachable endpoint with no location reports a distinct, non-outage failure", async () => {
+// The location comes from a thread VIEW and this read never fetches one, so telling the reader
+// to "open the worker to re-read it" asked them to do the very thing that produced the error —
+// following it could never work. Ask for the reconcile that does learn it instead.
+test("a reachable endpoint with no location asks for the reconcile that learns it", async () => {
+  const relearned: Array<[string, string, string]> = [];
   const read = createCodexConversationHistoryRead({
     locations: new CodexRolloutLocations(),
     nativeSession: () => ({ availability: "ready", status: "idle" }) as never,
+    relearnLocation: (endpointId, thread, mappingId) => relearned.push([endpointId, thread, mappingId]),
     readPage: async () => assert.fail("no page can be read without a location"),
   });
 
@@ -137,7 +142,9 @@ test("a reachable endpoint with no location reports a distinct, non-outage failu
     (error: unknown) => {
       assert.ok(error instanceof AppError);
       assert.equal(error.code, "OPERATION_FAILED");
-      assert.match(error.message, /no rollout location is known/u);
+      assert.match(error.message, /being re-read/u);
+      assert.doesNotMatch(error.message, /open the worker/u, "never instruct the reader to repeat what just failed");
       return true;
     });
+  assert.deepEqual(relearned, [["prenyx", threadId, "mapping-1"]]);
 });

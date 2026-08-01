@@ -52,6 +52,10 @@ export class CodexRolloutLocations {
 export function createCodexConversationHistoryRead(deps: {
   locations: CodexRolloutLocations;
   nativeSession(endpointId: string, threadId: string, mappingId: string): NativeSessionView | undefined;
+  // Asks for the thread to be reconciled, which is what learns its rollout location. Called
+  // when a read finds none: the location comes from a thread VIEW, never from this read, so
+  // without it the only way out was for someone to trigger a reconcile by other means.
+  relearnLocation?(endpointId: string, threadId: string, mappingId: string): void;
   readPage(
     input: {
       endpointId: string;
@@ -91,9 +95,13 @@ export function createCodexConversationHistoryRead(deps: {
           `${endpointId} is not connected, so this worker's history cannot be read yet; it loads once the endpoint reconnects`);
       }
       // Reachable endpoint, no location: the entry was evicted (the map is bounded) or the
-      // thread was never read. A read of the thread repopulates it.
+      // thread has not been reconciled on this generation. Only a thread VIEW carries the
+      // location, and this read never fetches one — so telling the reader to "open the worker
+      // to re-read it" asked them to do the very thing that produced this error, and following
+      // it could never work. Ask for the reconcile that does learn it, and say so.
+      deps.relearnLocation?.(endpointId, threadId, mappingId);
       throw new AppError("OPERATION_FAILED",
-        `no rollout location is known for thread ${threadId} on ${endpointId}; open the worker to re-read it`);
+        `this worker's history location is not known yet on ${endpointId}; it is being re-read and will load shortly`);
     }
     const nativeStatus = native?.availability === "ready" ? native.status : "unknown";
     const activeTurnId = native?.availability === "ready" ? native.activeTurnId : null;
