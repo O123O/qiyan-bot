@@ -49,6 +49,9 @@ export interface ClaudeThreadView {
   // Work Claude started for itself and is still running after the turn that began it.
   // Present only for a Claude worker; absent means "none", not "unknown".
   nativeActivity?: { backgroundTasks: number; subagents: number };
+  // The turn now producing output, named on a view whose turns may be stripped or may not yet
+  // hold it — a turn runs before `claude` writes its user row. Absent means no turn is running.
+  activeTurnId?: string;
   itemsView: "full";
   turns: ClaudeThreadTurn[];
   threadSource?: string;

@@ -1784,6 +1784,41 @@ test("an oversized turn falls back to the transcript instead of delivering part 
   assert.deepEqual(terminals.at(-1)?.turn, { id: "ctx:a" }, "no items, so the relay reads the turn itself");
 });
 
+// A turn executes before `claude` flushes its user row, and a reconnect asks for this view
+// with its turns stripped — so neither the view's turns nor the transcript can name the turn
+// that is running. Left unnamed, the consumer records the identity as unresolved and probes
+// history for it; the probe finds only the previous, COMPLETED turn and stores the session
+// state as unknown, after which every operation on that worker fails as if its endpoint were
+// gone. That is what the manager reports as the session being down while its process is fine.
+test("the thread view names the running turn the transcript has not flushed", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "one" }] });
+  claude.answer(thread.id, "first answer");
+  await delay(5);
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "two" }] });
+  claude.withholdTranscriptTail(thread.id);
+
+  const resumed = await rt.request<{ thread: any }>("thread/resume", { threadId: thread.id, excludeTurns: true });
+  assert.deepEqual(resumed.thread.status, { type: "active" });
+  assert.equal(resumed.thread.activeTurnId, "ctx:b", "the running turn is named, so nothing has to go looking for it");
+
+  // And the paged history stays exactly as it was: hydrating the PREVIOUS turn, whose answer
+  // the relay still has to deliver, must keep working while a turn is running.
+  const reader = new ThreadHistoryReader((method, params) => rt.request(method, params));
+  const exact = await reader.exactTurnItems(thread.id, "ctx:a", { budget: createHistoryScanBudget() });
+  assert.deepEqual(
+    exact.items.filter((item: any) => item.type === "agentMessage").map((item: any) => item.text),
+    ["first answer"],
+    "the completed turn is still hydratable",
+  );
+  const suffix = await reader.descendingSuffix(thread.id, undefined, createHistoryScanBudget());
+  assert.deepEqual(suffix.turns.map((turn: any) => turn.id), ["ctx:a"], "and the scan is undisturbed");
+});
+
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
 // Without a way to stop it the session stays active forever — unarchivable and
 // unrestartable — with nothing left that could ever end it.
@@ -1868,3 +1903,4 @@ test("interrupting a turn also stops the work it spawned", async () => {
   assert.deepEqual(claude.interrupts, [thread.id], "the response was interrupted");
   assert.deepEqual(claude.stoppedTasks, ["agent-1"], "and its subagent was stopped, not left running");
 });
+

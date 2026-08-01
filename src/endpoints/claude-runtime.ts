@@ -180,6 +180,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // those counts, so leaving them behind reports the thread active forever — and a
       // thread that never returns to idle can never be archived, unadopted, or restarted.
       if (this.taskActivity.delete(threadId)) this.publishActivityStatus(threadId);
+      // Its retained turn text can no longer be republished — the only consumer is a background
+      // report from a session that no longer exists — so it is dead weight from here.
+      state.liveItems.clear();
       return;
     }
     // Claude's own background work — backgrounded Bash and Task-tool subagents — is never
@@ -361,6 +364,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // A turn that was running on a session that has since died can never be settled by a
       // host event, so leaving the reservation would wedge the thread as SESSION_BUSY.
       state.running = [];
+      state.liveItems.clear();
     }
     // The background work died with the sessions, and no task/set will ever arrive to retire
     // it. Keeping the counts would report every one of those threads active for good.
@@ -611,6 +615,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return {
       id: threadId,
       cwd: state.cwd,
+      // Named here because this view is sent with its turns stripped, so a consumer cannot
+      // read the running turn's identity out of them — and a turn executes before `claude`
+      // flushes its user row, so looking for it in the transcript can find only the previous,
+      // COMPLETED turn. That answer makes the identity probe record the session state as
+      // unknown, after which every operation on the worker fails as if its endpoint were gone.
+      ...(state.running[0] === undefined ? {} : { activeTurnId: state.running[0] }),
       // A session with a background task or subagent still running is NOT idle in any sense
       // the manager cares about: it will speak again without being prompted. Reporting it
       // as plain idle invited concluding the work was finished.

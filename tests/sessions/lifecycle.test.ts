@@ -40,6 +40,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
   failResume = false;
   resumeError: Error | undefined;
   failTurnsList = false;
+  viewActiveTurnId: string | undefined;
   listError: Error | undefined;
   unsubscribeError: Error | undefined;
   archiveError: Error | undefined;
@@ -94,6 +95,9 @@ class LifecycleEndpoint implements AppServerEndpoint {
         cwd: this.cwd,
         status: { type: this.status },
         turns: this.turns,
+        // A Claude endpoint names the running turn here, because a turn executes before
+        // `claude` writes its user row and this response is requested without turns.
+        ...(this.viewActiveTurnId === undefined ? {} : { activeTurnId: this.viewActiveTurnId }),
       };
       return {
         thread: {
@@ -275,6 +279,27 @@ test("adopt resolves an active resume with one bounded latest-turn probe", async
     sortDirection: "desc",
     itemsView: "notLoaded",
   });
+});
+
+// A turn runs before `claude` writes its user row, and this response is requested without
+// turns, so neither can name it. Unnamed, the identity is recorded as unresolved and probed
+// for in history — where the newest turn is the previous, COMPLETED one — and that failure is
+// stored as an unknown session state that fails every later operation on the worker.
+test("a resume that names its running turn is not probed for, and is not left unknown", async () => {
+  const { registry, endpoint, lifecycle, native } = await fixture();
+  endpoint.status = "active";
+  endpoint.turns = [{ id: "already-finished", status: "completed" }];
+  endpoint.viewActiveTurnId = "running-now";
+
+  await lifecycle.adopt("payments", "local", "thread-1");
+
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/turns/list"), false,
+    "nothing has to go looking for a turn the endpoint already named");
+  const view = native.view({
+    endpointId: "local", threadId: "thread-1", mappingId: required(registry).mapping_id,
+  });
+  assert.equal(view?.status, "active");
+  assert.equal(view?.activeTurnId, "running-now");
 });
 
 test("adopt accepts stale nonterminal history when this App Server reports idle or notLoaded", async (t) => {
