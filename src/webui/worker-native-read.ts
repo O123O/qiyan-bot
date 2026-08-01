@@ -17,6 +17,11 @@ interface ReadyHistoryCursor {
   pageKey?: string;
 }
 
+// How many bounded native pages one read may walk to satisfy its message count. Enough that
+// a handful of very large turns cannot starve a normal request, small enough that a pathological
+// transcript cannot turn one read into an unbounded ssh transfer.
+const READY_PAGE_WALK_BUDGET = 8;
+
 const MAX_CURSOR_BYTES = 16_384;
 const MAX_NATIVE_CURSOR_BYTES = 8_192;
 
@@ -55,6 +60,13 @@ function readyPageKey(turns: readonly unknown[]): string {
 
 // Both providers expose this native turn-page contract. History stays behind the endpoint runtime;
 // the Web UI requests only the foreground page it needs.
+// Conversational messages a set of turns would yield — user rows plus delivered agent text.
+// Counted before flattening so the walk stops as soon as the request is answerable.
+function workerConversationSize(turns: readonly { items?: readonly { type: string }[] }[]): number {
+  return turns.reduce((total, turn) => total
+    + (turn.items ?? []).filter((item) => item.type === "userMessage" || item.type === "agentMessage").length, 0);
+}
+
 export async function readReadyWorkerTurns(
   deps: ReadyWorkerReadDeps,
   endpointId: string,
@@ -66,7 +78,12 @@ export async function readReadyWorkerTurns(
   return deps.withReadyWorkLease(endpointId, async (lease) => {
     const cursorState = decodeReadyCursor(cursor);
     const history = new ThreadHistoryReader((method, params) => deps.request(endpointId, method, params, signal, lease));
-    const page = await history.turnsPage(threadId, {
+    // One native page is a bounded transfer, so a single large turn can fill it and leave
+    // far fewer messages than the caller asked for — a `count: 20` request coming back with
+    // one or two. Keep walking older pages until the request is satisfiable, the transcript
+    // runs out, or the walk budget is spent. Each transfer stays bounded; only the number of
+    // them grows, and only when a page was genuinely too small to answer.
+    let page = await history.turnsPage(threadId, {
       ...(cursorState.nativeCursor === undefined ? {} : { cursor: cursorState.nativeCursor }),
       // The foreground panel needs conversational text, never historical tool payloads. Request
       // Codex's summary projection so a large turn cannot fill or stall the app-server transport.
@@ -74,7 +91,19 @@ export async function readReadyWorkerTurns(
       sortDirection: "desc",
       itemsView: "summary",
     });
-    const turns = [...page.data].reverse();
+    let collected = [...page.data];
+    for (let walked = 1; walked < READY_PAGE_WALK_BUDGET; walked += 1) {
+      if (page.nextCursor === null || page.nextCursor === undefined) break;
+      if (workerConversationSize(collected) >= limit) break;
+      page = await history.turnsPage(threadId, {
+        cursor: page.nextCursor,
+        limit: 12,
+        sortDirection: "desc",
+        itemsView: "summary",
+      });
+      collected = [...collected, ...page.data];
+    }
+    const turns = [...collected].reverse();
     const pageKey = readyPageKey(turns);
     if (cursorState.pageKey && cursorState.pageKey !== pageKey) throw new Error("worker history cursor is stale");
     const conversation = pageWorkerConversation(turns, limit, cursorState.messageCursor);
