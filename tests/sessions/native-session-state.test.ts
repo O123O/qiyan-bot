@@ -285,3 +285,25 @@ test("a completion observed while idle fences an older active refresh response",
   assert.equal(state.applyRefresh(stale, { status: "active" }), false);
   assert.equal(state.view(identity)?.status, "idle");
 });
+
+// A Claude worker whose background task or subagent outlives its turn announces itself
+// active through thread/status/changed. That is what stops archive_session and
+// unadopt_session: their idle proof refuses a session reporting active, so the host is
+// never closed — and the running work never killed — out from under a worker that is
+// about to speak again.
+test("background work reported as a status change keeps a session non-idle", () => {
+  const state = new NativeSessionState({ now: () => 100 });
+  state.register(identity, 4);
+
+  // The turn ends; the background task is still running.
+  state.observe("prenyx", 4, "turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
+  state.observe("prenyx", 4, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1" } });
+  state.observe("prenyx", 4, "thread/status/changed", { threadId: "thread-1", status: { type: "active" } });
+
+  assert.equal(state.view(identity)?.status, "active",
+    "a session with live background work is not idle, so the archive idle proof refuses it");
+
+  // It settles, and the session becomes archivable again.
+  state.observe("prenyx", 4, "thread/status/changed", { threadId: "thread-1", status: { type: "idle" } });
+  assert.equal(state.view(identity)?.status, "idle");
+});
