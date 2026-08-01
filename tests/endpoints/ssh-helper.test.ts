@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { unlinkSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -453,6 +453,44 @@ async function readLinuxProcessState(pid: number): Promise<{ processGroupId: num
 async function closeNetServer(server: Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+// A runtime's debris can outlive it and refuse to die: a process wedged in uninterruptible I/O
+// on a stalled filesystem keeps the dead server's process group open, and a SIGKILL aimed at it
+// merely sits pending. `stop` used to call that a failure, so the endpoint could never be
+// reclaimed and never restarted — locked out by wreckage that would never go away.
+//
+// Nothing here can wedge a process in real uninterruptible I/O, so this pins the ownership half
+// of the same trap: a group member that carries no token (a recycled pgid, or a descendant that
+// re-execed with a scrubbed environment) must not turn reclaim into a hard failure either.
+test("a stop reclaims a dead runtime whose surviving group members cannot be proven ours", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  // A live process in its own group, holding NO runtime token: exactly the shape of a recycled
+  // pgid. The recorded "server" pid is this group's leader but is long dead.
+  const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-survivor.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const identity = {
+    kind: "ssh", token: "b".repeat(32), pid: survivor.pid, linuxStartTime: "1", processGroupId: survivor.pid,
+  };
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+
+  const stopArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit", expected: identity,
+  }));
+  const stopped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", stopArg],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+
+  assert.equal(parseRemoteHelperResponse<{ stopped: boolean }>(stopped.stdout, "stop").stopped, true,
+    "reclaim completes rather than failing on debris it cannot prove or reap");
+  // And the tombstone is gone, so the next inspect reports `absent` and a fresh runtime starts.
+  await assert.rejects(stat(`${runtimeDir}/identity.json`));
+});
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {
   const uid = process.getuid?.();

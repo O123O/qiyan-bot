@@ -74,7 +74,7 @@ import { EventRelay } from "./events/relay.ts";
 import { persistDeliveryStateEvent, reconcileDeliveryStateEvents } from "./events/delivery-status.ts";
 import { buildWorkerChildEnvironment, assistantTurnConfig, LoopbackMcpServer, ToolReadinessGate } from "./mcp/server.ts";
 import { SessionRegistry, type RegistrySession } from "./registry/session-registry.ts";
-import { SessionDiscovery } from "./sessions/discovery.ts";
+import { DISCOVERY_SOURCE_KINDS, SessionDiscovery } from "./sessions/discovery.ts";
 import { FinalMessageStore } from "./sessions/final-messages.ts";
 import {
   currentSessionSettings,
@@ -2378,24 +2378,40 @@ export async function buildProductionApp(
           try {
             const session = Object.values(registry.snapshot().sessions).find((item) =>
               item.endpoint === endpointId && item.thread_id === threadId && item.mapping_id === mappingId);
-            const params: Record<string, unknown> = {
-              pageSize: 50,
-              sortKey: "updated_at",
-              sortDirection: "desc",
-              useStateDbOnly: false,
-              ...session?.project_dir ? { cwd: session.project_dir } : {},
-            };
-            const page = await pool.request<{ data: Array<{ id?: unknown; path?: unknown; preview?: unknown }> }>(
-              endpointId, "thread/list", params,
-            );
-            for (const row of page.data) {
-              if (String(row.id ?? "") !== threadId) continue;
-              codexRolloutLocations.observe(endpointId, {
-                id: threadId,
-                path: typeof row.path === "string" ? row.path : "",
-                preview: String(row.preview ?? ""),
+            // Same request shape the lifecycle's own "find this thread in thread/list" uses,
+            // except for `useStateDbOnly`: the state-DB path does not carry the on-disk path,
+            // which is the only thing being asked for here.
+            //
+            // Paged, not one page: a worker that is not among the most recently updated threads
+            // for its cwd would otherwise never be found, and the panel would sit on "being
+            // re-read and will load shortly" forever -- the never-resolving promise this call
+            // replaced in the first place.
+            let cursor: string | undefined;
+            for (let page = 0; page < 16; page += 1) {
+              const listed = await pool.request<{
+                data: Array<{ id?: unknown; path?: unknown; preview?: unknown }>;
+                nextCursor?: string | null;
+              }>(endpointId, "thread/list", {
+                ...cursor === undefined ? {} : { cursor },
+                limit: 100,
+                sortKey: "updated_at",
+                sortDirection: "desc",
+                sourceKinds: [...DISCOVERY_SOURCE_KINDS],
+                archived: false,
+                useStateDbOnly: false,
+                ...session?.project_dir ? { cwd: session.project_dir } : {},
               });
-              break;
+              const row = listed.data.find((candidate) => String(candidate.id ?? "") === threadId);
+              if (row) {
+                codexRolloutLocations.observe(endpointId, {
+                  id: threadId,
+                  path: typeof row.path === "string" ? row.path : "",
+                  preview: String(row.preview ?? ""),
+                });
+                break;
+              }
+              cursor = listed.nextCursor ?? undefined;
+              if (cursor === undefined) break;
             }
           } finally { relearningLocations.delete(key); }
         },

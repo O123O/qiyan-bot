@@ -1046,6 +1046,11 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // Bounded, not unbounded: each step reads one window and stops at the first marker found
   // walking back — which IS the last marker in the file, and the last marker wins. A transcript
   // with no goal at all costs the whole budget once, which is why the budget is modest.
+  private static parsesAsRecord(line: string): boolean {
+    if (!line.trim()) return false;
+    try { JSON.parse(line); return true; } catch { return false; }
+  }
+
   // `known: false` means the walk ran out of budget or could not read: no goal was FOUND, which
   // is not the same as there being none. Reporting the two as one value is what erased a live
   // goal from the panel — a bounded read wrote its own limitation down as an authoritative fact.
@@ -1078,8 +1083,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     let scanned = 0;
     while (scanned < GOAL_SCAN_MAX_BYTES) {
       // Jump the span an earlier scan already proved clean, rather than re-reading it.
-      if (end !== undefined && cached && end <= cached.top && end > cached.floor) end = cached.floor;
-      if (end === 0) return settle(null);
+      if (end !== undefined && cached && end <= cached.top && end > cached.floor) {
+        end = cached.floor;
+        // The fragment only means anything for the window IMMEDIATELY below the last one. After
+        // a jump the next window is somewhere else entirely, and splicing an unrelated fragment
+        // onto its last line can forge a record that concatenates two unrelated messages.
+        carry = undefined;
+      }
+      if (end === 0) return settle(null, top === undefined ? undefined : { floor: 0, top });
       const chunk = await this.options.runner
         .readTranscriptChunk(threadId, state.cwd, {
           offset: end === undefined ? "tail" : Math.max(0, end - GOAL_SCAN_TAIL_BYTES),
@@ -1101,7 +1112,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // and rejoin it instead; windows are always visited in descending order.
       const lines = Buffer.from(chunk.bytes).toString("utf8").split("\n");
       const fragment = chunk.offset > 0 ? lines.shift() ?? "" : undefined;
-      if (carry !== undefined && lines.length > 0) lines[lines.length - 1] += carry;
+      // Rejoin only when the last line is genuinely incomplete. A window can begin exactly after
+      // a newline, and then BOTH lines are whole records — appending would destroy two valid
+      // records where isolation only ever lost one.
+      if (carry !== undefined && carry !== "" && lines.length > 0 && !ClaudeCodeRuntime.parsesAsRecord(lines[lines.length - 1]!)) {
+        lines[lines.length - 1] += carry;
+      }
       carry = fragment;
       const records: unknown[] = [];
       for (const line of lines) {

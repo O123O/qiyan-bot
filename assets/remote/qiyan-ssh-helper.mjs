@@ -182,10 +182,9 @@ async function start(value) {
   if (capability.status !== 0 || capabilityPaths.slice(-3).length !== 3) throw new Error("codex, tmux, and tail are required to start a remote runtime");
   const before = await inspect(value);
   if (before.status === "healthy") return { identity: before.identity };
-  // A live supervisor means a runtime is genuinely there, and a second one must not be started
-  // against its socket. Without one there is nothing to protect -- see reclaimUnsupervised.
-  if (before.status === "unhealthy" && before.supervised) throw new Error("existing runtime is unhealthy");
-  if (before.status === "unhealthy") await reclaimUnsupervised(paths, before.identity);
+  // Reclaiming an unhealthy runtime is `stop`'s job, and ensureStarted routes through it before
+  // ever calling start. Starting over one here would race that.
+  if (before.status === "unhealthy") throw new Error("existing runtime is unhealthy");
   await unlink(paths.socketPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   await unlink(paths.identityPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   const inner = `exec ${paths.launcherPath} ${value.token} ${paths.socketPath} ${paths.identityPath}`;
@@ -204,26 +203,6 @@ async function start(value) {
   throw new Error(`runtime did not become healthy${await launcherFailureDetail(paths)}`);
 }
 
-// An unsupervised runtime is debris: its tmux session is gone, so no server is left to protect.
-// Signal whatever still carries our token, since a child that outlives the server inherits the
-// server's process group AND its environment -- which is why "a member of the group owns our
-// token" cannot mean "the runtime is alive". Reading it that way locked an endpoint out for
-// hours behind one `git` wedged in an unresponsive filesystem, which no signal can reap.
-//
-// Survivors are therefore left behind deliberately rather than failing the start: the
-// replacement gets a new pid, process group and token, so old debris cannot be mistaken for it.
-async function reclaimUnsupervised(paths, identity) {
-  if (identity && ownedGroupMembers(identity).length > 0) {
-    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-    await waitForEmptyGroup(identity.processGroupId, 2_000);
-    if (ownedGroupMembers(identity).length > 0) {
-      try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-      await waitForEmptyGroup(identity.processGroupId, 2_000);
-    }
-  }
-  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
-}
-
 async function launcherFailureDetail(paths) {
   try {
     const log = await readFile(join(paths.runtimeDir, "app-server.log"), "utf8");
@@ -238,6 +217,7 @@ async function stop(value) {
   const identity = await readIdentity(paths.identityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
+  let survivors = 0;
   if (identity) {
     // This gate is the protection against a RECYCLED pgid, not a redundant liveness check:
     // the signal below goes to the whole process group, and only a surviving member still
@@ -253,13 +233,30 @@ async function stop(value) {
         try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
         await waitForEmptyGroup(identity.processGroupId, 2_000);
       }
-      if (ownedGroupMembers(identity).length > 0) throw new Error("runtime process group did not stop");
+      survivors = ownedGroupMembers(identity).length;
+      // A survivor is only a FAILURE while something is left to protect. A process blocked in
+      // uninterruptible I/O -- a stalled network filesystem -- cannot be reaped by any signal:
+      // the SIGKILL simply sits pending. Refusing to finish there is how one wedged `git`, long
+      // outliving the server that spawned it, locked its endpoint out for hours: the repair was
+      // refused by debris that could never go away.
+      //
+      // So insist only that the SERVER is gone -- its recorded process dead and its supervisor
+      // with it. That is the condition under which a replacement cannot become a second live
+      // app-server on the same socket, which is the thing this check is really for. Leftover
+      // descendants do not qualify: the replacement gets a new pid, process group and token.
+      if (survivors > 0) {
+        const supervised = (await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true)).code === 0;
+        const serverAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
+        if (supervised || serverAlive) throw new Error("runtime process group did not stop");
+      }
     }
   }
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
-  return { stopped: true };
+  // Report what was left behind. A caller that reclaimed over unreapable debris should be able
+  // to say so rather than presenting the endpoint as cleanly stopped.
+  return { stopped: true, ...survivors > 0 ? { survivors } : {} };
 }
 
 // The Claude host runtime is the Codex app-server runtime with a different server: one
@@ -847,11 +844,15 @@ function processHasToken(pid, token) {
   return environment.toString("utf8").split("\0").includes(`QIYAN_RUNTIME_TOKEN=${token}`);
 }
 
+// The members of the runtime's process group that still carry its token. Deliberately NOT a
+// proof obligation: a descendant that re-execs with a scrubbed environment fails the token check
+// while still being ours (group membership implies descent -- setpgid can only join a group in
+// the caller's session), and a recycled pgid shows members that carry no token at all. Throwing
+// on either turned an endpoint whose debris could not be reaped into a permanent lockout, which
+// is the failure this whole path exists to end. Callers gate on `owned.length > 0` instead:
+// one surviving token-carrier is what proves the group is still ours and makes signalling it safe.
 function ownedGroupMembers(identity) {
-  const members = membersOfGroup(identity.processGroupId);
-  const owned = members.filter((pid) => processHasToken(pid, identity.token));
-  if (members.length > 0 && (owned.length === 0 || owned.length !== members.length)) throw new Error("runtime process group ownership cannot be proven");
-  return owned;
+  return membersOfGroup(identity.processGroupId).filter((pid) => processHasToken(pid, identity.token));
 }
 
 function identityMatches(identity) {
