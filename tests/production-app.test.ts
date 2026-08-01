@@ -1658,6 +1658,26 @@ test("managed endpoint-ready composition supplies any shared wake the owner has 
   }
 });
 
+// The owner retries what has already FAILED. A session that never got a first attempt is not
+// pending, so an endpoint whose first ready arrives after startup recovers nothing — and that is
+// every remote host, whose ssh, tmux, and handshake outlast the startup window. Its sessions stay
+// registered-but-unknown, which the manager reports as a session whose state cannot be
+// established: down, and refusing work, while the worker it names is running and reachable.
+test("an endpoint ready with nothing pending still resumes sessions never attempted", async () => {
+  const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "ready" };
+  for (const [recovery, expectedResumes] of [["none", 1], ["pending", 0], ["completed", 0]] as const) {
+    let resumes = 0;
+    await recoverManagedEndpointReady(
+      { endpointReady: async () => ({ recovery, sharedWake: "completed" }) },
+      "endpoint-a",
+      lease,
+      async () => {},
+      async () => { resumes += 1; },
+    );
+    assert.equal(resumes, expectedResumes, `recovery=${recovery}`);
+  }
+});
+
 test("ready endpoint recovery wakes each owner once and reconciles operations after shared work", async () => {
   const calls: string[] = [];
   let readyLeaseHeld = false;

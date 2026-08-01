@@ -1617,8 +1617,17 @@ export async function recoverManagedEndpointReady(
   endpointId: string,
   lease: EndpointWorkLease,
   wakeShared: () => Promise<void>,
+  // Resumes the endpoint's managed sessions that have no established native state. The owner
+  // retries what has already FAILED, so it has nothing to do for sessions that never got a
+  // first attempt — and that is every session on an endpoint whose first ready arrives after
+  // startup. A remote host is always in that group: its ssh, tmux, and handshake outlast the
+  // startup window. Its sessions were registered as `unknown` and then left there, which reads
+  // to the manager as a session whose state cannot be established, so it is reported down and
+  // refuses work — while the worker it names is running and perfectly reachable.
+  resumeUnattempted?: () => Promise<void>,
 ): Promise<ManagedEndpointReadyOutcome> {
   const result = await owner.endpointReady(endpointId, lease, wakeShared);
+  if (result.recovery === "none" && resumeUnattempted) await resumeUnattempted();
   if (result.sharedWake !== "needed") return result;
   await wakeShared();
   return { ...result, sharedWake: "completed" };
@@ -5238,7 +5247,16 @@ export async function buildProductionApp(
       await recoverReadyEndpointOwners({
         recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => {
           recoveredGeneration = lease.endpointGeneration;
-          return recoverManagedEndpointReady(managedRecoveryOwner!, endpointId, lease, wakeShared);
+          return recoverManagedEndpointReady(
+            managedRecoveryOwner!, endpointId, lease, wakeShared,
+            // Bounded to sessions with no established state, so an endpoint whose sessions are
+            // already known pays a walk over them and no requests at all.
+            () => resumeManagedSessions(endpointId, {
+              unavailableOnly: true,
+              lease,
+              isCurrent: () => isManagedRecoveryLeaseCurrent(endpointId, lease),
+            }).then(() => undefined),
+          );
         }),
         relay: () => relay.endpointReady(endpointId),
         observations: () => observations.endpointReady(endpointId),
