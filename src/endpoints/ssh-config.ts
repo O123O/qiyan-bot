@@ -121,8 +121,9 @@ export function buildSshStreamArgs(plan: SshConnectionPlan, remoteCommand: strin
 }
 
 // Reverse-forward (`-R`) a REMOTE loopback TCP port to a LOCAL port over the ControlMaster —
-// exposes QiYan's loopback worker-MCP on the remote host so a remote `claude -p` worker can
-// reach it. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
+// exposes QiYan's loopback worker-MCP on the remote host so a remote worker can reach it.
+// See the TODO(worker-mcp) note in src/scheduling/worker-mcp.ts: no provider is wired to it
+// today. The remote listener binds to `127.0.0.1` (not `0.0.0.0`) — with the default
 // `GatewayPorts no` this is bind-not-relax: only processes ON the remote host can connect,
 // never the network. Auth is the per-session bearer token in the worker's --mcp-config.
 // A remotePort of 0 asks the remote sshd to allocate a free port (reported on stdout); this

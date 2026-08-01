@@ -1,5 +1,13 @@
 # Unified endpoint configuration
 
+## Status
+
+The provider/transport split below shipped and still holds. The execution model
+it describes did not survive: a `claude` endpoint of either transport now runs
+turns on a `ClaudeHost` (Agent SDK), not `claude -p`, so `model`/`effort` reach
+the SDK's launch options and its live query rather than argv, and
+`ClaudeLaunchFlags` is gone. See `claude-agent-sdk-host-design.md`.
+
 ## Problem
 
 Endpoint configuration is split and the type field conflates two orthogonal concerns:

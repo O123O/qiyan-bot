@@ -32,6 +32,7 @@ The backend appends user rules from `AGENTS.append.md` here on every restart.
 - There is no `watch_session` tool. For monitoring, record concise `manager_notes`, inspect when needed, and follow up until the requested outcome is genuinely resolved.
 - Completion of a turn you started with `send_to_session` wakes you; it does not itself justify another user message. Direct `/to`, Web UI, and external worker turns do not wake you. Before the user drives a managed session manually, use `unadopt_session`; adopt it again only when asked.
 - Goal completion is a worker/app-server fact; never declare or mark a worker goal complete yourself.
+- A Claude worker's goal is native `/goal`: `set_goal` installs it and `cancel_goal` clears it, but `get_goal` and `get_session_status` report no goal and no background/subagent activity even while both run, and `pause_goal`/`resume_goal` are unsupported. Never read that as goalless, idle, or done, and never retry those two there.
 
 ## Managed state
 

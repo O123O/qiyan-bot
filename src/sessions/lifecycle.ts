@@ -612,9 +612,14 @@ export class SessionLifecycle {
     const nativeIdentity = this.nativeIdentity(identity);
     const generation = token.endpointGeneration;
     const activeTurnId = thread.status.type === "active"
-      ? knownActiveTurnId ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
+      ? knownActiveTurnId ?? viewActiveTurnId(thread)
+        ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? null
       : null;
-    this.native.applyRefresh(token, { status: thread.status.type, activeTurnId });
+    this.native.applyRefresh(token, {
+      status: thread.status.type,
+      activeTurnId,
+      nativeActivity: nativeActivityOf(thread),
+    });
     return this.native.captureRefresh(nativeIdentity, generation);
   }
 
@@ -630,11 +635,13 @@ export class SessionLifecycle {
 
   private applyManagedResponse(token: NativeRefreshToken, thread: ThreadView): boolean {
     const activeTurnId = thread.status.type === "active"
-      ? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? undefined
+      ? viewActiveTurnId(thread)
+        ?? [...thread.turns].reverse().find((turn) => !isTerminalTurnStatus(turn.status))?.id ?? undefined
       : null;
     return this.native.applyRefresh(token, {
       status: thread.status.type,
       ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      nativeActivity: nativeActivityOf(thread),
     });
   }
 
@@ -660,6 +667,22 @@ export class SessionLifecycle {
       step,
     };
   }
+}
+
+// A provider that has background work reports it on the thread view beside the status. Read
+// structurally: the shared ThreadView is the Codex shape, which has no such concept.
+function nativeActivityOf(thread: ThreadView): unknown {
+  return (thread as { nativeActivity?: unknown }).nativeActivity;
+}
+
+// The running turn named by the provider itself. Preferred over scanning the view's turns
+// because the view may carry none — reconnect asks for it without them — and because a turn
+// runs before its provider has written it anywhere the turns come from. Without this the
+// identity is recorded as unresolved and then probed for, and the probe's failure to find it
+// is stored as an unknown session state that fails every later operation.
+function viewActiveTurnId(thread: ThreadView): string | undefined {
+  const value = (thread as { activeTurnId?: unknown }).activeTurnId;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function sameMapping(left: RegistrySession, right: MappingIdentity): boolean {

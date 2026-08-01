@@ -93,6 +93,11 @@ body { margin:0; }
 .goal-status[data-status="blocked"]::before { background:#ef6b73; }
 .goal-objective { min-width:0; max-height:4.65em; overflow:auto; white-space:pre-wrap; word-break:break-word; }
 
+.tasks-row { border-top:1px solid var(--line); padding:6px 14px; background:var(--panel); display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+.tasks-spinner { flex:0 0 auto; width:8px; height:8px; border-radius:50%; background:#4aa3ff; animation:tasks-pulse 1.4s ease-in-out infinite; }
+.tasks-label { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+@keyframes tasks-pulse { 0%,100% { opacity:.35; } 50% { opacity:1; } }
+
 .composer { position:relative; border-top:1px solid var(--line); padding:10px 14px; display:flex; gap:8px; background:var(--panel); }
 .composer textarea { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; font:inherit; }
 .composer button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }

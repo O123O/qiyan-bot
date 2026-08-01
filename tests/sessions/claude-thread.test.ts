@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { reconstructClaudeThread, type ClaudeThreadView } from "../../src/sessions/claude-thread.ts";
+import { claudeMessagePhase, reconstructClaudeThread, type ClaudeThreadView } from "../../src/sessions/claude-thread.ts";
 
 function records(name: string): unknown[] {
   const path = fileURLToPath(new URL(`./fixtures/claude/${name}.jsonl`, import.meta.url));
@@ -47,7 +47,10 @@ test("a native subagent task notification remains internal to its parent turn", 
 
   const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
   assert.equal(v.turns.length, 1);
-  assert.equal(v.turns[0]?.id, "p1");
+  // The turn id is the user row's own uuid — for a QiYan-driven turn that IS the
+  // clientUserMessageId handed to the SDK, so live events and history agree. promptId is
+  // a separate Claude-generated id that matches nothing QiYan knows.
+  assert.equal(v.turns[0]?.id, "u1");
   assert.equal(v.turns[0]?.items.filter((item) => item.type === "userMessage").length, 1);
   assert.equal(v.turns[0]?.items.find((item) => item.phase === "final_answer")?.text, "parent result");
 });
@@ -65,7 +68,7 @@ test("an incomplete transcript is active only while its exact tracked Claude chi
   const raw = records("interrupted");
   const turnStart = raw.find((record): record is Record<string, unknown> => !!record && typeof record === "object"
     && (record as Record<string, unknown>).type === "user" && typeof (record as Record<string, unknown>).promptSource === "string");
-  const runningTurnId = String((turnStart as Record<string, unknown>).promptId);
+  const runningTurnId = String((turnStart as Record<string, unknown>).uuid);
   const v = reconstructClaudeThread({ threadId: "interrupted", cwd: "/tmp/x", records: raw, runningTurnId });
   assert.equal(v.turns[0]?.status, "inProgress");
   assert.equal(v.status.type, "active");
@@ -74,9 +77,30 @@ test("an incomplete transcript is active only while its exact tracked Claude chi
 test("a known-interrupted turn id is reported interrupted (terminal)", () => {
   const raw = records("interrupted");
   const turnStart = raw.find((r): r is Record<string, unknown> => !!r && typeof r === "object" && (r as Record<string, unknown>).type === "user" && typeof (r as Record<string, unknown>).promptSource === "string");
-  const turnId = String((turnStart as Record<string, unknown>).promptId);
+  const turnId = String((turnStart as Record<string, unknown>).uuid);
   const v = reconstructClaudeThread({ threadId: "interrupted", cwd: "/tmp/x", records: raw, interruptedTurnIds: new Set([turnId]) });
   assert.equal(v.turns[0]?.status, "interrupted");
+});
+
+// A live turn and its reconstructed history must key identically or the Web UI merges
+// nothing and renders every message twice: it matches on item id first, then clientId,
+// then a fallback needing turnId + body + phase to agree.
+test("reconstructed ids match what the live host events carry", () => {
+  const recs = [
+    { type: "user", promptSource: "sdk", promptId: "claude-generated", uuid: "client-uuid",
+      message: { role: "user", content: "hi" } },
+    { type: "assistant", uuid: "assistant-uuid",
+      message: { role: "assistant", stop_reason: "end_turn", content: [
+        { type: "text", text: "first" }, { type: "thinking", thinking: "ignored" }, { type: "text", text: "second" },
+      ] } },
+  ];
+  const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
+  assert.equal(v.turns[0]?.id, "client-uuid", "turn id === the uuid QiYan sent");
+  const items = v.turns[0]!.items;
+  assert.equal(items.find((item) => item.type === "userMessage")?.id, "client-uuid");
+  // Non-text blocks are skipped by BOTH enumerations, so the indices stay aligned.
+  assert.deepEqual(items.filter((item) => item.type === "agentMessage").map((item) => item.id),
+    ["assistant-uuid:0", "assistant-uuid:1"]);
 });
 
 test("userMessage carries the QiYan clientId marker; phases split final vs commentary", () => {
@@ -121,4 +145,38 @@ test("a turn truncated by max_tokens still completes (not open forever)", () => 
   const v = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: recs });
   assert.equal(v.turns[0]?.status, "completed");
   assert.equal(v.status.type, "idle");
+});
+
+// Live SDK events and reconstructed history are merged by item id, so they must phase an
+// assistant message identically or the merged message describes itself two ways.
+test("the phase rule is shared between the live path and reconstruction", () => {
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "end_turn" } }), "final_answer");
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "max_tokens" } }), "final_answer",
+    "a turn truncated by the model still ends it");
+  assert.equal(claudeMessagePhase({ message: { stop_reason: "tool_use" } }), "commentary",
+    "text before a tool call is intermediate, and is shown as it arrives");
+  assert.equal(claudeMessagePhase({ message: {} }), "commentary", "still streaming");
+  assert.equal(claudeMessagePhase({}), "commentary", "a malformed record is never a final answer");
+
+  // The same rule must produce the same phases reconstruction assigns.
+  const view = reconstructClaudeThread({ threadId: "s1", cwd: "/tmp/x", records: [
+    { type: "user", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "checking" }] } },
+    { type: "assistant", uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } },
+  ] });
+  assert.deepEqual(
+    view.turns[0]!.items.filter((item) => item.type === "agentMessage").map((item) => [item.text, item.phase]),
+    [["checking", "commentary"], ["done", "final_answer"]]);
+});
+
+// The transcript records the boundary too, so a turn reconstructed after a restart still
+// carries the item compact_session correlates against.
+test("a reconstructed turn carries its compaction boundary", () => {
+  const view = reconstructClaudeThread({ threadId: "s1", cwd: "/w", records: [
+    { type: "user", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "/compact" } },
+    { type: "system", subtype: "compact_boundary", uuid: "cb1", compactMetadata: { trigger: "manual" } },
+    { type: "assistant", uuid: "a1", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } },
+  ] });
+  const kinds = view.turns[0]!.items.map((item) => item.type);
+  assert.ok(kinds.includes("contextCompaction"), `expected a compaction item, got ${kinds.join(",")}`);
 });

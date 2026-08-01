@@ -23,10 +23,6 @@ export interface WorkerScheduleMcpOptions {
   // Resolve a per-session bearer token to the calling worker session.
   resolveToken(token: string): WorkerScheduleSession | undefined;
   now(): number;
-  // Let the calling WORKER mark its own goal complete/blocked (Claude only; Codex has a
-  // native goal engine and the assistant is not a worker). When present, exposes the
-  // set_goal_status tool.
-  setGoalStatus?(session: WorkerScheduleSession, status: "complete" | "blocked"): void;
   // Whether `monitor` is usable by the calling session. It is offered only when the session's
   // own host can run the check (locally for the local worker, over ssh for a remote worker), so
   // the tool description's "on your session's host" promise always holds. Default: usable.
@@ -38,6 +34,11 @@ export interface WorkerScheduleMcpOptions {
 const SCHEDULE_TOOLS = ["schedule_wakeup", "schedule_cron", "monitor", "list_schedules", "cancel_schedule"] as const;
 export const WORKER_SCHEDULE_TOOL_NAMES: readonly string[] = SCHEDULE_TOOLS;
 
+// TODO(worker-mcp): retained deliberately, not dead code. Claude workers no longer receive
+// these tools — a persistent Claude Code session owns its own scheduling, background tasks
+// and goals natively (see docs/development/claude-agent-sdk-host-design.md). Codex workers
+// have no native equivalent, so this stays available for a future Codex worker-side
+// scheduling surface. It currently has no caller; do not delete it on that basis alone.
 export class WorkerScheduleMcpServer {
   private http: Server | undefined;
   private actualPort = 0;
@@ -111,7 +112,7 @@ export class WorkerScheduleMcpServer {
     // over ssh for a remote worker. It is registered only when a host check runner exists
     // (supportsMonitor), so the description's "on your session's host" promise always holds.
     if (this.options.supportsMonitor?.(session) ?? true) mcp.registerTool("monitor", {
-      description: "Watch an external condition: QiYan runs `check` every poll_seconds on your session's host; when it exits 0, the monitor fires once, sends `message` as a new turn, and finishes. Use for durable external work such as builds, files, and jobs. Do not use it to wait for Claude subagents or background agents: headless Claude exits terminate them.",
+      description: "Watch an external condition: QiYan runs `check` every poll_seconds on your session's host; when it exits 0, the monitor fires once, sends `message` as a new turn, and finishes. Use for durable external work such as builds, files, and jobs. The check only observes the host, so do not use it to wait on work running inside this session.",
       inputSchema: { check: z.string().min(1).describe("shell command run on your host; exit 0 = condition met"), message: z.string().min(1).describe("the message sent to you when the check passes"), poll_seconds: z.number().int().min(1).describe("seconds between checks").optional() },
     }, async (args) => {
       const ms = (args.poll_seconds ?? 30) * 1000;
@@ -136,16 +137,6 @@ export class WorkerScheduleMcpServer {
         : `no such active schedule: ${args.id}`);
     });
 
-    if (this.options.setGoalStatus) {
-      const setGoalStatus = this.options.setGoalStatus;
-      mcp.registerTool("set_goal_status", {
-        description: "Report the status of YOUR current goal so QiYan stops driving you. Use status=\"complete\" when the goal is fully accomplished, or \"blocked\" when you cannot make progress without help.",
-        inputSchema: { status: z.enum(["complete", "blocked"]).describe("'complete' = goal accomplished; 'blocked' = cannot progress without help") },
-      }, async (args) => {
-        setGoalStatus(session, args.status);
-        return text(`goal marked ${args.status}`);
-      });
-    }
 
     // SDK 1.29 models stateless mode as an explicitly-undefined generator, which
     // conflicts with exactOptionalPropertyTypes despite being the documented API

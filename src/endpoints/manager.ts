@@ -465,6 +465,14 @@ export class EndpointManager {
 
   desiredState(id: string): EndpointDesiredState { return this.record(id).gate.desiredState; }
 
+  // True while automatic recovery is parked waiting for a human to re-authenticate (an SSH
+  // host with no fresh channel — MFA). Distinguishes "a person must act before anything can
+  // work" from "the runtime is simply gone", which is the case a restart exists to repair.
+  // Lifecycle fencing needs that distinction: retrying into an auth-blocked endpoint only
+  // manufactures more unresolved operations, while refusing a restart for a merely absent
+  // runtime deadlocks the only repair available.
+  awaitingAuthentication(id: string): boolean { return this.record(id).recoveryPause !== undefined; }
+
   onEndpoint(listener: (endpoint: ManagedAppServerEndpoint, generation: number) => void): () => void {
     this.endpointListeners.add(listener);
     return () => this.endpointListeners.delete(listener);
@@ -560,7 +568,21 @@ export class EndpointManager {
       const state = this.options.managedThreadState?.(endpointId, threadId, generation);
       if (!state || state.availability !== "ready" || state.endpointGeneration !== generation
         || state.status === "unknown" || state.status === "error") {
-        throw new AppError("OPERATION_UNCERTAIN", `could not prove managed thread idle on endpoint ${endpointId}`);
+        // OPERATION_CONFLICT, not OPERATION_UNCERTAIN. This guard runs at the `draining`
+        // phase, before stopEndpointRuntime, so the operation's OWN effect — stopping the
+        // runtime — provably did not happen, which is what the code has to report.
+        //
+        // Note this is narrower than "nothing happened": shutdownTarget may have started
+        // the endpoint to prove its identity (startedForProof), and reopenAfterLifecycleFailure
+        // then publishes it. That restores service rather than performing the shutdown, so
+        // the operation is still proven-no-effect, but the endpoint is not untouched.
+        //
+        // Reporting UNCERTAIN left the operation permanently recoverable, and an unresolved
+        // earlier operation fences the next lifecycle action on the endpoint. So a worker
+        // whose status could not be read wedged every future restart of its endpoint: the
+        // repair was refused by the wreckage of its own last attempt. The sibling not-idle
+        // branch below has always used CONFLICT for the same reason.
+        throw new AppError("OPERATION_CONFLICT", `could not prove managed thread idle on endpoint ${endpointId}`);
       }
       if (state.status !== "idle") {
         throw new AppError("OPERATION_CONFLICT", `managed thread is not idle on endpoint ${endpointId}`);
@@ -581,10 +603,10 @@ export class EndpointManager {
   }
 
   private scheduleReconnect(endpointId: string, record: EndpointRecord, generation: number, _kind: EndpointLossKind): void {
-    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
+    if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect) return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.endpoint?.id !== endpointId || record.generation !== generation
-        || record.gate.desiredState !== "automatic" || record.reconnect || record.recoveryPause) return;
+        || record.gate.desiredState !== "automatic" || record.reconnect) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -595,8 +617,7 @@ export class EndpointManager {
       });
       record.reconnect = schedule(delay, () => {
         delete record.reconnect;
-        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic"
-          || record.recoveryPause) return;
+        if (this.closing || record.generation !== generation || record.gate.desiredState !== "automatic") return;
         void this.activate(endpointId, false).catch((error) => {
           if (!this.pauseForRecovery(endpointId, record, generation, error)) {
             this.scheduleReconnect(endpointId, record, generation, "connection-lost");
@@ -609,11 +630,11 @@ export class EndpointManager {
   private scheduleActivationRetry(endpointId: string, record: EndpointRecord): void {
     const generation = record.generation;
     if (this.closing || record.gate.desiredState !== "automatic" || record.reconnect
-      || record.endpoint?.state === "ready" || record.recoveryPause) return;
+      || record.endpoint?.state === "ready") return;
     void Promise.resolve(this.options.hasIdentityReferences(endpointId)).then((referenced) => {
       if (this.closing || !referenced || record.generation !== generation
         || record.endpoint?.state === "ready" || record.gate.desiredState !== "automatic"
-        || record.reconnect || record.recoveryPause) return;
+        || record.reconnect) return;
       if (this.reachedReconnectLimit(endpointId, record)) return;
       const delay = reconnectDelayMs(record.reconnectAttempt);
       record.reconnectAttempt += 1;
@@ -642,6 +663,13 @@ export class EndpointManager {
     delete record.reconnect;
   }
 
+  // Records that recovery is blocked on a human (an ssh host with no fresh channel — MFA)
+  // and notifies once. It deliberately does NOT stop the reconnect backoff: the backoff
+  // already escalates to hourly and gives up after ~48h, which is the right cadence for a
+  // host waiting on a person, whereas stopping entirely meant nothing ever retried after
+  // the person acted. The pause was cleared only by a successful publish, and no publish
+  // could happen while every scheduler refused to run — so an endpoint stayed unreachable
+  // to QiYan long after it was reachable again.
   private pauseForRecovery(
     endpointId: string,
     record: EndpointRecord,
@@ -650,7 +678,6 @@ export class EndpointManager {
   ): boolean {
     const recovery = endpointRecoveryPause(error);
     if (!recovery || record.generation !== attemptedGeneration) return false;
-    this.cancelReconnect(record);
     if (record.recoveryPause?.reason !== recovery.reason || record.recoveryPause.sshHost !== recovery.sshHost) {
       record.recoveryPause = { ...recovery, notificationPrepared: false };
     }

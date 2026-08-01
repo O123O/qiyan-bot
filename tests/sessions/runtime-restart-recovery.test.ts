@@ -27,11 +27,6 @@ function harness() {
       : undefined,
     native: () => live,
     enqueueResume: ({ nickname }) => { resumed.push(nickname); },
-    resumeActiveGoal: ({ nickname }) => {
-      if (!goalOwnsRecovery) return false;
-      resumedGoals.push(nickname);
-      return true;
-    },
   });
   return {
     recovery,
@@ -76,14 +71,13 @@ test("connection-only loss, idle workers, and still-active turns never receive a
   assert.deepEqual(running.resumed, []);
 });
 
-test("an active goal owns restart continuation and an unavailable mapping waits for recovery", () => {
+test("every interrupted worker gets the resume prompt, and an unavailable mapping waits for recovery", () => {
+  // Goals are Claude's own now, so restart continuation has no goal-driver branch to take.
   const goal = harness();
   goal.recovery.endpointUnavailable("prenyx", "runtime-lost");
   goal.setLive({ availability: "ready", status: "idle" });
-  goal.setGoalOwnsRecovery(true);
   goal.recovery.endpointReady("prenyx");
-  assert.deepEqual(goal.resumed, []);
-  assert.deepEqual(goal.resumedGoals, ["worker"]);
+  assert.deepEqual(goal.resumed, ["worker"]);
 
   const delayed = harness();
   delayed.recovery.endpointUnavailable("prenyx", "runtime-lost");

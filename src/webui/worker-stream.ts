@@ -9,9 +9,12 @@ export type WorkerChatEvent =
   | { kind: "turn-started"; turnId: string; status?: string }
   | { kind: "turn-completed"; turnId: string; status?: string }
   | { kind: "item-started" | "item-completed"; turnId: string; item: WorkerChatItem; atMs?: number }
-  | { kind: "agent-message-delta"; turnId: string; itemId: string; delta: string };
+  | { kind: "agent-message-delta"; turnId: string; itemId: string; delta: string }
+  // Claude's own background work, shown as a live indicator beside the composer rather
+  // than as conversation. Absent for providers that report no such work.
+  | { kind: "tasks-updated"; background: number; subagents: number; descriptions: string[] };
 
-const METHODS = new Set(["turn/started", "turn/completed", "item/started", "item/completed", "item/agentMessage/delta"]);
+const METHODS = new Set(["turn/started", "turn/completed", "item/started", "item/completed", "item/agentMessage/delta", "thread/tasks/updated"]);
 
 const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
 const string = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
@@ -43,6 +46,16 @@ function mapItem(value: unknown): WorkerChatItem | undefined {
 }
 
 function normalize(method: string, params: Record<string, unknown>): WorkerChatEvent | undefined {
+  // Task activity is session-scoped, not turn-scoped: it outlives the turn that began it,
+  // so it carries no turnId and must be normalized before the turnId guard below.
+  if (method === "thread/tasks/updated") {
+    const background = number(params.background) ?? 0;
+    const subagents = number(params.subagents) ?? 0;
+    const descriptions = Array.isArray(params.descriptions)
+      ? params.descriptions.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    return { kind: "tasks-updated", background, subagents, descriptions };
+  }
   const turn = record(params.turn);
   const turnId = method.startsWith("turn/") ? string(turn?.id) : string(params.turnId);
   if (!turnId) return undefined;

@@ -11,7 +11,6 @@ import { ScheduleStore, type ScheduleRow } from "./schedule-store.ts";
 import { ScheduledSendOutbox } from "./send-outbox.ts";
 import { TriggerEngine } from "./trigger-engine.ts";
 import { WorkerScheduleMcpServer, type WorkerScheduleSession } from "./worker-mcp.ts";
-import type { ClaudeGoalStore } from "../sessions/claude-goals.ts";
 
 export interface SchedulingServiceDeps {
   db: Database;
@@ -30,12 +29,6 @@ export interface SchedulingServiceDeps {
   // Directory for per-session worker --mcp-config files (0700).
   mcpConfigDir: string;
   pollIntervalMs?: number;
-  // Enables the set_goal_status worker tool: the worker marks its own goal
-  // complete/blocked, and QiYan's goal driver stops.
-  goals?: ClaudeGoalStore;
-  // Notified after a worker marks its goal via set_goal_status, so the dashboard is
-  // refreshed (the worker write bypasses the manager tools' observeGoal).
-  onGoalStatusChanged?(session: WorkerScheduleSession): void;
   // Whether the `monitor` tool is available to a session — false for a remote worker, whose
   // check would run on the QiYan host, not the worker's (see remote-worker-scheduling §3.5).
   supportsMonitor?(session: WorkerScheduleSession): boolean;
@@ -44,9 +37,6 @@ export interface SchedulingServiceDeps {
   resolveRuntimeRecovery?(row: ScheduleRow, mappingId: string): string | undefined;
 }
 
-// Inter-drive pacing for goal auto-drive turns (F3/F6): bounds a failing goal to one
-// claude turn per this interval rather than at poll speed.
-const GOAL_DRIVE_DELAY_MS = 5_000;
 const RUNTIME_RECOVERY_SPEC = "runtime-recovery:";
 
 export class SchedulingService {
@@ -63,10 +53,6 @@ export class SchedulingService {
     this.server = new WorkerScheduleMcpServer({
       store: this.store, now: deps.now, resolveToken: (token) => this.sessionByToken.get(token),
       ...(deps.supportsMonitor ? { supportsMonitor: deps.supportsMonitor } : {}),
-      ...(deps.goals ? { setGoalStatus: (session, status) => {
-        deps.goals!.setStatus(session.endpointId, session.threadId, status, deps.now());
-        deps.onGoalStatusChanged?.(session);
-      } } : {}),
     });
     this.engine = new TriggerEngine({
       store: this.store,
@@ -107,16 +93,6 @@ export class SchedulingService {
   //     armed (never advance) until it is proven sent or the claim goes stale and is
   //     reclaimed. This closes the orphaned-send / lost-delivery hole.
   private async fire(row: ScheduleRow, singleFireKey: string): Promise<void> {
-    // A goal auto-drive send (spec "goal", paced GOAL_DRIVE_DELAY_MS after the prior turn) is
-    // stale if the goal stopped being active between enqueue and now — cancel_goal (deletes the
-    // goal), pause_goal, or the worker marking it complete|blocked. Drop it here, the single fire
-    // choke point, so a stopped goal never drives another turn (nor collides with a later manual
-    // send). This mirrors the driver's own active-check, so every stop path quiesces driving
-    // without having to find and cancel the pending row.
-    // `kind === "wakeup"` distinguishes a goal drive from a worker `monitor` whose free-form
-    // check string could also be "goal" (that row is kind "monitor").
-    if (row.kind === "wakeup" && row.spec === "goal" && this.deps.goals
-      && this.deps.goals.get(row.endpointId, row.threadId)?.status !== "active") return;
     const recoveryMappingId = row.kind === "wakeup" && row.spec.startsWith(RUNTIME_RECOVERY_SPEC)
       ? row.spec.slice(RUNTIME_RECOVERY_SPEC.length)
       : undefined;
@@ -143,27 +119,10 @@ export class SchedulingService {
     }
   }
 
-  // Claude steer: enqueue the message as an immediate one-shot so the engine delivers
-  // it as the next turn (retrying while the session is busy). Durable + recovers.
-  enqueueSteer(session: WorkerScheduleSession, message: string): void {
-    this.enqueueImmediate(session, "steer", message);
-  }
-
-  // Goal auto-drive: deliver the next goal-pursuit turn. Paced by a small delay so a
-  // failing/looping goal can't spawn back-to-back claude turns at poll speed.
-  enqueueGoalDrive(session: WorkerScheduleSession, message: string): void {
-    this.store.create({ nickname: session.nickname, endpointId: session.endpointId, threadId: session.threadId, kind: "wakeup", spec: "goal", message, nextFireAt: this.deps.now() + GOAL_DRIVE_DELAY_MS }, this.deps.now());
-  }
-
   enqueueRuntimeRecovery(session: WorkerScheduleSession & { mappingId: string }, message: string): void {
     const spec = `${RUNTIME_RECOVERY_SPEC}${session.mappingId}`;
     if (this.store.hasArmedSpec(session.endpointId, session.threadId, spec)) return;
     this.enqueueImmediate(session, spec, message);
-  }
-
-  // Is a goal drive already pending for this session? (dedup — one drive lane.)
-  hasPendingGoalDrive(session: WorkerScheduleSession): boolean {
-    return this.store.hasArmedSpec(session.endpointId, session.threadId, "goal");
   }
 
   private enqueueImmediate(session: WorkerScheduleSession, spec: string, message: string): void {
@@ -174,6 +133,12 @@ export class SchedulingService {
   // per-session --mcp-config path (byte-identical across the session's turns, so it
   // doesn't break the prompt cache). Idempotent per session.
   // The loopback port the worker MCP listens on (for the remote reverse tunnel's local end).
+  // TODO(worker-mcp): retained deliberately, not dead code. Claude workers no longer
+  // receive these tools — a persistent Claude Code session owns its own scheduling,
+  // background tasks and goals natively (see
+  // docs/development/claude-agent-sdk-host-design.md). Codex workers have no native
+  // equivalent, so this stays available for a future Codex worker-side scheduling
+  // surface. It currently has no caller; do not delete it on that basis alone.
   get mcpPort(): number { return this.server.port; }
 
   // The stable per-session bearer token (minted on first use). A remote worker's config uses

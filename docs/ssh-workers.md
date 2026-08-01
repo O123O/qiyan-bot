@@ -1,10 +1,10 @@
 # SSH worker endpoints
 
-QiYan can run ordinary project sessions on remote Linux machines while the assistant remains local. Remote Codex runs its App Server in a detached tmux session. Remote Claude uses the same endpoint lifecycle around a detached tmux runtime, with one persistent pane per managed session and a one-shot `claude -p` launcher for each turn. A dropped SSH connection or QiYan service restart detaches observation without aborting either provider's turn. Local remains the default endpoint.
+QiYan can run ordinary project sessions on remote Linux machines while the assistant remains local. Remote Codex runs its App Server in a detached tmux session. Remote Claude runs `qiyan-claude-host` in a detached tmux session the same way, holding one long-lived Agent SDK session per managed thread behind an owner-only Unix socket. A dropped SSH connection or QiYan service restart detaches observation without aborting either provider's turn. Local remains the default endpoint.
 
 ## Remote requirements
 
-Install Node.js 24 or newer and `tmux` on the remote host, plus Codex 0.144.4 or newer for a Codex endpoint or the `claude` CLI for a Claude endpoint. Authenticate the selected CLI on that host as the SSH user and configure it for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
+Install Node.js 24 or newer and `tmux` on the remote host, plus Codex 0.144.4 or newer for a Codex endpoint, or both the `claude` CLI and `@anthropic-ai/claude-agent-sdk` (`npm i -g @anthropic-ai/claude-agent-sdk`, resolvable from the npm global root or the account's own `node_modules`) for a Claude endpoint. Authenticate the selected CLI on that host as the SSH user and configure it for non-interactive automatic work; chat approvals are unsupported. QiYan does not copy local authentication or configuration.
 
 Verify the host key yourself. QiYan needs ordinary command channels only; TCP, stream-local, agent, X11, and tunnel-device forwarding can remain disabled. The endpoint name is an alias in the normal user SSH configuration.
 

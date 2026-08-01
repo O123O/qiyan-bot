@@ -2,8 +2,12 @@
 
 ## Status
 
-Planning handoff, captured on 2026-07-31. No Agent SDK production code has
-been implemented yet.
+**Historical.** Planning handoff captured on 2026-07-31, before any Agent SDK
+production code existed. The migration it proposed has landed; where this
+document and `claude-agent-sdk-host-design.md` disagree, that one wins, and its
+"Architecture (as built)" section describes the shipped shape. Everything here
+describing the one-shot `claude -p` engine is now an account of code that has
+been deleted, kept because it is the clearest statement of why.
 
 The implementation snapshot behind this document is commit `2cffd52`. It is
 four commits ahead of `main`/`origin/main` at `0344cb8`:

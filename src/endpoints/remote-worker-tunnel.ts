@@ -1,7 +1,13 @@
-// Reverse tunnel that exposes QiYan's loopback worker-MCP on a remote Claude endpoint's host,
-// so a remote `claude -p` worker can reach the scheduling/set_goal_status tools. One tunnel
-// per endpoint (shared by its sessions — the per-session bearer token distinguishes them),
-// established lazily on the first worker turn that needs scheduling and reused thereafter.
+// Reverse tunnel that exposes QiYan's loopback worker-MCP on a remote endpoint's host, so a
+// remote worker can reach the scheduling tools. One tunnel per endpoint (shared by its
+// sessions — the per-session bearer token distinguishes them), established lazily on the
+// first worker turn that needs scheduling and reused thereafter.
+//
+// TODO(worker-mcp): retained deliberately, not dead code. Claude workers no longer receive
+// these tools — a persistent Claude Code session owns its own scheduling, background tasks
+// and goals natively (see docs/development/claude-agent-sdk-host-design.md). Codex workers
+// have no native equivalent, so this stays available for a future Codex worker-side
+// scheduling surface. It currently has no caller; do not delete it on that basis alone.
 import { AppError } from "../core/errors.ts";
 import { buildSshReverseForwardArgs, buildSshReverseForwardCancelArgs, type SshConnectionPlan } from "./ssh-config.ts";
 import { runBoundedProcess } from "./ssh-process.ts";

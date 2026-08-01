@@ -4,7 +4,7 @@
 // successful turn completion is hydrated through bounded authoritative transcript pages
 // (`events/relay.ts` projectTarget). So the source of truth for delivered content is
 // the transcript on disk, not the live stream: a COMPLETED turn is fully persisted
-// by the time `claude -p` exits (spike 0.2/interrupt finding — only interrupted
+// by the time the SDK reports it done (spike 0.2/interrupt finding — only interrupted
 // turns lose un-flushed stream output). This pure function reconstructs the Codex
 // `thread/read` view from parsed transcript records; 1.3 wraps it with file I/O and
 // uses the live stream only to detect turn completion.
@@ -23,7 +23,9 @@ export type ClaudeTurnStatus = "completed" | "interrupted" | "failed" | "inProgr
 export type ClaudeMessagePhase = "final_answer" | "commentary";
 
 export interface ClaudeThreadItem {
-  type: "userMessage" | "agentMessage";
+  // contextCompaction is a marker, not content: compact_session correlates against it to
+  // know the native /compact took effect, and it carries no text.
+  type: "userMessage" | "agentMessage" | "contextCompaction";
   id: string;
   clientId?: string | null;
   content?: Array<{ type: "text"; text: string; text_elements: unknown[] }>;
@@ -44,6 +46,12 @@ export interface ClaudeThreadView {
   id: string;
   cwd: string;
   status: { type: "idle" | "active" };
+  // Work Claude started for itself and is still running after the turn that began it.
+  // Present only for a Claude worker; absent means "none", not "unknown".
+  nativeActivity?: { backgroundTasks: number; subagents: number };
+  // The turn now producing output, named on a view whose turns may be stripped or may not yet
+  // hold it — a turn runs before `claude` writes its user row. Absent means no turn is running.
+  activeTurnId?: string;
   itemsView: "full";
   turns: ClaudeThreadTurn[];
   threadSource?: string;
@@ -56,11 +64,11 @@ export interface ReconstructClaudeThreadParams {
   records: readonly unknown[];
   threadSource?: string;
   model?: string;
-  // Turn ids the runtime knows were interrupted (subprocess killed).
+  // Turn ids the runtime knows were interrupted (the SDK query's response was aborted).
   interruptedTurnIds?: ReadonlySet<string>;
-  // The turn whose `claude -p` subprocess is running right now (in-memory, authoritative).
-  // A turn can be executing before `claude` flushes its user row, so disk reconstruction
-  // alone can read `idle`; overlaying this forces the thread `active`.
+  // The turn the host is running right now (in-memory, authoritative). A turn can be
+  // executing before `claude` flushes its user row, so disk reconstruction alone can
+  // read `idle`; overlaying this forces the thread `active`.
   runningTurnId?: string;
 }
 
@@ -91,17 +99,18 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     const type = record.type;
 
     if (type === "user") {
-      const promptId = turnIdOf(record);
+      const rowId = promptOrRowId(record);
       const turnId = claudeTurnIdFromRecord(record);
-      if (!promptId || !turnId) continue; // tool_result or malformed user row
+      if (!rowId || !turnId) continue; // tool_result or malformed user row
       finalize(current);
       const marker = extractClaudeClientMarker(record.message);
-      // New turns use Claude's native promptId. Older QiYan transcripts may still
-      // carry a legacy client marker, which preserves their historical turn ids.
+      // The turn id is the row's own uuid (see claudeTurnIdFromRecord); Claude's promptId is
+      // only a fallback identity for a row that somehow has no uuid. A legacy client marker
+      // still wins, so transcripts written by the retired one-shot path keep their ids.
       const text = visibleClaudeUserText(record.message);
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
-        id: idOf(record) ?? `${promptId}:user`,
+        id: idOf(record) ?? `${rowId}:user`,
         clientId: marker ?? null,
         ...(text ? { content: [{ type: "text", text, text_elements: [] }] } : {}),
       };
@@ -117,6 +126,16 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
         terminal: false,
       };
       assistantRecordSeq = 0;
+      continue;
+    }
+
+    // Claude writes its compaction boundary into the transcript, so a turn reconstructed
+    // after a restart still carries the item compact_session correlates against.
+    if (type === "system" && record.subtype === "compact_boundary" && current) {
+      current.turn.items.push({
+        type: "contextCompaction",
+        id: `${idOf(record) ?? current.turn.id}:compaction`,
+      });
       continue;
     }
 
@@ -178,15 +197,23 @@ export function claudeTurnIdFromRecord(raw: unknown): string | undefined {
   const record = raw as Record<string, unknown>;
   if (record.type !== "user" || typeof record.promptSource !== "string" || record.promptSource.length === 0) return undefined;
   if (isClaudeInternalTaskNotification(record.message)) return undefined;
-  const promptId = turnIdOf(record);
-  if (!promptId) return undefined;
-  return extractClaudeClientMarker(record.message) ?? promptId;
+  const fallback = promptOrRowId(record);
+  if (!fallback) return undefined;
+  // A turn's id is the user row's own uuid, which for a QiYan-driven turn IS the
+  // clientUserMessageId we handed the SDK. That makes a live turn and its reconstructed
+  // history agree on identity, so the Web UI merges them instead of rendering both.
+  // `promptId` is a separate Claude-generated id and must NOT be used: it never matches
+  // anything QiYan knows. A legacy client marker still wins so transcripts written by the
+  // retired one-shot path keep their historical turn ids.
+  return extractClaudeClientMarker(record.message) ?? idOf(record) ?? fallback;
 }
 
-function turnIdOf(record: Record<string, unknown>): string | undefined {
+// Any identity the row carries, in the order the retired one-shot path used. Only a
+// presence check and the user item's id fallback still need it — a TURN's id comes from
+// claudeTurnIdFromRecord, which prefers the uuid.
+function promptOrRowId(record: Record<string, unknown>): string | undefined {
   if (typeof record.promptId === "string" && record.promptId.length > 0) return record.promptId;
-  if (typeof record.uuid === "string" && record.uuid.length > 0) return record.uuid;
-  return undefined;
+  return idOf(record);
 }
 
 function idOf(record: Record<string, unknown>): string | undefined {
@@ -203,10 +230,22 @@ function timestampOf(record: Record<string, unknown>): number | undefined {
 }
 
 function isTurnEnd(record: Record<string, unknown>): boolean {
+  return claudeMessagePhase(record) === "final_answer";
+}
+
+// Shared by reconstruction and by the live SDK event path, so an assistant message is
+// phased identically whether the Web UI sees it stream in or reloads it from the
+// transcript. The two must agree: a live item and its reconstructed twin are merged by id,
+// and a divergent phase would leave the merged message describing itself two ways.
+// `stop_reason` is "tool_use" when the model is pausing to call a tool, so anything else
+// non-empty terminates the turn; absent means still streaming.
+export function claudeMessagePhase(record: Record<string, unknown>): ClaudeMessagePhase {
   const message = record.message;
-  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (!message || typeof message !== "object" || Array.isArray(message)) return "commentary";
   const stopReason = (message as Record<string, unknown>).stop_reason;
-  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use";
+  return typeof stopReason === "string" && stopReason.length > 0 && stopReason !== "tool_use"
+    ? "final_answer"
+    : "commentary";
 }
 
 // Only assistant TEXT blocks become deliverable agentMessages; thinking and tool_use
@@ -224,4 +263,37 @@ function textBlocks(message: unknown): string[] {
     }
   }
   return blocks;
+}
+
+// Claude's `/goal` writes its state into the session's own transcript: the slash command
+// echoes `Goal set: <condition>` on stdout, and clearing echoes `Goal cleared`. That is a
+// durable record QiYan already reads for history, so a native goal is observable after all
+// — what the SDK withholds is only the LIVE progress of one (iterations, tokens), never
+// whether one exists. Reading the last marker wins over storing a duplicate goal row.
+export function claudeNativeGoal(records: readonly unknown[]): { objective: string } | null {
+  let goal: { objective: string } | null = null;
+  for (const raw of records) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    if (record.type !== "user") continue;
+    const text = messageTextOf(record.message);
+    if (!text.includes("<local-command-stdout>")) continue;
+    // Later markers supersede earlier ones, so the last one in the file is current.
+    const set = /Goal set:\s*([^<\n]+)/u.exec(text);
+    if (set?.[1]) { goal = { objective: set[1].trim() }; continue; }
+    if (/Goal cleared/u.test(text)) goal = null;
+  }
+  return goal;
+}
+
+function messageTextOf(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const content = (message as Record<string, unknown>).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => block && typeof block === "object" && (block as Record<string, unknown>).type === "text"
+      ? String((block as Record<string, unknown>).text ?? "")
+      : "")
+    .join("");
 }

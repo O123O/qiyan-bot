@@ -7,6 +7,11 @@ data/
 coordinator/session-status.json
 coordinator/session-status.json.invalid-*
 
+# Node diagnostic reports. The test runner redirects them into .tmp/, but a signal
+# reaching any other node process still drops one in the cwd — never commit those:
+# they carry the developer's whole environment block, absolute paths and pids.
+report.*.json
+
 # webui client build deps
 webui-client/node_modules/
 webui-client/dist/

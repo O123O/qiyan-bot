@@ -40,7 +40,6 @@ import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-cont
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { ensureWebUiToken } from "./webui/web-token.ts";
-import { claudeLaunchPolicy } from "./config.ts";
 import { AppError } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
@@ -86,7 +85,7 @@ import { CodexRolloutLocations, createCodexConversationHistoryRead } from "./ses
 import { readReadyWorkerTurns } from "./webui/worker-native-read.ts";
 import { createWorkerStream, offerWorkerDiscontinuity, offerWorkerNotification } from "./webui/worker-stream.ts";
 import { preparedProjectWorkspaceFromCheckpoint, ProjectWorkspacePolicy, type PreparedProjectWorkspace } from "./sessions/project-workspace.ts";
-import { SessionService } from "./sessions/service.ts";
+import { backgroundStopReport, SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
 import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
@@ -122,9 +121,9 @@ import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
-import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
-import { RemoteWorkerTunnel } from "./endpoints/remote-worker-tunnel.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
+import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
+import { SshClaudeHostRuntime } from "./endpoints/ssh-claude-host.ts";
 import { prepareLocalSshRuntimeRoot } from "./endpoints/local-runtime.ts";
 import { WebSocketWire } from "./app-server/websocket-wire.ts";
 import { SshHost } from "./endpoints/ssh-host.ts";
@@ -140,10 +139,12 @@ import {
 import { WorkerFileBridge } from "./endpoints/worker-file-bridge.ts";
 import { EndpointCapacityRecovery, recoverableCapacityHint } from "./endpoints/capacity-recovery.ts";
 import { ClaudeCodeRuntime } from "./endpoints/claude-runtime.ts";
-import { LocalClaudeCommandRunner, type ClaudeLaunchFlags } from "./endpoints/claude-command-runner.ts";
-import { ClaudeGoalStore } from "./sessions/claude-goals.ts";
+import { LocalClaudeCommandRunner } from "./endpoints/claude-command-runner.ts";
+import { LocalClaudeHost, type OpenSessionRequest } from "./claude-host/host.ts";
+import { loadAgentSdk, resolveClaudeCli } from "./claude-host/requirements.ts";
+import { sdkSessionPreparer, type QueryFn } from "./claude-host/sdk-query.ts";
+import type { SessionQueryFactory } from "./claude-host/session.ts";
 import { ClaudeArchiveStore } from "./sessions/claude-archives.ts";
-import { ClaudeGoalDriver } from "./sessions/claude-goal-driver.ts";
 import { SchedulingService } from "./scheduling/scheduling-service.ts";
 import type { ScheduleRow } from "./scheduling/schedule-store.ts";
 
@@ -180,6 +181,35 @@ export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]):
 // cannot diverge (they did — the local Claude endpoint was mis-sent through the ssh path).
 export function isLocalEndpointId(endpointId: string, localClaudeEndpointId?: string): boolean {
   return endpointId === "local" || (localClaudeEndpointId !== undefined && endpointId === localClaudeEndpointId);
+}
+
+// The in-process host that runs local Claude sessions.
+//
+// The Agent SDK and the Claude CLI are deployment PREREQUISITES, not bundled dependencies
+// (the SDK carries a ~264 MB platform-specific binary and is `external` in the build), so
+// they are resolved on the first session open rather than at composition time: a
+// Codex-only deployment must still start, and startup must not pay for a `claude
+// --version` probe. Only a successful load is memoized, so an operator who installs the
+// SDK mid-run can simply retry the turn instead of restarting QiYan.
+function localClaudeHost(claudeExecutable: string, onWarning: (message: string) => void): LocalClaudeHost {
+  let loading: Promise<(request: OpenSessionRequest) => Promise<SessionQueryFactory>> | undefined;
+  const load = async (): Promise<(request: OpenSessionRequest) => Promise<SessionQueryFactory>> => {
+    const sdk = await loadAgentSdk();
+    await resolveClaudeCli(claudeExecutable);
+    return sdkSessionPreparer(sdk.query as QueryFn, { claudeExecutable, onWarning });
+  };
+  return new LocalClaudeHost(async (request) => {
+    const pending = loading ?? load();
+    loading = pending;
+    let prepare: (request: OpenSessionRequest) => Promise<SessionQueryFactory>;
+    try {
+      prepare = await pending;
+    } catch (error) {
+      if (loading === pending) loading = undefined;
+      throw error;
+    }
+    return await prepare(request);
+  });
 }
 
 function isForeignAssistantThreadNotification(
@@ -708,18 +738,16 @@ export function selectRecoveredSendTurn<T extends {
 }>(
   turns: readonly T[],
   clientId: string,
-  options: { provider: string; mode: string; baselineRecorded: boolean },
+  options: { provider: string },
 ): T | undefined {
   const correlated = turns.find((candidate) => candidate.items.some(
     (item) => item.type === "userMessage" && item.clientId === clientId,
   ));
   if (correlated) return correlated;
-  // Claude runs one serialized `claude -p` process per turn. Once the pre-dispatch
-  // native baseline is durable, one appended native turn is the exact outcome.
-  return options.provider === "claude" && options.mode === "start"
-    && options.baselineRecorded && turns.length === 1
-    ? turns[0]
-    : undefined;
+  // A Claude turn's id IS the clientUserMessageId QiYan handed the SDK, which the SDK
+  // writes as the transcript user row's uuid — so the send is correlated exactly, not
+  // inferred from "the baseline was durable and exactly one turn was appended".
+  return options.provider === "claude" ? turns.find((candidate) => candidate.id === clientId) : undefined;
 }
 
 export function recoverableOperationEndpointReferences(
@@ -754,13 +782,16 @@ export function hasEarlierEndpointOperation(
 type EndpointLifecycleOperationKind = "disconnect_endpoint" | "restart_endpoint";
 
 export async function settleEarlierEndpointOperations(options: {
-  operations: Pick<OperationStore, "listRecoverable" | "get">;
+  operations: Pick<OperationStore, "listRecoverable" | "get" | "fail">;
   currentSequence: number;
   endpointId: string;
   currentKind: EndpointLifecycleOperationKind;
   resolver: OperationRecoveryTargetResolver;
   reconcile(): Promise<void>;
   isEndpointReady(endpointId: string): boolean;
+  // Parked waiting for a human to re-authenticate. Retrying into that only manufactures
+  // more unresolved operations, so the fence still refuses there.
+  isAwaitingAuthentication(endpointId: string): boolean;
   waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
   waitTimeoutMs?: number;
   signal?: AbortSignal;
@@ -783,7 +814,38 @@ export async function settleEarlierEndpointOperations(options: {
     let unresolved = earlier();
     while (unresolved.length > 0) {
       const oldest = unresolved[0]!;
-      if (!options.isEndpointReady(options.endpointId) || oldest.state !== "uncertain") throw conflict();
+      // A `dispatched` operation is genuinely in flight; a second lifecycle action would
+      // race it. Refuse regardless of endpoint health.
+      if (oldest.state !== "uncertain") throw conflict();
+      if (!options.isEndpointReady(options.endpointId)) {
+        // Waiting cannot settle anything here: an endpoint that does not answer has nothing
+        // left to report an earlier attempt's outcome, so the join below would only time out.
+        //
+        // Refusing outright is what wedged endpoints permanently — the restart was denied
+        // because the endpoint was unhealthy, which was the reason for the restart. But
+        // proceeding is only sound when this action's postcondition subsumes every earlier
+        // one: a restart ends with the endpoint stopped and replaced, which is also where a
+        // stalled restart or disconnect was heading. It is NOT sound for a `ready_endpoint`
+        // operation such as an in-flight send, whose effect a restart does not subsume.
+        if (options.isAwaitingAuthentication(options.endpointId)) throw conflict();
+        // Every one of them, not just the oldest: the settle below retires the whole list,
+        // so a `dispatched` straggler among them must still refuse. Two bot instances share
+        // one ledger in the deployed setup, so a newer dispatched operation really can sit
+        // behind an older uncertain one.
+        if (!unresolved.every((operation) => operation.state === "uncertain"
+          && subsumedByLifecycle(operation, options.currentKind, options.resolver))) {
+          throw conflict();
+        }
+        // Settle them as superseded so they stop fencing every future attempt. This is the
+        // ONLY place an unresolvable lifecycle operation is retired, and it is a proof about
+        // postconditions, never a timeout.
+        for (const operation of unresolved) {
+          options.operations.fail(operation.id, {
+            message: `superseded by a later ${options.currentKind} on endpoint ${options.endpointId}`,
+          });
+        }
+        return "proceed";
+      }
       const controller = new AbortController();
       const abort = (): void => controller.abort(options.signal?.reason);
       if (options.signal?.aborted) abort();
@@ -810,6 +872,20 @@ export async function settleEarlierEndpointOperations(options: {
     && options.operations.get(lastEarlier.id)?.state === "succeeded"
     ? "satisfied"
     : "proceed";
+}
+
+// A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
+// So a restart subsumes an unfinished restart or disconnect, and a disconnect subsumes only
+// an unfinished disconnect — a stalled restart still owes a replacement that a disconnect
+// will not provide. Anything that is not an endpoint-lifecycle operation is never subsumed.
+function subsumedByLifecycle(
+  operation: RecoverableOperation,
+  currentKind: EndpointLifecycleOperationKind,
+  resolver: OperationRecoveryTargetResolver,
+): boolean {
+  if (recoverableOperationTarget(operation, resolver).policy !== "endpoint_lifecycle") return false;
+  if (operation.kind === "disconnect_endpoint") return true;
+  return operation.kind === "restart_endpoint" && currentKind === "restart_endpoint";
 }
 
 export function hasEarlierSessionCreation(
@@ -1541,8 +1617,22 @@ export async function recoverManagedEndpointReady(
   endpointId: string,
   lease: EndpointWorkLease,
   wakeShared: () => Promise<void>,
+  // Resumes the endpoint's managed sessions that have no established native state. The owner
+  // retries what has already FAILED, so it has nothing to do for sessions that never got a
+  // first attempt — and that is every session on an endpoint whose first ready arrives after
+  // startup. A remote host is always in that group: its ssh, tmux, and handshake outlast the
+  // startup window. Its sessions were registered as `unknown` and then left there, which reads
+  // to the manager as a session whose state cannot be established, so it is reported down and
+  // refuses work — while the worker it names is running and perfectly reachable.
+  resumeUnattempted?: () => Promise<void>,
 ): Promise<ManagedEndpointReadyOutcome> {
   const result = await owner.endpointReady(endpointId, lease, wakeShared);
+  // Unconditional: the owner recovering something does not mean it recovered EVERYTHING.
+  // resumeManagedSessions breaks out when the generation changes mid-walk, so a previous
+  // attempt can leave one session pending and a tail of sessions never attempted at all —
+  // and a later ready that reports "pending" would then skip that tail for good. The walk
+  // costs nothing when every session is already established.
+  if (resumeUnattempted) await resumeUnattempted();
   if (result.sharedWake !== "needed") return result;
   await wakeShared();
   return { ...result, sharedWake: "completed" };
@@ -2113,10 +2203,7 @@ export async function buildProductionApp(
   let assistantEndpoint!: ManagedAppServerEndpoint;
   let claudeEndpoint: ClaudeCodeRuntime | undefined;
   let scheduling: SchedulingService | undefined;
-  let claudeGoals: ClaudeGoalStore | undefined;
   let claudeArchives: ClaudeArchiveStore | undefined;
-  let claudeGoalDriver: ClaudeGoalDriver | undefined;
-  const CLAUDE_MAX_GOAL_TURNS = 50;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
   let endpointManager!: EndpointManager;
@@ -2738,16 +2825,7 @@ export async function buildProductionApp(
         // unconditionally: a remote Claude endpoint is added at runtime by writing
         // endpoints.json, so a startup-snapshot gate would leave it without goals/scheduling.
         // The cost when no Claude endpoint exists is one idle loopback MCP + one poll loop.
-        claudeGoals = new ClaudeGoalStore(db);
         claudeArchives = new ClaudeArchiveStore(db);
-        // Refresh the dashboard after a worker/driver goal-status change (those bypass
-        // the manager tools' observeGoal). Provider-based, so it covers remote Claude too.
-        const refreshClaudeGoalObservation = (nickname: string): void => {
-          const session = registry.get(nickname);
-          if (!session || sessionProvider(session.endpoint) !== "claude") return;
-          observeGoal(nickname, { goal: claudeGoals!.get(session.endpoint, session.thread_id) });
-          void renderDashboardSafely();
-        };
         // A `monitor` check must run on the SESSION's own host. The local Claude worker runs
         // it here (runMonitorCheck); each remote Claude endpoint registers its ssh runner
         // below so the check runs over ssh on the worker's host. `monitor` is offered only to
@@ -2767,9 +2845,6 @@ export async function buildProductionApp(
                 || session.mapping_id !== expected.mappingId) {
                 throw new AppError("SESSION_DETACHED", "runtime recovery mapping changed before dispatch");
               }
-              if (claudeGoalOwnsWorkerRecovery(session)) {
-                throw new AppError("SESSION_BUSY", "active goal owns worker recovery");
-              }
             } } : {}),
           }).then(() => undefined),
           // A monitor check MUST run on the session's own host. If no runner is registered for
@@ -2778,8 +2853,6 @@ export async function buildProductionApp(
           // condition as UNMET rather than running a remote worker's shell check here. Returning
           // false re-arms the poll, so the monitor self-heals once the endpoint is re-activated.
           runCheck: (row: ScheduleRow) => { const check = monitorCheckRunners.get(row.endpointId); return check ? check(row.spec) : Promise.resolve(false); },
-          goals: claudeGoals,
-          onGoalStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
           // `monitor` is offered to any Claude session whose host can run the check — the
           // local worker (checked here) and every remote worker (checked over ssh). Both
           // register a runner in monitorCheckRunners.
@@ -2789,65 +2862,29 @@ export async function buildProductionApp(
             if (!current || current.session.lifecycle_state !== "managed" || current.session.mapping_id !== mappingId) return undefined;
             const live = nativeSessions.view({ endpointId: row.endpointId, threadId: row.threadId, mappingId });
             if (live?.availability === "ready" && live.status === "active") return undefined;
-            if (claudeGoalOwnsWorkerRecovery(current.session)) return undefined;
             return current.nickname;
           },
         });
-        // Goal enforcement (auto-drive). The goal is set via the assistant's set_goal
-        // MCP manager tool (NOT Claude's internal /goal); the worker ends it via the
-        // set_goal_status MCP tool. QiYan drives the next turn after each completion
-        // while the goal is active. Endpoint-agnostic — drives local and remote Claude alike.
-        claudeGoalDriver = new ClaudeGoalDriver({
-          goals: claudeGoals,
-          now: () => Date.now(),
-          maxDrivenTurns: CLAUDE_MAX_GOAL_TURNS,
-          enqueue: (session, message) => scheduling!.enqueueGoalDrive(session, message),
-          hasPendingDrive: (session) => scheduling!.hasPendingGoalDrive(session),
-          onStatusChanged: (session) => refreshClaudeGoalObservation(session.nickname),
-        });
-        // Goal + steer options wired into a Claude runtime (local or remote). Both are
-        // QiYan-side and host-agnostic; steer = durable enqueue delivered as the next turn
-        // (Claude has no mid-turn injection). workerMcpConfigPath is added per-endpoint
-        // separately (local: loopback; remote: reverse tunnel).
-        const claudeGoalRuntimeOptions = (endpointId: string) => ({
-          goals: claudeGoals!,
-          archives: claudeArchives!,
-          steer: async (threadId: string, message: string): Promise<void> => {
-            const found = registry.getByIdentity(endpointId, threadId);
-            if (found) scheduling!.enqueueSteer({ nickname: found.nickname, endpointId, threadId }, message);
-          },
-        });
-        // Route a Claude endpoint's completed turns to the goal driver (auto-drive). The
-        // runtime self-emits turn/completed, so subscribing on the endpoint object works for
-        // both local (builtin) and remote (createRemote) Claude endpoints.
-        const subscribeClaudeGoalDriver = (endpoint: ClaudeCodeRuntime, endpointId: string): void => {
-          unsubscribers.push(endpoint.onNotification((method, params) => {
-            if (method !== "turn/completed") return;
-            const threadId = (params as { threadId?: string }).threadId;
-            if (typeof threadId !== "string") return;
-            const found = registry.getByIdentity(endpointId, threadId);
-            if (found) claudeGoalDriver!.onTurnCompleted({ nickname: found.nickname, endpointId, threadId });
-          }));
-        };
-        // The launch policy (disabled built-in scheduling tools + redirect prompt) applies to
-        // EVERY Claude session, local or remote; model/effort are the per-endpoint overrides from
-        // the endpoint's endpoints.json entry.
+        // Archive tombstones are the only QiYan-side state a Claude runtime still needs.
+        // Steering is no longer one: the SDK queues input arriving mid-turn and runs it in
+        // order, so a steer is an ordinary send rather than a durable row redelivered later.
+        const claudeRuntimeOptions = (_endpointId: string) => ({ archives: claudeArchives! });
+        // A managed Claude session is an ordinary Claude Code session: the only per-endpoint
+        // launch settings are the model/effort defaults from its endpoints.json entry. The
+        // host runs the turns (one long-lived SDK query per session); the runner stays only
+        // as the transcript/discovery source.
         claudeEndpoint = localClaudeDef === undefined ? undefined : new ClaudeCodeRuntime({
           id: localClaudeDef.id,
-          runner: new LocalClaudeCommandRunner({ command: localClaudeDef.command ?? "claude" }),
-          launchFlags: claudeLaunchPolicy(localClaudeDef.model, localClaudeDef.effort),
-          ...claudeGoalRuntimeOptions(localClaudeDef.id),
-          // Local: the worker reaches the loopback MCP directly (no tunnel).
-          workerMcpConfigPath: async (threadId: string) => {
-            const found = registry.getByIdentity(localClaudeDef.id, threadId);
-            return found ? scheduling!.workerMcpConfigPath({ nickname: found.nickname, endpointId: localClaudeDef.id, threadId }) : undefined;
+          host: localClaudeHost(localClaudeDef.command ?? "claude", (message) => reportOperationalSafely(report, {
+            level: "warn", code: "claude_permission_mode", component: "claude_host", reason: message,
+          })),
+          runner: new LocalClaudeCommandRunner(),
+          launchFlags: {
+            ...(localClaudeDef.model === undefined ? {} : { model: localClaudeDef.model }),
+            ...(localClaudeDef.effort === undefined ? {} : { effort: localClaudeDef.effort }),
           },
+          ...claudeRuntimeOptions(localClaudeDef.id),
         });
-        // Drive the goal loop: after each completed Claude turn, if the goal is still
-        // active, enqueue the next pursuit turn. Stops when the worker's set_goal_status
-        // flips the status (or the backstop cap pauses it). (The remote endpoint is
-        // subscribed the same way inside createRemote.)
-        if (claudeEndpoint) subscribeClaudeGoalDriver(claudeEndpoint, localClaudeDef!.id);
         // The local worker's `monitor` check runs on this host.
         if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
@@ -2879,78 +2916,27 @@ export async function buildProductionApp(
               // helper eagerly here (installs it + establishes the ControlMaster) — the
               // Workspace and file operations need the installed helper immediately.
               const host = await prepareRemoteHost({ endpointId: definition.id, remote, assetRoot: remoteAssetRoot });
-              // Tier B: expose QiYan's worker-MCP on the remote host via an ssh -R reverse
-              // tunnel over this endpoint's ControlMaster, so the remote worker can self-schedule.
-              // The remote listen port is allocated dynamically by the remote sshd (read back
-              // after ensure()); the worker learns it from the URL in its per-session config.
-              const tunnel = new RemoteWorkerTunnel({
-                plan: generation.plan, localPort: scheduling!.mcpPort,
-              });
-              // Warn the user once per session when the tunnel degrades (below), so the loss of
-              // self-scheduling is visible, not just an operational log line.
-              const tunnelWarned = new Set<string>();
-              const remoteWorkerMcpConfigPath = async (threadId: string): Promise<string | undefined> => {
-                const found = registry.getByIdentity(definition.id, threadId);
-                if (!found) return undefined;
-                // Self-scheduling is best-effort: the reverse tunnel must NOT be a single point of
-                // failure for basic remote messaging. If establishing it (or writing the config)
-                // fails, run the turn WITHOUT the scheduling tools rather than failing the whole
-                // turn. The degradation is surfaced as an operational warning (not silent), and the
-                // acceptance test's schedule-step assertion still fails loudly on a real regression.
-                try {
-                  await tunnel.ensure();
-                  const content = scheduling!.workerMcpConfigContent(
-                    { nickname: found.nickname, endpointId: definition.id, threadId },
-                    `http://127.0.0.1:${tunnel.remotePort}/mcp`,
-                  );
-                  // Write the token-bearing config to the REMOTE runtime dir (content-addressed
-                  // under files/<sha256>, mode 0600) so `claude -p --mcp-config` reads it there.
-                  const buffer = Buffer.from(content, "utf8");
-                  const result = await remote.invokeTransfer<{ path: string }>("write-file",
-                    [JSON.stringify({ runtimeDir: host.remoteRuntimeDir, size: buffer.byteLength, sha256: createHash("sha256").update(buffer).digest("hex") })],
-                    { input: (async function* () { yield buffer; })(), maxOutputBytes: 64 * 1024 }, host.remoteHelperPath);
-                  return result.path;
-                } catch (error) {
-                  const reason = error instanceof Error ? error.message : String(error);
-                  reportOperationalSafely(report, {
-                    level: "warn", code: "worker_scheduling_unavailable", component: "remote_worker_tunnel", reason,
-                  });
-                  // The reverse tunnel (Tier B) only carries the worker's SELF-scheduling tools; the
-                  // worker's turns and QiYan-side goal drive/steer (Tier A) go over the ControlMaster
-                  // and are unaffected. Surface the degradation to the user once per session — but,
-                  // like the operational log above, this MUST NOT fail the turn (this whole branch
-                  // exists to degrade gracefully), so swallow any delivery/binding error and add to
-                  // the dedup set only after a successful prepare (so a throw doesn't lose the warning).
-                  try {
-                    if (deliveries && !tunnelWarned.has(threadId)) {
-                      deliveries.prepare({
-                        id: `worker-scheduling-unavailable:${definition.id}:${threadId}`,
-                        kind: "worker_warning", binding: currentOwnerBinding(), mandatory: true,
-                        body: `[${found.nickname}] the remote worker can't reach QiYan's scheduling tools (reverse tunnel failed: ${reason}). It still runs turns and pursues its goal, but can't set its own wakeups, crons, or monitors this turn.`,
-                      });
-                      tunnelWarned.add(threadId);
-                    }
-                  } catch { /* surfacing the warning must not fail the turn */ }
-                  return undefined;
-                }
-              };
-              const claudeRemoteRunner = new SshClaudeCommandRunner({
-                plan: generation.plan,
+              // The turns run inside `qiyan-claude-host` on the worker's machine, reached
+              // over an attested unix socket; the runner stays only as the transcript and
+              // discovery source, and as the host for this worker's `monitor` checks.
+              const claudeHostRuntime = new SshClaudeHostRuntime({
+                endpointId: definition.id,
                 host: { ...host, remote },
               });
+              const claudeRemoteRunner = new SshClaudeCommandRunner({ plan: generation.plan });
               // The remote worker's `monitor` check runs over ssh on ITS host, not ours.
               monitorCheckRunners.set(definition.id, (command) => claudeRemoteRunner.runShellCheck(command));
               const claudeRemoteEndpoint = new ClaudeCodeRuntime({
                 id: definition.id,
+                host: claudeHostRuntime.host,
                 runner: claudeRemoteRunner,
-                persistentRuntime: claudeRemoteRunner,
-                launchFlags: claudeLaunchPolicy(definition.model, definition.effort),
-                // Goals + steer are QiYan-side (Tier A); worker self-scheduling reaches the MCP
-                // over the reverse tunnel (Tier B).
-                ...claudeGoalRuntimeOptions(definition.id),
-                workerMcpConfigPath: remoteWorkerMcpConfigPath,
+                persistentRuntime: claudeHostRuntime,
+                launchFlags: {
+                  ...(definition.model === undefined ? {} : { model: definition.model }),
+                  ...(definition.effort === undefined ? {} : { effort: definition.effort }),
+                },
+                ...claudeRuntimeOptions(definition.id),
               });
-              subscribeClaudeGoalDriver(claudeRemoteEndpoint, definition.id);
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
@@ -3129,11 +3115,6 @@ export async function buildProductionApp(
             threadId: session.thread_id,
             mappingId: session.mapping_id,
           }, RUNTIME_RESTART_RESUME_MESSAGE),
-          resumeActiveGoal: ({ nickname, session }) => {
-            if (!claudeGoalOwnsWorkerRecovery(session)) return false;
-            claudeGoalDriver!.resumeActive([{ nickname, endpointId: session.endpoint, threadId: session.thread_id }]);
-            return true;
-          },
         });
         observations = new SessionObservationProcessor(dashboardStore, registry, sessionControls, {
           now: () => Date.now(),
@@ -3370,19 +3351,6 @@ export async function buildProductionApp(
         // proactive assistant, NOT worker goal-drive / self-scheduling). Recovery re-arms
         // durable schedules on start; fires drive send_to_session.
         if (scheduling) await scheduling.start();
-        // Re-kick active Claude goals whose drive turn was in flight at restart (no
-        // pending schedule, no live turn) so goal enforcement is restart-durable. listActive
-        // is per endpointId, so enumerate every Claude endpoint present in the registry
-        // (local + any remote ssh claude endpoint), not just the local one.
-        if (claudeGoalDriver && claudeGoals) {
-          const claudeEndpointIds = new Set(Object.values(registry.snapshot().sessions)
-            .filter((s) => sessionProvider(s.endpoint) === "claude").map((s) => s.endpoint));
-          const active = [...claudeEndpointIds].flatMap((endpointId) => claudeGoals!.listActive(endpointId)
-            .map((g) => registry.getByIdentity(endpointId, g.threadId))
-            .filter((found): found is NonNullable<typeof found> => found !== undefined)
-            .map((found) => ({ nickname: found.nickname, endpointId, threadId: found.session.thread_id })));
-          claudeGoalDriver.resumeActive(active);
-        }
         if (options.testing?.holdAssistantScheduler) return;
         schedulerAccepting = true;
         await enqueuePendingEvents();
@@ -3751,12 +3719,19 @@ export async function buildProductionApp(
         : sessions.collect(args.nickname, args.count),
       interrupt_session: async (args, context) => {
         if (args.nickname === "assistant") throw new AppError("UNSUPPORTED_CAPABILITY", "the assistant cannot interrupt its own active tool turn");
-        const turnId = await sessions.interrupt(args.nickname, args.turn_id, {
+        const outcome = await sessions.interrupt(args.nickname, args.turn_id, {
           onBeforeNativeDispatch: (resolvedTurnId) => context.checkpoint({ turnId: resolvedTurnId }),
+          // No turn id to checkpoint when the session is busy with work that belongs to no
+          // turn. Record that this is what was dispatched, so recovery after a crash can
+          // settle the operation instead of leaving it unresolved forever — an unresolved
+          // operation is itself what blocks the restart this interrupt was clearing the way for.
+          onBeforeBackgroundStop: () => context.checkpoint({ backgroundStop: true }),
         });
         dashboardStore.markDirty();
         await renderDashboardSafely();
-        return { interrupted: true, turnId };
+        return typeof outcome === "string"
+          ? { interrupted: true, turnId: outcome }
+          : { interrupted: true, stoppedBackgroundWork: outcome.stoppedBackgroundWork };
       },
       compact_session: async (args, context) => {
         if (args.nickname === "assistant") {
@@ -3851,7 +3826,6 @@ export async function buildProductionApp(
           () => setGoalControlled(args.nickname, false),
         );
         observeGoal(args.nickname, result);
-        activateClaudeGoalIfClaude(args.nickname);
         await renderDashboardSafely();
         return result;
       },
@@ -3869,7 +3843,6 @@ export async function buildProductionApp(
           () => setGoalControlled(args.nickname, false),
         );
         observeGoal(args.nickname, result);
-        activateClaudeGoalIfClaude(args.nickname);
         await renderDashboardSafely();
         return result;
       },
@@ -4103,11 +4076,6 @@ export async function buildProductionApp(
     sessionControls.setGoalControlled(identity.endpointId, identity.threadId, identity.mappingId, controlled);
   }
 
-  function claudeGoalOwnsWorkerRecovery(session: RegistrySession): boolean {
-    return sessionProvider(session.endpoint) === "claude"
-      && claudeGoals?.get(session.endpoint, session.thread_id)?.status === "active";
-  }
-
   function armGoalControl(nickname: string): void {
     const identity = dashboardIdentity(nickname);
     sessionControls.setGoalControlled(
@@ -4140,16 +4108,6 @@ export async function buildProductionApp(
       turn_id: result.turnId,
       at: new Date(observedAt).toISOString(),
     }, operationSequence);
-  }
-
-  // Kick the Claude goal auto-drive when a goal is set/resumed via the MCP manager
-  // tools. No-op for Codex sessions (native goal engine) and when Claude is disabled.
-  function activateClaudeGoalIfClaude(nickname: string): void {
-    if (!claudeGoalDriver) return;
-    const session = registry.get(nickname);
-    if (session && sessionProvider(session.endpoint) === "claude") {
-      claudeGoalDriver.activate({ nickname, endpointId: session.endpoint, threadId: session.thread_id });
-    }
   }
 
   function projectEndpoint(requested?: string): string {
@@ -4191,6 +4149,9 @@ export async function buildProductionApp(
       resolver: operationTargetResolver(),
       reconcile: reconcileOperations,
       isEndpointReady: isRecoveryEndpointReady,
+      // Defaults to refusing: an absent manager means unknown, and isRecoveryEndpointReady
+      // also degrades to false, so `?? false` would steer an unknown state into superseding.
+      isAwaitingAuthentication: (id) => endpointManager?.awaitingAuthentication(id) ?? true,
       waitForTerminal: (operationId, operationSignal) => {
         if (!operationReconciler) throw new AppError("ENDPOINT_UNAVAILABLE", "operation reconciliation is not ready");
         return operationReconciler.waitForTerminal(operationId, operationSignal);
@@ -4777,8 +4738,6 @@ export async function buildProductionApp(
           const clientId = `${operation.contextId}:${operation.callId}`;
           const turn = selectRecoveredSendTurn(history.thread.turns, clientId, {
             provider: sessionProvider(session.endpoint),
-            mode: args.mode,
-            baselineRecorded: hasBaseline,
           });
           const holds = (args.attachment_ids as string[]).map((id, index) => {
             const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
@@ -5038,8 +4997,42 @@ export async function buildProductionApp(
         } else if (operation.kind === "interrupt_session") {
           const session = registry.get(args.nickname);
           if (!session) return;
-          const turnId = args.turn_id ?? (operation.receipt as { turnId?: string } | undefined)?.turnId;
-          if (!turnId) return;
+          const receipt = operation.receipt as { turnId?: string; backgroundStop?: boolean } | undefined;
+          const turnId = args.turn_id ?? receipt?.turnId;
+          // An interrupt that was stopping background work has no turn to prove terminal, and
+          // the session's own status is a belief this process lost across the crash. Re-issue
+          // the stop: it is idempotent, it finishes the job if the crash landed mid-dispatch,
+          // and the endpoint answers from the host, which outlived the restart.
+          //
+          // The re-issue is unscoped — the receipt records no task ids — so it stops whatever
+          // is running now, which may include work started after the crash.
+          if (!turnId) {
+            if (!receipt?.backgroundStop) return;
+            const stopped = backgroundStopReport(await pool.request<unknown>(
+              session.endpoint, "thread/tasks/stop", { threadId: session.thread_id }, undefined, recoveryLease,
+            ));
+            // No usable answer proves nothing either way; leave it for the next pass.
+            if (!stopped) return;
+            if (stopped.remaining === 0) {
+              await succeedRecovered(operation, { interrupted: true, stoppedBackgroundWork: stopped.stopped }, () => {
+                dashboardStore.markDirty();
+              });
+              return;
+            }
+            // Work survived the stop. Resolve the operation as failed rather than leaving it
+            // open: an unresolved operation blocks every later restart of its endpoint, and a
+            // restart is the only remaining way to kill a task that will not stop — the
+            // operation would be holding the door shut on its own escape route. Refusing the
+            // restart is the live idle check's job, and that clears itself when the work ends.
+            // Records what the stop DID as well as what it failed to do — the ledger's only
+            // account of an effect that was applied.
+            operations.failAndUnbind(operation.id, {
+              message: `${args.nickname} stopped ${stopped.stopped} background task(s); `
+                + `${stopped.remaining} kept running`,
+            });
+            await renderDashboardSafely();
+            return;
+          }
           const turn = await pool.historyReader(session.endpoint, recoveryLease).findTurn(
             session.thread_id, turnId, createHistoryScanBudget(),
           );
@@ -5259,7 +5252,16 @@ export async function buildProductionApp(
       await recoverReadyEndpointOwners({
         recoverManaged: (wakeShared) => endpointManager.withReadyWorkLease(endpointId, (lease) => {
           recoveredGeneration = lease.endpointGeneration;
-          return recoverManagedEndpointReady(managedRecoveryOwner!, endpointId, lease, wakeShared);
+          return recoverManagedEndpointReady(
+            managedRecoveryOwner!, endpointId, lease, wakeShared,
+            // Bounded to sessions with no established state, so an endpoint whose sessions are
+            // already known pays a walk over them and no requests at all.
+            () => resumeManagedSessions(endpointId, {
+              unavailableOnly: true,
+              lease,
+              isCurrent: () => isManagedRecoveryLeaseCurrent(endpointId, lease),
+            }).then(() => undefined),
+          );
         }),
         relay: () => relay.endpointReady(endpointId),
         observations: () => observations.endpointReady(endpointId),

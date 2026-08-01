@@ -479,7 +479,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     ...(claudeRemoteAlias ? [{ endpoint: claudeRemoteAlias, nickname: `mcp-claude-remote-${suffix}` }] : []),
   ] as const;
 
-  // Ground-truth check that a per-session model actually reached `claude -p`: the resolved model
+  // Ground-truth check that a per-session model actually reached the session's SDK query: the resolved model
   // id is recorded on the transcript's assistant records (NOT the appliedSettings echo that
   // masked the original no-op). Reads the transcript on the host (local fs / remote ssh).
   const claudeTranscriptModels = async (endpoint: string, threadId: string): Promise<string[]> => {
@@ -601,7 +601,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     await removeMarker();
     await waitFor(() => finalCount() >= beforeMonitorFinals + 2, workerTimeoutMs, `${fixture.nickname} monitor set + delivery turns did not both complete`);
 
-    // ---- Per-session model + effort must ACTUALLY reach `claude -p` (regressions: set_session_model
+    // ---- Per-session model + effort must ACTUALLY reach the live session (regressions: set_session_model
     // threw on empty list_models; set_reasoning_effort was a silent no-op). Proof is the resolved
     // model id on the transcript, NOT the appliedSettings echo. Runs AFTER the tool-dependent goal/
     // scheduling steps because it sets a STICKY smaller model that would degrade tool-calling. ----
@@ -613,7 +613,7 @@ test("the exact production MCP map succeeds for every local and remote manager a
     const modelSend = await call("send_to_session", { nickname: fixture.nickname, content: modelAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${modelAsk}`);
     await deliverTurn(modelSend.turnId, `${fixture.nickname} model turn delivered`);
     assert.ok((await claudeTranscriptModels(fixture.endpoint, session.thread_id)).some((m) => /haiku/iu.test(m)),
-      `${fixture.nickname} set_session_model not applied to claude -p`);
+      `${fixture.nickname} set_session_model not applied to the live session`);
     // Sticky: a SECOND turn without re-setting still runs on haiku (Claude settings are NOT consumed).
     const stickyAsk = "Reply with exactly MODELSTICK.";
     const stickySend = await call("send_to_session", { nickname: fixture.nickname, content: stickyAsk, attachment_ids: [], mode: "start" }, fixture.endpoint, `/pass ${stickyAsk}`);

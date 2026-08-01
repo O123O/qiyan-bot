@@ -42,6 +42,10 @@ class ServiceEndpoint implements AppServerEndpoint {
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
   compactDelayMs = 0;
+  // What this endpoint answers for thread/tasks/stop. Undefined models a provider that does
+  // not implement it at all — a Codex app-server, where an active turn with no id really is
+  // an identity still being refreshed.
+  backgroundStop: { stopped: number; remaining: number } | undefined;
   onTurnStart: (() => void) | undefined;
   constructor(id = "local") { this.id = id; }
   private historyTurns(): any[] {
@@ -115,6 +119,10 @@ class ServiceEndpoint implements AppServerEndpoint {
       return { goal: this.goal } as T;
     }
     if (method === "thread/goal/clear") { this.goal = null; return { goal: null } as T; }
+    if (method === "thread/tasks/stop") {
+      if (!this.backgroundStop) throw new AppError("UNSUPPORTED_CAPABILITY", `does not implement ${method}`);
+      return this.backgroundStop as T;
+    }
     return { goal: { objective: params.objective, status: params.status } } as T;
   }
 }
@@ -382,6 +390,100 @@ test("a poisoned persisted active turn cannot authorize interrupt", async () => 
   });
 
   assert.equal(value.endpoint.calls.some((call) => call.method === "turn/interrupt"), false);
+});
+
+// A Claude worker whose turn ended while a subagent kept running is active with no turn to
+// name. Refusing here left it that way for good: nothing could interrupt it, so nothing could
+// archive or restart it either.
+test("background work with no turn to name is stopped so the session can be restarted", async () => {
+  const value = await fixture();
+  value.endpoint.backgroundStop = { stopped: 2, remaining: 0 };
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+    nativeActivity: { backgroundTasks: 1, subagents: 1 },
+  });
+
+  const outcome = await value.service.interrupt("payments");
+
+  assert.deepEqual(outcome, { stoppedBackgroundWork: 2 }, "reported as work stopped, not as a turn interrupted");
+  assert.ok(
+    value.endpoint.calls.some((call) => call.method === "thread/tasks/stop" && call.params.threadId === "thread"),
+    "the stop was actually dispatched to the endpoint",
+  );
+});
+
+// The endpoint accepted the stop and the work is still running. Reporting that as an interrupt
+// hands back a success the very next archive or restart attempt contradicts.
+test("background work that did not stop is not reported as interrupted", async () => {
+  const value = await fixture();
+  value.endpoint.backgroundStop = { stopped: 0, remaining: 2 };
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+    nativeActivity: { backgroundTasks: 0, subagents: 2 },
+  });
+
+  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "SESSION_BUSY");
+    assert.match(String((error as Error).message), /did not stop/u);
+    return true;
+  });
+});
+
+// A stop that took on some tasks and not others HAS applied an effect. Every "busy" code is
+// classified as proving no effect, which discards the operation's checkpoint and skips its
+// recovery — recording two destroyed subagents as though nothing had happened.
+test("a partly applied stop is reported as uncertain, never as proving no effect", async () => {
+  const value = await fixture();
+  value.endpoint.backgroundStop = { stopped: 2, remaining: 1 };
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+    nativeActivity: { backgroundTasks: 1, subagents: 2 },
+  });
+
+  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "OPERATION_UNCERTAIN");
+    assert.match(String((error as Error).message), /stopped 2 background task\(s\); 1 did not stop/u);
+    return true;
+  });
+});
+
+// The response was lost, not refused: tasks may already be dead. Reporting a code that means
+// "nothing happened" would strand the ledger on a fiction.
+test("a lost stop response is uncertain rather than a clean refusal", async () => {
+  const value = await fixture();
+  value.endpoint.backgroundStop = undefined;
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+    nativeActivity: { backgroundTasks: 1, subagents: 0 },
+  });
+
+  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "OPERATION_UNCERTAIN");
+    return true;
+  });
+});
+
+// Codex reports no background work, so for it an id-less active status still means an identity
+// that has to be probed for. It must keep taking that path — here the probe finds no active
+// turn and the state is unknown — and must never be sent a stop it does not implement.
+test("a provider with no background work is probed as before and never asked to stop", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.native.observe("local", value.nativeGeneration, "thread/status/changed", {
+    threadId: "thread",
+    status: { type: "active" },
+  });
+
+  await assert.rejects(value.service.interrupt("payments"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "ENDPOINT_UNAVAILABLE");
+    return true;
+  });
+  assert.equal(value.endpoint.calls.some((call) => call.method === "thread/tasks/stop"), false,
+    "no stop is dispatched to a provider that never reported background work");
 });
 
 test("interrupt recovery resumes the exact native active turn when runtime cache is empty", async () => {

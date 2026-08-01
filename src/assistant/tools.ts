@@ -19,7 +19,7 @@ export const ASSISTANT_TOOL_SCHEMAS = {
   adopt_session: z.object({ nickname, thread_id: z.string().min(1).describe("native thread id to adopt (from discover_sessions)"), endpoint: endpoint().optional() }).strict(),
   rename_session: z.object({ old_nickname: nickname, new_nickname: nickname }).strict(),
   unadopt_session: z.object({ nickname }).strict(), archive_session: z.object({ nickname }).strict(),
-  send_to_session: z.object({ nickname, content: z.string().describe("the message text to send to the worker"), attachment_ids: z.array(z.string()).describe("attachment ids to include, in order").default([]), mode: z.enum(["start", "steer"]).describe("'start' = new turn (fails if one is running); 'steer' = queue onto the active turn") }).strict(),
+  send_to_session: z.object({ nickname, content: z.string().describe("the message text to send to the worker"), attachment_ids: z.array(z.string()).describe("attachment ids to include, in order").default([]), mode: z.enum(["start", "steer"]).describe("'start' = new turn (Codex fails if one is running; a Claude worker queues it and runs it next); 'steer' = queue onto the active turn") }).strict(),
   read_worker_message: z.object({ nickname, message_id: z.string().min(1).describe("worker message id (from a notification)") }).strict(),
   inspect_worker_conversation: z.object({
     nickname,
@@ -82,7 +82,7 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   inspect_worker_conversation: "Inspect a bounded page of the latest native conversation on demand, including user messages and final worker answers. Set include_commentary=true to also include worker commentary. Structured tool calls/results and reasoning are always excluded. No message id is required; use before to page backward. Large pages return an owner-only temporary JSON path instead of message bodies. QiYan creates no operation/receipt record; the native assistant rollout still records the tool result.",
   collect_messages: "Deliver the worker's last N final message bodies into chat. Used by /collect.",
   interrupt_session: "Interrupt the worker's active turn.",
-  compact_session: "Compact a managed Codex session.",
+  compact_session: "Compact a managed session's context (Codex natively; a Claude worker runs its own /compact).",
   list_models: "List an endpoint's selectable models and their supported reasoning efforts. Call before set_session_model / set_reasoning_effort.",
   disconnect_endpoint: "Disconnect an endpoint's runtime; managed sessions recover on next use.",
   restart_endpoint: "Restart an endpoint's runtime and restore its managed sessions.",

@@ -6,7 +6,7 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import hljs from "highlight.js/lib/common";
 import "katex/dist/katex.min.css";
-import { formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
+import { describeWorkerTasks, formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
@@ -196,6 +196,9 @@ export function App() {
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
   const goal = selectedWorkerGoal(sessions, selected);
+  // Work Claude started for itself, shown beside the composer. Session-scoped, so it
+  // persists across turns and is deliberately not part of the message list.
+  const workerTasks = workerChat?.tasks;
   const selectedSession = selected === null ? assistantSession : sessions.find((session) => session.nickname === selected) ?? null;
   const slashSuggestions = slashSuggestionsOpen
     ? filterCommandSuggestions(text, selected === null ? ASSISTANT_COMMAND_SUGGESTIONS : WORKER_COMMAND_SUGGESTIONS)
@@ -1030,6 +1033,11 @@ export function App() {
               </div>;
             })}
           </div>
+          {workerTasks && <div className="tasks-row" aria-label={`${selected} background work`} aria-live="polite"
+            title={workerTasks.descriptions.join("\n")}>
+            <span className="tasks-spinner" aria-hidden="true" />
+            <span className="tasks-label">{describeWorkerTasks(workerTasks)}</span>
+          </div>}
           {goal && <div className="goal-row" aria-label={`${selected} goal`} aria-live="polite">
             <div className="goal-meta"><span className="goal-label">Goal</span><span className="goal-status" data-status={goal.status}>{formatGoalStatus(goal.status)}</span></div>
             <div className="goal-objective">{goal.objective}</div>

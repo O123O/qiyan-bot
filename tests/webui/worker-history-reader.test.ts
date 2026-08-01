@@ -145,10 +145,35 @@ test("native Web UI paging wraps one stable turn cursor without head-relative me
   const page = await readReadyWorkerTurns(deps, "local", "thread", 20, undefined, new AbortController().signal);
 
   assert.deepEqual(page.messages, []);
-  assert.ok(page.nextCursor);
-  await readReadyWorkerTurns(deps, "local", "thread", 20, page.nextCursor, new AbortController().signal);
+  // A page that cannot answer the requested count walks to the next one rather than
+  // returning almost nothing: a single large turn used to fill the bounded transfer and
+  // leave a `count: 20` request with one or two messages. The walk stops when the
+  // transcript runs out, and each native page still asks for the same bounded 12 turns.
+  assert.deepEqual(cursors, [undefined, "older"], "it followed the older cursor itself");
   assert.equal(requests, 2);
-  assert.deepEqual(cursors, [undefined, "older"]);
+  assert.equal(page.nextCursor, undefined, "no cursor once the transcript is exhausted");
+});
+
+// The walk is bounded: a transcript that keeps offering more never turns one read into an
+// unbounded ssh transfer.
+test("native Web UI paging stops walking at its page budget", async () => {
+  let requests = 0;
+  const page = await readReadyWorkerTurns({
+    withReadyWorkLease: async (_endpoint: string, run: (lease: never) => unknown) =>
+      run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
+    request: async (_endpoint: string, _method: string, params: unknown) => {
+      requests += 1;
+      assert.equal((params as any).limit, 12, "message count must not expand the bounded native turn page");
+      return {
+        data: [{ id: `turn-${requests}`, status: "completed", itemsView: "summary", items: [] }],
+        nextCursor: `older-${requests}`,          // always more available
+        backwardsCursor: null,
+      };
+    },
+  } as never, "local", "thread", 500, undefined, new AbortController().signal);
+
+  assert.equal(requests, 8, "walked exactly the budget, not until the count was met");
+  assert.ok(page.nextCursor, "and still hands back a cursor so the caller can continue");
 });
 
 test("native Web UI paging never requests full tool history", async () => {
@@ -193,4 +218,32 @@ test("history pages prove terminal turns and preserve native read failures", asy
   });
   const page = await reader.read(next.subscriptionId, "worker", 20);
   assert.deepEqual(page.terminalTurnIds, ["turn"]);
+});
+
+// The reported symptom: one very large turn fills the bounded native page, so a request
+// for 20 messages came back with a couple and the caller had to guess it should page.
+test("a large turn no longer starves the requested message count", async () => {
+  const bigTurn = {
+    id: "huge", status: "completed", itemsView: "summary",
+    items: [{ type: "userMessage", id: "u", content: [{ type: "text", text: "go", text_elements: [] }] },
+      { type: "agentMessage", id: "a", text: "x".repeat(200) }],
+  };
+  let served = 0;
+  const page = await readReadyWorkerTurns({
+    withReadyWorkLease: async (_endpoint: string, run: (lease: never) => unknown) =>
+      run({ endpointId: "local", endpointGeneration: 1, leaseId: "lease" } as never),
+    request: async (_endpoint: string, _method: string, params: unknown) => {
+      served += 1;
+      // Each bounded page holds only this one big turn — exactly the starving case.
+      return {
+        data: [{ ...bigTurn, id: `huge-${served}` }],
+        nextCursor: served < 5 ? `older-${served}` : null,
+        backwardsCursor: null,
+      };
+    },
+  } as never, "local", "thread", 8, undefined, new AbortController().signal);
+
+  assert.ok(served > 1, "it kept reading instead of returning a near-empty page");
+  assert.ok(page.messages.length >= 4,
+    `expected the walk to accumulate messages, got ${page.messages.length} from ${served} pages`);
 });

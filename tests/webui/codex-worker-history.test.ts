@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import {
   CodexRolloutLocations,
   createCodexConversationHistoryRead,
@@ -19,6 +20,7 @@ test("Codex worker history reuses a bounded page until a native event changes th
     nativeSession: () => ({
       availability: "ready",
       status: "idle",
+      backgroundWork: false,
       activeTurnId: null,
       endpointGeneration: 1,
       lifecycleRevision: receiveSequence,
@@ -97,4 +99,45 @@ test("the production Web UI history path does not call thread/read", async () =>
   const historyPath = source.slice(start, end);
   assert.doesNotMatch(historyPath, /thread\/read/u);
   assert.match(historyPath, /readCodexWorkerTurns/u);
+});
+
+// Rollout locations are learned only from a thread/read on the worker's own endpoint, and
+// the map starts empty on every boot. An endpoint QiYan cannot reach therefore has no
+// location — history really is unavailable, but only until it reconnects. Reporting that as
+// a bare error made a self-healing outage read as corruption in the chat panel.
+test("an unreachable endpoint reports history as unavailable, not as a defect", async () => {
+  const read = createCodexConversationHistoryRead({
+    locations: new CodexRolloutLocations(),          // empty: nothing has been read yet
+    nativeSession: () => ({ availability: "unavailable", status: "unknown" }) as never,
+    readPage: async () => assert.fail("no page can be read without a location"),
+  });
+
+  await assert.rejects(
+    read("prenyx", threadId, "mapping-1", 20, undefined, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.code, "ENDPOINT_UNAVAILABLE", "retryable, so the panel can say it will load later");
+      assert.match(error.message, /prenyx is not connected/u);
+      assert.match(error.message, /reconnects/u, "the message says it resolves itself");
+      return true;
+    });
+});
+
+// A reachable endpoint with no location is a different situation: the bounded map evicted
+// the entry, or the thread was never read. That is not an outage and must not claim to be.
+test("a reachable endpoint with no location reports a distinct, non-outage failure", async () => {
+  const read = createCodexConversationHistoryRead({
+    locations: new CodexRolloutLocations(),
+    nativeSession: () => ({ availability: "ready", status: "idle" }) as never,
+    readPage: async () => assert.fail("no page can be read without a location"),
+  });
+
+  await assert.rejects(
+    read("prenyx", threadId, "mapping-1", 20, undefined, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.code, "OPERATION_FAILED");
+      assert.match(error.message, /no rollout location is known/u);
+      return true;
+    });
 });

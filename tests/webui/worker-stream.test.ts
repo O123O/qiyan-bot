@@ -101,3 +101,25 @@ test("a failing Web UI observer cannot prevent later core notification routing",
   });
   assert.equal(coreReached, true);
 });
+
+// Task activity is session-scoped, not turn-scoped: it outlives the turn that started it,
+// so it carries no turnId and must survive the normalizer's turnId guard.
+test("task activity reaches the Web UI without a turn id", () => {
+  const published: unknown[] = [];
+  const stream = createWorkerStream({
+    bus: {
+      hasWorkerSubscriber: () => true,
+      pruneWorkerSubscriptions: () => {},
+      publishWorker: (_endpointId: string, _threadId: string, event: unknown) => { published.push(event); },
+      publishWorkerDiscontinuity: () => {},
+    } as never,
+    resolveSession: () => ({ endpointId: "claude-local", threadId: "t1", mappingId: "m1" }),
+  });
+
+  stream.handleNotification("claude-local", "thread/tasks/updated", {
+    threadId: "t1", background: 2, subagents: 1, descriptions: ["npm test", "survey"],
+  });
+  assert.deepEqual(published, [{
+    kind: "tasks-updated", background: 2, subagents: 1, descriptions: ["npm test", "survey"],
+  }]);
+});

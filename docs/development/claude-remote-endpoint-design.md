@@ -1,6 +1,9 @@
 # Design: Remote Claude endpoints (catalog `claude-code`) + ssh ownership scan
 
-Status: historical; remote Claude endpoints remain, but the ownership scan was removed in July 2026.
+Status: historical. Remote Claude endpoints remain, but the ownership scan was removed in July 2026 and
+the `claude -p` execution model this describes was replaced by the persistent Agent SDK host in July 2026
+(`claude-agent-sdk-host-design.md`). `SshClaudeCommandRunner` survives only as the transcript and
+discovery reader; it starts no turns.
 Goal: let the assistant add a **remote Claude Code** endpoint the same way it adds a remote Codex one — an
 `endpoints.json` entry — and manage sessions on it safely, including the **ownership scan over ssh** (external-
 turn / duplicate-driver detection). This is the deferred remote half of the Claude endpoint work (PRs #7–#12).

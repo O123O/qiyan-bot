@@ -260,7 +260,11 @@ test("a loss-triggered retry pauses immediately when activation reports a fresh-
   assert.equal(scheduled.length, 0, "the classified retry failure does not recursively reschedule");
 });
 
-test("a pending reference check cannot install a reconnect timer after operator action is latched", async () => {
+// A host waiting on a person must still be retried, on the backoff's slow cadence: the
+// pause is a notify-once marker, not a stop. Latching it meant nothing retried after the
+// person acted, and since only a successful publish clears the pause, the endpoint stayed
+// unreachable to QiYan long after it was reachable again.
+test("a paused endpoint keeps retrying so it can recover once the human acts", async () => {
   const local = new FakeEndpoint("local");
   const remote = new FakeEndpoint("prenyx-codex");
   let resolveReferences!: (value: boolean) => void;
@@ -288,7 +292,7 @@ test("a pending reference check cannot install a reconnect timer after operator 
   await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
   resolveReferences(true);
   await settle();
-  assert.equal(scheduled.length, 0, "the stale async continuation observes the recovery pause");
+  assert.ok(scheduled.length > 0, "a paused endpoint still has a retry armed");
 });
 
 test("notification preparation failure cannot alter the endpoint error and is retried only on direct use", async () => {
@@ -688,10 +692,17 @@ test("lifecycle idle proof fails closed on an error native state", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
   remote.threadStatus = "systemError";
+  const shutdownsBefore = remote.runtimeStops;
   await assert.rejects(
     value.manager.disconnect("devbox"),
-    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN",
+    // CONFLICT, not UNCERTAIN. The proof runs before the runtime is stopped and reopens the
+    // endpoint untouched, so the outcome is not in doubt — and only a proven-no-effect code
+    // lets the operation settle as failed. Reported as uncertain it stayed recoverable
+    // forever, and an unresolved earlier operation fences the next lifecycle action, so a
+    // worker whose status could not be read wedged every future restart of its endpoint.
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT",
   );
+  assert.equal(remote.runtimeStops, shutdownsBefore, "the runtime was never stopped");
 });
 
 test("lifecycle idle proof does not request native history", async () => {
@@ -1268,4 +1279,30 @@ test("a builtin (e.g. local Claude) endpoint resolves through leased mutations w
   assert.equal(resolved, claude);
   assert.equal(claude.starts >= 1, true);
   assert.equal(requiredCatalog, false); // never consulted the ssh catalog for a builtin
+});
+
+// The pause must not survive recovery: a successful publish clears it, so a later
+// lifecycle fence does not still believe a human is required.
+test("a successful activation clears the recovery pause", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  const scheduled: Array<() => void> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (_delay, run) => { scheduled.push(run); return { cancel: () => undefined }; },
+    onRecoveryPaused: () => true,
+  });
+
+  remote.failStart = true;
+  remote.startError = freshSshChannelUnavailable();
+  await assert.rejects(manager.ensureReady(remote.id));
+  assert.equal(manager.awaitingAuthentication(remote.id), true, "the human-required state is recorded");
+
+  remote.failStart = false;
+  await manager.ensureReady(remote.id);
+  assert.equal(manager.awaitingAuthentication(remote.id), false, "and cleared once it comes back");
 });
