@@ -1,15 +1,64 @@
 #!/bin/sh
-# Restart qiyan-bot only when no managed worker is mid-turn.
+# Restart qiyan-bot only when no managed worker is still working.
 #
-# A worker's native transcript is the architecture-independent signal: a user row with no
-# assistant row after it means a turn is awaiting its reply. Grepping for a process pattern
-# is not — the SDK host spawns no `claude -p`, so such a check silently reports "idle"
-# forever and a restart kills live work. Pass --force to override deliberately.
+# The running bot is the authority, and it is asked first: a session's status lives in its
+# memory, not on disk. Background work — a Claude subagent or backgrounded command still
+# running after its turn ended — is the case that has no transcript signal at all, so a
+# file-based check cannot see it and would report "idle" while killing live work.
+#
+# The transcript scan below is the fallback for when the bot cannot be asked (web UI off, or
+# already down). It catches a worker mid-turn: a user row with no assistant row after it.
+# Grepping for a process pattern catches neither — the SDK host spawns no `claude -p`, so
+# such a check reports "idle" forever. Pass --force to override deliberately.
 set -eu
 if [ "${1-}" != "--force" ] && ! python3 - <<'PY'
-import glob, json, os, sys, time
+import glob, json, os, sys, time, urllib.request
+
+home = os.path.expanduser('~/.qiyan-bot')
+
+
+def refuse(reason):
+    print('refusing: ' + reason, file=sys.stderr)
+    sys.exit(1)
+
+
+# Ask the running bot. Its /api/sessions reports each managed session's live native status,
+# which is active for a turn in flight AND for background work that outlives its turn.
+def ask_bot():
+    with open(os.path.join(home, 'webui.json')) as handle:
+        state = json.load(handle)
+    if not state.get('enabled'):
+        return None
+    # `port` is recorded only when it was given as an explicit override, so its absence means
+    # the default — not "no web UI". Bailing out on it silently downgraded every default
+    # deployment to the transcript scan, which is exactly the check that cannot see a subagent.
+    port = state.get('port') or int(os.environ.get('WEB_PORT', 9520))
+    # A wildcard bind answers on loopback; anything else has to be dialled where it listens.
+    host = state.get('host') or '127.0.0.1'
+    if host in ('0.0.0.0', '::', ''):
+        host = '127.0.0.1'
+    with open(os.path.join(home, 'data', 'web-token')) as handle:
+        token = handle.read().strip()
+    url = 'http://%s:%d/api/sessions?token=%s' % (host, port, token)
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return json.load(response)
+
+
+try:
+    snapshot = ask_bot()
+except Exception:
+    snapshot = None
+
+if snapshot is not None:
+    busy = [s['nickname'] for s in snapshot.get('sessions', []) if s.get('nativeStatus') == 'active']
+    if busy:
+        refuse('managed workers are still working: ' + ', '.join(sorted(busy)))
+    sys.exit(0)
+
+# Fallback: the bot could not be asked, so read the transcripts directly.
+print('note: the bot could not be asked; falling back to a transcript scan', file=sys.stderr)
 managed = set()
-with open(os.path.expanduser('~/.qiyan-bot/data/sessions.json')) as handle:
+with open(os.path.join(home, 'data', 'sessions.json')) as handle:
     registry = json.load(handle)
 for entry in (registry.get('sessions', registry)).values():
     if isinstance(entry, dict) and entry.get('thread_id'):
@@ -34,8 +83,7 @@ for path in glob.glob(os.path.expanduser('~/.claude/projects/*/*.jsonl')):
     if last_user > last_assistant:
         busy.append(thread[:8])
 if busy:
-    print('refusing: managed workers mid-turn: ' + ', '.join(busy), file=sys.stderr)
-    sys.exit(1)
+    refuse('managed workers mid-turn: ' + ', '.join(busy))
 PY
 then
   echo "restart refused; re-run with --force to interrupt them" >&2
