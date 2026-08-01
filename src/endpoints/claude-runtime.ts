@@ -1058,15 +1058,23 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // A marker anywhere resolves the question: `claudeNativeGoal` returns null both for "no
     // marker here" and for "the last marker was a clear", and walking past a clear would
     // resurrect a goal the user cancelled.
-    const settle = (goal: { objective: string } | null): { goal: { objective: string; status: string } | null; known: true } => {
-      delete state.goalScan;
+    // An answer also PROVES a span clean: everything above the window that answered holds no
+    // marker, or that window would not have been the last one. Recording it is what makes a
+    // repeat read cost one window; discarding it made the cache never apply to any transcript
+    // small enough to finish inside the budget, which is most of them.
+    const settle = (
+      goal: { objective: string } | null,
+      proven?: { floor: number; top: number },
+    ): { goal: { objective: string; status: string } | null; known: true } => {
+      if (proven) state.goalScan = proven; else delete state.goalScan;
       // Claude drives its own goal to completion, so an installed goal is by definition still
       // being pursued; there is no paused or blocked state to distinguish.
       return { goal: goal ? { ...goal, status: "active" } : null, known: true };
     };
-    const cached = state.goalScan;
+    let cached = state.goalScan;
     let top: number | undefined;
     let end: number | undefined;
+    let carry: string | undefined;
     let scanned = 0;
     while (scanned < GOAL_SCAN_MAX_BYTES) {
       // Jump the span an earlier scan already proved clean, rather than re-reading it.
@@ -1083,24 +1091,34 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       if (top === undefined) {
         top = chunk.offset + chunk.bytes.length;
         // A transcript that shrank was rewritten, so cached offsets no longer mean anything.
-        if (cached && top < cached.top) delete state.goalScan;
+        // Clearing only the field would leave this walk still jumping by the stale span below.
+        if (cached && top < cached.top) { delete state.goalScan; cached = undefined; }
       }
-      // A window can start mid-line; that partial first line is not valid JSON and would be
-      // dropped by the parser anyway, but skip it explicitly when the window was clipped.
+      // A window can start mid-line. That leading fragment is the TAIL of a record whose head
+      // lives in the next window down, and the next window's own last line is that record's
+      // head, truncated. Dropping both — which is what parsing each window in isolation does —
+      // loses any record that straddles a boundary, marker included. Carry the fragment down
+      // and rejoin it instead; windows are always visited in descending order.
       const lines = Buffer.from(chunk.bytes).toString("utf8").split("\n");
-      if (chunk.offset > 0) lines.shift();
+      const fragment = chunk.offset > 0 ? lines.shift() ?? "" : undefined;
+      if (carry !== undefined && lines.length > 0) lines[lines.length - 1] += carry;
+      carry = fragment;
       const records: unknown[] = [];
       for (const line of lines) {
         if (!line.trim()) continue;
         try { records.push(JSON.parse(line)); } catch { /* partial or non-JSON line */ }
       }
+      // What this window proves clean is everything ABOVE it: had a marker been up there, an
+      // earlier window would have answered first. Recording the window's own start instead
+      // would make the next read jump straight over the marker this one just found.
+      const proven = { floor: chunk.offset + chunk.bytes.length, top };
       const goal = claudeNativeGoal(records);
-      if (goal) return settle(goal);
+      if (goal) return settle(goal, proven);
       // Match the marker the way the parser does — on a `/goal` command's own stdout record.
       // Testing the raw window text instead stopped the walk on any prose containing the words,
       // which reported "no goal" for a session whose goal was one window further back.
-      if (claudeGoalMarkerPresent(records)) return settle(null);
-      if (chunk.offset === 0) return settle(null);
+      if (claudeGoalMarkerPresent(records)) return settle(null, proven);
+      if (chunk.offset === 0) return settle(null, { floor: 0, top });
       scanned += chunk.bytes.length;
       end = chunk.offset;
     }

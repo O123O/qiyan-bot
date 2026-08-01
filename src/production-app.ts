@@ -2359,13 +2359,14 @@ export async function buildProductionApp(
     locations: codexRolloutLocations,
     nativeSession: (endpointId, threadId, mappingId) =>
       nativeSessions.view({ endpointId, threadId, mappingId }),
-    // A rollout location is learned by reconciling the thread, which is what hydrateThreadOrder
-    // does with the resulting view.
+    // A rollout location is just the thread's path on disk, and `thread/list` reports it. Ask
+    // for exactly that.
     //
-    // Reconciled DIRECTLY, not by arming the managed retry: that path filters on
-    // `unavailableOnly`, so it skips any session that is ready and merely lacks a location —
-    // which is every session that reaches here. Arming it promised a re-read that could never
-    // happen and left the reader watching a message that would never resolve.
+    // It was previously learned by RECONCILING the session, which is a mutation dressed as a
+    // read: it takes a lease, re-issues `thread/resume` against a thread the app-server already
+    // has loaded and may be running a turn on, bumps the session's lifecycle revision (so a
+    // concurrent send loses its turn id), and on an unrestorable thread ends the epoch and
+    // unregisters the session outright. None of that belongs behind opening a panel.
     //
     // Debounced per session: each failed history read asks again, and a panel retries.
     relearnLocation: (endpointId, threadId, mappingId) => {
@@ -2374,8 +2375,29 @@ export async function buildProductionApp(
       relearningLocations.add(key);
       runBackground(
         async () => {
-          try { await resumeManagedSessions(endpointId, { keys: [key] }); }
-          finally { relearningLocations.delete(key); }
+          try {
+            const session = Object.values(registry.snapshot().sessions).find((item) =>
+              item.endpoint === endpointId && item.thread_id === threadId && item.mapping_id === mappingId);
+            const params: Record<string, unknown> = {
+              pageSize: 50,
+              sortKey: "updated_at",
+              sortDirection: "desc",
+              useStateDbOnly: false,
+              ...session?.project_dir ? { cwd: session.project_dir } : {},
+            };
+            const page = await pool.request<{ data: Array<{ id?: unknown; path?: unknown; preview?: unknown }> }>(
+              endpointId, "thread/list", params,
+            );
+            for (const row of page.data) {
+              if (String(row.id ?? "") !== threadId) continue;
+              codexRolloutLocations.observe(endpointId, {
+                id: threadId,
+                path: typeof row.path === "string" ? row.path : "",
+                preview: String(row.preview ?? ""),
+              });
+              break;
+            }
+          } finally { relearningLocations.delete(key); }
         },
         () => recordBackgroundFailure("rollout location relearn"),
       );
@@ -3113,6 +3135,10 @@ export async function buildProductionApp(
             if (!registered || registered.session.mapping_id !== identity.mapping_id) {
               throw new AppError("OPERATION_CONFLICT", "managed goal mapping changed during recovery");
             }
+            // A bounded read that found nothing proves nothing. Treating it as "this session has
+            // no goal" un-armed goal control and erased the displayed goal for a session that
+            // still had one.
+            if ((currentGoal as { known?: boolean }).known === false) return;
             const active = restoredGoalControlIsActive(currentGoal);
             const hasGoal = currentGoal.goal !== null;
             if (!control.known) setGoalControlled(registered.nickname, hasGoal);
@@ -3547,7 +3573,7 @@ export async function buildProductionApp(
       get_session_status: async (args) => {
         if (args.nickname === "assistant") return assistantSessionStatus(true);
         const live = await sessions.status(args.nickname) as any;
-        observeGoal(args.nickname, live.goal);
+        observeGoal(args.nickname, live.goalKnown === false ? { goal: null, known: false } : live.goal);
         await renderDashboardSafely();
         const facts = dashboard.status(args.nickname);
         return {
@@ -5033,7 +5059,9 @@ export async function buildProductionApp(
           const proven = operation.kind === "set_goal" ? goal?.objective === args.objective && goal?.status === "active" && actualBudget === (args.token_budget ?? null)
             : operation.kind === "pause_goal" ? goal?.status === "paused"
               : operation.kind === "resume_goal" ? goal?.status === "active"
-                : goal == null && cancelInterruptProven;
+                // `cancel_goal` is proven only by an ANSWER of "no goal", never by a read that
+                // merely failed to find one.
+                : goal == null && (current as { known?: boolean })?.known !== false && cancelInterruptProven;
           if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")) {
             restoredGoalControlIsActive(current);
             setGoalControlled(args.nickname, false);

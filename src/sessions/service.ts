@@ -1,4 +1,4 @@
-import type { AppServerPool } from "../app-server/pool.ts";
+import { turnNoLongerSteerable, type AppServerPool } from "../app-server/pool.ts";
 import { AppError } from "../core/errors.ts";
 import type { RegistrySession, SessionRegistry } from "../registry/session-registry.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
@@ -115,7 +115,7 @@ export class SessionService {
           // Safe to retry with the same id: the endpoint drops a duplicate message uuid rather
           // than starting a second turn, so if the steer did land after all, this reconciles
           // against it instead of doubling it.
-          if (mode === "steer" || !(error instanceof AppError && error.code === "OPERATION_CONFLICT")) throw error;
+          if (mode === "steer" || !turnNoLongerSteerable(error)) throw error;
         }
       }
       const settings = options.settings ?? this.controls.settings(session.endpoint, session.thread_id, session.mapping_id);
@@ -340,6 +340,10 @@ export class SessionService {
         nativeStatus,
         activeTurnId,
         goal: goal && typeof goal === "object" && "goal" in goal ? (goal as any).goal : goal ?? null,
+        // Whether that goal reading is an answer or merely the absence of one. A provider whose
+        // goal read is bounded says so, and dropping the distinction here is what let a status
+        // poll -- the most frequent reader there is -- overwrite a live goal with "none".
+        ...goal && typeof goal === "object" && "known" in goal ? { goalKnown: (goal as any).known === true } : {},
       };
     };
     return this.endpoints
@@ -440,7 +444,10 @@ export class SessionService {
     try { return await this.pool.request(session.endpoint, "thread/goal/clear", { threadId: session.thread_id }); }
     catch (error) {
       const current = await this.getGoal(nickname).catch(() => undefined) as any;
-      if (current && current.goal == null) return current;
+      // Only an ANSWER proves the clear landed. A read that merely failed to find a goal is not
+      // evidence that there is none, and accepting it reported success for a clear that may not
+      // have happened.
+      if (current && current.goal == null && current.known !== false) return current;
       throw error;
     }
   }

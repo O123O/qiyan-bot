@@ -8,6 +8,9 @@ import type { RpcRequest } from "./protocol.ts";
 import { RpcClient, type RpcWire } from "./rpc-client.ts";
 import { requireMinimumCodexVersion } from "./version-compat.ts";
 
+// Bound on tearing down a connection whose transport may never answer. See disposeConnection.
+const CONNECTION_CLOSE_TIMEOUT_MS = 15_000;
+
 export interface PermissionBlockedEvent {
   method: string;
   threadId?: string;
@@ -186,7 +189,18 @@ export class ManagedAppServerEndpoint {
     delete this.connection;
     delete this.connectionIdentity;
     client?.close();
-    await connection?.close();
+    // Bounded, because this runs inside a lifecycle action holding the endpoint's admission gate
+    // shut: a transport whose peer is gone can accept the close and never answer it, and an
+    // unbounded wait there left the endpoint permanently `draining` -- refusing every read AND
+    // the restart that was its only repair. The connection is being discarded either way, so
+    // waiting past the bound buys nothing; the endpoint's state is already `stopped` above.
+    await Promise.race([
+      connection?.close() ?? Promise.resolve(),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, CONNECTION_CLOSE_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
   }
 
   private async handleServerRequest(request: RpcRequest): Promise<unknown> {

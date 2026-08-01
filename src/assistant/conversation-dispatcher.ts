@@ -1,5 +1,5 @@
 import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
-import { TurnIdentityConflictError } from "../app-server/pool.ts";
+import { TurnIdentityConflictError, turnNoLongerSteerable } from "../app-server/pool.ts";
 import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
 import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
 import { AppError } from "../core/errors.ts";
@@ -875,13 +875,7 @@ export class ConversationDispatcher {
   }
 
   private isKnownNonSteerable(error: unknown): boolean {
-    if (error instanceof AppError) return new Set(["SESSION_IDLE", "OPERATION_CONFLICT"]).has(error.code);
-    if (!(error instanceof JsonRpcResponseError) || !error.data || typeof error.data !== "object") return false;
-    const data = error.data as Record<string, unknown>;
-    const info = data.codexErrorInfo && typeof data.codexErrorInfo === "object"
-      ? data.codexErrorInfo as Record<string, unknown>
-      : data;
-    return Object.hasOwn(info, "activeTurnNotSteerable");
+    return turnNoLongerSteerable(error);
   }
 
   private correlatedUnresolvedStart(turn: TurnSnapshot): ReservedSubmission | undefined {

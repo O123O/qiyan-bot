@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AppServerEndpoint } from "../../src/app-server/pool.ts";
-import { AppServerPool } from "../../src/app-server/pool.ts";
+import { AppServerPool, TurnIdentityConflictError } from "../../src/app-server/pool.ts";
+import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { SessionObservationProcessor } from "../../src/assistant/session-observer.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { SessionRegistry } from "../../src/registry/session-registry.ts";
@@ -510,6 +511,42 @@ test("a send that races a turn boundary becomes its own turn instead of an error
   assert.equal(result.mode, "start", "the message is sent rather than refused");
   assert.ok(value.endpoint.calls.some((call) => call.method === "turn/start" && call.params.clientUserMessageId === "web:1"),
     "and carries the same id, so a steer that landed after all reconciles instead of doubling");
+});
+
+// The AppError above is Claude's in-process shape. Codex — where this was actually reported —
+// refuses over JSON-RPC, and a check that only understood AppError still dropped the message on
+// exactly the provider the bug came from.
+test("a Codex steer refusal over JSON-RPC also becomes its own turn", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new JsonRpcResponseError(-32600, "turn is no longer steerable", {
+    codexErrorInfo: { activeTurnNotSteerable: { turnId: "started-1" } },
+  });
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  const result = await value.service.send("payments", "another thought", { clientUserMessageId: "web:2" });
+
+  assert.equal(result.mode, "start", "the message is sent rather than refused");
+  assert.ok(value.endpoint.calls.some((call) => call.method === "turn/start" && call.params.clientUserMessageId === "web:2"));
+});
+
+// A turn-identity conflict is a different thing wearing the same error code: it says the START
+// response named a turn the caller did not claim. Retrying THAT as a new turn is the one case
+// that really can produce a second turn, so it must still surface.
+test("a turn-identity conflict is not mistaken for a steer refusal", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new TurnIdentityConflictError("returned-9", "started-1");
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(value.service.send("payments", "another thought", { clientUserMessageId: "web:3" }),
+    (error: unknown) => error instanceof TurnIdentityConflictError);
 });
 
 // An explicit steer names one turn on purpose. Redirecting THAT into a different turn is the
