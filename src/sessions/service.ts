@@ -87,10 +87,19 @@ export class SessionService {
           return { mode: "steer" as const, turnId: response.turnId };
         } catch (error) {
           if (!options.clientUserMessageId) throw error;
+          // Best-effort proof that the message landed despite the failure. It scans history for
+          // the turn, and on a long-lived worker that scan can run out of budget — especially
+          // when the turn it is looking for was never written, which is exactly the case where
+          // the steer failed because that turn had already finished.
+          //
+          // A proof that could not be carried out proves nothing, so the ORIGINAL failure stands.
+          // Reporting the scan's own exhaustion instead replaced an actionable message ("that
+          // turn is no longer running; send it as a new turn") with an internal one about a
+          // budget, for a send the user simply needs to retry.
           const items = await this.pool.historyReader(session.endpoint, lease).exactTurnItems(
             session.thread_id, activeTurn, { budget: createHistoryScanBudget() },
-          );
-          const proven = items.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId);
+          ).catch(() => undefined);
+          const proven = items?.items.some((item) => item.type === "userMessage" && item.clientId === options.clientUserMessageId) ?? false;
           if (!proven) throw error;
           options.onTurnAccepted?.({ session, mode: "steer", turnId: activeTurn });
           this.onTurnAccepted(session, activeTurn);

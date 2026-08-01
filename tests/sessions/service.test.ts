@@ -42,6 +42,8 @@ class ServiceEndpoint implements AppServerEndpoint {
   rejectNextGoalSetBeforeEffect = false;
   rejectNextGoalGet = false;
   compactDelayMs = 0;
+  failSteer: Error | undefined;
+  failTurnsList = false;
   // What this endpoint answers for thread/tasks/stop. Undefined models a provider that does
   // not implement it at all — a Codex app-server, where an active turn with no id really is
   // an identity still being refreshed.
@@ -70,8 +72,12 @@ class ServiceEndpoint implements AppServerEndpoint {
       this.status = "active";
       return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
-    if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
+    if (method === "turn/steer") {
+      if (this.failSteer) throw this.failSteer;
+      return { turnId: params.expectedTurnId } as T;
+    }
     if (method === "thread/turns/list") {
+      if (this.failTurnsList) throw new AppError("OPERATION_UNCERTAIN", "native history scan budget was exhausted");
       const source = params.sortDirection === "desc" ? [...this.historyTurns()].reverse() : this.historyTurns();
       const offset = params.cursor === undefined ? 0 : Number(params.cursor);
       const limit = Number(params.limit);
@@ -484,6 +490,30 @@ test("a provider with no background work is probed as before and never asked to 
   });
   assert.equal(value.endpoint.calls.some((call) => call.method === "thread/tasks/stop"), false,
     "no stop is dispatched to a provider that never reported background work");
+});
+
+// The steer-failure proof scans history for the turn. On a long-lived worker that scan can run
+// out of budget — especially when the turn was never written, which is the very case where the
+// steer failed because it had already finished. A proof that could not run proves nothing, and
+// reporting its own exhaustion replaced an actionable error with an internal one about a budget.
+test("a proof that cannot run reports the original failure, not its own", async () => {
+  const value = await fixture();
+  value.endpoint.status = "active";
+  value.endpoint.failSteer = new AppError("OPERATION_CONFLICT", "turn started-1 is no longer running");
+  value.endpoint.failTurnsList = true;
+  value.native.observe("local", value.nativeGeneration, "turn/started", {
+    threadId: "thread",
+    turn: { id: "started-1", status: "inProgress" },
+  });
+
+  await assert.rejects(
+    value.service.send("payments", "another thought", { clientUserMessageId: "web:1" }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "OPERATION_CONFLICT");
+      assert.match(String((error as Error).message), /no longer running/u);
+      return true;
+    },
+  );
 });
 
 test("interrupt recovery resumes the exact native active turn when runtime cache is empty", async () => {
