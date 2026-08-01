@@ -262,7 +262,10 @@ test("the remote app-server launcher retains one bounded owner-only diagnostic g
   assert.equal(log.match(/stderr marker/gu)?.length, 1);
   assert.equal(previousLog.match(/stdout marker/gu)?.length, 1);
   assert.equal(previousLog.match(/stderr marker/gu)?.length, 1);
-  assert.match(log, /filter=off,codex_app_server::app_server_tracing=info,codex_app_server::transport=info/u);
+  // Errors only. The log lives on tmpfs and is rotated only when the launcher next starts, so
+  // nothing caps it while the app-server runs: at info level every request logged an enter and
+  // an exit span, and one runtime wrote 3.1 GB in under five minutes before being killed.
+  assert.match(log, /filter=error/u);
   assert.doesNotMatch(log, /codex_app_server_transport/u);
   assert.doesNotMatch(log, /filter=.*(?:^|,)warn(?:,|$)/mu);
   assert.doesNotMatch(log, /filter=.*codex_app_server=info/u);
@@ -485,7 +488,7 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
     runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
   }));
   const inspected = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
-  assert.deepEqual(parseRemoteHelperResponse(inspected.stdout, "inspect"), { status: "absent" });
+  assert.deepEqual(parseRemoteHelperResponse(inspected.stdout, "inspect"), { status: "absent", supervised: false });
 
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");
@@ -644,7 +647,7 @@ test("the remote Claude host serves proxied sessions from one supervised process
   );
   await tmux("new-session", "-d", "-s", codexSession, "sleep 120");
   t.after(() => tmux("kill-session", "-t", codexSession).catch(() => undefined));
-  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent" },
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent", supervised: false },
     "the co-resident Codex session is not mistaken for a Claude host");
 
   let identity: { token: string; pid: number } | undefined;
@@ -669,7 +672,7 @@ test("the remote Claude host serves proxied sessions from one supervised process
   const socketState = await stat(join(runtimeDir, "claude.sock"));
   assert.equal(socketState.isSocket(), true);
   assert.equal(socketState.mode & 0o777, 0o600);
-  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "healthy", identity: started.identity });
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "healthy", identity: started.identity, supervised: true });
 
   const stream = await openReadyProcessStream("env", [
     ...environment, process.execPath, installed,
@@ -698,7 +701,7 @@ test("the remote Claude host serves proxied sessions from one supervised process
 
   await invoke("stop-claude-host", { ...base, expected: started.identity }, 15_000);
   identity = undefined;
-  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent" });
+  assert.deepEqual(await invoke("inspect-claude-host", base), { status: "absent", supervised: false });
   await assert.rejects(stat(join(runtimeDir, "claude.sock")));
   // Stopping the Claude host must leave the Codex generation — and the tmux socket serving
   // it — alone; unlinking that socket would strand a live app-server QiYan can no longer

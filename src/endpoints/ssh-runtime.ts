@@ -20,8 +20,8 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "885b9ecbdfa60c1e92013fc04c32dfef81528e4657d450ba7345ff9226877ab7";
-export const REMOTE_LAUNCHER_SHA256 = "643dd9424f3d7fb5cca8d9f7cbd835fb40a57e8a7e728ed1529259e92fa793c5";
+export const REMOTE_HELPER_SHA256 = "02647e5676730e34a124b36f852ebfab7548e6a72dfb3e7de24e0d66a353bfc3";
+export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "e8e32d34ad7a1447016d3ef73db90d53fce3b918fd253e903b10840a8c9e0c5a";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
@@ -44,9 +44,9 @@ const preflightSchema = z.object({
   runtimeBase: z.string(),
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("absent") }).strict(),
-  z.object({ status: z.literal("unhealthy"), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional() }).strict(),
-  z.object({ status: z.literal("healthy"), identity: z.unknown() }).strict(),
+  z.object({ status: z.literal("absent"), supervised: z.boolean().optional() }).strict(),
+  z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional() }).strict(),
+  z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional() }).strict(),
 ]);
 
 export interface RemoteAssets {
@@ -213,7 +213,28 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
     if (current.status === "healthy") return current.identity;
-    if (current.status === "unhealthy") throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
+    if (current.status === "unhealthy") {
+      // A runtime whose SUPERVISOR is gone is dead, whatever it left behind. What keeps it
+      // reading "unhealthy" rather than "absent" is its own leftovers — a socket, an identity
+      // file, or a process it spawned that outlived it and still carries our runtime token.
+      // Refusing there is a dead end: `start` will not touch an unhealthy runtime, so nothing
+      // ever clears the leftovers and the endpoint can never come back without a human on the
+      // worker's machine. Observed with a `git` a dead app-server had spawned, still running
+      // hours later and holding its process group open.
+      //
+      // Reclaiming is safe precisely here: `stop` proves the recorded identity before it acts,
+      // and only signals processes carrying that identity's token. A runtime that is still
+      // SUPERVISED is a live thing this build does not understand, and is still left alone.
+      if (current.supervised !== false || !current.identity) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
+      }
+      await this.options.remote.invoke("stop", [JSON.stringify({
+        runtimeDir: prepared.runtimeDir,
+        session: prepared.session,
+        tmuxMode: prepared.tmuxMode,
+        expected: current.identity,
+      })], prepared.host.remoteHelperPath);
+    }
     if (prepared.tmuxMode === "legacy") {
       delete this.prepared;
       return this.ensureStarted();
@@ -300,13 +321,21 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   }
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<
-    { status: "absent" } | { status: "unhealthy"; identity?: RuntimeIdentity } | { status: "healthy"; identity: RuntimeIdentity }
+    { status: "absent" }
+    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean }
+    | { status: "healthy"; identity: RuntimeIdentity }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
       runtimeDir: prepared.runtimeDir, session: prepared.session, tmuxMode: prepared.tmuxMode,
     })], prepared.host.remoteHelperPath));
-    if (parsed.status === "unhealthy") return { status: "unhealthy", ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }) };
-    if (parsed.status !== "healthy") return parsed;
+    if (parsed.status === "unhealthy") {
+      return {
+        status: "unhealthy",
+        ...(parsed.supervised === undefined ? {} : { supervised: parsed.supervised }),
+        ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }),
+      };
+    }
+    if (parsed.status !== "healthy") return { status: "absent" };
     return { status: "healthy", identity: parseRuntimeIdentity(parsed.identity) };
   }
 }

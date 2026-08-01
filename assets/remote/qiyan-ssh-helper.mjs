@@ -127,15 +127,19 @@ async function inspect(value) {
   const group = identity ? membersOfGroup(identity.processGroupId) : [];
   const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
   const groupAlive = group.length > 0;
-  if (tmux.code !== 0) {
-    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
-    return { status: "absent" };
+  // Whether the supervisor is still there. A caller cannot otherwise tell a runtime whose tmux
+  // session is GONE — dead, and its leftovers reclaimable — from one that is alive but failing a
+  // check, which must be left alone.
+  const supervised = tmux.code === 0;
+  if (!supervised) {
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "absent", supervised };
   }
-  if (!identity || !identityMatches(identity)) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+  if (!identity || !identityMatches(identity)) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
   }
-  return { status: "healthy", identity };
+  return { status: "healthy", identity, supervised };
 }
 
 async function start(value) {
@@ -203,19 +207,20 @@ async function inspectClaudeHost(value) {
   const group = identity ? membersOfGroup(identity.processGroupId) : [];
   const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
   const groupAlive = group.length > 0;
-  if (tmux.code !== 0) {
-    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
-    return { status: "absent" };
+  const supervised = tmux.code === 0;
+  if (!supervised) {
+    if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "absent", supervised };
   }
   // The launcher exports QIYAN_RUNTIME_TOKEN before exec, so the environ check proves the
   // live process is the one we started rather than a recycled pid that matches by accident.
   if (!identity || !identityMatches(identity) || !processHasToken(identity.pid, identity.token)) {
-    return { status: "unhealthy", ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
   }
-  return { status: "healthy", identity };
+  return { status: "healthy", identity, supervised };
 }
 
 async function startClaudeHost(value) {
