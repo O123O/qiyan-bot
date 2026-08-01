@@ -156,11 +156,22 @@ export class NativeSessionState {
       || current.lifecycleRevision !== token.lifecycleRevision || current.availability !== "ready") return false;
     const status = nativeStatus(observation.status);
     const activeTurnId = status === "active" ? observation.activeTurnId ?? current.activeTurnId : null;
-    this.apply(current, {
-      status,
-      activeTurnId,
-      backgroundWork: status === "active" && hasNativeActivity(observation.nativeActivity),
-    });
+    const backgroundWork = status === "active" && hasNativeActivity(observation.nativeActivity);
+    // A turn this generation already saw settle cannot be the one now running. A response built
+    // just before that terminal arrived would otherwise reinstate it, and the view would sit
+    // active on a finished turn — which `send` then steers into and is refused. The live event
+    // paths already fence on this; the refresh path is the one that did not, and it matters more
+    // now that the active turn is taken from the response rather than probed for afterwards.
+    if (activeTurnId !== null
+      && this.isTerminal(token.endpointId, token.endpointGeneration, token.threadId, activeTurnId)) {
+      this.apply(current, {
+        status: backgroundWork ? "active" : "idle",
+        activeTurnId: null,
+        backgroundWork,
+      });
+      return true;
+    }
+    this.apply(current, { status, activeTurnId, backgroundWork });
     return true;
   }
 

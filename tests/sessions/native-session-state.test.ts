@@ -404,6 +404,42 @@ test("background work reported as a status change keeps a session non-idle", () 
   assert.equal(state.view(identity)?.backgroundWork, false);
 });
 
+// A resume response is built from a thread view that may have been read moments before the
+// turn it names settled. Adopting that id leaves the session active on a finished turn, which
+// `send` steers into and is refused — and with the active turn now taken from the response
+// rather than probed for afterwards, nothing corrects it until the next turn starts.
+test("a refresh cannot reinstate a turn this generation already saw settle", () => {
+  const state = new NativeSessionState({ now: () => 100 });
+  state.register(identity, 4);
+  state.observe("prenyx", 4, "turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
+  state.observe("prenyx", 4, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1" } });
+
+  // The response was assembled before that completion and still calls turn-1 the active one.
+  state.applyRefresh(state.captureRefresh(identity, 4), { status: "active", activeTurnId: "turn-1" });
+
+  assert.equal(state.view(identity)?.status, "idle");
+  assert.equal(state.view(identity)?.activeTurnId, null);
+});
+
+// The same stale response, but the session really is still busy — on work that belongs to no
+// turn. The settled turn is dropped; the reason it is busy is not.
+test("a stale refresh still reports background work as busy", () => {
+  const state = new NativeSessionState({ now: () => 100 });
+  state.register(identity, 4);
+  state.observe("prenyx", 4, "turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
+  state.observe("prenyx", 4, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1" } });
+
+  state.applyRefresh(state.captureRefresh(identity, 4), {
+    status: "active",
+    activeTurnId: "turn-1",
+    nativeActivity: { backgroundTasks: 1, subagents: 0 },
+  });
+
+  assert.equal(state.view(identity)?.status, "active");
+  assert.equal(state.view(identity)?.activeTurnId, null);
+  assert.equal(state.view(identity)?.backgroundWork, true);
+});
+
 // Without the activity to explain it, an id-less active status is a turn whose identity is
 // not yet established — the Codex case, which must keep asking for the refresh.
 test("an id-less active status with no background work still requests identity repair", () => {

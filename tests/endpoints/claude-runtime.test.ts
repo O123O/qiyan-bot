@@ -1903,4 +1903,3 @@ test("interrupting a turn also stops the work it spawned", async () => {
   assert.deepEqual(claude.interrupts, [thread.id], "the response was interrupted");
   assert.deepEqual(claude.stoppedTasks, ["agent-1"], "and its subagent was stopped, not left running");
 });
-
