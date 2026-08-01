@@ -5161,6 +5161,32 @@ export async function buildProductionApp(
     if (requireAcknowledged) requireManagedRecoveryAcknowledged(outcome, endpointId);
   }
 
+  // A Codex goal lives in the app-server and drives its own continuations, so a restart resumes
+  // the work by itself. A Claude goal is Claude's own `/goal`, advanced by its Stop hook — which
+  // fires only when a TURN ENDS, inside a live session. A local Claude host dies with QiYan, and
+  // an interrupted turn never reaches the hook, so after a restart the worker sits idle with an
+  // active goal and nothing to advance it. Nothing in memory survives to notice: the interrupted
+  // set is rebuilt per process from a runtime-lost event that a restart never produces.
+  //
+  // The goal itself is the durable evidence — it is read from the session's own transcript — so
+  // one message restarts the loop, and the Stop hook carries it from there.
+  async function resumeGoalDrivenClaudeWorker(nickname: string, session: RegistrySession): Promise<void> {
+    if (sessionProvider(session.endpoint) !== "claude") return;
+    const live = nativeSessions.view({
+      endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
+    });
+    // Only a settled session needs starting; one already working will reach its Stop hook.
+    if (live?.availability !== "ready" || live.status !== "idle") return;
+    const goal = await sessions.getGoal(nickname).catch(() => undefined) as { goal?: { status?: unknown } } | undefined;
+    if (goal?.goal?.status !== "active") return;
+    scheduling?.enqueueRuntimeRecovery({
+      nickname,
+      endpointId: session.endpoint,
+      threadId: session.thread_id,
+      mappingId: session.mapping_id,
+    }, RUNTIME_RESTART_RESUME_MESSAGE);
+  }
+
   async function resumeManagedSessions(endpointFilter?: string, options: {
     unavailableOnly?: boolean;
     keys?: readonly ManagedRetryKey[];
@@ -5205,6 +5231,10 @@ export async function buildProductionApp(
         });
         if (options.isCurrent && !options.isCurrent()) throw new AppError("ENDPOINT_UNAVAILABLE", "managed recovery owner stopped");
         restoredKeys.push(key);
+        runBackground(
+          () => resumeGoalDrivenClaudeWorker(nickname, session),
+          () => recordBackgroundFailure("claude goal resume"),
+        );
       } catch (error) {
         if (options.isCurrent && !options.isCurrent()) throw error;
         const current = registry.get(nickname);

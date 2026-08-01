@@ -586,7 +586,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const state = knownState ?? await this.ensureState(threadId);
     const records = state.materialized === false
       ? []
-      : await this.history.fullRecords(threadId, state.cwd) ?? [];
+      : await this.history.recentRecords(threadId, state.cwd) ?? [];
     return reconstructClaudeThread({
       threadId, cwd: state.cwd, records,
       interruptedTurnIds: state.terminalTurns,

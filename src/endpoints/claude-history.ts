@@ -58,14 +58,20 @@ export class ClaudeTranscriptHistory {
     throw new AppError("OPERATION_UNCERTAIN", "Claude transcript does not expose a non-empty session cwd");
   }
 
-  async fullRecords(threadId: string, cwd: string): Promise<unknown[] | undefined> {
+  // The TAIL, not the whole transcript. Reading from offset 0 and refusing anything larger than
+  // the window meant a thread stopped being reconstructible the moment it outgrew it — and a
+  // transcript only grows, so that is a deadline every long-lived worker eventually passes. A
+  // bounded window from the end degrades instead: recent turns are reconstructed and older ones
+  // are reached through the paged reader, which is how every other history read already works.
+  //
+  // A window can begin mid-line, so the partial first record is dropped rather than parsed.
+  async recentRecords(threadId: string, cwd: string): Promise<unknown[] | undefined> {
     const chunk = await this.runner.readTranscriptChunk(threadId, cwd, {
-      offset: 0,
+      offset: "tail",
       length: EXACT_TRANSFER_BYTES,
     });
     if (!chunk) return undefined;
-    if (chunk.snapshot.size > EXACT_TRANSFER_BYTES) throw new HistoryScanBudgetExhaustedError();
-    return parseRecords(chunk, false).map((record) => record.value);
+    return parseRecords(chunk, true).map((record) => record.value);
   }
 
   async turnsPage(

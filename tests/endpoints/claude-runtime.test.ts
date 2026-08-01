@@ -1951,6 +1951,38 @@ test("an interrupted turn promotes nothing into a final answer", async () => {
   assert.deepEqual(finals, [], "an interrupted turn has no final answer to deliver");
 });
 
+// A transcript only grows. Reading it from offset 0 and refusing anything past the window meant
+// a thread stopped being reconstructible the moment it outgrew one — a deadline every long-lived
+// worker eventually passes, after which the read threw instead of returning what it could.
+test("a transcript larger than the read window reconstructs its recent turns instead of failing", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  // Older than the window: padded far beyond it, so a head-anchored read could never reach the end.
+  const filler = Array.from({ length: 400 }, (_, index) => ({
+    type: "assistant",
+    uuid: `old-${index}`,
+    cwd: "/w",
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "x".repeat(12_000) }] },
+  }));
+  claude.seed("cold-big", [
+    { type: "user", uuid: "ctx:old", sessionId: "cold-big", cwd: "/w", promptSource: "sdk", message: { role: "user", content: "ancient" } },
+    ...filler,
+    { type: "user", uuid: "ctx:recent", sessionId: "cold-big", cwd: "/w", promptSource: "sdk", message: { role: "user", content: "recent question" } },
+    { type: "assistant", uuid: "agent-recent", cwd: "/w", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "recent answer" }] } },
+  ]);
+
+  const read = await rt.request<{ thread: any }>("thread/read", { threadId: "cold-big", includeTurns: true });
+
+  const turns = read.thread.turns as Array<{ id: string; items: Array<{ type: string; text?: string }> }>;
+  assert.ok(turns.length > 0, "a transcript past the window still reconstructs");
+  assert.equal(turns.at(-1)?.id, "ctx:recent", "and the newest turn is the one it reaches");
+  assert.ok(
+    turns.at(-1)?.items.some((item) => item.type === "agentMessage" && item.text === "recent answer"),
+    "with its answer intact",
+  );
+});
+
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
 // Without a way to stop it the session stays active forever — unarchivable and
 // unrestartable — with nothing left that could ever end it.
