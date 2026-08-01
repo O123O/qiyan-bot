@@ -109,6 +109,58 @@ test("background work is not an unidentified turn, so the probe leaves it alone"
   assert.equal(native.view(identity)?.activeTurnId, null);
 });
 
+// Queue a second message while the first turn runs and this is the ordinary sequence: the next
+// turn is announced started, then the finished one's completion arrives, and the mismatch asks
+// for a refresh. That refresh carries an expected revision, which bypasses the guard for a view
+// that already names a turn — so the probe reads history, finds only the COMPLETED turn (the
+// running one has not been written yet), and erases a live identity to `unknown`. Every later
+// operation on the session then fails on that, which is a worker reported down mid-conversation.
+test("a refresh does not erase a running turn history has not caught up with", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.observe("remote", 3, "turn/started", { threadId: "thread", turn: { id: "first" } });
+  native.observe("remote", 3, "turn/started", { threadId: "thread", turn: { id: "queued" } });
+  const refreshRequired = native.observe("remote", 3, "turn/completed", { threadId: "thread", turn: { id: "first" } });
+  assert.equal(refreshRequired, true, "the mismatched completion is what asks for the refresh");
+
+  await repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    expectedLifecycleRevision: native.view(identity)!.lifecycleRevision,
+    // The queued turn is executing; the transcript's newest turn is still the finished one.
+    latestTurn: async () => ({ id: "first", status: "completed", itemsView: "notLoaded", items: [] }),
+  });
+
+  assert.equal(native.view(identity)?.status, "active");
+  assert.equal(native.view(identity)?.activeTurnId, "queued", "the turn that is actually running is kept");
+});
+
+// A forced refresh can arrive after the session has already settled — its turn completed while
+// the refresh was in flight. There is no identity left to establish, and recording `unknown`
+// replaces a good idle state with one that fails every later operation, for a session that is
+// simply finished.
+test("a refresh does not make an already idle session unknown", async () => {
+  const native = new NativeSessionState();
+  const identity = { endpointId: "remote", threadId: "thread", mappingId: "mapping" };
+  native.register(identity, 3);
+  native.observe("remote", 3, "turn/started", { threadId: "thread", turn: { id: "only" } });
+  native.observe("remote", 3, "turn/completed", { threadId: "thread", turn: { id: "only" } });
+  assert.equal(native.view(identity)?.status, "idle");
+
+  await repairActiveTurnIdentity({
+    native,
+    identity,
+    endpointGeneration: 3,
+    expectedLifecycleRevision: native.view(identity)!.lifecycleRevision,
+    latestTurn: async () => ({ id: "only", status: "completed", itemsView: "notLoaded", items: [] }),
+  });
+
+  assert.equal(native.view(identity)?.status, "idle", "a settled session stays settled");
+  assert.equal(native.view(identity)?.activeTurnId, null);
+});
+
 // A reconnect settles state from a thread VIEW, not from notifications: every managed session
 // is reconciled through applyRefresh after the endpoint's generation bumps. Dropping the
 // activity there meant the flag reverted to false on every reconnect, the probe then ran, and
