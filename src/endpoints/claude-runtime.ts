@@ -126,6 +126,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // work — session close, endpoint shutdown, archive, unsubscribe, a proven stop — clears it.
   private readonly taskActivity = new Map<string, { backgroundTasks: number; subagents: number }>();
   private readonly stateLoads = new Map<string, Promise<ThreadState>>();
+  // Claude's own model list, read once a session is loaded and then reused (see models()).
+  private modelCatalog?: unknown[];
   private readonly history: ClaudeTranscriptHistory;
   private persistentUnavailableSubscription?: () => void;
   private readonly hostSubscription: () => void;
@@ -422,10 +424,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         this.taskActivity.delete(id);
         return { status: "unsubscribed" } as T;
       }
-      case "thread/name/set": return {} as T;
+      // The SDK can rename a session, but only ON the machine that holds its transcript, so
+      // serving this needs a host method and therefore a protocol bump — which fails activation
+      // for every remote host already running an older one until it is replaced by hand.
+      // Until that is done deliberately, refuse: returning {} reported a rename that never
+      // happened, and a caller cannot tell an unsupported operation from a silent no-op.
+      case "thread/name/set":
+        throw new AppError("UNSUPPORTED_CAPABILITY", "renaming a Claude session needs a host protocol bump");
       // Claude has no model-list API; return the curated catalog (Codex `{data,nextCursor}` shape)
       // so set_session_model / the model picker have real entries to validate against.
-      case "model/list": return { data: claudeModelCatalog(this.options.launchFlags.model), nextCursor: null } as T;
+      case "model/list": return { data: await this.models(), nextCursor: null } as T;
       // A goal is Claude's own `/goal`, driven by its Stop hook. QiYan stores none and
       // reads the objective back out of the session's transcript, where the slash command
       // records it — so an installed goal is reported without a duplicate goal row, and it
@@ -789,6 +797,42 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     }
     await this.deliverGoalCommand(threadId, `/goal ${objective}`);
     return { goal: { objective, status: "active" } };
+  }
+
+  // The models Claude itself reports, which is the only source that knows which EFFORT levels
+  // each model actually supports — the static catalog asserts the same set for every model, so
+  // set_session_model would accept an effort a model does not offer.
+  //
+  // model/list is endpoint-scoped and the SDK answers per session, so this asks whichever
+  // session is loaded and remembers the answer: the set does not vary by session, and without
+  // remembering it the picker would report different models depending on what happened to be
+  // open. Falls back to the catalog until a session has ever been loaded.
+  private async models(): Promise<unknown[]> {
+    if (this.modelCatalog) return this.modelCatalog;
+    const loaded = [...this.threads].find(([, state]) => state.loaded)?.[0];
+    const reported = loaded === undefined
+      ? undefined
+      : await this.options.host.models(loaded).catch(() => undefined);
+    const mapped = reported?.flatMap((model) => {
+      const value = model as { value?: unknown; displayName?: unknown; supportedEffortLevels?: unknown };
+      if (typeof value.value !== "string" || value.value.length === 0) return [];
+      const efforts = Array.isArray(value.supportedEffortLevels)
+        ? value.supportedEffortLevels.filter((effort): effort is string => typeof effort === "string")
+        : [];
+      return [{
+        id: value.value,
+        model: value.value,
+        displayName: typeof value.displayName === "string" ? value.displayName : value.value,
+        hidden: false,
+        supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
+        defaultReasoningEffort: efforts.includes(CLAUDE_DEFAULT_REASONING_EFFORT)
+          ? CLAUDE_DEFAULT_REASONING_EFFORT
+          : efforts.at(-1) ?? CLAUDE_DEFAULT_REASONING_EFFORT,
+        isDefault: value.value === (this.options.launchFlags.model ?? "default"),
+      }];
+    });
+    if (mapped && mapped.length > 0) this.modelCatalog = mapped;
+    return this.modelCatalog ?? claudeModelCatalog(this.options.launchFlags.model);
   }
 
   // The live background/subagent set the host tracks for this session. Undefined when the

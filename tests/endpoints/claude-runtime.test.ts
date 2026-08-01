@@ -99,7 +99,9 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     this.setEfforts.push({ sessionId, ...(effort === undefined ? {} : { effort }) });
   }
 
-  async models(): Promise<unknown[]> { return []; }
+  private modelRows: unknown[] = [];
+  reportModels(rows: unknown[]): void { this.modelRows = rows; }
+  async models(): Promise<unknown[]> { return this.modelRows; }
 
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
@@ -1817,6 +1819,48 @@ test("the thread view names the running turn the transcript has not flushed", as
   );
   const suffix = await reader.descendingSuffix(thread.id, undefined, createHistoryScanBudget());
   assert.deepEqual(suffix.turns.map((turn: any) => turn.id), ["ctx:a"], "and the scan is undisturbed");
+});
+
+// The static catalog asserts the same effort levels for every model, so set_session_model would
+// accept an effort a model does not offer. Claude reports the real per-model set.
+test("model/list reports the efforts Claude actually supports, and remembers them", async () => {
+  const claude = new FakeClaude();
+  claude.reportModels([
+    { value: "claude-opus-4-8", displayName: "Opus 4.8", supportedEffortLevels: ["low", "high"] },
+    { value: "claude-sonnet-5", displayName: "Sonnet 5", supportedEffortLevels: ["medium"] },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  // No session is loaded yet, so the catalog is all there is.
+  const before = await rt.request<{ data: any[] }>("model/list", {});
+  assert.ok(before.data.length > 0, "the picker always has entries to validate against");
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
+  const listed = await rt.request<{ data: any[] }>("model/list", {});
+
+  assert.deepEqual(
+    listed.data.map((m: any) => [m.id, m.supportedReasoningEfforts.map((e: any) => e.reasoningEffort)]),
+    [["claude-opus-4-8", ["low", "high"]], ["claude-sonnet-5", ["medium"]]],
+  );
+  // Endpoint-scoped, so it must not vary with whatever session happens to be open.
+  claude.reportModels([]);
+  const again = await rt.request<{ data: any[] }>("model/list", {});
+  assert.deepEqual(again.data.map((m: any) => m.id), ["claude-opus-4-8", "claude-sonnet-5"]);
+});
+
+// Returning {} reported a rename that never happened. A caller cannot tell that from success.
+test("renaming a Claude session is refused rather than silently dropped", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  await assert.rejects(
+    rt.request("thread/name/set", { threadId: thread.id, name: "new name" }),
+    (error: unknown) => (error as any).code === "UNSUPPORTED_CAPABILITY",
+  );
 });
 
 // A background task or subagent belongs to no turn, so turn/interrupt cannot name it.
