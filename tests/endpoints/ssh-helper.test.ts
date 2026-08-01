@@ -490,6 +490,22 @@ test("the packaged helper bootstraps owner-only assets and inspects an absent is
   const inspected = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
   assert.deepEqual(parseRemoteHelperResponse(inspected.stdout, "inspect"), { status: "absent", supervised: false });
 
+  // The launcher rotates the runtime log only when it STARTS, then execs the server — so no
+  // process remains to rotate a log that is already running, and one grew to 3.1 GB in under
+  // five minutes in /run/user, which is RAM. The probe caps it, which is safe rather than
+  // clever: the launcher redirects with `>>`, so the server's descriptor is O_APPEND and its
+  // next write lands at offset 0 after a truncate.
+  const runtimeLog = `${runtimeDir}/app-server.log`;
+  await writeFile(runtimeLog, Buffer.alloc(65 * 1024 * 1024, 0x61));
+  const capped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  assert.deepEqual(parseRemoteHelperResponse(capped.stdout, "inspect"), { status: "absent", supervised: false });
+  assert.equal((await stat(runtimeLog)).size, 0, "an oversized runtime log is emptied, not left to fill the tmpfs");
+
+  await writeFile(runtimeLog, "recent errors worth keeping");
+  const kept = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", inspectArg], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  assert.deepEqual(parseRemoteHelperResponse(kept.stdout, "inspect"), { status: "absent", supervised: false });
+  assert.equal((await stat(runtimeLog)).size, 27, "a log under the cap is left alone");
+
   const source = `${runtimeDir}/report.txt`;
   await writeFile(source, "descriptor-safe");
   const rootState = await stat(runtimeDir, { bigint: true });

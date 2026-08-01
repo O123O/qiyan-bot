@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, truncate, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -14,6 +14,9 @@ const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
 const DECIMAL = /^\d+$/u;
 const MAX_ARGUMENT_BYTES = 96 * 1024;
+// Declared up here with the other constants because the operation dispatch below runs at
+// module top level: a const defined further down is still in its temporal dead zone by then.
+const RUNTIME_LOG_CAP_BYTES = 64 * 1024 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 107;
 const NFS_SUPER_MAGIC = 0x6969;
 const RESPONSE_PREFIX = "qiyan-helper-v1:";
@@ -118,8 +121,28 @@ async function bootstrap(value) {
   return { installed: true };
 }
 
+// The launcher rotates the runtime log only when it STARTS: it moves the old file aside,
+// keeps its last MiB, and begins a fresh one. Then it execs the server, so no launcher process
+// remains and nothing rotates a log that is already running — which is how one grew to 3.1 GB
+// in under five minutes, in /run/user, which is RAM.
+//
+// Truncating in place is safe rather than clever: the launcher redirects with `>>`, so the
+// server's descriptor is O_APPEND and every write atomically seeks to end-of-file. After a
+// truncate the next write lands at offset 0 — no sparse file, no interleaving, and no
+// intermediary process between tmux and the server, which is what the identity checks rely on.
+// Keeping a tail instead WOULD race the appender, so the whole file goes.
+
+async function capRuntimeLog(logPath) {
+  try {
+    const current = await stat(logPath);
+    if (!current.isFile() || current.size <= RUNTIME_LOG_CAP_BYTES) return;
+    await truncate(logPath, 0);
+  } catch { /* the log is absent or unreadable: nothing to cap, and never a probe failure */ }
+}
+
 async function inspect(value) {
   const paths = runtimePaths(value, true);
+  await capRuntimeLog(join(paths.runtimeDir, "app-server.log"));
   const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
   const identityFile = await stat(paths.identityPath).catch(() => undefined);
   const socketFile = await stat(paths.socketPath).catch(() => undefined);
@@ -200,6 +223,7 @@ async function stop(value) {
 // private — so the two providers cannot drift into different liveness semantics.
 async function inspectClaudeHost(value) {
   const paths = claudeRuntimePaths(value, true);
+  await capRuntimeLog(join(paths.runtimeDir, "claude-host.log"));
   const tmux = await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true);
   const identityFile = await stat(paths.claudeHostIdentityPath).catch(() => undefined);
   const socketFile = await stat(paths.claudeHostSocketPath).catch(() => undefined);
