@@ -1822,32 +1822,36 @@ test("the thread view names the running turn the transcript has not flushed", as
 });
 
 // The static catalog asserts the same effort levels for every model, so set_session_model would
-// accept an effort a model does not offer. Claude reports the real per-model set.
-test("model/list reports the efforts Claude actually supports, and remembers them", async () => {
+// accept an effort a model does not offer. Claude reports the real per-model set — but only as
+// an OVERLAY. The catalog is what guarantees a `default` row, and `set_reasoning_effort` looks
+// the session's CURRENT model up in this list: a Claude endpoint with no pinned model reports
+// that as the literal "default", so replacing the catalog would break setting effort on the
+// default configuration of every Claude endpoint.
+test("model/list overlays Claude's real efforts without dropping what the catalog guarantees", async () => {
   const claude = new FakeClaude();
   claude.reportModels([
     { value: "claude-opus-4-8", displayName: "Opus 4.8", supportedEffortLevels: ["low", "high"] },
-    { value: "claude-sonnet-5", displayName: "Sonnet 5", supportedEffortLevels: ["medium"] },
   ]);
   const rt = makeRuntime(claude);
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
-
-  // No session is loaded yet, so the catalog is all there is.
-  const before = await rt.request<{ data: any[] }>("model/list", {});
-  assert.ok(before.data.length > 0, "the picker always has entries to validate against");
-
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "go" }] });
-  const listed = await rt.request<{ data: any[] }>("model/list", {});
 
+  const listed = await rt.request<{ data: any[] }>("model/list", {});
+  const byId = new Map(listed.data.map((model: any) => [model.id, model]));
+
+  assert.ok(byId.has("default"), "the documented way to clear a model override stays settable");
   assert.deepEqual(
-    listed.data.map((m: any) => [m.id, m.supportedReasoningEfforts.map((e: any) => e.reasoningEffort)]),
-    [["claude-opus-4-8", ["low", "high"]], ["claude-sonnet-5", ["medium"]]],
+    byId.get("claude-opus-4-8").supportedReasoningEfforts.map((e: any) => e.reasoningEffort),
+    ["low", "high"],
+    "and the model Claude described carries the efforts it actually offers",
   );
-  // Endpoint-scoped, so it must not vary with whatever session happens to be open.
+  assert.equal(listed.data.filter((model: any) => model.isDefault).length, 1, "exactly one default");
+
+  // Endpoint-scoped, so it must not vary with whichever session happens to be open.
   claude.reportModels([]);
   const again = await rt.request<{ data: any[] }>("model/list", {});
-  assert.deepEqual(again.data.map((m: any) => m.id), ["claude-opus-4-8", "claude-sonnet-5"]);
+  assert.deepEqual(again.data.map((m: any) => m.id), listed.data.map((m: any) => m.id));
 });
 
 // Returning {} reported a rename that never happened. A caller cannot tell that from success.

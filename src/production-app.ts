@@ -1627,7 +1627,12 @@ export async function recoverManagedEndpointReady(
   resumeUnattempted?: () => Promise<void>,
 ): Promise<ManagedEndpointReadyOutcome> {
   const result = await owner.endpointReady(endpointId, lease, wakeShared);
-  if (result.recovery === "none" && resumeUnattempted) await resumeUnattempted();
+  // Unconditional: the owner recovering something does not mean it recovered EVERYTHING.
+  // resumeManagedSessions breaks out when the generation changes mid-walk, so a previous
+  // attempt can leave one session pending and a tail of sessions never attempted at all —
+  // and a later ready that reports "pending" would then skip that tail for good. The walk
+  // costs nothing when every session is already established.
+  if (resumeUnattempted) await resumeUnattempted();
   if (result.sharedWake !== "needed") return result;
   await wakeShared();
   return { ...result, sharedWake: "completed" };

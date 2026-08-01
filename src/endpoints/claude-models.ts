@@ -1,27 +1,25 @@
-// TODO(claude-model-list): this catalog is STATIC, not real-time — it does not reflect the host's
-// actual available models, account/org access, or new releases; it can go stale as Claude ships
-// models. Replace it with the live Claude model list once Claude Code exposes one non-interactively
-// (open feature request anthropics/claude-code#12612 — `claude model list`); until then keep the
-// documented aliases here in sync with the model-config docs.
+// The FALLBACK model catalog, and the floor every model list is built on.
 //
-// Curated Claude model catalog. Claude Code has NO `models` list API (verified: the CLI has no
-// `models`/`config get` command — it's an open feature request), so QiYan cannot discover models
-// dynamically. This static list of the documented `--model` aliases is what `model/list` returns
-// for a Claude endpoint, so `set_session_model` (which validates against it) and the assistant's
-// picker have real, stable entries. Aliases resolve to the latest concrete model on the host; the
-// transcript records the resolved id.
+// The SDK does report Claude's real models (`supportedModels()`), and claude-runtime overlays
+// that onto these entries for the one thing only it knows: which effort levels each model
+// actually offers. This list is still what answers `model/list` until any session has been
+// loaded, and it is never replaced, because it is the only source of two entries the live list
+// does not contain:
 //
-// `default` is the special alias that CLEARS any model override and reverts to your account's
-// recommended model (or the org default) — i.e. "follow the user's setting". It is the catalog
-// default unless the endpoint pins one via its endpoints.json `model`.
+//   - `default`, the special alias that CLEARS a model override and reverts to your account's
+//     recommended model (or the org default). `set_session_model default` is the documented way
+//     to do that, and `set_reasoning_effort` looks the session's CURRENT model up in this list —
+//     which for an endpoint with no pinned model is the literal string "default".
+//   - the endpoint's pinned `endpoints.json` model, which may be an alias Claude does not list.
 //
-// Context windows (per the models overview): opus/sonnet/fable are 1M-token; haiku is 200k.
+// Aliases resolve to the latest concrete model on the host; the transcript records the resolved
+// id. Context windows (per the models overview): opus/sonnet/fable are 1M-token, haiku 200k.
 // Effort defaults to `high` on Opus 4.8 / Claude Code, so that is the catalog default effort.
 //
-// INVARIANT: every entry shares the SAME `supportedReasoningEfforts` — `set_reasoning_effort`
-// validates the requested effort against the session's resolved model, so divergent effort sets
-// per model would make validation depend on which model is current. `--effort` accepts exactly
-// these levels (verified via `claude --help`).
+// Entries here share one `supportedReasoningEfforts` set because a static list cannot know
+// better. That is a floor, NOT an invariant of `model/list`: the live overlay deliberately gives
+// a model the narrower set it reports, and `set_reasoning_effort` validates against whichever
+// entry is current. `--effort` accepts exactly these levels (verified via `claude --help`).
 
 export const CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export const CLAUDE_DEFAULT_REASONING_EFFORT = "high";

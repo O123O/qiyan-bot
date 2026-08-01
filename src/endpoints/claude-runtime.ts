@@ -368,6 +368,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       state.running = [];
       state.liveItems.clear();
     }
+    // Claude's reported model list belongs to the host build that answered it; an operator
+    // restarts an endpoint precisely to pick up an upgraded remote `claude`.
+    delete this.modelCatalog;
     // The background work died with the sessions, and no task/set will ever arrive to retire
     // it. Keeping the counts would report every one of those threads active for good.
     this.taskActivity.clear();
@@ -809,30 +812,68 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // open. Falls back to the catalog until a session has ever been loaded.
   private async models(): Promise<unknown[]> {
     if (this.modelCatalog) return this.modelCatalog;
+    // The catalog is the FLOOR, never replaced by what Claude reports. It is what guarantees a
+    // `default` row — the documented way to clear a model override — the endpoint's pinned
+    // alias, and exactly one isDefault. Claude reports concrete ids, so replacing the catalog
+    // with them makes `default` unknown, and `set_reasoning_effort` looks the session's CURRENT
+    // model up in this list: a Claude endpoint with no pinned model reports that as the literal
+    // "default", so replacing would break setting effort on the default configuration of every
+    // Claude endpoint. Live rows are overlaid onto it for the one thing only they know.
+    const catalog = claudeModelCatalog(this.options.launchFlags.model);
     const loaded = [...this.threads].find(([, state]) => state.loaded)?.[0];
     const reported = loaded === undefined
       ? undefined
       : await this.options.host.models(loaded).catch(() => undefined);
-    const mapped = reported?.flatMap((model) => {
-      const value = model as { value?: unknown; displayName?: unknown; supportedEffortLevels?: unknown };
-      if (typeof value.value !== "string" || value.value.length === 0) return [];
-      const efforts = Array.isArray(value.supportedEffortLevels)
-        ? value.supportedEffortLevels.filter((effort): effort is string => typeof effort === "string")
-        : [];
-      return [{
-        id: value.value,
-        model: value.value,
-        displayName: typeof value.displayName === "string" ? value.displayName : value.value,
-        hidden: false,
-        supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
-        defaultReasoningEffort: efforts.includes(CLAUDE_DEFAULT_REASONING_EFFORT)
-          ? CLAUDE_DEFAULT_REASONING_EFFORT
-          : efforts.at(-1) ?? CLAUDE_DEFAULT_REASONING_EFFORT,
-        isDefault: value.value === (this.options.launchFlags.model ?? "default"),
-      }];
+    if (!reported || reported.length === 0) return catalog;
+    const live = new Map<string, { displayName?: string; efforts: string[] }>();
+    for (const model of reported) {
+      const row = model as { value?: unknown; resolvedModel?: unknown; displayName?: unknown; supportedEffortLevels?: unknown };
+      if (typeof row.value !== "string" || row.value.length === 0) continue;
+      const entry = {
+        ...(typeof row.displayName === "string" && row.displayName.length > 0 ? { displayName: row.displayName } : {}),
+        efforts: Array.isArray(row.supportedEffortLevels)
+          ? row.supportedEffortLevels.filter((effort): effort is string => typeof effort === "string")
+          : [],
+      };
+      live.set(row.value, entry);
+      // An alias row names the wire id it resolves to, so a catalog entry keyed either way finds it.
+      if (typeof row.resolvedModel === "string" && row.resolvedModel.length > 0 && !live.has(row.resolvedModel)) {
+        live.set(row.resolvedModel, entry);
+      }
+    }
+    const merged = catalog.map((entry) => {
+      const match = live.get(entry.id);
+      if (!match || match.efforts.length === 0) return entry;
+      return {
+        ...entry,
+        ...(match.displayName === undefined ? {} : { displayName: match.displayName }),
+        supportedReasoningEfforts: match.efforts.map((reasoningEffort) => ({ reasoningEffort })),
+        // Keep the configured default when the model offers it; otherwise the CHEAPEST it
+        // offers, because a model silently defaulted to its most expensive level is a surprise
+        // nobody asked for.
+        defaultReasoningEffort: match.efforts.includes(entry.defaultReasoningEffort)
+          ? entry.defaultReasoningEffort
+          : match.efforts[0]!,
+      };
     });
-    if (mapped && mapped.length > 0) this.modelCatalog = mapped;
-    return this.modelCatalog ?? claudeModelCatalog(this.options.launchFlags.model);
+    const known = new Set(catalog.map((entry) => entry.id));
+    for (const [id, match] of live) {
+      if (known.has(id) || match.efforts.length === 0) continue;
+      known.add(id);
+      merged.push({
+        id,
+        model: id,
+        displayName: match.displayName ?? id,
+        hidden: false,
+        supportedReasoningEfforts: match.efforts.map((reasoningEffort) => ({ reasoningEffort })),
+        defaultReasoningEffort: match.efforts.includes(CLAUDE_DEFAULT_REASONING_EFFORT)
+          ? CLAUDE_DEFAULT_REASONING_EFFORT
+          : match.efforts[0]!,
+        isDefault: false,
+      });
+    }
+    this.modelCatalog = merged;
+    return merged;
   }
 
   // The live background/subagent set the host tracks for this session. Undefined when the

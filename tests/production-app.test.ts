@@ -1663,9 +1663,13 @@ test("managed endpoint-ready composition supplies any shared wake the owner has 
 // every remote host, whose ssh, tmux, and handshake outlast the startup window. Its sessions stay
 // registered-but-unknown, which the manager reports as a session whose state cannot be
 // established: down, and refusing work, while the worker it names is running and reachable.
-test("an endpoint ready with nothing pending still resumes sessions never attempted", async () => {
+//
+// Unconditional, because the owner recovering SOMETHING does not mean it recovered everything: a
+// walk that stops on a generation change leaves a tail never attempted, and a later ready
+// reporting "pending" would skip that tail for good.
+test("every endpoint ready resumes the sessions that were never attempted", async () => {
   const lease: EndpointWorkLease = { endpointId: "endpoint-a", lifecycleGeneration: 1, endpointGeneration: 1, leaseId: "ready" };
-  for (const [recovery, expectedResumes] of [["none", 1], ["pending", 0], ["completed", 0]] as const) {
+  for (const recovery of ["none", "pending", "completed"] as const) {
     let resumes = 0;
     await recoverManagedEndpointReady(
       { endpointReady: async () => ({ recovery, sharedWake: "completed" }) },
@@ -1674,7 +1678,7 @@ test("an endpoint ready with nothing pending still resumes sessions never attemp
       async () => {},
       async () => { resumes += 1; },
     );
-    assert.equal(resumes, expectedResumes, `recovery=${recovery}`);
+    assert.equal(resumes, 1, `recovery=${recovery}`);
   }
 });
 
