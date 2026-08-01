@@ -2352,16 +2352,33 @@ export async function buildProductionApp(
   // The web file store: inbound sends and outbound files QiYan sends both land here, and the paths
   // are surfaced to the browser (clickable preview). Read lazily so `dataDir` is the finalized root.
   const webUploads = () => ({ dir: join(dataDir, "web-uploads"), maxBytes: config.attachmentMaxBytes, ttlMs: 30 * 24 * 60 * 60 * 1000 });
+  // Sessions whose rollout location is being relearned, so a panel that retries does not
+  // stack reconciles for the same thread.
+  const relearningLocations = new Set<string>();
   const readCodexWorkerTurns = createCodexConversationHistoryRead({
     locations: codexRolloutLocations,
     nativeSession: (endpointId, threadId, mappingId) =>
       nativeSessions.view({ endpointId, threadId, mappingId }),
     // A rollout location is learned by reconciling the thread, which is what hydrateThreadOrder
-    // does with the resulting view. Arming the existing retry is enough: it reconciles the exact
-    // session and the next read finds the location, instead of the reader being told to repeat
-    // the action that just failed.
+    // does with the resulting view.
+    //
+    // Reconciled DIRECTLY, not by arming the managed retry: that path filters on
+    // `unavailableOnly`, so it skips any session that is ready and merely lacks a location —
+    // which is every session that reaches here. Arming it promised a re-read that could never
+    // happen and left the reader watching a message that would never resolve.
+    //
+    // Debounced per session: each failed history read asks again, and a panel retries.
     relearnLocation: (endpointId, threadId, mappingId) => {
-      managedRecoveryOwner?.recordFailure(managedRetryKey(endpointId, threadId, mappingId), "retry");
+      const key = managedRetryKey(endpointId, threadId, mappingId);
+      if (relearningLocations.has(key)) return;
+      relearningLocations.add(key);
+      runBackground(
+        async () => {
+          try { await resumeManagedSessions(endpointId, { keys: [key] }); }
+          finally { relearningLocations.delete(key); }
+        },
+        () => recordBackgroundFailure("rollout location relearn"),
+      );
     },
     readPage: async ({ endpointId, allowMissing, ...input }, signal) => {
       const context = remoteContexts.get(endpointId);
