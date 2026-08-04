@@ -176,6 +176,11 @@ const assistantMappingId = "assistant";
 // time and is never refreshed, so after a restart every recovered operation is already older
 // than any age budget and would be retired on its first failure, having tried nothing.
 const LIFECYCLE_RECOVERY_MAX_FAILURES = 5;
+// How long startup waits for referenced endpoints to come up before continuing without the
+// stragglers. They keep connecting in the background and publish when they land, so this
+// bounds the WAIT, not the work — an unreachable host costs its full connect timeout, and
+// startup spent 48s of ~70s holding for hosts nobody was waiting on.
+const STARTUP_ENDPOINT_ACTIVATION_BUDGET_MS = 12_000;
 const recoveryTurnWindowLimit = 64;
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
@@ -3353,7 +3358,18 @@ export async function buildProductionApp(
     {
       name: "assistant",
       start: async () => {
-        await reconcileDashboard(true);
+        // The assistant phase is most of startup and, until this, a single opaque number. Same
+        // rule as the phase timer: report only what is slow, so the line that appears is the
+        // answer rather than a table to read.
+        const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+          const began = Date.now();
+          try { return await run(); }
+          finally {
+            const elapsedMs = Date.now() - began;
+            if (elapsedMs >= 1_000) report({ level: "info", code: "startup_phase_completed", phase: `assistant_${name}`, elapsedMs });
+          }
+        };
+        await step("dashboard", () => reconcileDashboard(true));
         await activateAssistantProfileIdentity({
           registry,
           endpointId: assistantEndpoint.id,
@@ -3361,7 +3377,7 @@ export async function buildProductionApp(
           activationRequired: assistantProfile.activationRequired,
           markActivated: () => assistantProfile.markActivated(),
         });
-        const assistantNativeStatus = await startOrResumeAssistant();
+        const assistantNativeStatus = await step("assistant_session", () => startOrResumeAssistant());
         const identity = registry.snapshot().assistant;
         const assistantThread = conversationCutoverNeedsAssistantHistory(db)
           ? await readBoundedThread(identity.endpoint, identity.thread_id)
@@ -3426,11 +3442,13 @@ export async function buildProductionApp(
           lifecycleOwnedEndpointIds: lifecycleOwned,
           assistantEndpointId: assistantEndpoint.id,
         });
-        const activation = await endpointManager.activateReferenced(referencedEndpoints);
-        await reconcileOperations();
+        const activation = await step("endpoints", () => endpointManager.activateReferenced(
+          referencedEndpoints, STARTUP_ENDPOINT_ACTIVATION_BUDGET_MS,
+        ));
+        await step("operations", () => reconcileOperations());
         conversations.repairQueueNotices();
-        await reconcileStartupLifecycleState();
-        const capacityBootstrapped = await resumeStartupManagedSessions();
+        await step("lifecycle_state", () => reconcileStartupLifecycleState());
+        const capacityBootstrapped = await step("managed_sessions", () => resumeStartupManagedSessions());
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
           // Managed startup recovery already performed the endpoint reconcile (relay + claims)
           // behind the startup barrier. Do not race or repeat it here.
@@ -3440,8 +3458,8 @@ export async function buildProductionApp(
           endpointReadyBuffer?.acknowledge(endpointId);
         }
         deliveries.recoverAfterCrash();
-        await reconcileDeliveryEvents();
-        await endpointReadyBuffer?.acceptAndDrain();
+        await step("delivery_events", () => reconcileDeliveryEvents());
+        await step("endpoint_ready", async () => { await endpointReadyBuffer?.acceptAndDrain(); });
         assistantToolReadiness.ready();
       }, stop: async () => undefined,
     },
