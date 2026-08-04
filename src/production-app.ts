@@ -91,7 +91,7 @@ import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
-import { openDatabase, type Database } from "./storage/database.ts";
+import { markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lease.ts";
 import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
@@ -2623,6 +2623,9 @@ export async function buildProductionApp(
           blockedStorageCleanup = { database: db, lease };
           throw error;
         }
+        // Only after SQLite closed without complaint, and only describing the file as it is
+        // now: this is the whole basis on which the next open skips verifying it.
+        markDatabaseClosedCleanly(join(dataDir, "bot.sqlite3"));
         try { await lease.release(); }
         catch (error) {
           blockedStorageCleanup = { lease };

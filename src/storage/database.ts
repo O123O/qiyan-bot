@@ -11,7 +11,9 @@ import {
   readSync,
   rmSync,
   statSync,
+  writeFileSync,
   writeSync,
+  readFileSync,
   type BigIntStats,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +26,8 @@ export type Database = DatabaseSync;
 
 interface OpenDatabaseOptions {
   closeInspector?: (inspector: DatabaseSync) => void;
+  /** Skip verification outright. Set only where the caller has already established the file. */
+  verifyIntegrity?: false;
 }
 
 const integrityFailure = "QiYan Bot state database failed integrity check; restore or recover it before starting";
@@ -54,10 +58,49 @@ export function isDatabaseIntegrityFailure(error: unknown): boolean {
   return error instanceof DatabaseIntegrityError;
 }
 
+// Written when the database is closed cleanly, and consumed by the next open. It records the
+// file the marker describes, so it cannot vouch for a different or later state.
+function cleanShutdownMarkerPath(path: string): string { return `${path}.clean`; }
+
+function cleanShutdownMarker(path: string): string | undefined {
+  try {
+    const stats = statSync(path, { bigint: true });
+    return `${stats.size}:${stats.mtimeNs}:${stats.ino}`;
+  } catch { return undefined; }
+}
+
+/** Records that this database was closed cleanly, so the next open can skip verifying it. */
+export function markDatabaseClosedCleanly(path: string): void {
+  if (path === ":memory:") return;
+  const marker = cleanShutdownMarker(path);
+  if (marker === undefined) return;
+  try { writeFileSync(cleanShutdownMarkerPath(path), marker, { mode: 0o600 }); }
+  catch { /* Best effort: a missing marker only costs the next open its verification. */ }
+}
+
+// The integrity check copies the whole database and scans it, which is work proportional to the
+// FILE — startup paid it every time, on a network filesystem, for a database that is mostly
+// free pages. It exists to catch corruption, and a database closed cleanly by the process that
+// owned it is not a plausible place for corruption to have appeared. So the check now runs
+// where it earns its cost: after an unclean exit, or when the marker does not describe the file
+// actually on disk.
+function verifiedByCleanShutdown(path: string): boolean {
+  let recorded: string;
+  try { recorded = readFileSync(cleanShutdownMarkerPath(path), "utf8").trim(); }
+  catch { return false; }
+  const actual = cleanShutdownMarker(path);
+  return actual !== undefined && recorded === actual;
+}
+
 export function openDatabase(path: string, options: OpenDatabaseOptions = {}): Database {
   if (path !== ":memory:") {
     const state = existingFileState(path);
-    if (state === "nonempty") assertQiYanDatabase(path, options.closeInspector ?? ((inspector) => { inspector.close(); }));
+    if (state === "nonempty" && !(options.verifyIntegrity === false || verifiedByCleanShutdown(path))) {
+      assertQiYanDatabase(path, options.closeInspector ?? ((inspector) => { inspector.close(); }));
+    }
+    // Consumed: the database is about to be written, so the marker no longer describes it and
+    // a crash from here on must fall back to verifying.
+    try { rmSync(cleanShutdownMarkerPath(path), { force: true }); } catch { /* nothing to consume */ }
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   }
   const db = new DatabaseSync(path);
