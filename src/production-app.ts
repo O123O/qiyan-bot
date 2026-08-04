@@ -474,18 +474,27 @@ export function createEndpointReadyBuffer(options: {
     },
     acknowledge: (endpointId) => { pending.delete(endpointId); },
     pause: () => { if (!stopped) accepting = false; },
+    // Concurrently, for the same reason activateReferenced is: these are different endpoints
+    // with nothing ordered between them, and draining them one at a time made this the SUM of
+    // every endpoint's recovery. It is also where the cost lands once startup stops waiting for
+    // slow endpoints to activate — bounding that wait moved 48s into this loop rather than
+    // removing it, because the serial shape was the real problem in both places.
     acceptAndDrain: async () => {
       if (stopped) return;
       accepting = true;
-      for (const endpointId of [...pending].sort()) {
-        if (stopped || !accepting) break;
+      let failure: unknown;
+      await Promise.all([...pending].sort().map(async (endpointId) => {
+        // Re-checked per endpoint rather than once: a pause partway through must stop the ones
+        // that have not begun, which is what breaking out of the loop used to do.
+        if (stopped || !accepting) return;
         pending.delete(endpointId);
         try { await requestRecovery(endpointId); }
         catch (error) {
           if (!stopped) pending.add(endpointId);
-          throw error;
+          failure ??= error;
         }
-      }
+      }));
+      if (failure !== undefined) throw failure;
     },
     stop: async () => {
       stopped = true;
