@@ -29,6 +29,11 @@ const launcherPath = new URL("../../assets/remote/qiyan-app-server-launcher.sh",
 const claudeHostPath = new URL("../../assets/remote/qiyan-claude-host.mjs", import.meta.url);
 const claudeHostLauncherPath = new URL("../../assets/remote/qiyan-claude-host-launcher.sh", import.meta.url);
 
+// The pins are written by scripts/build.mjs from the assets themselves, so this asserts the
+// build was run — not that someone pasted the right sha. Maintaining them by hand made a
+// version bump silently poisonous: the Claude host embeds APP_VERSION, so bumping changed its
+// bytes, and requireDigest verifies the WHOLE bundle at once — one stale pin fails every SSH
+// endpoint, Codex included. v1.0.0 shipped exactly that.
 test("packaged remote assets match their pinned digests", async () => {
   const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
   assert.equal(digest(await readFile(helperPath)), REMOTE_HELPER_SHA256);

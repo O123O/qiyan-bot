@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { build } from "esbuild";
@@ -47,9 +48,40 @@ async function buildClaudeHost(target) {
   await rename(temporary, target);
 }
 
+// The pins src/endpoints/ssh-runtime.ts holds for the remote assets, rewritten from the assets
+// themselves. They used to be maintained by hand, which meant every change to an asset — and
+// every VERSION BUMP, because the Claude host embeds APP_VERSION — needed a sha pasted in by a
+// person who had to remember to. Forgetting was not a small failure: requireDigest verifies the
+// whole bundle at once, so one stale pin fails prepareRemoteHost for EVERY SSH endpoint, Codex
+// included, with "packaged SSH runtime assets are unavailable". v1.0.0 shipped exactly that.
+async function syncRemoteAssetDigests() {
+  const pinned = [
+    ["REMOTE_HELPER_SHA256", "assets/remote/qiyan-ssh-helper.mjs"],
+    ["REMOTE_LAUNCHER_SHA256", "assets/remote/qiyan-app-server-launcher.sh"],
+    ["REMOTE_CLAUDE_HOST_SHA256", "assets/remote/qiyan-claude-host.mjs"],
+    ["REMOTE_CLAUDE_HOST_LAUNCHER_SHA256", "assets/remote/qiyan-claude-host-launcher.sh"],
+  ];
+  const source = resolve(root, "src/endpoints/ssh-runtime.ts");
+  const before = await readFile(source, "utf8");
+  let after = before;
+  for (const [name, assetPath] of pinned) {
+    const digest = createHash("sha256").update(await readFile(resolve(root, assetPath))).digest("hex");
+    const pattern = new RegExp(`(export const ${name} = ")[a-f0-9]*(";)`, "u");
+    if (!pattern.test(after)) throw new Error(`no pin declaration found for ${name}`);
+    after = after.replace(pattern, `$1${digest}$2`);
+  }
+  if (after === before) return;
+  await writeFile(source, after);
+  console.log("build: refreshed remote asset digests in src/endpoints/ssh-runtime.ts");
+}
+
 if (claudeHostOnly) {
   await buildClaudeHost(resolve(root, process.argv[3] ?? claudeHostOutfile));
 } else {
+  // Assets first, then their pins, then the bundle — so dist/qiyan-bot is compiled against
+  // digests that already describe the assets shipped beside it.
+  await buildClaudeHost(claudeHostOutfile);
+  await syncRemoteAssetDigests();
   await rm(dist, { recursive: true, force: true });
   await build({
     absWorkingDir: root,
@@ -72,5 +104,4 @@ if (claudeHostOnly) {
     logLevel: "info",
   });
   await chmod(outfile, 0o755);
-  await buildClaudeHost(claudeHostOutfile);
 }
