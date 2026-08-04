@@ -209,13 +209,20 @@ export class EndpointManager {
     return true;
   }
 
+  // Concurrently, because these are DIFFERENT endpoints: each has its own record, its own
+  // activation lock and its own transport, so nothing here is ordered with respect to anything
+  // else. Dialling them one at a time made startup the SUM of every remote's handshake — each
+  // one an ssh spawn and an app-server probe — and an endpoint that was merely slow delayed
+  // every endpoint behind it. A host that is down costs its full connect timeout, so serially
+  // that alone could exceed the whole startup budget.
   async activateReferenced(ids: readonly string[]): Promise<{ unavailable: string[] }> {
     const unavailable: string[] = [];
-    for (const id of [...new Set(ids)]) {
+    await Promise.all([...new Set(ids)].map(async (id) => {
       try { await this.ensureReady(id); }
       catch { unavailable.push(id); }
-    }
-    return { unavailable };
+    }));
+    // Stable regardless of which endpoint answered first: callers compare and log this.
+    return { unavailable: unavailable.sort() };
   }
 
   async disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {

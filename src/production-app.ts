@@ -5655,7 +5655,11 @@ export async function buildProductionApp(
     );
   }
 
-  return composeApp(phases);
+  return composeApp(phases, (phase, elapsedMs) => {
+    // Only the slow ones: a line per phase would bury the signal, and the question this exists
+    // to answer is "which phase is holding startup", not "what did each cost".
+    if (elapsedMs >= 1_000) report({ level: "info", code: "startup_phase_completed", phase, elapsedMs });
+  });
 }
 
 export function createChatHistoryAction(

@@ -1031,6 +1031,38 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
 });
 
+// These are different endpoints with independent locks and transports, so dialling them one at
+// a time made startup the SUM of every remote handshake — and one slow or unreachable host
+// delayed every endpoint queued behind it, which is how startup reached ~70s for the phase that
+// does this. Nothing about the result may change: the unavailable set is still exact.
+test("referenced endpoints are activated concurrently, not one after another", async () => {
+  const first = new FakeEndpoint("devbox");
+  const second = new FakeEndpoint("devbox2");
+  const { manager } = queuedFixture([first, second]);
+  // A barrier, so this cannot pass by accident: neither handshake completes until BOTH have
+  // begun. Activated one at a time, the first would wait for a second start that can never
+  // happen while it holds the loop — so serial activation does not merely run slower here, it
+  // fails to finish at all.
+  let bothStarted!: () => void;
+  const started = new Promise<void>((resolve) => { bothStarted = resolve; });
+  let begun = 0;
+  const gate = Promise.race([
+    started,
+    new Promise<void>((_, reject) => setTimeout(() => reject(new Error("endpoints were activated serially")), 2_000)),
+  ]);
+  for (const endpoint of [first, second]) {
+    endpoint.startGate = gate;
+    endpoint.onStart = () => { if ((begun += 1) === 2) bothStarted(); };
+  }
+  second.failStart = true;
+  second.startError = new Error("that host is down");
+
+  const result = await manager.activateReferenced(["devbox", "devbox2"]);
+
+  assert.equal(begun, 2);
+  assert.deepEqual(result.unavailable, ["devbox2"], "and the failing endpoint is still reported exactly");
+});
+
 test("a close that never answers cannot leave the endpoint draining", async () => {
   const first = new FakeEndpoint("devbox");
   const abandoned = new FakeEndpoint("devbox");

@@ -6,6 +6,7 @@ export type OperationalEventCode =
   | "web_ui_lan_exposure"
   | "chat_input_ignored"
   | "chat_ingress_failed"
+  | "startup_phase_completed"
   | "chat_ingress_recovered"
   | "chat_connection_lost"
   | "chat_reconnect_failed"
@@ -35,6 +36,8 @@ export interface OperationalEvent {
   reason?: string;
   component?: string;
   consecutiveFailures?: number;
+  phase?: string;
+  elapsedMs?: number;
 }
 
 export type OperationalEventSink = (event: OperationalEvent) => void;
@@ -49,6 +52,8 @@ export function createOperationalLogSink(
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
     if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
     if (event.consecutiveFailures !== undefined) fields.push(`consecutive_failures=${safeCount(event.consecutiveFailures)}`);
+    if (event.phase !== undefined) fields.push(`phase=${safeToken(event.phase)}`);
+    if (event.elapsedMs !== undefined) fields.push(`elapsed_ms=${safeCount(event.elapsedMs)}`);
     try { write(`qiyan-bot: ${event.level.toUpperCase()} ${fields.join(" ")}\n`); }
     catch { /* operational logging must not change runtime behavior */ }
   };

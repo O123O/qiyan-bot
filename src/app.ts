@@ -28,7 +28,13 @@ export class TerminalInbox<T> {
   }
 }
 
-export function composeApp(phases: readonly AppPhase[]): BotApp {
+export function composeApp(
+  phases: readonly AppPhase[],
+  // Reports how long each startup phase took. Startup is ~2.5 minutes and nothing said where
+  // it went: the phases are named, but only their FAILURES were ever reported, so a slow one
+  // was indistinguishable from a fast one. Measuring is the prerequisite for fixing it.
+  onPhaseStarted?: (phase: string, elapsedMs: number) => void,
+): BotApp {
   const started: AppPhase[] = [];
   let state: "stopped" | "starting" | "running" | "stopping" = "stopped";
   let transition: Promise<void> | undefined;
@@ -44,7 +50,9 @@ export function composeApp(phases: readonly AppPhase[]): BotApp {
         try {
           for (const phase of phases) {
             startingPhase = phase.name;
+            const began = Date.now();
             await phase.start();
+            onPhaseStarted?.(phase.name, Date.now() - began);
             started.push(phase);
           }
           startingPhase = undefined;
