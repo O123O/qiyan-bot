@@ -1382,21 +1382,18 @@ test("a restart still refuses to race an earlier dispatched operation", async ()
 // lifecycle action forever, including the disconnect that would have ended the situation. An
 // operation the system cannot reconcile has to stop being an obstacle on its own.
 test("an unreconcilable lifecycle operation is retired rather than fencing forever", async () => {
-  const created = 1_000_000;
-  const exhausted = (over: boolean, state = "uncertain"): boolean => lifecycleRecoveryExhausted({
-    policy: "endpoint_lifecycle",
-    state,
-    createdAt: created,
-    now: created + (over ? 60_001 : 59_999),
-    maxAgeMs: 60_000,
+  const exhausted = (failures: number, state = "uncertain"): boolean => lifecycleRecoveryExhausted({
+    policy: "endpoint_lifecycle", state, failures, maxFailures: 3,
   });
 
-  assert.equal(exhausted(false), false, "inside the budget it stays recoverable");
-  assert.equal(exhausted(true), true, "past it the operation stops blocking later lifecycle actions");
-  // Elapsed time never makes retiring an in-flight operation safe: it is genuinely running.
-  assert.equal(exhausted(true, "dispatched"), false, "a dispatched operation is never retired on age");
+  assert.equal(exhausted(2), false, "while attempts are still being spent it stays recoverable");
+  assert.equal(exhausted(3), true, "once they are exhausted it stops blocking later lifecycle actions");
+  // Counted in attempts, not elapsed time: `createdAt` is the ledger insert time and is never
+  // refreshed, so after a restart every recovered operation is already past any age budget and
+  // would be retired on its first failure, having tried nothing at all.
+  assert.equal(exhausted(3, "dispatched"), false, "a dispatched operation is never retired — it is genuinely running");
   assert.equal(lifecycleRecoveryExhausted({
-    policy: "ready_endpoint", state: "uncertain", createdAt: created, now: created + 10 * 60_000, maxAgeMs: 60_000,
+    policy: "ready_endpoint", state: "uncertain", failures: 99, maxFailures: 3,
   }), false, "only endpoint-lifecycle operations are retired this way — a send's effect is not superseded");
 });
 

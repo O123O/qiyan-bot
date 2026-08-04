@@ -168,10 +168,14 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
-// How long an endpoint-lifecycle operation may stay unreconcilable before it is retired. It is
-// a give-up, not a proof — the outcome stays unknown — and it exists because the alternative is
-// an endpoint that no operator action can reach for as long as its host stays down.
-const LIFECYCLE_RECOVERY_MAX_AGE_MS = 15 * 60_000;
+// How many consecutive failed recovery attempts retire an endpoint-lifecycle operation. It is a
+// give-up, not a proof — the outcome stays unknown — and it exists because the alternative is an
+// endpoint that no operator action can reach for as long as its host stays down.
+//
+// Counted in attempts rather than elapsed time on purpose. `createdAt` is the ledger insert
+// time and is never refreshed, so after a restart every recovered operation is already older
+// than any age budget and would be retired on its first failure, having tried nothing.
+const LIFECYCLE_RECOVERY_MAX_FAILURES = 5;
 const recoveryTurnWindowLimit = 64;
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
@@ -884,12 +888,11 @@ export async function settleEarlierEndpointOperations(options: {
 export function lifecycleRecoveryExhausted(options: {
   policy: string;
   state: string | undefined;
-  createdAt: number;
-  now: number;
-  maxAgeMs?: number;
+  failures: number;
+  maxFailures?: number;
 }): boolean {
   if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
-  return options.now - options.createdAt > (options.maxAgeMs ?? LIFECYCLE_RECOVERY_MAX_AGE_MS);
+  return options.failures >= (options.maxFailures ?? LIFECYCLE_RECOVERY_MAX_FAILURES);
 }
 
 // A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
@@ -4705,6 +4708,10 @@ export async function buildProductionApp(
     return operationReconciler?.request() ?? Promise.resolve();
   }
 
+  // Consecutive failed recovery attempts per operation, for this process only. Deliberately not
+  // durable: it counts effort actually spent, and a restart genuinely does start that over.
+  const lifecycleRecoveryFailures = new Map<string, number>();
+
   async function reconcileOperationsOnce(): Promise<OperationReconciliationPass> {
     let attempted = false;
     let waitingForEndpoint = false;
@@ -4737,6 +4744,9 @@ export async function buildProductionApp(
         return true;
       }
       attempted = true;
+      // A pass that gets this far will either settle the operation or fail; a run that does not
+      // throw means progress, so the failure streak restarts.
+      lifecycleRecoveryFailures.delete(operation.id);
       const args = operation.args as any;
       let attemptedEndpointGeneration: number | undefined;
       try {
@@ -5183,17 +5193,24 @@ export async function buildProductionApp(
         // runtime attests its identity on the remote host, and a start refuses over a live
         // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
         // is recorded as exactly that: the outcome is unknown, and said so.
+        const failures = (lifecycleRecoveryFailures.get(operation.id) ?? 0) + 1;
+        lifecycleRecoveryFailures.set(operation.id, failures);
         if (lifecycleRecoveryExhausted({
           policy: target.policy,
           state: operations.get(operation.id)?.state,
-          createdAt: operation.createdAt,
-          now: Date.now(),
+          failures,
         })) {
-          operations.fail(operation.id, {
-            message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
-              + `${Math.round(LIFECYCLE_RECOVERY_MAX_AGE_MS / 60_000)} minutes; its outcome is unknown `
-              + "and it no longer blocks later lifecycle actions",
-          });
+          lifecycleRecoveryFailures.delete(operation.id);
+          // `fail` throws if the state moved under us — two bot instances share one ledger in
+          // the deployed setup — and losing the whole reconciliation pass to that would be a
+          // worse outcome than leaving this one operation for the next pass.
+          try {
+            operations.fail(operation.id, {
+              message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
+                + `${failures} failed recovery attempts; its outcome is unknown and it no longer `
+                + "blocks later lifecycle actions",
+            });
+          } catch { /* another writer settled it; nothing left to retire */ }
         }
       }
       const current = operations.get(operation.id);
