@@ -131,6 +131,20 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
 
   isLoaded(sessionId: string): boolean { return this.sessions.has(sessionId); }
   inFlight(sessionId: string): string[] { return [...(this.sessions.get(sessionId)?.inFlight ?? [])]; }
+  // The turn finishes on the host but its completion never reaches QiYan — a stream that ended
+  // without one, or a host that answered while QiYan was restarting.
+  loseCompletion(sessionId: string, uuid: string): void {
+    const session = this.require(sessionId);
+    session.inFlight = session.inFlight.filter((id) => id !== uuid);
+  }
+
+  // A turn the host is holding without QiYan having dispatched it in this process — what a
+  // reattach finds. The real host derives a recovered turn id FROM its in-flight list
+  // (ssh-claude-host.ts: `status.inFlightTurns[0]`), so a fixture that reports one without
+  // holding it describes a host that cannot exist.
+  holdTurn(sessionId: string, uuid: string): void {
+    this.require(sessionId).inFlight.push(uuid);
+  }
 
   // Claude answers. The SDK streams the assistant message and Claude writes the matching
   // transcript row under the SAME uuid — that identity is what keeps the live item id and
@@ -348,6 +362,7 @@ test("cold resume adopts the turn the persistent host reports still running", as
         // A recovered turn means the host still holds that session, so model it: the
         // runtime adopts it as loaded and sends to it without reopening.
         await claude.open({ sessionId: threadId, mode: "resume", cwd: "/remote/work" });
+        claude.holdTurn(threadId, "ctx:live");
         return { turnId: "ctx:live" };
       },
     }),
@@ -1451,6 +1466,38 @@ test("prose quoting the goal marker does not hide the real goal behind it", asyn
   const read = await rt.request<{ goal: any; known: boolean }>("thread/goal/get", { threadId: "thread-prose" });
   assert.equal(read.goal?.objective, "ship the fix");
   assert.equal(read.known, true);
+});
+
+// `state.running` is assembled from events, so a completion that never arrives leaves a turn in
+// it forever: the session reads `active` on a turn that finished hours ago, shows "working"
+// while doing nothing, and queues every later send behind a ghost. The host knows what it is
+// actually running, so a status read asks it rather than trusting the belief.
+test("a turn the host no longer holds is settled instead of running forever", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const terminals: string[] = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/completed") terminals.push(String((params as any).turn?.id ?? ""));
+  });
+  await rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:ghost",
+    input: [{ type: "text", text: "think about it" }],
+  });
+
+  const running = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(running.thread.status.type, "active", "a turn the host IS running still reads active");
+  assert.equal(running.thread.activeTurnId, "to:web:ghost");
+
+  claude.loseCompletion(thread.id, "to:web:ghost");
+
+  const settled = await rt.request<{ thread: any }>("thread/read", { threadId: thread.id });
+  assert.equal(settled.thread.status.type, "idle", "the host no longer holds it, so it is not running");
+  assert.equal(settled.thread.activeTurnId, undefined);
+  assert.ok(terminals.includes("to:web:ghost"),
+    "and its terminal is republished, so the answer it produced is still delivered");
 });
 
 test("a cleared native goal reports none, and the last marker wins", async () => {

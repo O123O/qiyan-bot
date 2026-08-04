@@ -489,6 +489,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private async threadRead(params: Record<string, unknown>): Promise<{ thread: ClaudeThreadView }> {
     const threadId = requireString(params.threadId, "threadId");
     const state = await this.ensureState(threadId);
+    await this.reconcileRunningTurns(threadId, state);
     const projected = params.includeTurns === true
       ? await this.reconstruct(threadId, state)
       : this.stateOnlyThread(threadId, state);
@@ -505,6 +506,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Re-adopting a thread un-tombstones it (Codex parity: resuming an archived thread revives it).
     this.options.archives?.remove(this.id, threadId);
     const state = await this.ensureState(threadId, recoveryCwd);
+    await this.reconcileRunningTurns(threadId, state);
     const projected = params.excludeTurns === true
       ? this.stateOnlyThread(threadId, state)
       : await this.reconstruct(threadId, state);
@@ -623,6 +625,35 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         ? { ...turn, status: "inProgress" }
         : turn),
     };
+  }
+
+  // `state.running` is a BELIEF, assembled from events. A completion that never arrives — a
+  // stream that ended without one, a host that answered while QiYan was restarting — leaves a
+  // turn in it forever, and the session then reads `active` on a turn that finished hours ago:
+  // permanently "working" while doing nothing, with every send queued behind a ghost.
+  //
+  // The host knows what it is actually running. Ask it, and settle anything it no longer holds.
+  // Only when no start is in flight: a turn is added to `running` before the host accepts it,
+  // and that window would otherwise look exactly like a turn the host has forgotten.
+  private async reconcileRunningTurns(threadId: string, state: ThreadState): Promise<void> {
+    if (state.running.length === 0 || this.startingTurns > 0 || !state.loaded) return;
+    const status = await this.options.host.status(threadId).catch(() => undefined);
+    if (!status) return;
+    const settled = state.running.filter((id) => !status.inFlightTurns.includes(id));
+    if (settled.length === 0) return;
+    state.running = state.running.filter((id) => status.inFlightTurns.includes(id));
+    for (const turnId of settled) {
+      state.materialized = true;
+      state.lastTurnId = turnId;
+      // Republish the terminal rather than dropping it silently: the answer this turn produced
+      // is still on disk, and this is the only thing that will ever deliver it.
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: this.terminalTurnPayload(state, turnId, "completed"),
+      });
+    }
+    if (state.running[0] !== undefined) this.announceHead(threadId, state.running[0]);
+    else this.publishActivityStatus(threadId);
   }
 
   private stateOnlyThread(threadId: string, state: ThreadState): ClaudeThreadView {

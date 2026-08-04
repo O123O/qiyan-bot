@@ -29,6 +29,11 @@ const launcherPath = new URL("../../assets/remote/qiyan-app-server-launcher.sh",
 const claudeHostPath = new URL("../../assets/remote/qiyan-claude-host.mjs", import.meta.url);
 const claudeHostLauncherPath = new URL("../../assets/remote/qiyan-claude-host-launcher.sh", import.meta.url);
 
+// The pins are written by scripts/build.mjs from the assets themselves, so this asserts the
+// build was run — not that someone pasted the right sha. Maintaining them by hand made a
+// version bump silently poisonous: the Claude host embeds APP_VERSION, so bumping changed its
+// bytes, and requireDigest verifies the WHOLE bundle at once — one stale pin fails every SSH
+// endpoint, Codex included. v1.0.0 shipped exactly that.
 test("packaged remote assets match their pinned digests", async () => {
   const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
   assert.equal(digest(await readFile(helperPath)), REMOTE_HELPER_SHA256);
@@ -490,6 +495,44 @@ test("a stop reclaims a dead runtime whose surviving group members cannot be pro
     "reclaim completes rather than failing on debris it cannot prove or reap");
   // And the tombstone is gone, so the next inspect reports `absent` and a fresh runtime starts.
   await assert.rejects(stat(`${runtimeDir}/identity.json`));
+});
+
+// The case that actually locked an endpoint out: a survivor that IS ours — a descendant which
+// inherited the runtime token and cannot be reaped. `stop` used to call that a failure, so the
+// reclaim never completed and no restart could follow. It now insists only that the server
+// itself is gone, which is the condition under which a replacement cannot become a second live
+// runtime on one socket.
+test("a stop reclaims a dead runtime whose token-carrying descendant survives", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  const token = "c".repeat(32);
+  // A descendant carrying the token, in its own group, with the recorded "server" pid being a
+  // pid that is dead. SIGKILL to the group cannot reach it because it is not in that group —
+  // which is what an unreapable survivor looks like from `stop`'s side.
+  const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token },
+  });
+  t.after(() => { try { process.kill(survivor.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const identity = {
+    kind: "ssh", token, pid: survivor.pid, linuxStartTime: "1", processGroupId: survivor.pid,
+  };
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+
+  const stopArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit", expected: identity,
+  }));
+  const stopped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", stopArg],
+    { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+
+  const result = parseRemoteHelperResponse<{ stopped: boolean; survivors?: number }>(stopped.stdout, "stop");
+  assert.equal(result.stopped, true, "the reclaim completes despite a survivor it cannot reap");
+  await assert.rejects(stat(`${runtimeDir}/identity.json`), "and the tombstone is cleared, so a fresh runtime can start");
 });
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {

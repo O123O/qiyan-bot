@@ -1031,6 +1031,62 @@ test("restart checkpoints and reopens admission before publishing its replacemen
   assert.equal(manager.endpointGeneration("devbox").endpoint, replacement);
 });
 
+// These are different endpoints with independent locks and transports, so dialling them one at
+// a time made startup the SUM of every remote handshake — and one slow or unreachable host
+// delayed every endpoint queued behind it, which is how startup reached ~70s for the phase that
+// does this. Nothing about the result may change: the unavailable set is still exact.
+test("referenced endpoints are activated concurrently, not one after another", async () => {
+  const first = new FakeEndpoint("devbox");
+  const second = new FakeEndpoint("devbox2");
+  const { manager } = queuedFixture([first, second]);
+  // A barrier, so this cannot pass by accident: neither handshake completes until BOTH have
+  // begun. Activated one at a time, the first would wait for a second start that can never
+  // happen while it holds the loop — so serial activation does not merely run slower here, it
+  // fails to finish at all.
+  let bothStarted!: () => void;
+  const started = new Promise<void>((resolve) => { bothStarted = resolve; });
+  let begun = 0;
+  const gate = Promise.race([
+    started,
+    new Promise<void>((_, reject) => setTimeout(() => reject(new Error("endpoints were activated serially")), 2_000)),
+  ]);
+  for (const endpoint of [first, second]) {
+    endpoint.startGate = gate;
+    endpoint.onStart = () => { if ((begun += 1) === 2) bothStarted(); };
+  }
+  second.failStart = true;
+  second.startError = new Error("that host is down");
+
+  const result = await manager.activateReferenced(["devbox", "devbox2"]);
+
+  assert.equal(begun, 2);
+  assert.deepEqual(result.unavailable, ["devbox2"], "and the failing endpoint is still reported exactly");
+});
+
+// An unreachable host costs its full connect timeout, and startup used to wait for it — 48s of
+// a 70s startup, held for endpoints nobody was waiting on. The budget bounds the WAIT, not the
+// work: a straggler keeps connecting and publishes when it lands, exactly as it would after a
+// later loss, so nothing is lost by not waiting for it.
+test("startup stops waiting for an endpoint that will not come up", async () => {
+  const quick = new FakeEndpoint("devbox");
+  const slow = new FakeEndpoint("devbox2");
+  let releaseSlow!: () => void;
+  slow.startGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  const { manager } = queuedFixture([quick, slow]);
+
+  const began = Date.now();
+  const result = await manager.activateReferenced(["devbox", "devbox2"], 40);
+
+  assert.ok(Date.now() - began < 2_000, "the budget expires instead of waiting for the slow host");
+  assert.deepEqual(result.unavailable, ["devbox2"], "and an endpoint that is not ready is reported as such");
+  assert.equal(manager.endpointGeneration("devbox").endpoint, quick, "the endpoint that answered is published");
+
+  // The straggler is still connecting, and completes on its own afterwards.
+  releaseSlow();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(slow.starts, 1, "its handshake was never abandoned");
+});
+
 test("a close that never answers cannot leave the endpoint draining", async () => {
   const first = new FakeEndpoint("devbox");
   const abandoned = new FakeEndpoint("devbox");

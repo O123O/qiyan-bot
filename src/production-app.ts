@@ -91,7 +91,7 @@ import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
-import { openDatabase, type Database } from "./storage/database.ts";
+import { markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lease.ts";
 import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
@@ -168,10 +168,19 @@ const remoteAssetRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ass
 const webuiStaticRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../assets/webui");
 const fullAccessWarning = "QiYan assistant is running non-interactively with full filesystem access and approvals disabled.";
 const assistantMappingId = "assistant";
-// How long an endpoint-lifecycle operation may stay unreconcilable before it is retired. It is
-// a give-up, not a proof — the outcome stays unknown — and it exists because the alternative is
-// an endpoint that no operator action can reach for as long as its host stays down.
-const LIFECYCLE_RECOVERY_MAX_AGE_MS = 15 * 60_000;
+// How many consecutive failed recovery attempts retire an endpoint-lifecycle operation. It is a
+// give-up, not a proof — the outcome stays unknown — and it exists because the alternative is an
+// endpoint that no operator action can reach for as long as its host stays down.
+//
+// Counted in attempts rather than elapsed time on purpose. `createdAt` is the ledger insert
+// time and is never refreshed, so after a restart every recovered operation is already older
+// than any age budget and would be retired on its first failure, having tried nothing.
+const LIFECYCLE_RECOVERY_MAX_FAILURES = 5;
+// How long startup waits for referenced endpoints to come up before continuing without the
+// stragglers. They keep connecting in the background and publish when they land, so this
+// bounds the WAIT, not the work — an unreachable host costs its full connect timeout, and
+// startup spent 48s of ~70s holding for hosts nobody was waiting on.
+const STARTUP_ENDPOINT_ACTIVATION_BUDGET_MS = 12_000;
 const recoveryTurnWindowLimit = 64;
 
 export function assistantAccessWarning(mode: BotConfig["assistantSandboxMode"]): string | undefined {
@@ -465,18 +474,27 @@ export function createEndpointReadyBuffer(options: {
     },
     acknowledge: (endpointId) => { pending.delete(endpointId); },
     pause: () => { if (!stopped) accepting = false; },
+    // Concurrently, for the same reason activateReferenced is: these are different endpoints
+    // with nothing ordered between them, and draining them one at a time made this the SUM of
+    // every endpoint's recovery. It is also where the cost lands once startup stops waiting for
+    // slow endpoints to activate — bounding that wait moved 48s into this loop rather than
+    // removing it, because the serial shape was the real problem in both places.
     acceptAndDrain: async () => {
       if (stopped) return;
       accepting = true;
-      for (const endpointId of [...pending].sort()) {
-        if (stopped || !accepting) break;
+      let failure: unknown;
+      await Promise.all([...pending].sort().map(async (endpointId) => {
+        // Re-checked per endpoint rather than once: a pause partway through must stop the ones
+        // that have not begun, which is what breaking out of the loop used to do.
+        if (stopped || !accepting) return;
         pending.delete(endpointId);
         try { await requestRecovery(endpointId); }
         catch (error) {
           if (!stopped) pending.add(endpointId);
-          throw error;
+          failure ??= error;
         }
-      }
+      }));
+      if (failure !== undefined) throw failure;
     },
     stop: async () => {
       stopped = true;
@@ -884,12 +902,11 @@ export async function settleEarlierEndpointOperations(options: {
 export function lifecycleRecoveryExhausted(options: {
   policy: string;
   state: string | undefined;
-  createdAt: number;
-  now: number;
-  maxAgeMs?: number;
+  failures: number;
+  maxFailures?: number;
 }): boolean {
   if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
-  return options.now - options.createdAt > (options.maxAgeMs ?? LIFECYCLE_RECOVERY_MAX_AGE_MS);
+  return options.failures >= (options.maxFailures ?? LIFECYCLE_RECOVERY_MAX_FAILURES);
 }
 
 // A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
@@ -2606,6 +2623,9 @@ export async function buildProductionApp(
           blockedStorageCleanup = { database: db, lease };
           throw error;
         }
+        // Only after SQLite closed without complaint, and only describing the file as it is
+        // now: this is the whole basis on which the next open skips verifying it.
+        markDatabaseClosedCleanly(join(dataDir, "bot.sqlite3"));
         try { await lease.release(); }
         catch (error) {
           blockedStorageCleanup = { lease };
@@ -3350,7 +3370,18 @@ export async function buildProductionApp(
     {
       name: "assistant",
       start: async () => {
-        await reconcileDashboard(true);
+        // The assistant phase is most of startup and, until this, a single opaque number. Same
+        // rule as the phase timer: report only what is slow, so the line that appears is the
+        // answer rather than a table to read.
+        const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+          const began = Date.now();
+          try { return await run(); }
+          finally {
+            const elapsedMs = Date.now() - began;
+            if (elapsedMs >= 1_000) report({ level: "info", code: "startup_phase_completed", phase: `assistant_${name}`, elapsedMs });
+          }
+        };
+        await step("dashboard", () => reconcileDashboard(true));
         await activateAssistantProfileIdentity({
           registry,
           endpointId: assistantEndpoint.id,
@@ -3358,7 +3389,7 @@ export async function buildProductionApp(
           activationRequired: assistantProfile.activationRequired,
           markActivated: () => assistantProfile.markActivated(),
         });
-        const assistantNativeStatus = await startOrResumeAssistant();
+        const assistantNativeStatus = await step("assistant_session", () => startOrResumeAssistant());
         const identity = registry.snapshot().assistant;
         const assistantThread = conversationCutoverNeedsAssistantHistory(db)
           ? await readBoundedThread(identity.endpoint, identity.thread_id)
@@ -3423,11 +3454,13 @@ export async function buildProductionApp(
           lifecycleOwnedEndpointIds: lifecycleOwned,
           assistantEndpointId: assistantEndpoint.id,
         });
-        const activation = await endpointManager.activateReferenced(referencedEndpoints);
-        await reconcileOperations();
+        const activation = await step("endpoints", () => endpointManager.activateReferenced(
+          referencedEndpoints, STARTUP_ENDPOINT_ACTIVATION_BUDGET_MS,
+        ));
+        await step("operations", () => reconcileOperations());
         conversations.repairQueueNotices();
-        await reconcileStartupLifecycleState();
-        const capacityBootstrapped = await resumeStartupManagedSessions();
+        await step("lifecycle_state", () => reconcileStartupLifecycleState());
+        const capacityBootstrapped = await step("managed_sessions", () => resumeStartupManagedSessions());
         for (const endpointId of [...new Set(recoveredEndpointIds)]) {
           // Managed startup recovery already performed the endpoint reconcile (relay + claims)
           // behind the startup barrier. Do not race or repeat it here.
@@ -3437,8 +3470,8 @@ export async function buildProductionApp(
           endpointReadyBuffer?.acknowledge(endpointId);
         }
         deliveries.recoverAfterCrash();
-        await reconcileDeliveryEvents();
-        await endpointReadyBuffer?.acceptAndDrain();
+        await step("delivery_events", () => reconcileDeliveryEvents());
+        await step("endpoint_ready", async () => { await endpointReadyBuffer?.acceptAndDrain(); });
         assistantToolReadiness.ready();
       }, stop: async () => undefined,
     },
@@ -3501,8 +3534,21 @@ export async function buildProductionApp(
     {
       name: "chat-ingress",
       start: async () => {
-        await Promise.all(chats.map((adapter) => adapter.start()));
-        for (const adapter of chats) report({ level: "info", code: "chat_ingress_started", adapter: adapter.delivery.id });
+        // A chat adapter that cannot connect is reported and left disconnected, never fatal.
+        // Nothing else here depends on chat: the Web UI, the assistant and every managed worker
+        // run without it, and the adapters reconnect on their own. Aborting startup instead
+        // meant one flaky transport took the whole assistant down and held it down — a Slack
+        // websocket that stopped answering pings crash-looped the service, and with it went the
+        // Web UI, which is the one surface an operator would use to see what was wrong.
+        const started = await Promise.allSettled(chats.map((adapter) => adapter.start()));
+        started.forEach((outcome, index) => {
+          const adapter = chats[index]!;
+          if (outcome.status === "fulfilled") {
+            report({ level: "info", code: "chat_ingress_started", adapter: adapter.delivery.id });
+          } else {
+            report({ level: "warn", code: "chat_ingress_failed", adapter: adapter.delivery.id });
+          }
+        });
       },
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
@@ -4705,6 +4751,10 @@ export async function buildProductionApp(
     return operationReconciler?.request() ?? Promise.resolve();
   }
 
+  // Consecutive failed recovery attempts per operation, for this process only. Deliberately not
+  // durable: it counts effort actually spent, and a restart genuinely does start that over.
+  const lifecycleRecoveryFailures = new Map<string, number>();
+
   async function reconcileOperationsOnce(): Promise<OperationReconciliationPass> {
     let attempted = false;
     let waitingForEndpoint = false;
@@ -4737,6 +4787,9 @@ export async function buildProductionApp(
         return true;
       }
       attempted = true;
+      // A pass that gets this far will either settle the operation or fail; a run that does not
+      // throw means progress, so the failure streak restarts.
+      lifecycleRecoveryFailures.delete(operation.id);
       const args = operation.args as any;
       let attemptedEndpointGeneration: number | undefined;
       try {
@@ -5183,17 +5236,24 @@ export async function buildProductionApp(
         // runtime attests its identity on the remote host, and a start refuses over a live
         // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
         // is recorded as exactly that: the outcome is unknown, and said so.
+        const failures = (lifecycleRecoveryFailures.get(operation.id) ?? 0) + 1;
+        lifecycleRecoveryFailures.set(operation.id, failures);
         if (lifecycleRecoveryExhausted({
           policy: target.policy,
           state: operations.get(operation.id)?.state,
-          createdAt: operation.createdAt,
-          now: Date.now(),
+          failures,
         })) {
-          operations.fail(operation.id, {
-            message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
-              + `${Math.round(LIFECYCLE_RECOVERY_MAX_AGE_MS / 60_000)} minutes; its outcome is unknown `
-              + "and it no longer blocks later lifecycle actions",
-          });
+          lifecycleRecoveryFailures.delete(operation.id);
+          // `fail` throws if the state moved under us — two bot instances share one ledger in
+          // the deployed setup — and losing the whole reconciliation pass to that would be a
+          // worse outcome than leaving this one operation for the next pass.
+          try {
+            operations.fail(operation.id, {
+              message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
+                + `${failures} failed recovery attempts; its outcome is unknown and it no longer `
+                + "blocks later lifecycle actions",
+            });
+          } catch { /* another writer settled it; nothing left to retire */ }
         }
       }
       const current = operations.get(operation.id);
@@ -5625,7 +5685,11 @@ export async function buildProductionApp(
     );
   }
 
-  return composeApp(phases);
+  return composeApp(phases, (phase, elapsedMs) => {
+    // Only the slow ones: a line per phase would bury the signal, and the question this exists
+    // to answer is "which phase is holding startup", not "what did each cost".
+    if (elapsedMs >= 1_000) report({ level: "info", code: "startup_phase_completed", phase, elapsedMs });
+  });
 }
 
 export function createChatHistoryAction(

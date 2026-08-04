@@ -6,11 +6,46 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { isDatabaseIntegrityFailure, openDatabase } from "../../src/storage/database.ts";
+import { isDatabaseIntegrityFailure, markDatabaseClosedCleanly, openDatabase } from "../../src/storage/database.ts";
 import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+
+// Verifying the database copies the whole file and scans it — work proportional to the FILE,
+// paid on every startup, over a network filesystem, for a database that is mostly free pages.
+// It exists to catch corruption, and a database closed cleanly by the process that owned it is
+// not a plausible place for corruption to have appeared. So it runs where it earns its cost.
+test("a cleanly closed database is not re-verified, and any other state still is", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-clean-marker-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "bot.sqlite3");
+  openDatabase(path).close();
+
+  let inspected = 0;
+  const count = (inspector: DatabaseSync): void => { inspected += 1; inspector.close(); };
+
+  openDatabase(path, { closeInspector: count }).close();
+  assert.equal(inspected, 1, "with no marker the database is verified");
+
+  markDatabaseClosedCleanly(path);
+  openDatabase(path, { closeInspector: count }).close();
+  assert.equal(inspected, 1, "a clean close is taken at its word");
+
+  // The marker describes one exact file. Anything else — a crash after it was written, or a
+  // database written by someone else afterwards — is not covered by it.
+  markDatabaseClosedCleanly(path);
+  const raw = new DatabaseSync(path);
+  try { raw.exec("PRAGMA user_version = 7"); } finally { raw.close(); }
+  openDatabase(path, { closeInspector: count }).close();
+  assert.equal(inspected, 2, "a database that changed after the marker is verified again");
+
+  // And the marker is consumed by the open, so the NEXT open verifies again.
+  markDatabaseClosedCleanly(path);
+  openDatabase(path, { closeInspector: count }).close();
+  openDatabase(path, { closeInspector: count }).close();
+  assert.equal(inspected, 3, "the marker vouches for exactly one open");
+});
 
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {

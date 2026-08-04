@@ -127,6 +127,30 @@ test("a new Claude snapshot row replaces its pending message but an older identi
   ]);
 });
 
+// An agent message streamed while the session believed a stale turn was still running carries
+// THAT turn's id, and the transcript row written for it carries the real one. Requiring the two
+// to agree before reuniting them is then the reason the same answer is shown twice — which is
+// what the reader saw, on a few messages rather than all: only the ones that straddled it.
+test("a live agent message reloaded under a different turn id is reunited, not shown twice", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = receiveWorkerEvent(state, envelope({
+    kind: "item-completed", turnId: "ghost", atMs: 10,
+    item: { type: "agent-message", id: "a1", text: "the answer", phase: "commentary" },
+  }));
+  assert.equal(state.messages.length, 1);
+
+  state = applyWorkerSnapshot(state, {
+    messages: [{
+      id: "a:real:1", turnId: "real", body: "the answer", completedAt: 11,
+      terminalStatus: "completed", turnOrder: 1, itemOrder: 1,
+    }],
+    hasOlder: false, terminalTurnIds: ["real"], openTurnIds: [],
+  });
+
+  assert.deepEqual(state.messages.map((message) => message.body), ["the answer"],
+    "the same answer under a corrected turn id is one message, not two");
+});
+
 test("a rejected worker send removes only its optimistic echo", () => {
   let state = beginWorkerSubscription("worker", "codex", ids.requestId);
   state = addOptimisticWorkerMessage(state, "to:web:one", "first", 1);

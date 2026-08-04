@@ -240,6 +240,18 @@ function mergeSnapshotMessage(messages: WorkerChatMessage[], snapshot: WorkerCha
       && candidate.body === snapshot.body
     ));
     if (matches.length === 1) index = matches[0]!.candidateIndex;
+    if (index < 0) {
+      // Nor the turn id. A message dispatched while the session believed a stale turn was still
+      // running is attributed to THAT turn live, and to the real one when the transcript is
+      // read back — so the strictly-correct comparison is the reason the reader saw it twice.
+      // Restricted to live messages, which are only the ones this stream produced, so two rows
+      // that merely happen to repeat the same text are never collapsed into one.
+      const liveMatches = messages.map((candidate, candidateIndex) => ({ candidate, candidateIndex }))
+        .filter(({ candidate }) => candidate.live && candidate.role === snapshot.role && candidate.body === snapshot.body
+          // An OLDER row repeating the same text is a different message, not this one reloaded.
+          && (snapshot.completedAt || 0) >= (candidate.completedAt || 0));
+      if (liveMatches.length === 1) index = liveMatches[0]!.candidateIndex;
+    }
   }
   if (index < 0) return [...messages, snapshot];
   const existing = messages[index]!;

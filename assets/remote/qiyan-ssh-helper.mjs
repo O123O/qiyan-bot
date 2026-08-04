@@ -354,6 +354,7 @@ async function stopClaudeHost(value) {
   const identity = await readIdentity(paths.claudeHostIdentityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  let survivors = 0;
   let members = ownedGroupMembers(identity);
   if (members.length > 0) {
     try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
@@ -363,7 +364,16 @@ async function stopClaudeHost(value) {
       try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
     }
-    if (ownedGroupMembers(identity).length > 0) throw new Error("Claude host process group did not stop");
+    survivors = ownedGroupMembers(identity).length;
+    // Same rule as the Codex runtime's stop, and it matters MORE here: Claude runs Bash tools,
+    // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem —
+    // inheriting the host's process group and token, unreapable by any signal, and otherwise
+    // refusing this reclaim forever. Insist only that the HOST is gone.
+    if (survivors > 0) {
+      const supervised = (await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true)).code === 0;
+      const hostAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
+      if (supervised || hostAlive) throw new Error("Claude host process group did not stop");
+    }
   }
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.claudeHostSocketPath, { force: true });
@@ -371,7 +381,7 @@ async function stopClaudeHost(value) {
   // The tmux socket is deliberately left alone: one tmux server in this runtime directory
   // may also be supervising the endpoint's Codex app-server session, and unlinking it would
   // strand that generation. Codex's own stop() does not remove it either.
-  return { stopped: true };
+  return { stopped: true, ...survivors > 0 ? { survivors } : {} };
 }
 
 async function proxyAppServer(value) {

@@ -209,13 +209,41 @@ export class EndpointManager {
     return true;
   }
 
-  async activateReferenced(ids: readonly string[]): Promise<{ unavailable: string[] }> {
+  // Concurrently, because these are DIFFERENT endpoints: each has its own record, its own
+  // activation lock and its own transport, so nothing here is ordered with respect to anything
+  // else. Dialling them one at a time made startup the SUM of every remote's handshake — each
+  // one an ssh spawn and an app-server probe — and an endpoint that was merely slow delayed
+  // every endpoint behind it. A host that is down costs its full connect timeout, so serially
+  // that alone could exceed the whole startup budget.
+  async activateReferenced(ids: readonly string[], budgetMs?: number): Promise<{ unavailable: string[] }> {
     const unavailable: string[] = [];
-    for (const id of [...new Set(ids)]) {
+    const pending = [...new Set(ids)].map(async (id) => {
       try { await this.ensureReady(id); }
       catch { unavailable.push(id); }
+    });
+    // Bounded: an endpoint whose host is unreachable costs its full connect timeout, and
+    // waiting for it holds up everything that comes after — startup spent 48s here for hosts
+    // nobody was waiting on. A straggler keeps connecting in the background and publishes when
+    // it lands, exactly as it would after a later loss, so nothing is lost by not waiting.
+    if (budgetMs === undefined) await Promise.all(pending);
+    else {
+      let expire: ScheduledWork | undefined;
+      await Promise.race([
+        Promise.all(pending),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, budgetMs);
+          timer.unref?.();
+          expire = { cancel: () => clearTimeout(timer) };
+        }),
+      ]).finally(() => expire?.cancel());
+      // Anything still in flight is neither ready nor proven unavailable; report it as not
+      // ready so callers do not treat it as usable yet.
+      for (const id of [...new Set(ids)]) {
+        if (!unavailable.includes(id) && this.records.get(id)?.endpoint?.state !== "ready") unavailable.push(id);
+      }
     }
-    return { unavailable };
+    // Stable regardless of which endpoint answered first: callers compare and log this.
+    return { unavailable: unavailable.sort() };
   }
 
   async disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
