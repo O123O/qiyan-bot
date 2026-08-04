@@ -1472,6 +1472,36 @@ test("prose quoting the goal marker does not hide the real goal behind it", asyn
 // it forever: the session reads `active` on a turn that finished hours ago, shows "working"
 // while doing nothing, and queues every later send behind a ghost. The host knows what it is
 // actually running, so a status read asks it rather than trusting the belief.
+// Reconciling on a read is not enough: the panel's status comes from the in-memory session
+// view that notifications update, so a session NOBODY reads never reaches that path. A worker
+// with no goal driving it sat "working" on a turn that had ended 22 minutes earlier, while a
+// worker being polled corrected itself — the fix was right and simply never ran.
+test("a stale turn is settled without anyone reading the thread", async (t) => {
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, staleTurnSweepMs: 10 });
+  await rt.start();
+  t.after(() => rt.closeConnection());
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const terminals: string[] = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/completed") terminals.push(String((params as any).turn?.id ?? ""));
+  });
+  await rt.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:unwatched",
+    input: [{ type: "text", text: "think" }],
+  });
+  claude.loseCompletion(thread.id, "to:web:unwatched");
+
+  // No thread/read, no thread/resume — nothing reads this session at all. The sweep runs anyway.
+  for (let waited = 0; waited < 100 && !terminals.includes("to:web:unwatched"); waited += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.ok(terminals.includes("to:web:unwatched"),
+    "the sweep settles it and republishes its terminal, so the view stops reading active");
+});
+
 test("a turn the host no longer holds is settled instead of running forever", async () => {
   const claude = new FakeClaude();
   const rt = makeRuntime(claude);

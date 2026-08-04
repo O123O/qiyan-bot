@@ -73,6 +73,10 @@ interface LiveTurnItems {
 // Bounded tail scanned for the native goal marker. Generous enough that an active goal —
 // which writes a Stop-hook row per continuation — always falls inside it, while never
 // transferring a whole transcript over ssh on a status poll.
+// How often a thread believed to be running is checked against the host. Long enough to be
+// invisible for a session that is genuinely working, short enough that a stale turn does not
+// outlive the reader's patience.
+const STALE_TURN_SWEEP_MS = 60_000;
 const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
 // How far back readNativeGoal will walk in total. A goal that scrolled out of one window is
 // still a goal; a transcript with none pays this once per status read, so it stays modest.
@@ -143,6 +147,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   private lifecycleGeneration = 0;
   private evicting?: Promise<void>;
   private startingTurns = 0;
+  private staleTurnSweep?: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: {
     id: string;
@@ -156,6 +161,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Claude Code session.
     launchFlags: { model?: string; effort?: string };
     persistentRuntime?: ClaudePersistentRuntime;
+    /** How often to check threads believed to be running against the host. Tests drive this. */
+    staleTurnSweepMs?: number;
     // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
     archives?: ClaudeArchiveStore;
@@ -335,10 +342,35 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       return;
     }
     this.endpointState = "ready";
+    this.startStaleTurnSweep();
     this.emitter.emit("ready");
   }
 
+  // Reconciling on a thread read is not enough on its own: the panel's status comes from the
+  // in-memory session view, which notifications update, so a session NOBODY reads never
+  // reaches that path and keeps a finished turn forever. That is exactly what happened — a
+  // worker with no goal driving it sat "working" on a turn that had ended 22 minutes earlier,
+  // while a worker being polled corrected itself. So the correction also runs on its own.
+  //
+  // Cheap by construction: it asks the host only about threads this runtime already believes
+  // are running, and a thread that really is running answers that it is.
+  private startStaleTurnSweep(): void {
+    if (this.staleTurnSweep) return;
+    const timer = setInterval(() => {
+      if (this.endpointState !== "ready") return;
+      void (async () => {
+        for (const [threadId, state] of [...this.threads]) {
+          if (state.running.length === 0) continue;
+          await this.reconcileRunningTurns(threadId, state).catch(() => undefined);
+        }
+      })();
+    }, this.options.staleTurnSweepMs ?? STALE_TURN_SWEEP_MS);
+    timer.unref?.();
+    this.staleTurnSweep = timer;
+  }
+
   async closeConnection(): Promise<void> {
+    if (this.staleTurnSweep) { clearInterval(this.staleTurnSweep); delete this.staleTurnSweep; }
     this.lifecycleGeneration += 1;
     this.endpointState = "stopped";
     this.persistentUnavailableSubscription?.();
