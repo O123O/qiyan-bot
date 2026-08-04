@@ -3504,8 +3504,21 @@ export async function buildProductionApp(
     {
       name: "chat-ingress",
       start: async () => {
-        await Promise.all(chats.map((adapter) => adapter.start()));
-        for (const adapter of chats) report({ level: "info", code: "chat_ingress_started", adapter: adapter.delivery.id });
+        // A chat adapter that cannot connect is reported and left disconnected, never fatal.
+        // Nothing else here depends on chat: the Web UI, the assistant and every managed worker
+        // run without it, and the adapters reconnect on their own. Aborting startup instead
+        // meant one flaky transport took the whole assistant down and held it down — a Slack
+        // websocket that stopped answering pings crash-looped the service, and with it went the
+        // Web UI, which is the one surface an operator would use to see what was wrong.
+        const started = await Promise.allSettled(chats.map((adapter) => adapter.start()));
+        started.forEach((outcome, index) => {
+          const adapter = chats[index]!;
+          if (outcome.status === "fulfilled") {
+            report({ level: "info", code: "chat_ingress_started", adapter: adapter.delivery.id });
+          } else {
+            report({ level: "warn", code: "chat_ingress_failed", adapter: adapter.delivery.id });
+          }
+        });
       },
       stop: async () => { await settleAll(chats.map((adapter) => adapter.stop())); },
     },
