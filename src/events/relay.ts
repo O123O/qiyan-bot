@@ -19,6 +19,9 @@ import {
 interface TerminalTurn {
   id: string;
   status: string;
+  // This send was folded into another turn, which answered it. It is terminal, but it is not
+  // a worker event of its own and has no transcript row anywhere: see commitTerminal.
+  folded?: boolean;
   itemsView?: "full" | "summary" | "notLoaded";
   startedAt?: number | null;
   completedAt: number | null;
@@ -32,6 +35,11 @@ interface RelayTarget {
   mappingId: string;
   epochId: string;
   fullTurn?: TerminalTurn;
+  // Kept on the IDENTITY, not just on fullTurn, because a retry strips fullTurn. A folded
+  // send has no transcript row, so a retry that forgot it was folded would resolve it the
+  // only way left -- scanning the native history for a row that was never written -- and
+  // bounded retries on that end in a degraded endpoint and an operator warning.
+  folded?: boolean;
 }
 
 interface RelayTimer {
@@ -115,6 +123,9 @@ export class EventRelay {
       threadId,
       turnId,
       fullNotificationTurn(params.turn, turnId),
+      // Read off the raw notification, not the parsed payload: a payload that fails the full
+      // parse would otherwise silently lose `folded` and send a retry down the scan path.
+      (params.turn as { folded?: unknown }).folded === true,
     ));
     if (!target || this.stopped) return "conclusively_ignored";
     this.retryTargets.set(relayTargetKey(target), retryTarget(target));
@@ -218,7 +229,7 @@ export class EventRelay {
     await Promise.allSettled([...this.endpointTails.values()]);
   }
 
-  private captureTarget(endpointId: string, threadId: string, turnId: string, fullTurn?: TerminalTurn): RelayTarget | undefined {
+  private captureTarget(endpointId: string, threadId: string, turnId: string, fullTurn?: TerminalTurn, folded = false): RelayTarget | undefined {
     const mapping = this.mapping(endpointId, threadId);
     if (!mapping || (mapping.session.lifecycle_state !== "managed" && mapping.session.lifecycle_state !== "adopting")) return undefined;
     const epoch = this.epochs.current(endpointId, threadId, mapping.session.mapping_id);
@@ -230,6 +241,7 @@ export class EventRelay {
       mappingId: mapping.session.mapping_id,
       epochId: epoch.id,
       ...(fullTurn ? { fullTurn } : {}),
+      ...(folded || fullTurn?.folded ? { folded: true } : {}),
     };
   }
 
@@ -263,6 +275,14 @@ export class EventRelay {
     if (stateBefore !== "deliverable") return stateBefore === "stale" ? "conclusively_ignored" : "retry";
     const epoch = this.epochs.current(target.endpointId, target.threadId, target.mappingId)!;
     if (target.turnId === epoch.baselineTurnId) return "conclusively_ignored";
+    // Before the fullTurn branch, so a first attempt and a retry commit the SAME terminal:
+    // a folded send is answered inside the turn that absorbed it and has no row of its own,
+    // so there is nothing a history scan could find and nothing the payload adds.
+    if (target.folded) {
+      return this.commitCurrentTerminal(target, {
+        id: target.turnId, status: "completed", itemsView: "full", folded: true, completedAt: null, items: [],
+      }, lease, generation);
+    }
     if (target.fullTurn) {
       const current = this.mapping(target.endpointId, target.threadId);
       if (!current || current.session.mapping_id !== target.mappingId) return "conclusively_ignored";
@@ -395,7 +415,13 @@ export class EventRelay {
     const nickname = mapping.nickname;
     const messages = this.finals.persistTerminalTurn(target.endpointId, target.threadId, turn, this.options.clock.now());
     const eventId = `terminal:${target.endpointId}:${target.threadId}:${turn.id}`;
-    await this.options.onTerminal?.({
+    // A folded send is settled, not reported. It was answered inside the turn that absorbed
+    // it, so it is not a worker event: observing it mints a turn ordinal ABOVE the absorbing
+    // turn's -- it is first seen here, never at turn/started -- and the dashboard then takes
+    // it as the worker's last event and REJECTS the real terminal that follows on the lower
+    // ordinal. The manager would read a phantom turn id with no final message precisely when
+    // the user steered mid-turn.
+    if (!turn.folded) await this.options.onTerminal?.({
       endpointId: target.endpointId,
       threadId: target.threadId,
       turnId: turn.id,
@@ -449,7 +475,10 @@ export class EventRelay {
     generation: number,
   ): Promise<RelayOutcome> {
     const outcome = await this.commitTerminal(target, turn, lease);
-    if (outcome === "handled" && this.runIsCurrent(target.endpointId, generation)
+    // Never anchor the cursor on a folded send: its only reader scans the native transcript
+    // for it as a suffix anchor, and a folded send has no row there to find -- an anchor that
+    // cannot be found fails reconciliation into a degraded endpoint.
+    if (outcome === "handled" && !turn.folded && this.runIsCurrent(target.endpointId, generation)
       && this.targetState(target) === "deliverable") {
       // The delivery/event writes are durable before this boundary advances. A current live
       // terminal also establishes a fresh recovery point, so it clears a prior bounded-scan
@@ -677,6 +706,7 @@ function fullNotificationTurn(value: unknown, turnId: string): TerminalTurn | un
     id: turnId,
     status: turn.status,
     itemsView: "full",
+    ...(turn.folded === true ? { folded: true } : {}),
     startedAt: typeof turn.startedAt === "number" || turn.startedAt === null ? turn.startedAt : null,
     completedAt: typeof turn.completedAt === "number" || turn.completedAt === null ? turn.completedAt : null,
     items,

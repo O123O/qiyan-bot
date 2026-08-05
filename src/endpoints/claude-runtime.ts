@@ -285,6 +285,24 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // The queue moved on: the next send is now the one producing output, and nothing else
     // would ever announce it.
     if (wasHead && state.running[0] !== undefined) this.announceHead(threadId, state.running[0]);
+    // A folded send was answered inside the turn that absorbed it, and has no turn row of its
+    // own for anyone to find. Settle it as terminal-and-empty: an explicitly empty full view
+    // is the one shape that neither sends the relay hunting the transcript for a row that was
+    // never written — bounded retries, then a degraded endpoint — nor reports the send
+    // unanswered. `lastTurnId` deliberately stays on the absorbing turn, which is the findable
+    // one and the one a background task's report must republish.
+    if (event.folded) {
+      this.emitter.emit("notification", "turn/completed", {
+        threadId,
+        turn: { id: turnId, status: "completed", itemsView: "full", items: [], folded: true },
+      });
+      // Deliberately no idle sweep here. The absorbing turn's terminal always follows in the
+      // same result, and it sweeps -- while sweeping HERE would run against an in-flight set
+      // already emptied by that result, so eviction closes the session re-entrantly and the
+      // `session/closed` handler clears the live items the absorbing turn's terminal is
+      // about to carry, degrading a delivered answer into a transcript lookup.
+      return;
+    }
     if (event.status !== "completed") state.terminalTurns.add(turnId);
     // Only a normally completed turn is certain to be a findable transcript turn: a turn
     // that failed before `claude` wrote its user row exists only as a synthesized terminal.

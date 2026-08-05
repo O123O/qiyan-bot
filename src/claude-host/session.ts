@@ -96,6 +96,36 @@ interface LiveTask {
   startedAt: number;
 }
 
+// Every terminal error the SDK can end a turn with. `SDKResultError` declares no
+// `user_message_uuid` on ANY of them -- only a success result carries one -- so position is
+// the only attribution available for all four. Handling just `error_during_execution` left
+// the other three falling through as uncorrelated, stranding the turn in flight forever:
+// the same permanent `working` as a folded send, reached by a different subtype.
+const RESULT_ERROR_SUBTYPES = new Set([
+  "error_during_execution",
+  "error_max_turns",
+  "error_max_budget_usd",
+  "error_max_structured_output_retries",
+]);
+
+// Whether a result may settle an accepted human send by POSITION. `origin` is an eight-member
+// union, of which exactly one kind — `human` — is a send this host made; the rest are Claude
+// speaking for itself or for another session. Excluding only `task-notification` let the other
+// six claim a turn they never owned. The pairing that bites: QiYan's goal feature drives sessions through Claude's
+// Stop hook, i.e. auto-continuation, which is far and away the likeliest source of
+// error_max_turns — so a goal-driven worker hitting the cap reported the user's still-running
+// turn terminal, and the relay announced it "interrupted without a final response" while the
+// worker was still writing one. That is the exact regression the positional branch was
+// written to avoid, and widening the subtype list tripled how reachable it was.
+//
+// An UNSTAMPED origin stays permissive, unchanged: every measured abort result carries
+// {kind:"human"}, but nothing proves the CLI always stamps one, and refusing those would
+// strand the turn — the leak this whole change exists to close. The known-not-human kinds are
+// what the evidence covers, so they are what this excludes.
+function claimsHumanTurn(origin: Record<string, unknown>): boolean {
+  return origin.kind === undefined || origin.kind === "human";
+}
+
 function classifyTask(record: Record<string, unknown>): LiveTask["kind"] {
   return typeof record.subagent_type === "string" && record.subagent_type.length > 0
     ? "subagent"
@@ -110,6 +140,12 @@ export class ClaudeHostSession {
   // queued messages in order, so the head is the turn a uuid-less result belongs to.
   private readonly inFlight: AcceptedTurn[] = [];
   private readonly acceptedUuids = new Set<string>();
+  // The turn a pending interrupt is aborting. Deliberately not a boolean: a flag set before
+  // the round trip has no reliable clear -- an interrupt over nothing in flight, a round trip
+  // that throws, or an abort result arriving on an empty queue all leave it set forever, and
+  // it then disables this reconciliation for the rest of the session's life with no signal.
+  // Held as the identity instead, so every route that retires that turn clears it implicitly.
+  private abortingUuid?: string;
   private readonly backgroundTasks = new Map<string, LiveTask>();
   private closed = false;
   private lastActiveAt = 0;
@@ -153,7 +189,71 @@ export class ClaudeHostSession {
 
   async interrupt(): Promise<void> {
     if (this.closed) return;
-    await this.query.interrupt();
+    // Read the turn being aborted BEFORE the round trip. The SDK writes the receipt before
+    // the abort's result on a clean interrupt but may emit that result first when the turn
+    // crashes during interrupt handling, and then the aborted head is already gone and the
+    // folded send has taken index 0. Position is a proxy for identity here, and identity is
+    // available: taking the position instead skipped the folded send and stranded it working
+    // forever -- the very leak this reconciliation exists to close.
+    const aborting = this.inFlight[0]?.uuid;
+    // A second interrupt issued before the first abort's result lands sees the turn the SDK
+    // has since DEQUEUED and is now running, which the receipt does not list (it names what
+    // is queued or imminent, never what is executing). Reconciling then would report a
+    // running turn as folded: terminal, empty, and silent. Skip while one is outstanding.
+    const outstanding = this.abortInFlight();
+    // Only sends already accepted can be in scope. The receipt is a snapshot taken with abort
+    // processing, so it can never name one that arrives during the round trip -- and over ssh
+    // that is a whole network round trip, not a millisecond. "Press stop, then immediately
+    // type what you actually wanted" would otherwise be reported answered before it ran, with
+    // the session reading idle and evictable while it worked. Gives up one case in exchange:
+    // a send that both arrives in the window AND is folded before the abort lands is left in
+    // flight, which the next result sweeps — a recoverable strand rather than an
+    // unrecoverable false terminal for a turn that is still running.
+    const candidates = new Set(this.inFlight.map((turn) => turn.uuid));
+    if (aborting !== undefined) this.abortingUuid = aborting;
+    const receipt = await this.query.interrupt();
+    if (!outstanding) this.settleFoldedAcrossInterrupt(receipt, aborting, candidates);
+  }
+
+  // True while the turn a previous interrupt aborted is still in flight. Self-clearing: it
+  // reads the queue rather than a flag, so there is no state to leak.
+  private abortInFlight(): boolean {
+    return this.abortingUuid !== undefined && this.inFlight.some((turn) => turn.uuid === this.abortingUuid);
+  }
+
+  // An interrupt is not a fold: the SDK keeps queued commands across one and they still run,
+  // so the abort's own result settles the head and nothing else. But a send already folded
+  // into the aborted turn never runs and never produces a result, and in `inFlight` the two
+  // are indistinguishable — which stranded one on every ordinary "send a follow-up, then hit
+  // stop", the same permanent `working` this whole change exists to end.
+  //
+  // The interrupt receipt is the discriminator, and it is evidence rather than inference: the
+  // SDK reports exactly which sends survive. Anything in flight it does NOT name was folded.
+  // An older CLI sends no receipt at all, and that is unknown, not empty — settle nothing.
+  private settleFoldedAcrossInterrupt(receipt: unknown, aborting: string | undefined, candidates: ReadonlySet<string>): void {
+    const queued = (receipt as { still_queued?: unknown } | undefined)?.still_queued;
+    if (!Array.isArray(queued)) return;
+    const survives = new Set(queued.filter((uuid): uuid is string => typeof uuid === "string"));
+    // By identity, not position: the aborted turn is settled by its own result, whenever that
+    // lands relative to this receipt.
+    const folded = this.inFlight.filter((turn) =>
+      candidates.has(turn.uuid) && turn.uuid !== aborting && !survives.has(turn.uuid));
+    if (folded.length === 0) return;
+    const settled = new Set(folded.map((turn) => turn.uuid));
+    for (let index = this.inFlight.length - 1; index >= 0; index -= 1) {
+      if (settled.has(this.inFlight[index]!.uuid)) this.inFlight.splice(index, 1);
+    }
+    for (const turn of folded) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "human",
+        status: "completed",
+        folded: true,
+        uuid: turn.uuid,
+        at: this.now(),
+      });
+    }
   }
 
   async setModel(model?: string): Promise<void> { await this.query.setModel(model); }
@@ -331,6 +431,19 @@ export class ClaudeHostSession {
     }
   }
 
+  // A top-level end-of-turn belonging to no accepted send. Delivered — that is how a
+  // background task's report reaches chat — but it settles nothing.
+  private emitUncorrelated(message: Record<string, unknown>, failed: boolean): void {
+    this.emit({
+      type: "turn/completed",
+      sessionId: this.sessionId,
+      origin: "task-notification",
+      status: failed ? "failed" : "completed",
+      result: message,
+      at: this.now(),
+    });
+  }
+
   private consumeResult(message: Record<string, unknown>): void {
     const uuid = typeof message.user_message_uuid === "string" ? message.user_message_uuid : undefined;
     const origin = (message.origin ?? {}) as Record<string, unknown>;
@@ -353,10 +466,67 @@ export class ClaudeHostSession {
     }
 
     let settled: AcceptedTurn | undefined;
+    // Sends that were FOLDED into the turn this result ends, and so are ended by it. A send
+    // that arrives while a turn is running is not started as a turn of its own: Claude pulls
+    // it out of the queue and folds it into the turn already in flight, which then answers
+    // both prompts under that turn's uuid. No result ever carries the folded send's uuid —
+    // the SDK states it outright ("it never runs as its own turn").
+    //
+    // Read directly off a stuck session's transcript, where a normal send is enqueued and
+    // dequeued in the same millisecond while every ghost was enqueued and then REMOVED, and
+    // survives only as an attachment:
+    //   07:17:18 enqueue "this doc is still too long…"   07:17:18 dequeue   -> its own turn
+    //   07:19:35 enqueue "also let a subagent review…"   07:19:36 remove    -> folded
+    //            + {"type":"attachment","attachment":{"type":"queued_command",
+    //               "source_uuid":"to:web:af757927-…"}}, and no turn record anywhere
+    //
+    // Settling on the exact uuid alone therefore stranded every folded send here forever.
+    // `activity()` reads `working` off a non-empty array, so the session reported working
+    // while idle and was never evictable — and worst, reconciliation asks the host which
+    // turns are still in flight, so this leak made the host authoritatively CONFIRM its own
+    // ghost: two sessions sat "working" overnight through a sweep running every 60 seconds.
+    //
+    // Everything still in flight when a result lands was queued while that turn was running,
+    // and was therefore folded into it. Settle the lot; leaving any behind is what made a
+    // session stick, and a trailing folded send has nothing later to settle it.
+    //
+    // One send can be misread as folded: one accepted in the window between the SDK emitting
+    // this result and the host consuming it, which really does start a turn. Accepted as the
+    // better trade. It reads idle for that turn's duration, but its answer is NOT lost — its
+    // own result arrives naming a turn no longer in flight, and is delivered as uncorrelated,
+    // which republishes the previous turn's terminal carrying the text it produced. The
+    // alternative, holding turns on the chance one is still live, is the permanent `working`
+    // this exists to end.
+    let folded: AcceptedTurn[] = [];
+    let preceding: AcceptedTurn[] = [];
     if (uuid) {
       const index = this.inFlight.findIndex((turn) => turn.uuid === uuid);
-      if (index >= 0) settled = this.inFlight.splice(index, 1)[0];
-    } else if (message.subtype === "error_during_execution" && this.inFlight.length > 0) {
+      // A uuid naming nothing in flight settles NOTHING. It is a late or duplicate result for
+      // a turn already gone, and falling through from here would emit a human terminal with
+      // no uuid — which the runtime attributes to `state.running[0]`, killing an unrelated
+      // turn that is still running.
+      if (index < 0) {
+        this.emitUncorrelated(message, failed);
+        return;
+      }
+      // Only what came AFTER the named turn was queued while it ran. Anything before it is
+      // settled on the SDK's in-order execution, as a turn of its own — folding those would
+      // publish them as answerless and drop answers they really produced, and silent loss is
+      // not the failure to pick.
+      //
+      // Not provably empty, though it is under everything measured here. The SDK also
+      // coalesces a dequeued batch into ONE turn owned by a "batch-representative" uuid, and
+      // which member of a batch owns the result is undocumented: if it is ever not the
+      // oldest, these are members with no row of their own, and they take the wrong branch.
+      // Weigh what that costs before changing it. The runtime keys live items on the head, so
+      // it will have been attributing the NAMED turn's streamed text to preceding[0] the
+      // whole time it ran — the failure there is the absorbing turn's answer delivered twice,
+      // once under the wrong turn id, not merely a turn nobody can find. Left as the safer of
+      // two wrong answers rather than defended against blind.
+      preceding = this.inFlight.splice(0, index);
+      settled = this.inFlight.shift();
+      folded = this.inFlight.splice(0);
+    } else if (claimsHumanTurn(origin) && RESULT_ERROR_SUBTYPES.has(String(message.subtype ?? "")) && this.inFlight.length > 0) {
       // Measured: an INTERRUPTED turn's result carries no user_message_uuid, so it can only
       // be attributed by position — the oldest in flight is the one the SDK was executing.
       //
@@ -365,21 +535,45 @@ export class ClaudeHostSession {
       // and treating those as terminal settled the running human turn before it had
       // answered. The relay then read a turn with no final answer yet and reported it
       // "interrupted without a final response" while the worker was still writing one.
+      // Only the head. An interrupt is NOT a fold: the SDK states that queued commands
+      // survive it and will still run (they come back on the interrupt receipt's
+      // `still_queued`), and settling them here would report turns as ended that are about
+      // to produce answers. One that was mid-fold when the abort landed is stranded, and is
+      // swept by the next turn's result below rather than guessed at here.
       settled = this.inFlight.shift();
     } else if (!uuid) {
       // A top-level end-of-turn that belongs to no accepted send. It is still delivered —
       // that is how a background task's report reaches chat — but it settles nothing.
-      this.emit({
-        type: "turn/completed",
-        sessionId: this.sessionId,
-        origin: "task-notification",
-        status: failed ? "failed" : "completed",
-        result: message,
-        at: this.now(),
-      });
+      this.emitUncorrelated(message, failed);
       return;
     }
 
+    // Oldest first, so each removal hands the queue's head to the next one, and WITHOUT the
+    // result — it belongs to the turn that was named, not to these. `folded` marks them as
+    // ended by that turn rather than in their own right, so the consumer neither hunts the
+    // transcript for a turn row a folded send never had nor announces one as unanswered:
+    // its answer was delivered, inside the turn that absorbed it.
+    for (const turn of preceding) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "human",
+        status: "completed",
+        uuid: turn.uuid,
+        at: this.now(),
+      });
+    }
+    for (const turn of folded) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "human",
+        status: "completed",
+        folded: true,
+        uuid: turn.uuid,
+        at: this.now(),
+      });
+    }
     this.emit({
       type: "turn/completed",
       sessionId: this.sessionId,

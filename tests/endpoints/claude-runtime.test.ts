@@ -2224,3 +2224,50 @@ test("interrupting a turn also stops the work it spawned", async () => {
   assert.deepEqual(claude.interrupts, [thread.id], "the response was interrupted");
   assert.deepEqual(claude.stoppedTasks, ["agent-1"], "and its subagent was stopped, not left running");
 });
+
+// A send folded into a running turn is answered by that turn and has no turn row of its own.
+// Its terminal must settle the session without sending the relay to find that row (bounded
+// retries there degrade the whole endpoint) and without stealing the absorbing turn's place
+// as the findable one a background task's report republishes.
+test("a folded turn settles as terminal-and-empty without displacing the turn that absorbed it", async () => {
+  const claude = new FakeClaude();
+  const runtime = makeRuntime(claude);
+  await runtime.start();
+  const { thread } = await runtime.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  const notifications: Array<{ method: string; params: any }> = [];
+  runtime.onNotification((method, params) => notifications.push({ method, params: params as any }));
+
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:running",
+    input: [{ type: "text", text: "this doc is still too long" }],
+  });
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:folded",
+    input: [{ type: "text", text: "also let a subagent review" }],
+  });
+
+  // The absorbing turn answers both, so the host settles the folded send alongside it.
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:folded", status: "completed", folded: true, at: 1,
+  });
+  claude.settleTurn(thread.id, "to:web:running", "completed");
+
+  const terminals = notifications.filter((entry) => entry.method === "turn/completed").map((entry) => entry.params.turn);
+  assert.deepEqual(terminals[0], { id: "to:web:folded", status: "completed", itemsView: "full", items: [], folded: true },
+    "an explicit empty full view: nothing to deliver, and no transcript row to go looking for");
+
+  // The session is genuinely idle again, and a background report still republishes the turn
+  // that actually holds the answer rather than the folded send.
+  const read = await runtime.request<{ thread: any }>("thread/read", { threadId: thread.id, includeTurns: false });
+  assert.equal(read.thread.status.type, "idle");
+  assert.equal(read.thread.activeTurnId, undefined);
+  notifications.length = 0;
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification",
+    status: "completed", at: 2,
+  });
+  assert.deepEqual(notifications.map((entry) => entry.params.turn?.id), ["to:web:running"]);
+});

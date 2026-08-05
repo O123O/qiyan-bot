@@ -62,6 +62,10 @@ export type HostEvent =
     type: "turn/completed";
     // Absent when the terminal result could not be attributed to an accepted send.
     uuid?: string;
+    // This send was folded into another turn, which answered it and ended it. It has no turn
+    // row of its own anywhere and produced no separate answer, so a consumer must settle it
+    // without looking for either.
+    folded?: boolean;
     origin: "human" | "task-notification";
     status: "completed" | "failed" | "interrupted";
     result?: Record<string, unknown>;

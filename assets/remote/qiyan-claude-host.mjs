@@ -107,6 +107,15 @@ var InputStream = class {
     };
   }
 };
+var RESULT_ERROR_SUBTYPES = /* @__PURE__ */ new Set([
+  "error_during_execution",
+  "error_max_turns",
+  "error_max_budget_usd",
+  "error_max_structured_output_retries"
+]);
+function claimsHumanTurn(origin) {
+  return origin.kind === void 0 || origin.kind === "human";
+}
 function classifyTask(record) {
   return typeof record.subagent_type === "string" && record.subagent_type.length > 0 ? "subagent" : "background";
 }
@@ -127,6 +136,12 @@ var ClaudeHostSession = class {
   // queued messages in order, so the head is the turn a uuid-less result belongs to.
   inFlight = [];
   acceptedUuids = /* @__PURE__ */ new Set();
+  // The turn a pending interrupt is aborting. Deliberately not a boolean: a flag set before
+  // the round trip has no reliable clear -- an interrupt over nothing in flight, a round trip
+  // that throws, or an abort result arriving on an empty queue all leave it set forever, and
+  // it then disables this reconciliation for the rest of the session's life with no signal.
+  // Held as the identity instead, so every route that retires that turn clears it implicitly.
+  abortingUuid;
   backgroundTasks = /* @__PURE__ */ new Map();
   closed = false;
   lastActiveAt = 0;
@@ -160,7 +175,48 @@ var ClaudeHostSession = class {
   }
   async interrupt() {
     if (this.closed) return;
-    await this.query.interrupt();
+    const aborting = this.inFlight[0]?.uuid;
+    const outstanding = this.abortInFlight();
+    const candidates = new Set(this.inFlight.map((turn) => turn.uuid));
+    if (aborting !== void 0) this.abortingUuid = aborting;
+    const receipt = await this.query.interrupt();
+    if (!outstanding) this.settleFoldedAcrossInterrupt(receipt, aborting, candidates);
+  }
+  // True while the turn a previous interrupt aborted is still in flight. Self-clearing: it
+  // reads the queue rather than a flag, so there is no state to leak.
+  abortInFlight() {
+    return this.abortingUuid !== void 0 && this.inFlight.some((turn) => turn.uuid === this.abortingUuid);
+  }
+  // An interrupt is not a fold: the SDK keeps queued commands across one and they still run,
+  // so the abort's own result settles the head and nothing else. But a send already folded
+  // into the aborted turn never runs and never produces a result, and in `inFlight` the two
+  // are indistinguishable — which stranded one on every ordinary "send a follow-up, then hit
+  // stop", the same permanent `working` this whole change exists to end.
+  //
+  // The interrupt receipt is the discriminator, and it is evidence rather than inference: the
+  // SDK reports exactly which sends survive. Anything in flight it does NOT name was folded.
+  // An older CLI sends no receipt at all, and that is unknown, not empty — settle nothing.
+  settleFoldedAcrossInterrupt(receipt, aborting, candidates) {
+    const queued = receipt?.still_queued;
+    if (!Array.isArray(queued)) return;
+    const survives = new Set(queued.filter((uuid) => typeof uuid === "string"));
+    const folded = this.inFlight.filter((turn) => candidates.has(turn.uuid) && turn.uuid !== aborting && !survives.has(turn.uuid));
+    if (folded.length === 0) return;
+    const settled = new Set(folded.map((turn) => turn.uuid));
+    for (let index = this.inFlight.length - 1; index >= 0; index -= 1) {
+      if (settled.has(this.inFlight[index].uuid)) this.inFlight.splice(index, 1);
+    }
+    for (const turn of folded) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "human",
+        status: "completed",
+        folded: true,
+        uuid: turn.uuid,
+        at: this.now()
+      });
+    }
   }
   async setModel(model) {
     await this.query.setModel(model);
@@ -330,6 +386,18 @@ var ClaudeHostSession = class {
       this.emit({ type: "session/init", sessionId: this.sessionId, message, at: this.now() });
     }
   }
+  // A top-level end-of-turn belonging to no accepted send. Delivered — that is how a
+  // background task's report reaches chat — but it settles nothing.
+  emitUncorrelated(message, failed) {
+    this.emit({
+      type: "turn/completed",
+      sessionId: this.sessionId,
+      origin: "task-notification",
+      status: failed ? "failed" : "completed",
+      result: message,
+      at: this.now()
+    });
+  }
   consumeResult(message) {
     const uuid = typeof message.user_message_uuid === "string" ? message.user_message_uuid : void 0;
     const origin = message.origin ?? {};
@@ -347,21 +415,43 @@ var ClaudeHostSession = class {
       return;
     }
     let settled;
+    let folded = [];
+    let preceding = [];
     if (uuid) {
       const index = this.inFlight.findIndex((turn) => turn.uuid === uuid);
-      if (index >= 0) settled = this.inFlight.splice(index, 1)[0];
-    } else if (message.subtype === "error_during_execution" && this.inFlight.length > 0) {
+      if (index < 0) {
+        this.emitUncorrelated(message, failed);
+        return;
+      }
+      preceding = this.inFlight.splice(0, index);
+      settled = this.inFlight.shift();
+      folded = this.inFlight.splice(0);
+    } else if (claimsHumanTurn(origin) && RESULT_ERROR_SUBTYPES.has(String(message.subtype ?? "")) && this.inFlight.length > 0) {
       settled = this.inFlight.shift();
     } else if (!uuid) {
+      this.emitUncorrelated(message, failed);
+      return;
+    }
+    for (const turn of preceding) {
       this.emit({
         type: "turn/completed",
         sessionId: this.sessionId,
-        origin: "task-notification",
-        status: failed ? "failed" : "completed",
-        result: message,
+        origin: "human",
+        status: "completed",
+        uuid: turn.uuid,
         at: this.now()
       });
-      return;
+    }
+    for (const turn of folded) {
+      this.emit({
+        type: "turn/completed",
+        sessionId: this.sessionId,
+        origin: "human",
+        status: "completed",
+        folded: true,
+        uuid: turn.uuid,
+        at: this.now()
+      });
     }
     this.emit({
       type: "turn/completed",

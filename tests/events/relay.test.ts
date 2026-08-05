@@ -1106,3 +1106,53 @@ test("relay stop cancels retry timers and awaits active endpoint work", async ()
   await Promise.all([handling, stopping]);
   assert.equal(stopped, true);
 });
+
+// A folded send was answered inside the turn that absorbed it, so it is settled but is NOT a
+// worker event. Reporting it made the dashboard take a phantom turn id as the worker's last
+// event -- it is first seen at its own terminal, so it mints an ordinal ABOVE the absorbing
+// turn's, and the real terminal that follows is then rejected as out of order. And its id is
+// never a usable delivery cursor: the cursor's only reader looks for it in the native
+// transcript, where a folded send has no row at all.
+test("a folded terminal is settled without becoming a worker event or a delivery cursor", async () => {
+  const observed: Array<{ turnId: string }> = [];
+  const { endpoint, relay, deliveries, progress } = await fixture((event) => { observed.push(event); });
+  const folded = { id: "to:web:folded", status: "completed", itemsView: "full", folded: true, startedAt: 5, completedAt: 10, items: [] };
+  endpoint.turns = [folded, terminal("to:web:absorbing")];
+
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: folded });
+  await relayIdle(relay);
+  assert.deepEqual(observed.map((event) => event.turnId), [], "not a worker event");
+  assert.equal(progress.cursor("local", "worker", mappingId), undefined, "never anchors the cursor");
+  assert.deepEqual(deliveries.listReady().map((entry) => entry.kind), [],
+    "nothing delivered, and no 'without a final response' warning either");
+
+  // The turn that actually answered still reports normally.
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: terminal("to:web:absorbing") });
+  await relayIdle(relay);
+  assert.deepEqual(observed.map((event) => event.turnId), ["to:web:absorbing"]);
+  assert.equal(progress.cursor("local", "worker", mappingId), "to:web:absorbing");
+});
+
+// A retry strips fullTurn, so `folded` has to live on the retry IDENTITY. Without it the
+// retry resolves the turn the only way left -- scanning the native transcript for a row a
+// folded send never had -- and bounded retries on that degrade the endpoint and raise a
+// mandatory operator warning, the exact outcome the folded path exists to avoid.
+test("a folded terminal still settles after a retry, without any transcript scan", async () => {
+  const observed: Array<{ turnId: string }> = [];
+  const { endpoint, relay, deliveries } = await fixture((event) => { observed.push(event); });
+  const folded = { id: "to:web:folded", status: "completed", itemsView: "full", folded: true, startedAt: 5, completedAt: 10, items: [] };
+  // Nothing for a history scan to find: the folded send has no row, exactly as in production.
+  endpoint.turns = [];
+  relay.endpointUnavailable("local");
+
+  await relay.handleNotification("local", "turn/completed", { threadId: "worker", turn: folded });
+  await relayIdle(relay);
+  assert.equal(retainedTargets(relay).length, 1, "held for retry, with fullTurn stripped");
+
+  await relay.endpointReady("local");
+  await relayIdle(relay);
+  assert.deepEqual(retainedTargets(relay), [], "settled rather than retried into a degrade");
+  assert.deepEqual(observed.map((event) => event.turnId), [], "still not a worker event");
+  assert.deepEqual(deliveries.listReady().map((entry) => entry.kind), [],
+    "no delivery and no recovery warning");
+});
