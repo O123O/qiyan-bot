@@ -9,7 +9,7 @@ import "katex/dist/katex.min.css";
 import { describeWorkerTasks, formatGoalStatus, selectedWorkerGoal, type WorkerGoal } from "./goal-presentation";
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
-import { joinFilesystemPath, parentFilesystemPath } from "./filesystem-path";
+import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkdownRef } from "./filesystem-path";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
@@ -955,13 +955,29 @@ export function App() {
     openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), session);
 
   const remark = [remarkGfm, remarkMath, remarkFilePaths];
-  const mdComponentsFor = (session: string | null) => ({ a: (props: any) => {
-    const href = typeof props.href === "string" ? props.href : "";
-    if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href, session)}>{props.children}</button>;
-    // A plain markdown link to a local file → open the preview, not navigate to the SPA fallback.
-    if (isLocalHref(href)) return <button className="file-link" onClick={() => openMentioned(MENTION + encodeURIComponent(href), session)}>{props.children}</button>;
-    return <a {...props} target="_blank" rel="noreferrer" />;
-  } });
+  // `baseDir` is the directory of the document being rendered, so its relative references
+  // resolve the way its author wrote them. Chat messages belong to no file and pass none,
+  // which leaves them resolving against the session's project root as they always have.
+  const mdComponentsFor = (session: string | null, baseDir = "") => ({
+    a: (props: any) => {
+      const href = typeof props.href === "string" ? props.href : "";
+      if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href, session)}>{props.children}</button>;
+      // A plain markdown link to a local file → open the preview, not navigate to the SPA fallback.
+      if (isLocalHref(href)) return <button className="file-link" onClick={() => openMentioned(MENTION + encodeURIComponent(resolveMarkdownRef(baseDir, href)), session)}>{props.children}</button>;
+      return <a {...props} target="_blank" rel="noreferrer" />;
+    },
+    // A local image src is a path on the worker's host, not a URL this origin can serve: left
+    // alone the browser resolves it against the SPA and gets the chat page back, so every
+    // figure in a document rendered as a broken image. Point it at the same raw-file route the
+    // image preview already streams from, which reaches local and remote sessions alike.
+    img: (props: any) => {
+      const src = typeof props.src === "string" ? props.src : "";
+      if (!isLocalHref(src)) return <img {...props} className="md-img" loading="lazy" />;
+      const path = resolveMarkdownRef(baseDir, src);
+      return <img {...props} className="md-img" loading="lazy" src={rawUrl(path, session)}
+        title={props.title ?? path} onClick={() => openPreview(path, session)} />;
+    },
+  });
 
   return (
     <div className="app">
@@ -1082,7 +1098,7 @@ export function App() {
                 {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
                   : preview.kind === "loading" ? <div className="hint">loading…</div>
                   : preview.kind === "error" ? <div className="hint">{preview.error}</div>
-                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected)}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
+                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(preview.session ?? null, markdownBaseDir(preview.path ?? preview.title))}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
                   : <><CodeView text={preview.text} title={preview.title} lang={preview.lang} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
               </div>
             </div>

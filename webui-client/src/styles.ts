@@ -116,4 +116,8 @@ body { margin:0; }
 .head-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
 .sheet-body { overflow:auto; padding:14px; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
 .preview-img { max-width:100%; max-height:78vh; object-fit:contain; display:block; margin:0 auto; }
+/* Figures inside rendered markdown. Capped so a full-resolution screenshot cannot push the
+   document into a horizontal scroll, and clickable because the cap makes detail unreadable. */
+.md img.md-img { max-width:100%; height:auto; display:block; margin:8px 0; border-radius:6px; cursor:zoom-in; }
+.md img.md-img[alt]:after { content:attr(alt); }
 `;
