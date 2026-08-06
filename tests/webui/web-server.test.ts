@@ -76,7 +76,7 @@ interface ServerCalls {
 }
 
 async function withServer(
-  run: (base: string, calls: ServerCalls, bus: WebBus, uploadsDir: string) => Promise<void>,
+  run: (base: string, calls: ServerCalls, bus: WebBus, uploadsDir: string, staticDir: string) => Promise<void>,
   readsOverride: WebReadsDeps = reads,
 ): Promise<void> {
   const bus = new WebBus();
@@ -103,7 +103,7 @@ async function withServer(
   });
   const { url } = await server.start();
   const base = url.slice(0, url.indexOf("/?"));
-  try { await run(base, calls, bus, uploadsDir); } finally { await server.stop(); }
+  try { await run(base, calls, bus, uploadsDir, staticDir); } finally { await server.stop(); }
 }
 
 test("the server handle is restartable: start → stop → start re-listens and re-serves WS", async () => {
@@ -630,5 +630,53 @@ test("the WebSocket protocol resumes the foreground worker stream before replayi
     assert.equal(replay.event.delta, "two");
     assert.ok(received.indexOf(ack) < received.indexOf(replay));
     second.close();
+  });
+});
+
+// The Web UI is a single inlined bundle. It was re-read from disk and re-sent whole on every
+// request, so on an NFS home a page load cost seconds of blocked event loop and every API call
+// queued behind it. Held in memory, revalidated, and compressed.
+test("the Web UI bundle is compressed, revalidated, and read from disk only once", async () => {
+  await withServer(async (base, _calls, _bus, _uploads, staticDir) => {
+    // Realistically sized: a bundle is megabytes, and tiny files are deliberately not compressed.
+    await writeFile(join(staticDir, "index.html"), `<!doctype html><title>ok</title><script>${"x".repeat(4096)}</script>`);
+    const first = await fetch(`${base}/?token=${TOKEN}`, { headers: { "accept-encoding": "gzip" } });
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get("content-encoding"), "gzip");
+    assert.equal(first.headers.get("vary"), "accept-encoding");
+    const etag = first.headers.get("etag");
+    assert.ok(etag, "an entity tag is what makes a reload conditional");
+    // The body still decodes to the real asset — fetch decompresses transparently.
+    assert.match(await first.text(), /<!doctype html>/u);
+
+    // A reload transfers nothing.
+    const reload = await fetch(`${base}/?token=${TOKEN}`, { headers: { "if-none-match": etag } });
+    assert.equal(reload.status, 304);
+    assert.equal((await reload.text()).length, 0);
+
+    // A client that cannot take gzip still gets a correct body.
+    const plain = await fetch(`${base}/?token=${TOKEN}`, { headers: { "accept-encoding": "identity" } });
+    assert.equal(plain.headers.get("content-encoding"), null);
+    assert.match(await plain.text(), /<!doctype html>/u);
+
+    // A route-like path serves the SPA from the same cache rather than re-reading it.
+    const spa = await fetch(`${base}/some/route?token=${TOKEN}`, { headers: { "accept-encoding": "gzip" } });
+    assert.equal(spa.status, 200);
+    assert.equal(spa.headers.get("etag"), etag);
+  });
+});
+
+// A rebuilt asset has to be picked up without a restart, or a deploy serves the old UI.
+test("a rebuilt Web UI asset invalidates the cached copy", async () => {
+  await withServer(async (base, _calls, _bus, _uploads, staticDir) => {
+    const before = await fetch(`${base}/?token=${TOKEN}`);
+    const firstTag = before.headers.get("etag");
+    await before.text();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writeFile(join(staticDir, "index.html"), "<!doctype html><title>rebuilt</title>");
+    const after = await fetch(`${base}/?token=${TOKEN}`);
+    assert.notEqual(after.headers.get("etag"), firstTag, "mtime+size changed, so the cache must not answer");
+    assert.match(await after.text(), /rebuilt/u);
   });
 });

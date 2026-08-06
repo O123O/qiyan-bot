@@ -3,6 +3,8 @@ import { createReadStream } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
+import { gzip } from "node:zlib";
+import { promisify } from "node:util";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { OperationalEvent } from "../core/operational-log.ts";
 import type { WebBus } from "./web-bus.ts";
@@ -222,7 +224,36 @@ export function createWebServer(options: WebServerOptions): WebServer {
     response.end(payload);
   };
 
-  const serveStatic = async (response: ServerResponse, pathname: string): Promise<void> => {
+  // The Web UI is one inlined 2.4 MB bundle, and it was re-read from disk and re-sent whole on
+  // every request: no compression, no validator, no reuse. On an NFS home that cold read cost
+  // seconds, and because it is also the SPA fallback, any route-like path paid it -- while the
+  // read and the send blocked the event loop, so every API call queued behind a page load and
+  // the whole UI felt stalled. Held in memory, revalidated by mtime+size, and compressed once.
+  const staticCache = new Map<string, { stamp: string; etag: string; body: Buffer; type: string; gzipped?: Buffer }>();
+  const gzipAsync = promisify(gzip);
+  const COMPRESSIBLE = /^(?:text\/|application\/(?:javascript|json|xml)|image\/svg)/u;
+
+  const loadStatic = async (full: string): Promise<{ etag: string; body: Buffer; type: string; gzipped?: Buffer } | undefined> => {
+    const info = await stat(full).catch(() => undefined);
+    if (!info?.isFile()) return undefined;
+    // mtime+size is the same identity the clean-shutdown marker uses; a rebuilt asset changes
+    // both, and an unchanged one never pays the read again.
+    const stamp = `${info.size}:${info.mtimeMs}`;
+    const cached = staticCache.get(full);
+    if (cached?.stamp === stamp) return cached;
+    const body = await readFile(full);
+    const type = CONTENT_TYPES[extname(full)] ?? "application/octet-stream";
+    // Compressed once per build, not once per request: gzip on a 2.4 MB buffer is far too slow
+    // to run on the request path of a single-threaded server.
+    const gzipped = COMPRESSIBLE.test(type) && body.byteLength >= 1024
+      ? await gzipAsync(body).catch(() => undefined)
+      : undefined;
+    const entry = { stamp, etag: `"${info.size.toString(16)}-${Math.trunc(info.mtimeMs).toString(16)}"`, body, type, ...(gzipped ? { gzipped } : {}) };
+    staticCache.set(full, entry);
+    return entry;
+  };
+
+  const serveStatic = async (response: ServerResponse, pathname: string, request?: IncomingMessage): Promise<void> => {
     // Confine to the static dir; a normalized path that escapes it falls back to index.html (SPA).
     const relative = normalize(pathname === "/" ? "index.html" : pathname.replace(/^\/+/, ""));
     const candidate = relative.startsWith("..") ? "index.html" : relative;
@@ -233,10 +264,26 @@ export function createWebServer(options: WebServerOptions): WebServer {
     for (const file of candidates) {
       const full = join(options.staticDir, file);
       try {
-        if (!(await stat(full)).isFile()) continue;
-        const body = await readFile(full);
-        response.writeHead(200, { "content-type": CONTENT_TYPES[extname(full)] ?? "application/octet-stream" });
-        response.end(body);
+        const asset = await loadStatic(full);
+        if (!asset) continue;
+        // A reload then costs one conditional request instead of the whole bundle again.
+        if (request?.headers["if-none-match"] === asset.etag) {
+          response.writeHead(304, { etag: asset.etag, "cache-control": "no-cache" });
+          response.end();
+          return;
+        }
+        const accepts = String(request?.headers["accept-encoding"] ?? "").includes("gzip");
+        const send = accepts && asset.gzipped ? asset.gzipped : asset.body;
+        response.writeHead(200, {
+          "content-type": asset.type,
+          "content-length": send.byteLength,
+          etag: asset.etag,
+          // Revalidate every time rather than caching by age: the asset is replaced by a
+          // deploy, and a stale UI against a new backend is its own class of bug report.
+          "cache-control": "no-cache",
+          ...(send === asset.gzipped ? { "content-encoding": "gzip", vary: "accept-encoding" } : { vary: "accept-encoding" }),
+        });
+        response.end(send);
         return;
       } catch { /* try the SPA fallback */ }
     }
@@ -470,7 +517,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       json(response, result.ok ? 200 : 400, result);
       return;
     }
-    if (request.method === "GET") { await serveStatic(response, url.pathname); return; }
+    if (request.method === "GET") { await serveStatic(response, url.pathname, request); return; }
     response.writeHead(405, { "content-type": "text/plain" });
     response.end("method not allowed");
   };
