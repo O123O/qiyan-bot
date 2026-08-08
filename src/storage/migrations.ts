@@ -841,4 +841,14 @@ export const migrations: readonly Migration[] = [
   // The dashboard notification table is a durable inbox, not an audit log. Projection
   // watermarks make replay idempotent, so only unresolved rows need to survive restart.
   `DELETE FROM session_dashboard_notifications WHERE state <> 'pending';`,
+  // The delivery queue is polled four times a second, and the queue is empty almost always:
+  // every row reaches 'confirmed' and stays. Without an index that poll was a full scan --
+  // reading every page of a table whose bodies are megabytes, to return zero rows, 4x per
+  // second, synchronously. Measured on a live bot: 0.117s per scan and 15 MB/s of sustained
+  // reads on an idle system, which on a network home blocked the event loop badly enough that
+  // an in-memory endpoint answering in 20ms reached a 33-second p90.
+  //
+  // Ordered by created_at so the queue drains in commit order off the index itself, with no
+  // temp b-tree. Covers the 'dispatched' recovery scan on the same shape.
+  `CREATE INDEX IF NOT EXISTS deliveries_state_created_idx ON deliveries(state, created_at, id);`,
 ];

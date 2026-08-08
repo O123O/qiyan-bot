@@ -145,7 +145,12 @@ export class DeliveryStore {
   }
 
   listReady(): DeliveryRecord[] {
-    const rows = this.db.prepare("SELECT id FROM deliveries WHERE state IN ('prepared', 'uncertain') ORDER BY created_at").all() as Array<{ id: string }>;
+    // rowid, not id, breaks the tie: two deliveries prepared in the same millisecond must send
+    // in the order they were committed, and `id` is a uuid, so ordering by it is arbitrary.
+    // Left implicit this was a latent ambiguity -- a temp sort happened to preserve insertion
+    // order until an index made the query answerable another way, and a warning then overtook
+    // the terminal it was reporting on.
+    const rows = this.db.prepare("SELECT id FROM deliveries WHERE state IN ('prepared', 'uncertain') ORDER BY created_at, rowid").all() as Array<{ id: string }>;
     return rows.map(({ id }) => this.get(id) as DeliveryRecord);
   }
 
