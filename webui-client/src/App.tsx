@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -64,6 +64,20 @@ const ASSIST = " assistant"; // log key for the QiYan tab (selected === null)
 const ASSIST_STREAM = "assistant";
 const PAGE = 20;             // messages fetched per page
 const RENDER_CAP = 30;       // messages rendered initially per tab
+// Hoisted out of the component: a fresh array identity on every render defeats react-markdown's
+// own memoisation, so it re-parsed every message whenever anything re-rendered.
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkFilePaths];
+const REHYPE_PLUGINS = [rehypeHighlight, rehypeKatex];
+
+// Rendering one message parses markdown, highlights code and typesets maths. Redoing that for
+// every visible message whenever any unrelated state changes is what made typing in the
+// composer stutter: the draft lives in App state, so each keystroke re-rendered the whole log.
+// Memoised on the only two inputs that can change the output.
+const MarkdownBody = memo(function MarkdownBody(
+  { body, components }: { body: string; components: Record<string, unknown> },
+) {
+  return <Markdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={components}>{normalizeMath(body)}</Markdown>;
+});
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
 const TOP_PX = 120, BOTTOM_PX = 80;
 const RECOVERY_RETRY_MS = [500, 1_500, 3_000] as const;
@@ -951,14 +965,22 @@ export function App() {
   // relative paths under their project, so the client never guesses which root a path lives in.
   // `session` decides which host a path resolves against: the current worker tab, or (in the QiYan tab)
   // the relayed message's origin worker — so a REMOTE worker's path streams from its host.
-  const openMentioned = (mention: string, session: string | null) =>
-    openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), session);
+  const openMentioned = useCallback((mention: string, session: string | null) =>
+    openPreview(decodeURIComponent(mention.replace(MENTION, "")).replace(/:\d+(?::\d+)?$/, "").replace(/^\.\//, ""), session), [openPreview]);
 
-  const remark = [remarkGfm, remarkMath, remarkFilePaths];
   // `baseDir` is the directory of the document being rendered, so its relative references
   // resolve the way its author wrote them. Chat messages belong to no file and pass none,
   // which leaves them resolving against the session's project root as they always have.
-  const mdComponentsFor = (session: string | null, baseDir = "") => ({
+  // Identity matters as much as content here: MarkdownBody is memoised on it, so rebuilding
+  // this object every render would defeat the memo and re-parse every message anyway. Safe to
+  // cache indefinitely because the only things it closes over -- openPreview and openMentioned
+  // -- are themselves stable.
+  const mdComponentCache = useRef(new Map<string, Record<string, unknown>>());
+  const mdComponentsFor = useCallback((session: string | null, baseDir = "") => {
+    const key = `${session ?? ""}\u0000${baseDir}`;
+    const cached = mdComponentCache.current.get(key);
+    if (cached) return cached;
+    const built = ({
     a: (props: any) => {
       const href = typeof props.href === "string" ? props.href : "";
       if (href.startsWith(MENTION)) return <button className="file-link" onClick={() => openMentioned(href, session)}>{props.children}</button>;
@@ -977,7 +999,10 @@ export function App() {
       return <img {...props} className="md-img" loading="lazy" src={rawUrl(path, session)}
         title={props.title ?? path} onClick={() => openPreview(path, session)} />;
     },
-  });
+    });
+    mdComponentCache.current.set(key, built);
+    return built;
+  }, [openMentioned, openPreview]);
 
   return (
     <div className="app">
@@ -1045,7 +1070,7 @@ export function App() {
                     ? <button type="button" className="worker-mention" title={`Message @${relayWorker}`} onClick={() => targetWorkerFromRelay(relayWorker)} onDoubleClick={(event) => event.stopPropagation()}>{presentation?.label ?? `Worker · ${relayWorker}`}</button>
                     : presentation?.label ?? "QiYan"
                   : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(selected ?? m.origin ?? null)}>{normalizeMath(m.body)}</Markdown></div>
+                <div className="md"><MarkdownBody body={m.body} components={mdComponentsFor(selected ?? m.origin ?? null)} /></div>
               </div>;
             })}
           </div>
@@ -1098,7 +1123,7 @@ export function App() {
                 {preview.kind === "image" ? <img className="preview-img" src={preview.url} alt={preview.title} />
                   : preview.kind === "loading" ? <div className="hint">loading…</div>
                   : preview.kind === "error" ? <div className="hint">{preview.error}</div>
-                  : isMd && !srcMode ? <div className="md"><Markdown remarkPlugins={remark} rehypePlugins={[rehypeHighlight, rehypeKatex]} components={mdComponentsFor(preview.session ?? null, markdownBaseDir(preview.path ?? preview.title))}>{normalizeMath(preview.text)}</Markdown>{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
+                  : isMd && !srcMode ? <div className="md"><MarkdownBody body={preview.text} components={mdComponentsFor(preview.session ?? null, markdownBaseDir(preview.path ?? preview.title))} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</div>
                   : <><CodeView text={preview.text} title={preview.title} lang={preview.lang} />{preview.truncated ? <div className="hint">… [truncated]</div> : null}</>}
               </div>
             </div>
