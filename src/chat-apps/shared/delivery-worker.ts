@@ -5,9 +5,16 @@ import type { JsonValue } from "./binding.ts";
 import type { ChatDeliveryAdapter } from "./contracts.ts";
 import type { ChatAdapterRegistry } from "./adapter-registry.ts";
 
+// How long a delivery that failed retryably waits before the next attempt. Armed only while
+// the queue actually holds one, so an idle queue runs no timer at all.
+const RETRY_INTERVAL_MS = 1_000;
+
 export class DeliveryWorker {
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
   private draining: Promise<void> | undefined;
+  private unsubscribe: (() => void) | undefined;
+  private again = false;
+  private retryIntervalMs = RETRY_INTERVAL_MS;
 
   constructor(
     private readonly store: DeliveryStore,
@@ -80,16 +87,39 @@ export class DeliveryWorker {
     }
   }
 
-  start(intervalMs = 250): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => {
-      if (this.draining) return;
-      this.draining = this.drain().catch(() => undefined).finally(() => { this.draining = undefined; });
-    }, intervalMs);
+  // Woken by the queue, not by a clock: the outbox is empty almost always, so a poll spends
+  // every read discovering nothing.
+  start(intervalMs = RETRY_INTERVAL_MS): void {
+    if (this.unsubscribe) return;
+    this.retryIntervalMs = intervalMs;
+    this.unsubscribe = this.store.onReady(() => this.wake());
+    this.wake();
+  }
+
+  private wake(): void {
+    if (this.draining) { this.again = true; return; }
+    this.draining = this.drain()
+      .catch(() => undefined)
+      .finally(() => {
+        this.draining = undefined;
+        if (this.again) { this.again = false; this.wake(); return; }
+        this.armRetry();
+      });
+  }
+
+  // A delivery put back by a rate limit, or left uncertain, becomes ready again with nothing
+  // to announce it. One timer while that is true, and none once the queue drains.
+  private armRetry(): void {
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    if (!this.unsubscribe || this.store.listReady().length === 0) return;
+    this.timer = setTimeout(() => { this.timer = undefined; this.wake(); }, this.retryIntervalMs);
+    this.timer.unref?.();
   }
 
   async stop(): Promise<void> {
-    if (this.timer) clearInterval(this.timer);
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     await this.draining;
   }

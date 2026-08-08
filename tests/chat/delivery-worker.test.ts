@@ -240,3 +240,35 @@ test("drain sends a newly prepared warning for an abandoned optional uncertain d
   }]);
   assert.equal(store.get("delivery-warning:optional-uncertain")?.state, "confirmed");
 });
+
+// The outbox is empty almost always -- every delivery reaches `confirmed` and stays -- so a
+// worker that polls for readiness spends every read discovering nothing. Measured on a live
+// bot before this: a full scan of the delivery table four times a second, 15 MB/s of sustained
+// reads while completely idle. It is told now, and an idle queue runs no timer at all.
+test("the delivery worker is woken by the queue and runs no timer while idle", async () => {
+  const store = new DeliveryStore(createTestDatabase());
+  const adapter = new FakeAdapter("slack", { ts: "1.0" });
+  const worker = new DeliveryWorker(store, new ChatAdapterRegistry([{ delivery: adapter }]));
+  const binding = { adapterId: "slack", conversationKey: "owner", destination: { channel: "C1" } } as const;
+  let reads = 0;
+  const listReady = store.listReady.bind(store);
+  store.listReady = () => { reads += 1; return listReady(); };
+
+  worker.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const readsWhileIdle = reads;
+  assert.equal(adapter.sent.length, 0, "nothing to send yet");
+
+  // Enqueueing is what wakes it -- no clock involved.
+  store.prepare({ id: "woken", kind: "chat", binding, body: "hello", mandatory: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(adapter.sent.map((entry) => entry.body), ["hello"], "sent without waiting for a poll");
+  assert.equal(store.get("woken")?.state, "confirmed");
+
+  // And once drained it goes quiet again: an idle queue must not accumulate reads.
+  const settled = reads;
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(reads, settled, "no polling once the queue is empty");
+  assert.ok(readsWhileIdle <= 2, `an idle start reads at most once, got ${readsWhileIdle}`);
+  await worker.stop();
+});

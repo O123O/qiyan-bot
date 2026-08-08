@@ -40,6 +40,28 @@ export class DeliveryStore {
     });
   }
 
+  // Fired when a row becomes ready to send, so the worker can be told instead of looking.
+  private readonly readyListeners = new Set<() => void>();
+  private announcing = false;
+  onReady(listener: () => void): () => void {
+    this.readyListeners.add(listener);
+    return () => { this.readyListeners.delete(listener); };
+  }
+  // Deferred and coalesced, for two reasons. A burst of prepares in one synchronous block must
+  // wake ONE drain after all of them, or the first is sent before the rest exist. And an
+  // attachment delivery inserts inside a transaction, where waking a sender that reads and
+  // writes the same rows would re-enter it mid-flight.
+  private announceReady(): void {
+    if (this.announcing) return;
+    this.announcing = true;
+    setImmediate(() => {
+      this.announcing = false;
+      for (const listener of this.readyListeners) {
+        try { listener(); } catch { /* a subscriber must never break the write that woke it */ }
+      }
+    });
+  }
+
   private insert(id: string, input: { kind: string; binding: ConversationBinding; body: string; mandatory: boolean; attachmentId?: string; attachmentScopeId?: string }): DeliveryRecord {
     const now = Date.now();
     this.db.prepare(`INSERT INTO deliveries
@@ -49,7 +71,9 @@ export class DeliveryStore {
       .run(id, input.kind, JSON.stringify(input.binding.destination), input.body, input.attachmentId ?? null, input.attachmentScopeId ?? null,
         input.mandatory ? 1 : 0, now, now, input.binding.adapterId, input.binding.conversationKey,
         JSON.stringify(input.binding.destination), input.binding.reply === undefined ? null : JSON.stringify(input.binding.reply));
-    return this.get(id) as DeliveryRecord;
+    const record = this.get(id) as DeliveryRecord;
+    this.announceReady();
+    return record;
   }
 
   // Append text to a delivery's stored body. The web surface uses this to persist an outbound file's
