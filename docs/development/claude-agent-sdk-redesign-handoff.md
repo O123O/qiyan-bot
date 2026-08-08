@@ -9,21 +9,34 @@ document and `claude-agent-sdk-host-design.md` disagree, that one wins, and its
 describing the one-shot `claude -p` engine is now an account of code that has
 been deleted, kept because it is the clearest statement of why.
 
-The implementation snapshot behind this document is commit `2cffd52`. It is
-four commits ahead of `main`/`origin/main` at `0344cb8`:
+The implementation snapshot behind this document is commit `2cffd52`. All four
+of the changes it once listed as unintegrated are now in `main`, so the warning
+that stood here is spent: `4f4c536` (pending Claude messages stay visible in the
+Web UI), `c1174ae` (native subagent notifications hidden from the user-message
+stream), `7cef7f4` (condition monitors complete after their first fire), and
+`2cffd52` (one-shot headless turns launch no background agents). The last of
+those was a workaround for the one-process-per-turn engine that this document
+argued against; the SDK host replaced that engine, and background tasks now have
+their own lifetime and delivery semantics, so the workaround no longer guards
+anything.
 
-- `4f4c536` keeps pending Claude messages visible in the Web UI.
-- `c1174ae` hides native Claude subagent notifications from the user-message
-  stream.
-- `7cef7f4` makes condition monitors complete after their first successful
-  fire.
-- `2cffd52` tells one-shot headless Claude turns not to launch background
-  agents.
+Since the migration landed, production has corrected two claims made here and in
+the design doc. Both are recorded where they belong rather than here — see
+"Turn identity" in `claude-agent-sdk-host-design.md` for the first — but they
+share a shape worth naming for anyone reading this as history:
 
-Do not start the migration from `origin/main` without first deciding how those
-changes are integrated. The last item is a workaround for the current
-one-process-per-turn design and should be removed only after the SDK host proves
-that background tasks have correct lifetime and delivery semantics.
+- **A turn id is not always a transcript row.** This document assumed every
+  accepted send becomes a turn. A send that arrives mid-turn does not: Claude
+  folds it into the turn already running, which answers both prompts under its
+  own id, and the folded send never runs as a turn of its own. Settling by id
+  alone therefore left it in flight forever, and the session reported "working"
+  while idle until a restart.
+- **Reconciliation is only as good as the source it trusts.** The correction
+  built for stale turns asked the host which turns were still running and
+  settled anything it no longer held. The host was itself the stale source, so
+  the sweep confirmed the ghost every 60 seconds instead of clearing it. A
+  bounded read that cannot say "I do not know" will eventually launder its own
+  limits into a fact.
 
 ## Executive decision
 

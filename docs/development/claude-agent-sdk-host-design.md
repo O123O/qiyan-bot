@@ -233,6 +233,35 @@ the filtered text blocks, matching reconstruction exactly. This is what makes
 duplicate Web UI bubbles after a reload structurally impossible, and it is why
 recovery correlates a send by turn id rather than by counting appended turns.
 
+**With one exception, found in production.** A send that arrives while a turn is
+running is not started as a turn at all: Claude pulls it out of the queue and
+*folds* it into the turn already in flight, which then answers both prompts under
+that turn's uuid. The folded send gets no transcript row of its own, and no
+result ever carries its id — the SDK states it outright, "it never runs as its
+own turn". The queue operations are the discriminator: a send that becomes a turn
+is `enqueue`/`dequeue` in the same millisecond, while a folded one is `enqueue`
+then `remove`, surviving only as a `queued_command` attachment.
+
+Consequences that are easy to get wrong, and were:
+
+- Settling by uuid alone strands a folded send in flight forever. `activity()`
+  reads "working" off a non-empty set, so the session reports working while idle
+  and is never evictable. Everything still in flight when a result lands was
+  queued while that turn ran, so it was folded into it: settle the lot.
+- A folded turn must be settled but **not reported**. It has no row for a
+  consumer to find, so a normal terminal sends the relay hunting for one, and
+  observing it mints a turn ordinal above the absorbing turn's — after which the
+  dashboard takes the phantom id as the worker's last event and rejects the real
+  terminal behind it.
+- An interrupt is not a fold. Queued commands survive one and still run, so only
+  the interrupt receipt's `still_queued` separates a folded send from one that
+  will run — matched by uuid, because the abort's result can precede the receipt.
+- `SDKResultError` declares `user_message_uuid` on none of its four subtypes, so
+  position is the only attribution available for all of them, gated on
+  `origin.kind` — the union has eight kinds and only `human` is a send QiYan
+  made. A goal-driven worker runs on auto-continuations, which is exactly what
+  produces `error_max_turns`.
+
 ### History
 
 Claude's JSONL remains the only durable transcript; QiYan keeps no cache and
