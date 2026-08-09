@@ -79,6 +79,11 @@ const MarkdownBody = memo(function MarkdownBody(
   return <Markdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={components}>{normalizeMath(body)}</Markdown>;
 });
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
+// Live messages retained per tab. The stream reducer bounds the worker snapshot already; this
+// is the other half -- your sent echoes and live replies -- which was appended to forever, so
+// a long conversation grew the array the shown-memo re-sorts on every single message.
+// Generous, because anything trimmed here is durable server-side and returns on scroll-up.
+const MAX_LIVE_LOG = 400;
 const TOP_PX = 120, BOTTOM_PX = 80;
 const RECOVERY_RETRY_MS = [500, 1_500, 3_000] as const;
 
@@ -234,7 +239,10 @@ export function App() {
   const reconciliationRetryRef = useRef<{ subscriptionId: string; attempt: number; timer: number } | null>(null);
   const workerHistoryAutoFillsRef = useRef(new Map<string, WorkerHistoryAutoFillState>());
   const workerTailRevisionRef = useRef("");
-  const push = (k: string, m: Msg) => setLog((prev) => ({ ...prev, [k]: [...(prev[k] ?? []), m] }));
+  const push = (k: string, m: Msg) => setLog((prev) => {
+    const next = [...(prev[k] ?? []), m];
+    return { ...prev, [k]: next.length > MAX_LIVE_LOG ? next.slice(next.length - MAX_LIVE_LOG) : next };
+  });
   const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
   const clearRecoveryRetries = useCallback(() => {
     for (const retry of recoveryRetriesRef.current.values()) window.clearTimeout(retry.timer);
@@ -666,7 +674,13 @@ export function App() {
 
   const onScroll = () => {
     const el = logRef.current; if (!el) return;
-    stickRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - BOTTOM_PX;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - BOTTOM_PX;
+    stickRef.current = atBottom;
+    // Returning to the bottom releases everything scrolling up revealed. Without this the
+    // window only ever ratchets open: REVEAL_STEP widens it, and every message arriving while
+    // you are scrolled up widens it by one more to hold your place, so a long conversation
+    // ended up rendering its entire history and never collapsed back to the recent window.
+    if (atBottom && visible > RENDER_CAP) setVisible(RENDER_CAP);
     if (el.scrollTop <= TOP_PX) {
       if (visible < shown.length) { preserveRef.current = { height: el.scrollHeight, pending: false }; setVisible((v) => Math.min(v + REVEAL_STEP, shown.length)); }
       else if (hasOlder[key] && !loadingOlder) void loadOlder();
