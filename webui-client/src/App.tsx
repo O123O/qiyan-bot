@@ -10,6 +10,7 @@ import { describeWorkerTasks, formatGoalStatus, selectedWorkerGoal, type WorkerG
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkdownRef } from "./filesystem-path";
+import { splitHighlightedLines } from "./highlight-lines";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
@@ -170,13 +171,33 @@ function CodeView({ text, title, lang: forced }: { text: string; title: string; 
   const parts = title.split(".");
   const ext = parts.length > 1 ? parts.pop()!.toLowerCase() : "";
   const lang = forced && hljs.getLanguage(forced) ? forced : ext && hljs.getLanguage(ext) ? ext : "";
-  // Uniform structure: <code class="hljs"> gets the theme's block styling either way; hljs escapes source.
+  // One row per source line, so a number stays beside its line even when that line wraps —
+  // a gutter at a fixed offset drifts the moment anything soft-wraps. hljs escapes the source;
+  // splitHighlightedLines keeps each fragment independently well-formed.
+  const lines = useMemo(() => {
+    const highlighted = lang ? hljs.highlight(text, { language: lang, ignoreIllegals: true }).value : escapeHtml(text);
+    return splitHighlightedLines(highlighted);
+  }, [text, lang]);
+  const width = `${String(lines.length).length}ch`;
   return (
     <pre className="code-view">
-      {lang ? <code className="hljs" dangerouslySetInnerHTML={{ __html: hljs.highlight(text, { language: lang, ignoreIllegals: true }).value }} />
-        : <code className="hljs">{text}</code>}
+      <code className="hljs code-lines" style={{ ["--gutter" as string]: width }}>
+        {lines.map((line, index) => (
+          <span className="code-line" key={index}>
+            {/* aria-hidden and unselectable: a number copied into the middle of pasted code is
+                worse than no gutter at all. */}
+            <span className="code-gutter" aria-hidden="true">{index + 1}</span>
+            <span className="code-text" dangerouslySetInnerHTML={{ __html: line }} />
+          </span>
+        ))}
+      </code>
     </pre>
   );
+}
+
+// Only for the unhighlighted path: hljs escapes its own output, this one must not be double-escaped.
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>]/gu, (character) => (character === "&" ? "&amp;" : character === "<" ? "&lt;" : "&gt;"));
 }
 
 const when = (m: Msg) => m.completedAt ?? m.at ?? 0;

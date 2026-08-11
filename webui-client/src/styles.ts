@@ -71,6 +71,17 @@ body { margin:0; }
 .md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */
 .code-view, .md pre .hljs { margin:0; border-radius:8px; font:12.5px/1.5 monospace; }
 .code-view { border:1px solid var(--line); overflow:auto; }
+/* One grid row per source line. The gutter column is sized to the widest line number, so a
+   1000-line file does not shift its code sideways relative to a 100-line one, and a wrapped
+   line keeps its number pinned to the row's first visual line rather than drifting. */
+.code-lines { display:grid; grid-template-columns:max-content 1fr; }
+.code-line { display:contents; }
+.code-gutter {
+  width:var(--gutter,2ch); padding:0 10px 0 4px; text-align:right;
+  color:var(--muted); opacity:.55; user-select:none; -webkit-user-select:none;
+  border-right:1px solid var(--line); position:sticky; left:0; background:inherit;
+}
+.code-text { white-space:pre-wrap; word-break:break-word; padding-left:10px; }
 /* highlight.js palette follows the app theme (github light/dark) */
 .hljs { display:block; overflow-x:auto; padding:12px; background:var(--hl-bg); color:var(--hl-fg); }
 .hljs-comment,.hljs-quote { color:var(--hl-comment); font-style:italic; }
