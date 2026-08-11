@@ -64,5 +64,10 @@ test("the file viewer renders a per-line gutter that never lands in copied text"
 
   const styles = await readFile(new URL("../../webui-client/src/styles.ts", import.meta.url), "utf8");
   assert.match(styles, /\.code-gutter \{[^}]*user-select:none/su, "numbers must not be selectable");
-  assert.match(styles, /\.code-lines \{ display:grid/u, "rows keep the number aligned with a wrapped line");
+  assert.match(styles, /\.code-lines \{ display:grid/u, "one grid row per source line");
+  // Source code must not soft-wrap. A wrapped line breaks the one-line-one-number
+  // correspondence the gutter promises, and continuations starting at column zero destroy the
+  // indentation that makes code readable. Scroll sideways instead.
+  assert.match(styles, /\.code-view \.code-text \{ white-space:pre;/u, "code must not wrap");
+  assert.doesNotMatch(styles, /\.code-view \.code-text \{[^}]*pre-wrap/u, "no soft wrapping in the code viewer");
 });

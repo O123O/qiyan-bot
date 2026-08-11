@@ -411,14 +411,22 @@ body { margin:0; }
 /* One grid row per source line. The gutter column is sized to the widest line number, so a
    1000-line file does not shift its code sideways relative to a 100-line one, and a wrapped
    line keeps its number pinned to the row's first visual line rather than drifting. */
-.code-lines { display:grid; grid-template-columns:max-content 1fr; }
+/* Source must not wrap: a wrapped line breaks the correspondence between one line and one
+   number, and reading indented code whose continuations start at column zero is worse than
+   scrolling. The grid is sized to its widest line so .code-view scrolls horizontally, and
+   min-width keeps it filling the panel when the file is narrow. */
+.code-lines { display:grid; grid-template-columns:max-content max-content; width:max-content; min-width:100%; background:inherit; }
 .code-line { display:contents; }
 .code-gutter {
   width:var(--gutter,2ch); padding:0 10px 0 4px; text-align:right;
   color:var(--muted); opacity:.55; user-select:none; -webkit-user-select:none;
-  border-right:1px solid var(--line); position:sticky; left:0; background:inherit;
+  border-right:1px solid var(--line);
+  /* Sticky so the numbers survive scrolling a wide file sideways; opaque so code cannot show
+     through underneath them while it scrolls past. */
+  position:sticky; left:0; background:inherit; z-index:1;
 }
-.code-text { white-space:pre-wrap; word-break:break-word; padding-left:10px; }
+/* Overrides the .sheet-body pre rule, which soft-wraps prose previews. */
+.code-view .code-text { white-space:pre; word-break:normal; overflow-wrap:normal; padding-left:10px; }
 /* highlight.js palette follows the app theme (github light/dark) */
 .hljs { display:block; overflow-x:auto; padding:12px; background:var(--hl-bg); color:var(--hl-fg); }
 .hljs-comment,.hljs-quote { color:var(--hl-comment); font-style:italic; }
