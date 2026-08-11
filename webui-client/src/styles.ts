@@ -70,7 +70,27 @@ body { margin:0; }
 .md p { margin:.4em 0; } .md pre { margin:.4em 0; border:1px solid var(--line); border-radius:8px; overflow:auto; }
 .md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */
 .code-view, .md pre .hljs { margin:0; border-radius:8px; font:12.5px/1.5 monospace; }
-.code-view { border:1px solid var(--line); overflow:auto; }
+/* Sized by the layout, not by guessing the modal's chrome from vh. .sheet is a fixed-height
+   flex column, so .sheet-body is a flex context and this child shrinks to the space available,
+   then scrolls internally while .sheet-body does not. What lets it shrink is overflow:auto --
+   a flex item whose overflow is not visible has an automatic minimum size of 0 (Flexbox 4.5),
+   which is also why a tall .md sibling does NOT shrink and still scrolls the body. min-height:0
+   is belt-and-braces; it measures as a no-op. Guessing this from the viewport instead produced
+   two nested scrollbars above 1440p, where a calc against 100vh outran a sheet sized in 92vh. */
+.code-view { border:1px solid var(--line); overflow:auto; min-height:0; }
+/* .sheet-body pre.code-view, not .code-view: the .sheet-body pre rule is (0,1,1) and outranks
+   win, keeping pre-wrap. Source must not soft-wrap on EITHER path -- above the numbering cap
+   the viewer falls back to a single block, and reusing the prose markup silently coupled
+   "no line numbers" to "soft-wrapped", so this repo's own 5,767-line production-app.ts
+   rendered at ~198% height with continuations at column zero. */
+.sheet-body pre.code-view { white-space:pre; word-break:normal; }
+/* :not(.code-lines) keeps this off the numbered path, and takes the selector to (0,2,1) --
+   a plain .code-view > code selector is (0,1,1) and would TIE code.code-lines, benign only
+   while the values happen to agree. Same defect as the grid's overflow:visible: the palette
+   makes this element its own scrollport, so the horizontal scrollbar sits at the bottom of the
+   whole file -- ~107,000px down in production-app.ts -- instead of at the bottom of the view.
+   Inert while this path wrapped; live the moment it stopped. */
+.code-view > code:not(.code-lines) { overflow:visible; width:max-content; min-width:100%; }
 /* One grid row per source line. The gutter column is sized to the widest line number, so a
    1000-line file does not shift its code sideways relative to a 100-line one, and a wrapped
    line keeps its number pinned to the row's first visual line rather than drifting. */
@@ -82,15 +102,33 @@ body { margin:0; }
    specificity and later in the sheet, so a bare class here loses the cascade and every line
    lays out inline -- the whole file on one line. Also drop the palette padding, which would
    otherwise indent the gutter away from the edge. */
-code.code-lines { display:grid; grid-template-columns:max-content max-content; width:max-content; min-width:100%; padding:0; background:inherit; }
+code.code-lines {
+  display:grid; grid-template-columns:max-content max-content; width:max-content; min-width:100%;
+  /* The palette rule sets FOUR properties on .hljs and every one of them has to be answered
+     here. overflow was the one missed: .hljs{overflow-x:auto} made this element its own
+     scrollport, so the sticky gutter resolved against a box that never scrolls and the numbers
+     scrolled away with the code. Scrolling belongs to .code-view. */
+  overflow:visible;
+  /* var(--hl-bg), never inherit: the ancestors are transparent, so inherit overrode the
+     palette background with nothing -- the viewer lost its code background, and code would
+     scroll visibly through the numbers. */
+  background:var(--hl-bg); padding:8px 0;
+}
 .code-line { display:contents; }
-.code-gutter {
-  width:var(--gutter,2ch); padding:0 10px 0 4px; text-align:right;
-  color:var(--muted); opacity:.55; user-select:none; -webkit-user-select:none;
+.code-view .code-gutter {
+  /* min-width, never width: the number must be free to exceed the reserved column. Pinned to
+     an exact width it inherits pre-wrap and break-word from the prose preview rule and breaks
+     INSIDE a number, so "15" stacks as 1 over 5. Its own white-space/word-break settings are
+     what actually stop that; the min-width only reserves alignment. */
+  min-width:var(--gutter,2ch); padding:0 10px 0 4px; text-align:right;
+  white-space:pre; word-break:normal; overflow-wrap:normal;
+  /* Dimmed through the colour, never through opacity: opacity fades the whole box, background
+     included, so code would show through the numbers however opaque the background is set. */
+  color:var(--muted); user-select:none; -webkit-user-select:none;
   border-right:1px solid var(--line);
-  /* Sticky so the numbers survive scrolling a wide file sideways; opaque so code cannot show
-     through underneath them while it scrolls past. */
-  position:sticky; left:0; background:inherit; z-index:1;
+  /* Sticky so the numbers survive scrolling a wide file sideways, over an opaque background so
+     nothing scrolls through them. */
+  position:sticky; left:0; background:var(--hl-bg); z-index:1;
 }
 /* Overrides the .sheet-body pre rule, which soft-wraps prose previews. */
 .code-view .code-text { white-space:pre; word-break:normal; overflow-wrap:normal; padding-left:10px; }
@@ -137,7 +175,7 @@ code.code-lines { display:grid; grid-template-columns:max-content max-content; w
 .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(1240px,96vw); height:92vh; max-height:100%; display:flex; flex-direction:column; box-shadow:0 12px 44px rgba(0,0,0,.45); }
 .sheet-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); font-family:monospace; word-break:break-all; }
 .head-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
-.sheet-body { overflow:auto; padding:14px; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
+.sheet-body { overflow:auto; padding:14px; display:flex; flex-direction:column; min-height:0; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
 .preview-img { max-width:100%; max-height:78vh; object-fit:contain; display:block; margin:0 auto; }
 /* Figures inside rendered markdown. Capped so a full-resolution screenshot cannot push the
    document into a horizontal scroll, and clickable because the cap makes detail unreadable. */

@@ -85,6 +85,9 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 // a long conversation grew the array the shown-memo re-sorts on every single message.
 // Generous, because anything trimmed here is durable server-side and returns on scroll-up.
 const MAX_LIVE_LOG = 400;
+// Above this a numbered gutter costs more than it is worth: each line becomes its own row of
+// elements, allocated synchronously while the modal opens.
+const MAX_NUMBERED_LINES = 5_000;
 const TOP_PX = 120, BOTTOM_PX = 80;
 const RECOVERY_RETRY_MS = [500, 1_500, 3_000] as const;
 
@@ -174,10 +177,24 @@ function CodeView({ text, title, lang: forced }: { text: string; title: string; 
   // One row per source line, so a number stays beside its line even when that line wraps —
   // a gutter at a fixed offset drifts the moment anything soft-wraps. hljs escapes the source;
   // splitHighlightedLines keeps each fragment independently well-formed.
+  // A lone CR is a line break to the HTML parser but not to the splitter, so a fragment would
+  // render as two visual lines under one number -- progress-bar output in a log is the usual
+  // source. Normalise before highlighting so the split and the render agree.
+  const source = useMemo(() => text.replace(/\r\n?/gu, "\n"), [text]);
   const lines = useMemo(() => {
-    const highlighted = lang ? hljs.highlight(text, { language: lang, ignoreIllegals: true }).value : escapeHtml(text);
+    const highlighted = lang ? hljs.highlight(source, { language: lang, ignoreIllegals: true }).value : escapeHtml(source);
     return splitHighlightedLines(highlighted);
-  }, [text, lang]);
+  }, [source, lang]);
+  // Numbering a huge file costs ~7 elements per line, built synchronously in the click that
+  // opened it. Past this the gutter is not worth freezing the tab for, so fall back to the
+  // single block, which is what this rendered before line numbers existed.
+  if (lines.length > MAX_NUMBERED_LINES) {
+    return (
+      <pre className="code-view">
+        <code className="hljs" dangerouslySetInnerHTML={{ __html: lines.join("\n") }} />
+      </pre>
+    );
+  }
   const width = `${String(lines.length).length}ch`;
   return (
     <pre className="code-view">
