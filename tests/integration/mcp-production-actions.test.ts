@@ -433,6 +433,14 @@ test("the exact production MCP map succeeds for every local and remote manager a
     }, fixture.endpoint);
     assert.equal(steered.mode, "steer");
     assert.equal(steered.turnId, longStart.turnId);
+    // A steer joins a turn QiYan may not have started, but QiYan is still the one supervising
+    // it. Recording the delegation is what makes its terminal wake QiYan; without it the turn
+    // settles as silently as a message the owner sent directly, and QiYan waits for a
+    // completion that never arrives.
+    assert.ok(db.prepare(`SELECT 1 FROM assistant_delegated_turns
+      WHERE endpoint_id = ? AND thread_id = ? AND turn_id = ?`)
+      .get(fixture.endpoint, session.thread_id, steered.turnId),
+      "a steered turn must be recorded as delegated, or its completion never notifies QiYan");
     await call("interrupt_session", { nickname: fixture.nickname }, fixture.endpoint);
 
     const beforeRestart = (await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname];

@@ -3816,18 +3816,22 @@ export async function buildProductionApp(
                 },
               });
             },
-            ...(args.mode === "start" ? {
-              onTurnAccepted: ({ session, turnId }: { session: RegistrySession; turnId: string }) => {
-                assistantDelegatedTurns.record({
-                  endpointId: session.endpoint,
-                  threadId: session.thread_id,
-                  turnId,
-                  mappingId: session.mapping_id,
-                  operationId: context.operationId,
-                  createdAt: Date.now(),
-                });
-              },
-            } : {}),
+            // Recorded for a steer as well as a start. A steer joins a turn already running, so
+            // QiYan owns only part of it -- but it is still the one supervising, and gating this
+            // on `start` meant a steered turn settled with nothing to wake it: indistinguishable
+            // from a message the owner sent directly, which is the one case that must stay
+            // silent. QiYan then had to reason about why a completion it was waiting for never
+            // arrived.
+            onTurnAccepted: ({ session, turnId }: { session: RegistrySession; turnId: string }) => {
+              assistantDelegatedTurns.record({
+                endpointId: session.endpoint,
+                threadId: session.thread_id,
+                turnId,
+                mappingId: session.mapping_id,
+                operationId: context.operationId,
+                createdAt: Date.now(),
+              });
+            },
             ...(pendingSettings ? { settings: pendingSettings } : {}),
           });
         } catch (error) {
@@ -4908,7 +4912,10 @@ export async function buildProductionApp(
           });
           if (turn) {
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turn.id);
-            if (args.mode === "start") {
+            // Same for the receipt path. Recording a steer late is safe by construction: the
+            // store reactivates an already-processed terminal back to pending, which is exactly
+            // the case where the steer lands on a turn that has since finished.
+            {
               const origin = assistantDelegatedTurns.record({
                 endpointId: session.endpoint,
                 threadId: session.thread_id,

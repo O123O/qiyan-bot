@@ -91,3 +91,31 @@ test("replaying the installed migration preserves current pending terminal work"
   assert.equal(reopened.prepare("SELECT state FROM events WHERE id = 'terminal:remote:thread-1:turn-1'").get()!.state, "pending");
   reopened.close();
 });
+
+// A steer joins a turn that is already running, and the turn can finish before the steer's
+// receipt is recorded. Its terminal has then already been settled -- with no wake, because at
+// that moment nothing marked the turn as QiYan's. Recording late has to reopen it, or
+// supervising a turn by steering into it would be a silent way to never hear it end.
+test("recording a steered turn late reopens a terminal that already settled", () => {
+  const db = createTestDatabase();
+  const store = new AssistantDelegatedTurnStore(db);
+  db.prepare(`INSERT INTO events(id, endpoint_id, thread_id, turn_id, kind, payload_json, state, created_at)
+    VALUES ('terminal:remote:thread-1:turn-1', 'remote', 'thread-1', 'turn-1', 'turn_terminal', '{}', 'processed', 1)`).run();
+
+  const outcome = store.record({
+    endpointId: "remote", threadId: "thread-1", turnId: "turn-1",
+    mappingId: "mapping-1", operationId: "operation-steer", createdAt: 2,
+  });
+
+  assert.equal(outcome.inserted, true);
+  assert.equal(outcome.reactivatedTerminalEvent, true, "the settled terminal must be reopened");
+  assert.equal(db.prepare("SELECT state FROM events WHERE id = 'terminal:remote:thread-1:turn-1'").get()!.state, "pending");
+  assert.equal(store.has("remote", "thread-1", "turn-1"), true, "and the turn now wakes QiYan");
+});
+
+// The delegation record is what separates a turn QiYan is supervising from one the owner sent
+// directly with /to. The latter must stay silent.
+test("a turn QiYan never sent is not delegated and does not wake it", () => {
+  const store = new AssistantDelegatedTurnStore(createTestDatabase());
+  assert.equal(store.has("remote", "thread-1", "owner-sent-turn"), false);
+});
