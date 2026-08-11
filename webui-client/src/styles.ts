@@ -78,7 +78,11 @@ body { margin:0; }
    number, and reading indented code whose continuations start at column zero is worse than
    scrolling. The grid is sized to its widest line so .code-view scrolls horizontally, and
    min-width keeps it filling the panel when the file is narrow. */
-.code-lines { display:grid; grid-template-columns:max-content max-content; width:max-content; min-width:100%; background:inherit; }
+/* code.code-lines, not .code-lines: the .hljs palette rule below sets display:block at equal
+   specificity and later in the sheet, so a bare class here loses the cascade and every line
+   lays out inline -- the whole file on one line. Also drop the palette padding, which would
+   otherwise indent the gutter away from the edge. */
+code.code-lines { display:grid; grid-template-columns:max-content max-content; width:max-content; min-width:100%; padding:0; background:inherit; }
 .code-line { display:contents; }
 .code-gutter {
   width:var(--gutter,2ch); padding:0 10px 0 4px; text-align:right;
