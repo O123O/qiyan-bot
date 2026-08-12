@@ -67,6 +67,10 @@ body { margin:0; }
 .worker-mention { padding:0; border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; }
 .worker-mention:hover, .worker-mention:focus-visible { color:var(--accent); text-decoration:underline; }
 .md { word-break:break-word; } .md > *:first-child { margin-top:0; } .md > *:last-child { margin-bottom:0; }
+/* pre-wrap, not pre: every space and newline is kept, but a long line still wraps to the
+   panel instead of forcing the conversation to scroll sideways. Same font as the composer, so
+   what you sent looks like what you typed. */
+.verbatim { white-space:pre-wrap; overflow-wrap:anywhere; margin:0; font:inherit; }
 .md p { margin:.4em 0; } .md pre { margin:.4em 0; border:1px solid var(--line); border-radius:8px; overflow:auto; }
 .md code:not(.hljs) { background:var(--code); padding:.1em .35em; border-radius:5px; font-size:.92em; } /* inline code only */
 .code-view, .md pre .hljs { margin:0; border-radius:8px; font:12.5px/1.5 monospace; }

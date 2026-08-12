@@ -73,7 +73,72 @@ test("a previewed markdown file keeps CommonMark semantics", async () => {
   const preview = /isMd && !srcMode \? <div className="md"><MarkdownBody[^/]*\/>/u.exec(source)?.[0] ?? "";
   assert.ok(preview.length > 0, "found the markdown preview render site");
   assert.doesNotMatch(preview, /REMARK_CHAT_PLUGINS/u, "the file preview must keep CommonMark");
+  // The browser test builds its own DOM, so it cannot see whether the app actually routes your
+  // messages to the verbatim branch. Without this, deleting that branch passes everything.
+  assert.match(source, /m\.role === "you"\s*\n?\s*\? <div className="verbatim">\{m\.body\}<\/div>/u,
+    "your own messages must render verbatim, not through markdown");
+  assert.match(source, /: <div className="md"><MarkdownBody/u, "replies must still render markdown");
   // The render() helper above replicates the app's plugin list; pin that it has not drifted.
   assert.match(source, /const REMARK_PLUGINS = \[remarkGfm, remarkMath, remarkFilePaths\];/u);
   assert.match(source, /const REMARK_CHAT_PLUGINS = \[\.\.\.REMARK_PLUGINS, remarkBreaks\];/u);
+});
+
+// Your own messages render verbatim. Markdown is what stripped the indentation: CommonMark
+// drops leading whitespace on a continuation line before any renderer sees it, so a pasted
+// config arrived flush left. These assert the bytes survive AND that copying gives back real
+// spaces -- an &nbsp; workaround would look right and paste broken into a terminal.
+const chromium = await import("playwright-core").then((m) => m.chromium).catch(() => undefined);
+const browserPath = (() => {
+  const { existsSync, readdirSync } = require_("node:fs") as typeof import("node:fs");
+  const { homedir } = require_("node:os") as typeof import("node:os");
+  const { join } = require_("node:path") as typeof import("node:path");
+  const root = join(homedir(), ".cache/ms-playwright");
+  if (!existsSync(root)) return undefined;
+  return readdirSync(root).filter((entry: string) => entry.startsWith("chromium-")).sort().reverse()
+    .flatMap((entry: string) => ["chrome-linux64/chrome", "chrome-linux/chrome"].map((bin) => join(root, entry, bin)))
+    .find((path: string) => existsSync(path));
+})();
+
+test("a pasted message keeps its exact spacing, and copies back as real spaces",
+  { skip: chromium && browserPath ? false : "no local chromium available" }, async () => {
+  const { STYLES } = await import("../../webui-client/src/styles.ts");
+  const config = "add this to the ssh config,\nHost lyris\n  HostName login.example.com\n  User someone\ntrailing  double  spaces";
+  const browser = await chromium!.launch({ executablePath: browserPath! });
+  try {
+    const view = await browser.newPage();
+    const escaped = config.replace(/[&<>]/gu, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+    await view.setContent(`<!doctype html><html data-theme="dark"><head><style>${STYLES}</style></head>
+      <body><div class="msg you"><div class="verbatim">${escaped}</div></div></body></html>`);
+
+    const rendered = await view.evaluate(`(() => {
+      const el = document.querySelector(".verbatim");
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      // Measured against a one-line control: line-height computes to "normal" here, so
+      // dividing by it yields NaN and the assertion would silently never fail.
+      const control = document.createElement("div");
+      control.className = "verbatim";
+      control.textContent = "one line";
+      el.parentElement.appendChild(control);
+      const lines = el.getBoundingClientRect().height / control.getBoundingClientRect().height;
+      control.remove();
+      return { text: el.textContent, copied: selection.toString(),
+               whiteSpace: getComputedStyle(el).whiteSpace, lines };
+    })()`) as { text: string; copied: string; whiteSpace: string; lines: number };
+
+    assert.equal(rendered.whiteSpace, "pre-wrap", "spaces and newlines must both be preserved");
+    assert.equal(rendered.text, config, "the DOM must hold the message byte for byte");
+    // The indentation the markdown parser used to eat.
+    assert.match(rendered.text, /\n {2}HostName/u, "leading indentation must survive");
+    assert.match(rendered.text, /trailing {2}double {2}spaces/u, "interior runs of spaces must survive");
+    // Real U+0020, not U+00A0: a non-breaking space looks identical and pastes broken.
+    assert.doesNotMatch(rendered.copied, / /u, "copied text must contain no non-breaking spaces");
+    assert.equal(rendered.copied.replace(/\r/gu, ""), config, "copying must return the original text");
+    assert.ok(rendered.lines >= 5, `all five lines must render (measured ${rendered.lines})`);
+  } finally {
+    await browser.close();
+  }
 });

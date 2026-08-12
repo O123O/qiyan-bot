@@ -1129,7 +1129,14 @@ export function App() {
                     ? <button type="button" className="worker-mention" title={`Message @${relayWorker}`} onClick={() => targetWorkerFromRelay(relayWorker)} onDoubleClick={(event) => event.stopPropagation()}>{presentation?.label ?? `Worker · ${relayWorker}`}</button>
                     : presentation?.label ?? "QiYan"
                   : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><MarkdownBody body={m.body} components={mdComponentsFor(selected ?? m.origin ?? null)} plugins={REMARK_CHAT_PLUGINS} /></div>
+                {/* Your own messages render exactly as you wrote them. Markdown is what strips
+                    indentation -- CommonMark drops leading whitespace on a continuation line
+                    before any renderer sees it -- so a pasted config came out flush left. As
+                    plain text the spaces are real spaces, which also means copying one back out
+                    gives something you can paste into a terminal. Replies keep markdown. */}
+                {m.role === "you"
+                  ? <div className="verbatim">{m.body}</div>
+                  : <div className="md"><MarkdownBody body={m.body} components={mdComponentsFor(selected ?? m.origin ?? null)} plugins={REMARK_CHAT_PLUGINS} /></div>}
               </div>;
             })}
           </div>
