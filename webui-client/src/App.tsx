@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
@@ -68,6 +69,12 @@ const RENDER_CAP = 30;       // messages rendered initially per tab
 // Hoisted out of the component: a fresh array identity on every render defeats react-markdown's
 // own memoisation, so it re-parsed every message whenever anything re-rendered.
 const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkFilePaths];
+// Chat only. In CommonMark a single newline is a SOFT break and renders as a space, so pasting
+// several lines into the composer arrived as one run-on line -- the text was never damaged, it
+// was stored intact and only collapsed at render. Chat is written like a message, not like
+// markdown, so a newline there means a line break. A previewed .md file keeps CommonMark: its
+// author really did write markdown, and hard-breaking it would misrepresent the document.
+const REMARK_CHAT_PLUGINS = [...REMARK_PLUGINS, remarkBreaks];
 const REHYPE_PLUGINS = [rehypeHighlight, rehypeKatex];
 
 // Rendering one message parses markdown, highlights code and typesets maths. Redoing that for
@@ -75,9 +82,9 @@ const REHYPE_PLUGINS = [rehypeHighlight, rehypeKatex];
 // composer stutter: the draft lives in App state, so each keystroke re-rendered the whole log.
 // Memoised on the only two inputs that can change the output.
 const MarkdownBody = memo(function MarkdownBody(
-  { body, components }: { body: string; components: Record<string, unknown> },
+  { body, components, plugins = REMARK_PLUGINS }: { body: string; components: Record<string, unknown>; plugins?: typeof REMARK_PLUGINS },
 ) {
-  return <Markdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={components}>{normalizeMath(body)}</Markdown>;
+  return <Markdown remarkPlugins={plugins} rehypePlugins={REHYPE_PLUGINS} components={components}>{normalizeMath(body)}</Markdown>;
 });
 const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory history
 // Live messages retained per tab. The stream reducer bounds the worker snapshot already; this
@@ -1122,7 +1129,7 @@ export function App() {
                     ? <button type="button" className="worker-mention" title={`Message @${relayWorker}`} onClick={() => targetWorkerFromRelay(relayWorker)} onDoubleClick={(event) => event.stopPropagation()}>{presentation?.label ?? `Worker · ${relayWorker}`}</button>
                     : presentation?.label ?? "QiYan"
                   : `${m.completedAt ? new Date(m.completedAt).toLocaleString() : ""} · ${m.terminalStatus ?? ""}`}</div>
-                <div className="md"><MarkdownBody body={m.body} components={mdComponentsFor(selected ?? m.origin ?? null)} /></div>
+                <div className="md"><MarkdownBody body={m.body} components={mdComponentsFor(selected ?? m.origin ?? null)} plugins={REMARK_CHAT_PLUGINS} /></div>
               </div>;
             })}
           </div>
