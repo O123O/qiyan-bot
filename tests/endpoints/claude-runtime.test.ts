@@ -1232,7 +1232,7 @@ test("a cold incomplete transcript is terminal on a daemonless endpoint, which l
 // goal, and QiYan stores no goal row of its own.
 test("the manager's goal tools install and clear Claude's native goal", async () => {
   const claude = new FakeClaude();
-  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {} });
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 0 });
   await rt.start();
   const delivered = (): string[] => claude.sends.map((send) => send.text);
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
@@ -2270,4 +2270,147 @@ test("a folded turn settles as terminal-and-empty without displacing the turn th
     status: "completed", at: 2,
   });
   assert.deepEqual(notifications.map((entry) => entry.params.turn?.id), ["to:web:running"]);
+});
+
+// A Claude goal exists only once the session runs `/goal` and writes its marker -- QiYan keeps
+// no goal row. So a goal reported "active" on delivery alone is a goal that does not exist:
+// nothing survives a restart, and the Stop hook has nothing to drive. Measured in production, a
+// `/goal` sat queued behind background work for seven minutes while set_goal reported success.
+test("a goal still queued is reported pending, not active", async () => {
+  const claude = new FakeClaude();
+  // A real transcript with no goal marker -- a busy worker that has not run the command. It
+  // must be materialized, or readNativeGoal short-circuits and the test would pass without
+  // ever consulting the transcript.
+  claude.seed("thread-goal-queued", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+  ]);
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 30 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-queued", cwd: "/w", excludeTurns: true });
+  const thread = { id: "thread-goal-queued" };
+  const readsBefore = claude.transcriptChunkLengths.length;
+
+  const pending = await rt.request<{ goal: any }>("thread/goal/set", { threadId: thread.id, objective: "finish phase 2" });
+  assert.ok(claude.transcriptChunkLengths.length > readsBefore, "confirmation must consult the transcript");
+  assert.equal(claude.sends.map((send) => send.text).at(-1), "/goal finish phase 2", "the command is still delivered");
+  assert.equal(pending.goal.status, "pending", "an unconfirmed goal must not be reported active");
+  assert.equal(pending.goal.objective, "finish phase 2");
+});
+
+test("a goal whose marker lands is reported active", async () => {
+  const claude = new FakeClaude();
+  // The session has already run the command and written the marker the reader looks for.
+  claude.seed("thread-goal-applied", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: finish phase 2</local-command-stdout>" } },
+  ]);
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 2_000 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-applied", cwd: "/w", excludeTurns: true });
+
+  const applied = await rt.request<{ goal: any }>("thread/goal/set", { threadId: "thread-goal-applied", objective: "finish phase 2" });
+  assert.equal(applied.goal.status, "active", "a goal the transcript confirms is genuinely active");
+});
+
+// Clearing has the same failure mode as setting: a `/goal clear` queued behind busy work has
+// cleared nothing, and answering `null` would show the goal gone while the session keeps
+// driving it. Unconfirmed, the honest answer is the goal as it still is.
+test("a queued clear reports the goal still standing, not cleared", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-goal-standing", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: still running</local-command-stdout>" } },
+  ]);
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 30 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-standing", cwd: "/w", excludeTurns: true });
+
+  const cleared = await rt.request<{ goal: any }>("thread/goal/clear", { threadId: "thread-goal-standing" });
+  assert.equal(claude.sends.map((send) => send.text).at(-1), "/goal clear", "the command is still delivered");
+  assert.equal(cleared.goal?.objective, "still running", "the goal that is still in force must be reported");
+  assert.equal(cleared.goal?.status, "clearing", "and marked as a clear that has not taken effect");
+});
+
+// Confirmation reads the TAIL only. A marker this command caused is at the end of the
+// transcript, and walking the full budget on a remote endpoint costs an ssh round trip per
+// window -- measured at ~95 of them for one set_goal against a large transcript.
+test("confirming a goal reads only the transcript tail", async () => {
+  const claude = new FakeClaude();
+  // A transcript far larger than one window, with no marker: the full walk would read many.
+  claude.seed("thread-goal-wide", Array.from({ length: 4000 }, (_, index) => ({
+    type: "user", cwd: "/w", promptSource: "sdk", uuid: `pad-${index}`,
+    message: { role: "user", content: "x".repeat(400) },
+  })));
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 30 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-wide", cwd: "/w", excludeTurns: true });
+
+  // What one full walk of this transcript costs, measured rather than guessed.
+  const fullBefore = claude.transcriptChunkLengths.length;
+  await rt.request("thread/goal/get", { threadId: "thread-goal-wide" });
+  const fullWalk = claude.transcriptChunkLengths.length - fullBefore;
+  assert.ok(fullWalk >= 3, `the fixture must be several windows deep, was ${fullWalk}`);
+
+  const before = claude.transcriptChunkLengths.length;
+  await rt.request("thread/goal/set", { threadId: "thread-goal-wide", objective: "never confirmed" });
+  const windows = claude.transcriptChunkLengths.length - before;
+  assert.ok(windows > 0, "confirmation must actually read the transcript");
+  // Each poll reads the tail; only the final attempt pays for a full walk. A full walk per poll
+  // is what this exists to prevent -- on a remote endpoint every window is its own ssh round
+  // trip, measured at ~95 of them for one set_goal against a large transcript.
+  assert.ok(windows < fullWalk * 2,
+    `confirmation must not walk the full budget per poll (read ${windows}, one walk is ${fullWalk})`);
+});
+
+// The shape that matters: a goal worth clearing has usually had a lot of work done against it,
+// so its marker sits far from the tail. Confirming on the tail alone returned "could not reach
+// far enough", fell through to the optimistic default, and answered "cleared" for a goal that
+// was still driving the session.
+test("a queued clear reports honestly even when the goal marker is far from the tail", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-goal-buried", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: long running objective</local-command-stdout>" } },
+    // Well over one tail window of work done since the goal was set.
+    ...Array.from({ length: 2000 }, (_, index) => ({
+      type: "user", cwd: "/w", promptSource: "sdk", uuid: `pad-${index}`,
+      message: { role: "user", content: "x".repeat(400) },
+    })),
+  ]);
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 30 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-buried", cwd: "/w", excludeTurns: true });
+
+  const cleared = await rt.request<{ goal: any }>("thread/goal/clear", { threadId: "thread-goal-buried" });
+  assert.equal(cleared.goal?.objective, "long running objective",
+    "a goal buried under later work is still in force and must be reported");
+  assert.equal(cleared.goal?.status, "clearing");
+});
+
+// The mirror of the clear-side case, and the one thing that had no coverage: `/goal` runs and
+// writes its marker, then the session writes a large tool result after it. Confirming on the
+// tail alone exhausts its budget, reports "could not reach far enough", and calls a genuinely
+// active goal `pending` -- which invites the retry that queues a duplicate `/goal`.
+test("a goal whose marker was pushed past the tail still confirms as active", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-goal-pushed", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", message: { role: "user", content: "go" } },
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u2",
+      message: { role: "user", content: "<local-command-stdout>Goal set: survive the spew</local-command-stdout>" } },
+    // A single large tool result is enough: Claude transcripts record full tool output.
+    ...Array.from({ length: 2000 }, (_, index) => ({
+      type: "user", cwd: "/w", promptSource: "sdk", uuid: `spew-${index}`,
+      message: { role: "user", content: "x".repeat(400) },
+    })),
+  ]);
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, goalConfirmMs: 30 });
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-goal-pushed", cwd: "/w", excludeTurns: true });
+
+  const applied = await rt.request<{ goal: any }>("thread/goal/set", { threadId: "thread-goal-pushed", objective: "survive the spew" });
+  assert.equal(applied.goal.status, "active",
+    "a goal the transcript proves is set must not be reported pending because it scrolled past the tail");
 });

@@ -89,7 +89,7 @@ export const TOOL_DESCRIPTIONS: Partial<Record<AssistantToolName, string>> = {
   set_session_model: "Set a session's model for its next new turn onward (sticky for Claude). Use a list_models value; 'default' = account default.",
   set_reasoning_effort: "Set a session's reasoning effort for its next new turn (sticky for Claude); values from list_models.supportedReasoningEfforts.",
   get_goal: "Read the session's current goal (objective + status) or null.",
-  set_goal: "Set/replace a worker's goal; the backend auto-drives it after each turn until the worker ends it via set_goal_status — or (Claude) up to 50 turns then it pauses budgetLimited (resume_goal continues).",
+  set_goal: "Set/replace a worker's goal; the backend auto-drives it after each turn until the worker ends it via set_goal_status — or (Claude) up to 50 turns then it pauses budgetLimited (resume_goal continues). A Claude goal may report status `pending`: the command was delivered but the session has not run it yet (it is busy). It will apply on its own -- do not re-send it, which only queues a duplicate.",
   pause_goal: "Pause the goal so the backend stops auto-driving it (resume_goal continues).",
   resume_goal: "Resume a paused/budgetLimited goal (resets the auto-continue counter).",
   cancel_goal: "Clear the session's goal (interrupt_active_turn also stops the running goal turn).",

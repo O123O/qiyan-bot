@@ -34,7 +34,9 @@ const supportedMethods = new Set([
   "thread/goal/updated",
   "thread/goal/cleared",
 ]);
-const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+// "pending" is a Claude goal that was delivered but whose `/goal` the session has not run yet:
+// real, not yet in effect, and legal here so a validator never rejects the honest answer.
+const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete", "pending", "clearing"]);
 
 export class SessionObservationProcessor {
   private tails = new Map<string, Promise<void>>();

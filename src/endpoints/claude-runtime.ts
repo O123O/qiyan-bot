@@ -81,6 +81,14 @@ const GOAL_SCAN_TAIL_BYTES = 256 * 1024;
 // How far back readNativeGoal will walk in total. A goal that scrolled out of one window is
 // still a goal; a transcript with none pays this once per status read, so it stays modest.
 const GOAL_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+// How long set_goal waits for `/goal` to actually take effect before reporting what it knows.
+// A Claude goal has NO existence until the session runs the command and writes its marker --
+// QiYan stores no goal row -- so reporting success on delivery alone claimed a goal that did
+// not exist, would not survive a restart, and drove nothing. An idle session confirms in well
+// under a second; a busy one can take minutes, and blocking the manager that long is worse
+// than telling it the truth, so the wait is short and the unconfirmed answer is honest.
+const GOAL_CONFIRM_MS = 15_000;
+const GOAL_CONFIRM_POLL_MS = 500;
 
 // How long the DRAIN POLL waits for the host to confirm the tasks are gone — long enough to
 // cover a stop that has to cross ssh and unwind a tool call. It does not bound the whole stop:
@@ -163,6 +171,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     persistentRuntime?: ClaudePersistentRuntime;
     /** How often to check threads believed to be running against the host. Tests drive this. */
     staleTurnSweepMs?: number;
+    // Shortened by tests; see GOAL_CONFIRM_MS.
+    goalConfirmMs?: number;
     // Emulated archive state (Claude has no native archive) — thread/archive tombstones a
     // thread here so thread/list (discover) hides it, matching Codex archive semantics.
     archives?: ClaudeArchiveStore;
@@ -889,7 +899,47 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         "claude goals are native /goal: set an objective, or clear it — pause/resume has no native equivalent");
     }
     await this.deliverGoalCommand(threadId, `/goal ${objective}`);
-    return { goal: { objective, status: "active" } };
+    // Confirmed against the transcript, not assumed from the delivery. `/goal` is an ordinary
+    // message: a session that is mid-turn or holding background work queues it, and until it
+    // runs there is no marker, which means no goal at all -- nothing to survive a restart and
+    // nothing for the Stop hook to drive. Reported `pending` in that case so the caller can see
+    // the difference between "set" and "sent".
+    const applied = await this.confirmGoal(threadId, (goal) => goal?.objective === objective);
+    return { goal: { objective, status: applied ? "active" : "pending" } };
+  }
+
+  // Polls the session's own transcript until it agrees, or the budget runs out. Returns false
+  // rather than throwing: the command is still queued and will very likely apply later, so this
+  // is "not yet", not "failed" -- and throwing would invite a retry that queues a second copy.
+  private async confirmGoal(
+    threadId: string,
+    matches: (goal: { objective: string; status: string } | null) => boolean,
+  ): Promise<boolean> {
+    const deadline = Date.now() + (this.options.goalConfirmMs ?? GOAL_CONFIRM_MS);
+    for (;;) {
+      // Tail window only. A marker this command just caused is at the END of the transcript, so
+      // confirming never needs the full walk -- and paying for it would be ruinous on a remote
+      // endpoint, where each window is its own ssh round trip: measured at ~95 of them, and
+      // ~30 MB of base64, for one set_goal against a large transcript.
+      const remainingBefore = deadline - Date.now();
+      // The LAST attempt pays for a full walk. A marker can be pushed past the tail window by a
+      // single large tool result written after `/goal` ran, and giving up on the tail alone
+      // would report `pending` for a goal that is genuinely active -- which invites the retry
+      // that queues a duplicate `/goal`.
+      const read = await this.readNativeGoal(threadId, remainingBefore <= 0 ? GOAL_SCAN_MAX_BYTES : GOAL_SCAN_TAIL_BYTES)
+        .catch(() => undefined);
+      // `known: false` is "the scan could not reach far enough", never "there is no goal".
+      if (read?.known && matches(read.goal)) return true;
+      const remaining = deadline - Date.now();
+      if (remainingBefore <= 0) return false;
+      // Clamped to what is left, so polling does not overrun the budget. The budget bounds the
+      // POLLING only: the final attempt's full walk runs after it, so the real worst case is
+      // GOAL_CONFIRM_MS plus one walk -- on a slow remote endpoint, appreciably more than 15s.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.max(0, Math.min(GOAL_CONFIRM_POLL_MS, remaining)));
+        timer.unref?.();
+      });
+    }
   }
 
   // The models Claude itself reports, which is the only source that knows which EFFORT levels
@@ -1135,7 +1185,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // `known: false` means the walk ran out of budget or could not read: no goal was FOUND, which
   // is not the same as there being none. Reporting the two as one value is what erased a live
   // goal from the panel — a bounded read wrote its own limitation down as an authoritative fact.
-  private async readNativeGoal(threadId: string): Promise<{
+  private async readNativeGoal(threadId: string, budgetBytes = GOAL_SCAN_MAX_BYTES): Promise<{
     goal: { objective: string; status: string } | null;
     known: boolean;
   }> {
@@ -1162,7 +1212,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     let end: number | undefined;
     let carry: string | undefined;
     let scanned = 0;
-    while (scanned < GOAL_SCAN_MAX_BYTES) {
+    while (scanned < budgetBytes) {
       // Jump the span an earlier scan already proved clean, rather than re-reading it.
       if (end !== undefined && cached && end <= cached.top && end > cached.floor) {
         end = cached.floor;
@@ -1227,8 +1277,24 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { goal: null, known: false };
   }
 
-  private async goalClear(params: Record<string, unknown>): Promise<{ goal: null }> {
-    await this.deliverGoalCommand(requireString(params.threadId, "threadId"), "/goal clear");
+  private async goalClear(params: Record<string, unknown>): Promise<{ goal: { objective: string; status: string } | null }> {
+    const threadId = requireString(params.threadId, "threadId");
+    await this.deliverGoalCommand(threadId, "/goal clear");
+    // A clear that is still queued has not cleared anything, so reporting `null` would show the
+    // goal gone while the session keeps driving it. Unconfirmed, the honest answer is the goal
+    // as it actually still is -- reading it back rather than asserting the outcome.
+    if (!await this.confirmGoal(threadId, (goal) => goal === null)) {
+      // Full budget deliberately, NOT the tail: a goal worth clearing has usually had >256 KB
+      // of work done against it, so its marker is far from the tail. Reading only the tail
+      // returned `known:false`, fell through to the optimistic default, and answered "cleared"
+      // for a goal that is still driving the session -- the exact lie this set out to remove.
+      // One walk, once, and only when the clear was not confirmed.
+      const current = await this.readNativeGoal(threadId).catch(() => undefined);
+      // `clearing`, not `pending`: from set_goal `pending` means "not installed yet", and using
+      // the same token here would show an identical status for the opposite state -- a goal on
+      // its way out looking exactly like one on its way in.
+      if (current?.known && current.goal) return { goal: { ...current.goal, status: "clearing" } };
+    }
     return { goal: null };
   }
 

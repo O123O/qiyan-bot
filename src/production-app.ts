@@ -1728,7 +1728,9 @@ export async function settleStartupCapacityBootstrap(
   return endpoints;
 }
 
-const threadGoalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+// "pending" is a Claude goal that was delivered but whose `/goal` the session has not run yet:
+// real, not yet in effect, and legal here so a validator never rejects the honest answer.
+const threadGoalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete", "pending", "clearing"]);
 
 export function restoredGoalControlIsActive(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "goal")) {
@@ -5156,7 +5158,13 @@ export async function buildProductionApp(
                 // `cancel_goal` is proven only by an ANSWER of "no goal", never by a read that
                 // merely failed to find one.
                 : goal == null && (current as { known?: boolean })?.known !== false && cancelInterruptProven;
-          if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")) {
+          // Same guard the session-restore path carries: `known: false` means the transcript
+          // scan could not reach far enough, never that there is no goal. Disarming on it
+          // un-armed goal control for a session that still had one -- reachable whenever a goal
+          // operation was in flight across a restart on a transcript larger than the scan
+          // budget, which is exactly the restart path a lost goal shows up in.
+          if (!proven && (operation.kind === "set_goal" || operation.kind === "resume_goal")
+            && (current as { known?: boolean })?.known !== false) {
             restoredGoalControlIsActive(current);
             setGoalControlled(args.nickname, false);
           }
