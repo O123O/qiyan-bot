@@ -2414,3 +2414,37 @@ test("a goal whose marker was pushed past the tail still confirms as active", as
   assert.equal(applied.goal.status, "active",
     "a goal the transcript proves is set must not be reported pending because it scrolled past the tail");
 });
+
+// The same failure one layer down. Reconstruction restores messages folded into a running
+// turn, but the summary projection kept only the FIRST userMessage -- so they came back in the
+// full view and vanished again in the one the panel actually pages with. Verified against a
+// real session: 313 of the user's messages in full, 250 in summary.
+test("the summary view keeps every user message, in the order they were written", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-folded", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "start" } },
+    { type: "assistant", uuid: "a1", timestamp: "2026-08-01T04:02:58.000Z",
+      message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "working" }] } },
+    // Sent mid-turn: recorded only as an attachment, restored by reconstruction.
+    { type: "attachment", uuid: "f1", timestamp: "2026-08-01T04:03:09.000Z",
+      attachment: { type: "queued_command", prompt: "use bits, not bytes", origin: { kind: "human" },
+        source_uuid: "to:web:abc", timestamp: "2026-08-01T04:03:09.000Z" } },
+    { type: "assistant", uuid: "a2", timestamp: "2026-08-01T04:03:59.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "switching to bits" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-folded", cwd: "/w", excludeTurns: true });
+
+  const page = await rt.request<{ data: Array<{ items: Array<{ type: string; text?: string; content?: unknown }> }> }>(
+    "thread/turns/list", { threadId: "thread-folded", limit: 10, sortDirection: "asc", itemsView: "summary" });
+  const items = page.data[0]!.items;
+  assert.equal(items.filter((item) => item.type === "userMessage").length, 2,
+    "the folded message survives the summary, not just the turn's first message");
+  // Interleaving matters: rebuilding the list as [user, ...agents] hoisted a mid-turn message
+  // above the replies that preceded it.
+  assert.deepEqual(items.map((item) => item.type),
+    ["userMessage", "agentMessage", "userMessage", "agentMessage"],
+    "each message sits where it was written");
+});

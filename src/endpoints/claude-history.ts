@@ -305,12 +305,15 @@ function parseRecords(chunk: ClaudeTranscriptChunk, leadingProbe: boolean): Pars
 function projectTurn(turn: ThreadHistoryTurn, view: ThreadItemsView): ThreadHistoryTurn {
   if (view === "full") return turn;
   if (view === "notLoaded") return { ...turn, itemsView: "notLoaded", items: [] };
-  const firstUser = turn.items.find((item) => item.type === "userMessage");
-  const agents = turn.items.filter((item) => item.type === "agentMessage");
+  // Every message, in the order they were written. Taking only the FIRST userMessage dropped
+  // every message folded into a running turn -- the ones reconstruction exists to restore --
+  // so they came back in the full view and vanished again in the one the panel pages with.
+  // And rebuilding the list as [user, ...agents] destroyed the interleaving: a message sent
+  // mid-turn belongs between the reply before it and the reply to it, not hoisted to the top.
   return {
     ...turn,
     itemsView: "summary",
-    items: [firstUser, ...agents].filter((item): item is ThreadHistoryItem => item !== undefined),
+    items: turn.items.filter((item) => item.type === "userMessage" || item.type === "agentMessage"),
   };
 }
 
