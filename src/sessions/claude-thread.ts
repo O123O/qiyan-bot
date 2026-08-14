@@ -103,6 +103,35 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
     const record = raw as Record<string, unknown>;
     const type = record.type;
 
+    // A message sent while a turn is running is FOLDED into it: Claude answers it inside that
+    // turn and never writes a user row for it, so reconstruction saw only the reply. Sixty-three
+    // of one session's messages were invisible in reloaded history for two weeks that way --
+    // the question gone, the answer still there. The attachment holds everything needed to put
+    // it back: the text, the moment, and the client id the panel correlates on.
+    if (type === "attachment") {
+      const attachment = record.attachment;
+      const folded = attachment !== null && typeof attachment === "object" && !Array.isArray(attachment)
+        ? attachment as Record<string, unknown>
+        : undefined;
+      // origin.kind is the discriminator, not the presence of a prompt: Claude folds its own
+      // task notifications the same way, and those are machinery, not something you said.
+      const origin = folded?.origin;
+      const human = origin !== null && typeof origin === "object" && !Array.isArray(origin)
+        && (origin as Record<string, unknown>).kind === "human";
+      const prompt = typeof folded?.prompt === "string" ? folded.prompt.trim() : "";
+      if (!current || folded?.type !== "queued_command" || !human || !prompt) continue;
+      const foldedAt = timestampOf(folded) ?? timestampOf(record);
+      const source = typeof folded.source_uuid === "string" && folded.source_uuid ? folded.source_uuid : null;
+      current.turn.items.push({
+        type: "userMessage",
+        id: idOf(record) ?? `${current.turn.id}:folded:${current.turn.items.length}`,
+        clientId: source,
+        content: [{ type: "text", text: prompt, text_elements: [] }],
+        ...(foldedAt === undefined ? {} : { atMs: foldedAt }),
+      });
+      continue;
+    }
+
     if (type === "user") {
       const rowId = promptOrRowId(record);
       const turnId = claudeTurnIdFromRecord(record);

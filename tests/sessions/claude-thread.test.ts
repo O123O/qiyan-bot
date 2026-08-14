@@ -184,3 +184,48 @@ test("a reconstructed turn carries its compaction boundary", () => {
   const kinds = view.turns[0]!.items.map((item) => item.type);
   assert.ok(kinds.includes("contextCompaction"), `expected a compaction item, got ${kinds.join(",")}`);
 });
+
+// A message sent while a turn runs is FOLDED into it: Claude answers it inside that turn and
+// never writes a user row, so reconstruction saw the reply and not the question. One session
+// had 63 messages invisible in reloaded history for two weeks.
+test("a message folded into a running turn is reconstructed as its own bubble", () => {
+  const { turns } = reconstructClaudeThread({ records: [
+    { type: "user", promptSource: "sdk", promptId: "p1", uuid: "t1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "start" } },
+    { type: "assistant", uuid: "a1", timestamp: "2026-08-01T04:02:58.000Z",
+      message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "text", text: "working" }] } },
+    // Sent mid-turn: only ever recorded as an attachment.
+    { type: "attachment", uuid: "f1", timestamp: "2026-08-01T04:03:09.000Z",
+      attachment: { type: "queued_command", prompt: "please use bit, not byte", commandMode: "prompt",
+        origin: { kind: "human" }, source_uuid: "to:web:abc", timestamp: "2026-08-01T04:03:09.000Z" } },
+    { type: "assistant", uuid: "a2", timestamp: "2026-08-01T04:03:59.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "switching to bits" }] } },
+  ] } as never) as unknown as { turns: Array<{ items: Array<Record<string, unknown>> }> };
+
+  const items = turns[0]!.items;
+  assert.deepEqual(items.map((item) => [item.type, item.id]), [
+    ["userMessage", "t1"], ["agentMessage", "a1:0"], ["userMessage", "f1"], ["agentMessage", "a2:0"],
+  ], "the folded message is its own item, between the reply before it and the reply to it");
+  const folded = items[2]!;
+  assert.deepEqual(folded.content, [{ type: "text", text: "please use bit, not byte", text_elements: [] }]);
+  // The client id is what lets the panel correlate it with the bubble you already saw.
+  assert.equal(folded.clientId, "to:web:abc");
+  assert.equal(folded.atMs, Date.parse("2026-08-01T04:03:09.000Z"), "placed at the moment you sent it");
+});
+
+// Claude folds its own task notifications the same way. Those are machinery, not something the
+// user said, so origin is the discriminator rather than the presence of a prompt.
+test("a folded task notification is not mistaken for a user message", () => {
+  const { turns } = reconstructClaudeThread({ records: [
+    { type: "user", promptSource: "sdk", promptId: "p1", uuid: "t1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "start" } },
+    { type: "attachment", uuid: "n1", timestamp: "2026-08-01T04:03:00.000Z",
+      attachment: { type: "queued_command", prompt: "<task-notification>\n<task-id>abc</task-id>",
+        origin: { kind: "task-notification" }, source_uuid: null, timestamp: "2026-08-01T04:03:00.000Z" } },
+    // An attachment that is not a queued command at all must also be ignored.
+    { type: "attachment", uuid: "n2", timestamp: "2026-08-01T04:03:30.000Z",
+      attachment: { type: "file", prompt: "not a command", origin: { kind: "human" } } },
+  ] } as never) as unknown as { turns: Array<{ items: Array<Record<string, unknown>> }> };
+
+  assert.deepEqual(turns[0]!.items.map((item) => item.type), ["userMessage"], "only the real turn-starting message");
+});
