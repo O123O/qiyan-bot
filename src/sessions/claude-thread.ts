@@ -31,6 +31,11 @@ export interface ClaudeThreadItem {
   content?: Array<{ type: "text"; text: string; text_elements: unknown[] }>;
   text?: string;
   phase?: ClaudeMessagePhase | null;
+  // When this record was written. A turn carries only a start and an end, so consumers that
+  // order by turn time collapse every item of a running turn onto its START -- and a message
+  // you send mid-turn then sorts AFTER replies the worker writes minutes later, putting its
+  // answers above the question. Each item knows its own moment; this is it.
+  atMs?: number;
 }
 
 export interface ClaudeThreadTurn {
@@ -108,10 +113,12 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       // only a fallback identity for a row that somehow has no uuid. A legacy client marker
       // still wins, so transcripts written by the retired one-shot path keep their ids.
       const text = visibleClaudeUserText(record.message);
+      const recordAt = timestampOf(record);
       const userItem: ClaudeThreadItem = {
         type: "userMessage",
         id: idOf(record) ?? `${rowId}:user`,
         clientId: marker ?? null,
+        ...(recordAt === undefined ? {} : { atMs: recordAt }),
         ...(text ? { content: [{ type: "text", text, text_elements: [] }] } : {}),
       };
       current = {
@@ -143,12 +150,14 @@ export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): 
       const terminal = isTurnEnd(record);
       const recordId = idOf(record) ?? `${current.turn.id}:assistant:${assistantRecordSeq}`;
       assistantRecordSeq += 1;
+      const assistantAt = timestampOf(record);
       for (const [blockIndex, block] of textBlocks(record.message).entries()) {
         current.turn.items.push({
           type: "agentMessage",
           id: `${recordId}:${blockIndex}`,
           text: block,
           phase: terminal ? "final_answer" : "commentary",
+          ...(assistantAt === undefined ? {} : { atMs: assistantAt }),
         });
       }
       if (terminal) {

@@ -118,6 +118,10 @@ test("userMessage carries the QiYan clientId marker; phases split final vs comme
     type: "userMessage",
     id: "u1",
     clientId: "ctx:7",
+    // The record's own moment. A turn carries only a start and an end, so a consumer ordering
+    // by turn time collapses every item of a RUNNING turn onto its start -- and a message sent
+    // mid-turn then sorts after replies written long afterwards.
+    atMs: Date.parse("2026-07-25T03:25:02.550Z"),
     content: [{ type: "text", text: "hello", text_elements: [] }],
   });
   assert.equal(turn.startedAt, Date.parse("2026-07-25T03:25:02.550Z"));

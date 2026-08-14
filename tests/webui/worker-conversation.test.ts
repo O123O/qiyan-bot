@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { reconstructClaudeThread } from "../../src/sessions/claude-thread.ts";
-import { openWorkerTurnIds, pageWorkerConversation, terminalWorkerTurnIds } from "../../src/webui/worker-conversation.ts";
+import { openWorkerTurnIds, pageWorkerConversation, terminalWorkerTurnIds, workerConversationRows } from "../../src/webui/worker-conversation.ts";
 
 const userMsg = (id: string, text: string) => ({ type: "userMessage", id, clientId: `client-${id}`, content: [{ type: "text", text, text_elements: [] }] });
 const agentMsg = (id: string, text: string, phase: string | null = "final_answer") => ({ type: "agentMessage", id, text, phase });
@@ -87,4 +87,42 @@ test("Claude transcript history places the response after its correlated user me
       ["worker", "done", Date.parse(completed), undefined],
     ],
   );
+});
+
+// A steer joins a turn that is already running, so its reply belongs to THAT turn. A turn
+// carries only a start and an end, and while it runs the end is null -- so stamping every item
+// with the turn's time collapsed them all onto its START. A message sent mid-turn then sorted
+// after replies written minutes later, and Claude's answers appeared above the question.
+test("items in a running turn keep their own moment, so a mid-turn message stays in order", () => {
+  const turns = [{
+    id: "running", status: "inProgress", turnOrder: 0,
+    startedAt: 1_786_000_000_000, completedAt: null,
+    items: [
+      { type: "userMessage", id: "u0", itemOrder: 0, atMs: 1_786_000_000_000, content: [{ type: "text", text: "start the work" }] },
+      { type: "agentMessage", id: "a1", itemOrder: 1, atMs: 1_786_000_060_000, text: "before the steer" },
+      // Your steer, folded into this turn, then the reply to it.
+      { type: "userMessage", id: "u1", itemOrder: 2, atMs: 1_786_000_120_000, content: [{ type: "text", text: "actually do X" }] },
+      { type: "agentMessage", id: "a2", itemOrder: 3, atMs: 1_786_000_180_000, text: "answering the steer" },
+    ],
+  }];
+
+  const rows = workerConversationRows(turns);
+  assert.deepEqual(rows.map((row) => [row.role, row.body, row.completedAt]), [
+    ["you", "start the work", 1_786_000_000_000],
+    ["worker", "before the steer", 1_786_000_060_000],
+    ["you", "actually do X", 1_786_000_120_000],
+    ["worker", "answering the steer", 1_786_000_180_000],
+  ]);
+});
+
+// Without per-item times nothing changes: the turn's own start and end still order the rows.
+test("a turn whose items carry no timestamps still orders by the turn", () => {
+  const rows = workerConversationRows([{
+    id: "done", status: "completed", turnOrder: 0, startedAt: 1_786_000_000_000, completedAt: 1_786_000_090_000,
+    items: [
+      { type: "userMessage", id: "u0", itemOrder: 0, content: [{ type: "text", text: "ask" }] },
+      { type: "agentMessage", id: "a1", itemOrder: 1, text: "answer" },
+    ],
+  }]);
+  assert.deepEqual(rows.map((row) => [row.role, row.completedAt]), [["you", 1_786_000_000_000], ["worker", 1_786_000_090_000]]);
 });
