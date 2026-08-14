@@ -9,6 +9,7 @@ import {
   beginWorkerSubscription,
   drainWorkerRecoveryAfterAttempt,
   dequeueWorkerRecovery,
+  discardWorkerHistoryCursor,
   failWorkerHistory,
   removeOptimisticWorkerMessage,
   requeueWorkerRecovery,
@@ -590,4 +591,55 @@ test("stale and duplicate sequences are ignored while a sequence gap requests re
   assert.equal(state.messages[0]?.body, "kept after gap");
   assert.equal(state.reconcilePending, true);
   assert.equal(receiveWorkerEvent(state, first), state);
+});
+
+// A paging cursor pins the window it was issued against, and a live worker invalidates that
+// window constantly: the transcript tail slides as the file grows, and the newest turn flips
+// from inProgress to completed. Keeping the cursor meant every later scroll-to-top retried the
+// same dead request and printed the same error for the rest of the session -- nothing short of
+// resubscribing cleared it.
+test("a stale history cursor is discarded rather than retried forever", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:t:1", turnId: "t", body: "hi", completedAt: 1, terminalStatus: "completed" }],
+    hasOlder: true, nextCursor: "cursor-from-a-window-that-moved", terminalTurnIds: [], openTurnIds: [],
+  });
+  assert.equal(state.olderCursor, "cursor-from-a-window-that-moved", "paging starts with a cursor");
+
+  const healed = discardWorkerHistoryCursor(state);
+  assert.equal(healed.olderCursor, undefined, "the dead cursor is dropped, not kept for the next retry");
+  assert.equal(healed.historyInFlight, false);
+  assert.equal(healed.initialHistoryPending, false);
+  // The messages already on screen are not thrown away with it.
+  assert.deepEqual(healed.messages.map((message) => message.body), ["hi"]);
+});
+
+// The interaction, not the pieces. Discarding the cursor is only half a heal: the re-read that
+// follows must INSTALL the cursor it fetches. Preserving instead keeps the one just cleared and
+// drops the fresh one, so paging older dies permanently -- and silently, because every later
+// scroll-up returns early on an absent cursor.
+test("a stale-cursor re-read installs the fresh cursor instead of preserving the dead one", () => {
+  let state = acknowledgeWorkerSubscription(beginWorkerSubscription("worker", "claude", ids.requestId), ids.subscriptionId);
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:t1:1", turnId: "t1", body: "first page", completedAt: 1, terminalStatus: "completed" }],
+    hasOlder: true, nextCursor: "CURSOR-A", terminalTurnIds: [], openTurnIds: [],
+  });
+  assert.equal(state.historyLoaded, true, "the first page succeeded, which is what a stale error follows");
+
+  // The server refuses CURSOR-A: the window it pinned has moved.
+  state = discardWorkerHistoryCursor(state);
+  assert.equal(state.olderCursor, undefined);
+
+  // The re-read. preserveOlderCursor MUST be false here -- that is the whole fix.
+  state = applyWorkerSnapshot(state, {
+    messages: [{ id: "a:t1:1", turnId: "t1", body: "first page", completedAt: 1, terminalStatus: "completed" }],
+    hasOlder: true, nextCursor: "CURSOR-B", terminalTurnIds: [], openTurnIds: [],
+  }, undefined, false);
+  assert.equal(state.olderCursor, "CURSOR-B", "paging resumes from a window the server will answer");
+
+  // With the old behaviour (preserve on a latest-page refresh) the fresh cursor is thrown away.
+  const preserved = applyWorkerSnapshot(discardWorkerHistoryCursor(state), {
+    messages: [], hasOlder: true, nextCursor: "CURSOR-C", terminalTurnIds: [], openTurnIds: [],
+  }, undefined, true);
+  assert.equal(preserved.olderCursor, undefined, "preserving after a discard is exactly the dead-paging bug");
 });

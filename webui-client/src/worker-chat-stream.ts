@@ -497,6 +497,16 @@ export function failWorkerHistory(state: WorkerStreamState): WorkerStreamState {
   return { ...state, historyInFlight: false, initialHistoryPending: false };
 }
 
+// A paging cursor the server can no longer honour. It pins the window it was issued against,
+// and a live worker invalidates that window constantly -- the transcript tail slides as the
+// file grows, and the newest turn flips from inProgress to completed. Keeping the cursor meant
+// every later scroll-to-top retried the same dead request and printed the same error, forever,
+// because nothing else clears it short of resubscribing. Dropping it costs one re-read of the
+// newest page and puts paging back in a state the server will answer.
+export function discardWorkerHistoryCursor(state: WorkerStreamState): WorkerStreamState {
+  return { ...state, olderCursor: undefined, historyInFlight: false, initialHistoryPending: false };
+}
+
 export function dequeueWorkerRecovery(state: WorkerStreamState): { state: WorkerStreamState; turnId?: string; reconcileLatest?: true } {
   if (state.historyInFlight) return { state };
   if (state.reconcilePending) return { state: { ...state, reconcilePending: false }, reconcileLatest: true };

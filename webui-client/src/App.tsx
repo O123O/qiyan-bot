@@ -39,6 +39,7 @@ import {
   beginWorkerSubscription,
   dequeueWorkerRecovery,
   drainWorkerRecoveryAfterAttempt,
+  discardWorkerHistoryCursor,
   failWorkerHistory,
   finishWorkerHistory,
   receiveWorkerEvent,
@@ -245,6 +246,7 @@ export function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [visible, setVisible] = useState(RENDER_CAP);
   const [stopping, setStopping] = useState(false);
+  const composerTabRef = useRef<string>(ASSIST);
   const [live, setLive] = useState(false);
   const [text, setText] = useState(() => readDraft(ASSIST));
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -267,6 +269,7 @@ export function App() {
   const preserveRef = useRef<WorkerScrollPreservation | null>(null); // scroll-height baseline across a prepend read
   const stickRef = useRef(true);                   // whether to stay pinned to the bottom
   const key = selected ?? ASSIST;
+  composerTabRef.current = key;
   const goal = selectedWorkerGoal(sessions, selected);
   // Work Claude started for itself, shown beside the composer. Session-scoped, so it
   // persists across turns and is deliberately not part of the message list.
@@ -385,7 +388,7 @@ export function App() {
       if (assistantHistoryAbortRef.current === abort) assistantHistoryAbortRef.current = null;
     }
   }, []);
-  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false): Promise<boolean> => {
+  const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false, staleRetry = false): Promise<boolean> => {
     const current = workerRef.current;
     if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return false;
     const started = beginWorkerHistory(current, snapshotPending);
@@ -398,7 +401,10 @@ export function App() {
       const page = await api<WorkerSnapshot>(`/api/sessions/${nickname}/messages?limit=${PAGE}${cursor}&subscriptionId=${encodeURIComponent(subscriptionId)}`, { signal: abort.signal });
       const latest = workerRef.current;
       if (!latest || latest.nickname !== nickname || latest.subscriptionId !== subscriptionId) return true;
-      const merged = applyWorkerSnapshot(latest, page, recoveredTurnId, before === undefined && latest.historyLoaded);
+      // NOT preserved on a stale retry: preserving would keep the cursor `discardWorkerHistoryCursor`
+      // just cleared and drop the fresh one this call fetched, leaving paging permanently dead
+      // and silent -- a scroll-up that does nothing rather than one that errors.
+      const merged = applyWorkerSnapshot(latest, page, recoveredTurnId, before === undefined && latest.historyLoaded && !staleRetry);
       replaceWorker(merged);
       if (reconcileLatest && reconciliationRetryRef.current?.subscriptionId === subscriptionId) {
         window.clearTimeout(reconciliationRetryRef.current.timer);
@@ -414,11 +420,25 @@ export function App() {
     } catch (error) {
       const latest = workerRef.current;
       if (latest?.nickname === nickname && latest.subscriptionId === subscriptionId) {
-        let failed = latest.initialHistoryPending ? failWorkerHistory(latest) : finishWorkerHistory(latest);
+        const reason = String((error as { error?: string }).error ?? error);
+        // A stale cursor is not a failure to report, it is a cursor to throw away. It pins the
+        // window it was issued against, and a live worker invalidates that constantly. Retrying
+        // it printed the same error on every scroll-to-top for the rest of the session.
+        // Once only. The re-read is itself snapshot-pinned in places, so on a worker writing
+        // steadily it can fail the same way -- and retrying without a ceiling spins invisibly,
+        // one ssh round trip per attempt, holding the endpoint's work lease each time.
+        const stale = !staleRetry && (reason.includes("cursor is stale") || reason.includes("transcript changed during"));
+        let failed = stale
+          ? discardWorkerHistoryCursor(latest)
+          : latest.initialHistoryPending ? failWorkerHistory(latest) : finishWorkerHistory(latest);
         if (recoveredTurnId) failed = requeueWorkerRecovery(failed, recoveredTurnId);
         if (reconcileLatest) failed = { ...failed, reconcilePending: true };
         replaceWorker(failed);
-        push(nickname, { role: "assistant", body: `Error: ${(error as { error?: string }).error ?? error}`, at: Date.now() });
+        if (stale) {
+          // Re-read the newest page so paging resumes from a window the server will answer.
+          setHasOlder((value) => ({ ...value, [nickname]: true }));
+          void loadWorkerPage(nickname, subscriptionId, snapshotPending, undefined, undefined, false, true);
+        } else push(nickname, { role: "assistant", body: `Error: ${reason}`, at: Date.now() });
       }
     } finally {
       if (workerHistoryAbortRef.current === abort) workerHistoryAbortRef.current = null;
@@ -652,6 +672,15 @@ export function App() {
     const el = logRef.current;
     const assistantCursor = selected === null ? history[0]?.at : undefined;
     const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
+    // A retry that also went stale leaves no cursor, and nothing reinstalls one -- so scrolling
+    // up would silently do nothing until the panel resubscribed. Re-read the newest page here
+    // instead: user-paced, so it is bounded by scrolling rather than by a timer or recursion,
+    // and it re-establishes a cursor for the next attempt.
+    if (selected !== null && workerCursor === undefined && hasOlder[selected]
+      && workerChat?.nickname === selected && workerChat.subscriptionId && !workerChat.historyInFlight) {
+      void loadWorkerPage(selected, workerChat.subscriptionId, false);
+      return;
+    }
     if (assistantCursor === undefined && workerCursor === undefined) return;
     setLoadingOlder(true);
     if (el) preserveRef.current = { height: el.scrollHeight, pending: true };
@@ -760,10 +789,11 @@ export function App() {
     if (!selected || stopping) return;
     setStopping(true);
     try {
-      const result = await api<{ ok: boolean; error?: string }>(`/api/sessions/${selected}/interrupt`, { method: "POST" });
-      if (!result.ok && result.error) push(selected, { role: "assistant", body: `[system] stop failed: ${result.error}`, at: Date.now() });
+      await api<{ ok: boolean; error?: string }>(`/api/sessions/${selected}/interrupt`, { method: "POST" });
     } catch (error) {
-      push(selected, { role: "assistant", body: `[system] stop failed: ${String(error)}`, at: Date.now() });
+      // api() throws the parsed body on a non-2xx, so the reason lives on `.error` -- reading
+      // the object with String() printed "[object Object]" and told the user nothing.
+      push(selected, { role: "assistant", body: `[system] stop failed: ${(error as { error?: string }).error ?? error}`, at: Date.now() });
     } finally { setStopping(false); }
   };
 
@@ -780,7 +810,7 @@ export function App() {
     setText(suggestion.insert); writeDraft(key, suggestion.insert); setSlashSuggestionsOpen(false); setMentionSuggestions([]);
   };
   const targetWorkerFromRelay = (nickname: string) => {
-    setText((draft) => workerMentionDraft(draft, nickname));
+    setText((draft) => { const next = workerMentionDraft(draft, nickname); writeDraft(key, next); return next; });
     setMentionSuggestions([]); setSlashSuggestionsOpen(false);
     window.requestAnimationFrame(() => {
       const input = composerInputRef.current;
@@ -833,6 +863,7 @@ export function App() {
     const target = redirect ?? selected ?? undefined;
     const body = redirect ? m![2] : t;
     setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); stickRef.current = true;
+    // Storage is NOT cleared here: it follows the outcome, so a failure can hand the text back.
     const clientInputId = target ? createBrowserUuid() : undefined;
     const active = workerRef.current;
     const inputDisplayMode = workerInputDisplayMode(
@@ -860,12 +891,24 @@ export function App() {
     // The draft is only surrendered once the server has it. A failed send used to clear the
     // composer AND delete the optimistic bubble, so a long message existed nowhere at all.
     const restore = (): void => {
-      setText((current) => (current ? current : t));
-      writeDraft(key, t);
+      // Only touch the composer if the sending tab is still the one on screen. There is ONE
+      // composer, so writing into it from another tab put this message in the wrong box -- and
+      // writing `current` under the sending tab's key overwrote THAT tab's draft with an
+      // unrelated one. Away from it, the text goes back to its own tab silently, which is where
+      // the failure notice is already sent.
+      // Away from the sending tab, only put the text back if that tab's draft is still the one
+      // that was sent. Typing into it after sending, then switching away, would otherwise have
+      // the response overwrite the newer text -- the same loss this exists to prevent.
+      if (composerTabRef.current !== key) { if (readDraft(key).trim() === t) writeDraft(key, t); return; }
+      // Written inside the updater so storage and the composer never disagree: writing `t`
+      // unconditionally overwrote a draft typed during the round trip, which is the loss this
+      // whole change exists to prevent.
+      setText((current) => { const next = current ? current : t; writeDraft(key, next); return next; });
     };
     try { const r = await api<{ ok: boolean; error?: string; clientUserMessageId?: string }>("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body, target, ...(clientInputId ? { clientInputId } : {}), ...(selected === null && redirect ? { echoInAssistant: true } : {}) }) });
       if (!r.ok) { restore(); push(key, { role: "assistant", body: `[send failed: ${r.error ?? ""} — your message is back in the box]`, at: Date.now() }); }
-      else writeDraft(key, ""); }
+      else if (composerTabRef.current === key) setText((current) => { writeDraft(key, current); return current; });
+      else if (readDraft(key).trim() === t) writeDraft(key, ""); }
     catch (e) { removeRejectedOptimisticMessage(); restore(); push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e} — your message is back in the box]`, at: Date.now() }); }
   };
 
@@ -878,7 +921,7 @@ export function App() {
     try {
       const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}${TOKEN_Q}`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/octet-stream" }, body: f });
       const b = await r.json();
-      if (r.ok && b.path) setText((t) => (t ? t.replace(/\s*$/, " ") : "") + b.path + " ");
+      if (r.ok && b.path) setText((t) => { const next = (t ? t.replace(/\s*$/u, " ") : "") + b.path + " "; writeDraft(key, next); return next; });
       else push(key, { role: "assistant", body: `[upload failed: ${b.error ?? r.status}]`, at: Date.now() });
     } catch { push(key, { role: "assistant", body: "[upload error]", at: Date.now() }); } finally { setUploading(false); }
   };
@@ -938,7 +981,7 @@ export function App() {
     }
   };
   const download = (path: string, session: string | null) => window.open(`${rawUrl(path, session)}&download=1`, "_blank");
-  const insertPath = (path: string) => { const proj = sessions.find((s) => s.nickname === selected)?.projectDir; setText((t) => `${t ? t.replace(/\s*$/, " ") : ""}${proj ? `${proj}/${path}` : path} `); };
+  const insertPath = (path: string) => { const proj = sessions.find((s) => s.nickname === selected)?.projectDir; setText((t) => { const next = `${t ? t.replace(/\s*$/u, " ") : ""}${proj ? `${proj}/${path}` : path} `; writeDraft(key, next); return next; }); };
   const openFilesystemPath = (path: string) => { void loadDir(null, path.trim() || "~", true); };
 
   // Recursive file tree: folders expand in place (lazy-loaded); files open the preview popup; hover
