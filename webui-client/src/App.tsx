@@ -92,6 +92,13 @@ const REVEAL_STEP = 20;      // reveal step when scrolling into in-memory histor
 // a long conversation grew the array the shown-memo re-sorts on every single message.
 // Generous, because anything trimmed here is durable server-side and returns on scroll-up.
 const MAX_LIVE_LOG = 400;
+// A composer draft is the one thing in this panel the user cannot get back if it is lost: it
+// exists nowhere else. Kept per tab, and only cleared once the server has accepted it.
+const draftKey = (tab: string) => `qiyan-draft:${tab}`;
+const readDraft = (tab: string): string => { try { return localStorage.getItem(draftKey(tab)) ?? ""; } catch { return ""; } };
+const writeDraft = (tab: string, value: string): void => {
+  try { if (value) localStorage.setItem(draftKey(tab), value); else localStorage.removeItem(draftKey(tab)); } catch { /* private mode, quota */ }
+};
 // Above this a numbered gutter costs more than it is worth: each line becomes its own row of
 // elements, allocated synchronously while the modal opens.
 const MAX_NUMBERED_LINES = 5_000;
@@ -239,7 +246,7 @@ export function App() {
   const [visible, setVisible] = useState(RENDER_CAP);
   const [stopping, setStopping] = useState(false);
   const [live, setLive] = useState(false);
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => readDraft(ASSIST));
   const [preview, setPreview] = useState<Preview | null>(null);
   const [srcMode, setSrcMode] = useState(false); // for markdown previews: rendered (false) vs raw source
   const [dirs, setDirs] = useState<Record<string, Array<{ name: string; type: string }> | { error: string }>>({}); // tree: entries by dir path ("" = root)
@@ -587,6 +594,9 @@ export function App() {
   // On tab switch: reset the render window, pin to bottom, and lazily load the transcript + file root.
   useEffect(() => {
     setVisible(RENDER_CAP); stickRef.current = true; preserveRef.current = null;
+    // Each tab keeps its own unsent draft, so switching away to check something does not cost
+    // you what you were writing.
+    setText(readDraft(selected ?? ASSIST));
     subscribeWorker(wsRef.current, selected);
     setDirs({}); setExpanded(new Set());
     if (selected) void loadDir(selected, "");
@@ -758,13 +768,16 @@ export function App() {
   };
 
   const onText = (v: string) => {
-    setText(v); setSugIdx(0); setSlashSuggestionsOpen(true);
+    setText(v); writeDraft(key, v); setSugIdx(0); setSlashSuggestionsOpen(true);
     const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v); // @-autocomplete of worker nicknames
     setMentionSuggestions(at ? sessions.map((s) => s.nickname).filter((n) => n.startsWith(at[1].toLowerCase())).slice(0, 6) : []);
   };
-  const pickMentionSuggestion = (nick: string) => { setText((t) => t.replace(/@[a-z0-9_-]*$/i, `@${nick} `)); setMentionSuggestions([]); };
+  const pickMentionSuggestion = (nick: string) => {
+    setText((t) => { const next = t.replace(/@[a-z0-9_-]*$/iu, `@${nick} `); writeDraft(key, next); return next; });
+    setMentionSuggestions([]);
+  };
   const pickCommandSuggestion = (suggestion: CommandSuggestion) => {
-    setText(suggestion.insert); setSlashSuggestionsOpen(false); setMentionSuggestions([]);
+    setText(suggestion.insert); writeDraft(key, suggestion.insert); setSlashSuggestionsOpen(false); setMentionSuggestions([]);
   };
   const targetWorkerFromRelay = (nickname: string) => {
     setText((draft) => workerMentionDraft(draft, nickname));
@@ -812,9 +825,9 @@ export function App() {
 
   const send = async () => {
     const t = text.trim(); if (!t) return;
-    if (selected && t.startsWith("!")) { setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runExec(t.slice(1).trim()); return; }
+    if (selected && t.startsWith("!")) { setText(""); writeDraft(key, ""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runExec(t.slice(1).trim()); return; }
     const workerCommand = selected ? parseWorkerCommand(t) : null;
-    if (workerCommand) { setText(""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runWorkerCommand(workerCommand, t); return; }
+    if (workerCommand) { setText(""); writeDraft(key, ""); setMentionSuggestions([]); setSlashSuggestionsOpen(false); void runWorkerCommand(workerCommand, t); return; }
     const m = /^@([a-z0-9][a-z0-9_-]*)\s+([\s\S]+)$/.exec(t);
     const redirect = m && sessions.some((s) => s.nickname === m[1]) ? m[1] : null;
     const target = redirect ?? selected ?? undefined;
@@ -844,9 +857,16 @@ export function App() {
       const current = workerRef.current;
       if (current?.nickname === target) replaceWorker(removeOptimisticWorkerMessage(current, `to:web:${clientInputId}`));
     };
+    // The draft is only surrendered once the server has it. A failed send used to clear the
+    // composer AND delete the optimistic bubble, so a long message existed nowhere at all.
+    const restore = (): void => {
+      setText((current) => (current ? current : t));
+      writeDraft(key, t);
+    };
     try { const r = await api<{ ok: boolean; error?: string; clientUserMessageId?: string }>("/api/input", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body, target, ...(clientInputId ? { clientInputId } : {}), ...(selected === null && redirect ? { echoInAssistant: true } : {}) }) });
-      if (!r.ok) push(key, { role: "assistant", body: `[send failed: ${r.error ?? ""}]`, at: Date.now() }); }
-    catch (e) { removeRejectedOptimisticMessage(); push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e}]`, at: Date.now() }); }
+      if (!r.ok) { restore(); push(key, { role: "assistant", body: `[send failed: ${r.error ?? ""} — your message is back in the box]`, at: Date.now() }); }
+      else writeDraft(key, ""); }
+    catch (e) { removeRejectedOptimisticMessage(); restore(); push(key, { role: "assistant", body: `[send error: ${(e as { error?: string }).error ?? e} — your message is back in the box]`, at: Date.now() }); }
   };
 
   const fileInput = useRef<HTMLInputElement>(null);
