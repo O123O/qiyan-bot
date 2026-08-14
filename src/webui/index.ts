@@ -32,6 +32,7 @@ export interface WebUiPhaseDeps {
   remote?: () => RemoteDeps | undefined; // provider — the ssh runtime root is only known after startup
   acceptChat(source: CanonicalChatSource, effects: ChatAcceptanceEffects, presentation?: { ownerDisplayText?: string }): Promise<void>;
   controlGoal(input: WebGoalControlInput): Promise<WebGoalControlResult>;
+  interruptSession(nickname: string): Promise<{ ok: boolean; error?: string }>;
   openGoalAdmission(): void;
   closeGoalAdmission(): void;
   waitForGoalControls(): Promise<void>;
@@ -132,7 +133,7 @@ export function createWebUiPhase(deps: WebUiPhaseDeps): AppPhase {
   const createServer = (host: string, port: number, token: string): WebServerHandle => createWebServer({
     host, port, token, staticDir: deps.staticDir,
     bus: deps.bus, reads: deps.reads, files: deps.files, ...(deps.uploads ? { uploads: deps.uploads } : {}), ...(deps.remote ? { remote: deps.remote } : {}),
-    submitInput, controlGoal: deps.controlGoal, openGoalAdmission: deps.openGoalAdmission,
+    submitInput, controlGoal: deps.controlGoal, interruptSession: deps.interruptSession, openGoalAdmission: deps.openGoalAdmission,
     closeGoalAdmission: deps.closeGoalAdmission, waitForGoalControls: deps.waitForGoalControls, report: deps.report,
   });
   const resolveTarget = (): WebUiTarget => {

@@ -3613,6 +3613,20 @@ export async function buildProductionApp(
       uploads: webUploads(),
       acceptChat,
       controlGoal: (input) => webGoalControl?.control(input) ?? Promise.resolve({ ok: false, error: "goal control is unavailable" }),
+      // The panel's stop button. Deliberately the same path the manager's interrupt_session
+      // takes, minus the operation record: this is the owner acting directly, not QiYan
+      // delegating. Queued messages survive and run next -- the SDK cancels them only when
+      // asked, and nothing here asks.
+      interruptSession: async (nickname) => {
+        try {
+          await sessions.interrupt(nickname);
+          dashboardStore.markDirty();
+          await renderDashboardSafely();
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, error: error instanceof AppError ? error.message : String(error) };
+        }
+      },
       openGoalAdmission: () => { webGoalControl?.openAdmission(); },
       closeGoalAdmission: () => { webGoalControl?.closeAdmission(); },
       waitForGoalControls: () => webGoalControl?.waitForActive() ?? Promise.resolve(),

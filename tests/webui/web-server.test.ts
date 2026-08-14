@@ -73,6 +73,7 @@ test("a session with no readability opinion reports its plain status", () => {
 interface ServerCalls {
   inputs: Array<{ text: string; target?: string; clientInputId?: string; echoInAssistant?: boolean }>;
   goals: WebGoalControlInput[];
+  interrupts: string[];
 }
 
 async function withServer(
@@ -80,7 +81,7 @@ async function withServer(
   readsOverride: WebReadsDeps = reads,
 ): Promise<void> {
   const bus = new WebBus();
-  const calls: ServerCalls = { inputs: [], goals: [] };
+  const calls: ServerCalls = { inputs: [], goals: [], interrupts: [] };
   const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
   await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
   const uploadsDir = await mkdtemp(join(tmpdir(), "qiyan-webui-up-"));
@@ -98,6 +99,7 @@ async function withServer(
       return { ok: true, ...(clientInputId ? { clientUserMessageId: `to:web:${clientInputId}` } : {}) };
     },
     controlGoal: async (input) => { calls.goals.push(input); return { ok: true }; },
+    interruptSession: async (nickname) => { calls.interrupts.push(nickname); return { ok: true }; },
     openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {},
     report: () => {},
   });
@@ -114,6 +116,7 @@ test("the server handle is restartable: start → stop → start re-listens and 
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     submitInput: async () => ({ ok: true }), controlGoal: async () => ({ ok: true }),
+    interruptSession: async () => ({ ok: true }),
     openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {}, report: () => {},
   });
   const httpBase = (u: string) => u.slice(0, u.indexOf("/?"));
@@ -145,6 +148,7 @@ test("server shutdown closes goal admission and drains an admitted goal request"
     host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
     files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
     submitInput: async () => ({ ok: true }),
+    interruptSession: async () => ({ ok: true }),
     controlGoal: async () => {
       events.push("goal:start");
       active = new Promise<void>((resolve) => { activeDone = resolve; });
@@ -413,6 +417,7 @@ test("dispatches a remote session's files over ssh (browse + raw stream + upload
     files: { projectDir: () => undefined, maxFileBytes: 4096, fileTarget: (n) => (n === "rworker" ? { transport: "remote", projectDir: remoteRoot, host: "testhost" } : undefined) },
     remote: () => ({ sshBinary: ssh, sshRuntimeRoot: sshRt }),
     submitInput: async () => ({ ok: true }), controlGoal: async () => ({ ok: true }),
+    interruptSession: async () => ({ ok: true }),
     openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {}, report: () => {},
   });
   const { url } = await server.start();
@@ -679,4 +684,48 @@ test("a rebuilt Web UI asset invalidates the cached copy", async () => {
     assert.notEqual(after.headers.get("etag"), firstTag, "mtime+size changed, so the cache must not answer");
     assert.match(await after.text(), /rebuilt/u);
   });
+});
+
+// The panel's stop button. Interrupting aborts the RUNNING work; anything already queued
+// deliberately survives and runs next, which is what makes this the way past a worker blocked
+// for minutes inside one long tool call.
+test("the stop route interrupts exactly the named worker", async () => {
+  await withServer(async (base, calls) => {
+    const response = await fetch(`${base}/api/sessions/payments/interrupt?token=${TOKEN}`, { method: "POST" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true });
+    assert.deepEqual(calls.interrupts, ["payments"], "the nickname from the path, and only once per request");
+  });
+});
+
+test("a failed stop reports the reason rather than a bare failure", async () => {
+  const bus = new WebBus();
+  const staticDir = await mkdtemp(join(tmpdir(), "qiyan-webui-"));
+  await writeFile(join(staticDir, "index.html"), "<!doctype html><title>ok</title>");
+  const server = createWebServer({
+    host: "127.0.0.1", port: 0, token: TOKEN, staticDir, bus, reads,
+    files: { projectDir: () => undefined, fileTarget: () => undefined, maxFileBytes: 1024 },
+    submitInput: async () => ({ ok: true }),
+    controlGoal: async () => ({ ok: true }),
+    interruptSession: async () => ({ ok: false, error: "session is idle" }),
+    openGoalAdmission: () => {}, closeGoalAdmission: () => {}, waitForGoalControls: async () => {},
+    uploads: { dir: staticDir, maxBytes: 1024, ttlMs: 1e9 },
+    report: () => {},
+  });
+  const { url } = await server.start();
+  const base = url.slice(0, url.indexOf("/?"));
+  try {
+    const response = await fetch(`${base}/api/sessions/payments/interrupt?token=${TOKEN}`, { method: "POST" });
+    assert.equal(response.status, 400, "a refused stop is not a success");
+    assert.deepEqual(await response.json(), { ok: false, error: "session is idle" });
+  } finally { await server.stop(); }
+});
+
+// The button itself: shown only for a busy worker, and one press is one interrupt.
+test("the stop button is scoped to a busy worker and cannot double-fire", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /selected !== null && workerBusy && <button className="stop"/u, "only for a busy worker, never for QiYan");
+  assert.match(source, /disabled=\{stopping\}/u, "disabled while the interrupt is in flight");
+  assert.match(source, /if \(!selected \|\| stopping\) return;/u, "and guarded in the handler too");
+  assert.match(source, /const workerBusy = selectedSession\?\.nativeStatus === "active";/u);
 });

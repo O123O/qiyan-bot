@@ -166,6 +166,10 @@ code.code-lines {
 .composer { position:relative; border-top:1px solid var(--line); padding:10px 14px; display:flex; gap:8px; background:var(--panel); }
 .composer textarea { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; resize:none; font:inherit; }
 .composer button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }
+/* Distinct from Send, and not alarming: stopping is a normal thing to do to a worker that is
+   blocked inside a long command, not an error state. */
+.composer button.stop { background:transparent; color:var(--muted); border:1px solid var(--line); font-weight:500; }
+.composer button.stop:hover:enabled { color:var(--text); border-color:var(--muted); }
 .worker-context { border-top:1px solid var(--line); padding:5px 14px 7px; background:var(--panel2); color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 14px; font-size:11px; }
 .worker-context strong { color:var(--text); font-weight:500; overflow-wrap:anywhere; }
 .suggest { position:absolute; bottom:calc(100% + 4px); left:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 6px 20px rgba(0,0,0,.3); }

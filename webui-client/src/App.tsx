@@ -237,6 +237,7 @@ export function App() {
   const [hasOlder, setHasOlder] = useState<Record<string, boolean>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [visible, setVisible] = useState(RENDER_CAP);
+  const [stopping, setStopping] = useState(false);
   const [live, setLive] = useState(false);
   const [text, setText] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -742,6 +743,20 @@ export function App() {
     void loadOlder();
   };
 
+  // Busy means "there is something to stop": a running turn, or background work that outlives
+  // its turn and would otherwise leave no way back to idle.
+  const workerBusy = selectedSession?.nativeStatus === "active";
+  const stopWorker = async () => {
+    if (!selected || stopping) return;
+    setStopping(true);
+    try {
+      const result = await api<{ ok: boolean; error?: string }>(`/api/sessions/${selected}/interrupt`, { method: "POST" });
+      if (!result.ok && result.error) push(selected, { role: "assistant", body: `[system] stop failed: ${result.error}`, at: Date.now() });
+    } catch (error) {
+      push(selected, { role: "assistant", body: `[system] stop failed: ${String(error)}`, at: Date.now() });
+    } finally { setStopping(false); }
+  };
+
   const onText = (v: string) => {
     setText(v); setSugIdx(0); setSlashSuggestionsOpen(true);
     const at = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(v); // @-autocomplete of worker nicknames
@@ -1160,6 +1175,13 @@ export function App() {
             <button className="ghost" title="Send a file (its path is appended)" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? "…" : "📎"}</button>
             <textarea ref={composerInputRef} value={text} onChange={(e) => onText(e.target.value)} onKeyDown={onKey} rows={2}
               placeholder={selected === null ? "Message QiYan… (type / for commands; @worker to direct-message)" : `Message ${selected}… (type / for commands)`} />
+            {/* Only for a worker, and only while it is doing something. Interrupting aborts the
+                RUNNING work -- typically a long tool call -- while anything already queued
+                survives and runs next, so this is the way to get past a worker that is blocked
+                for minutes inside one command. Disabled mid-flight so one press is one
+                interrupt. */}
+            {selected !== null && workerBusy && <button className="stop" title="Stop what this worker is doing now (queued messages still run)"
+              disabled={stopping} onClick={() => void stopWorker()}>{stopping ? "…" : "Stop"}</button>}
             <button onClick={() => void send()}>Send</button>
           </div>
           {selectedSession && <div className="worker-context" aria-label={`${selectedSession.nickname} session context`}>

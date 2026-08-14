@@ -108,6 +108,11 @@ export interface WebServerOptions {
   remote?: () => RemoteDeps | undefined;
   submitInput(text: string, target: string | undefined, clientInputId?: string, echoInAssistant?: boolean): Promise<{ ok: boolean; error?: string; clientUserMessageId?: string }>;
   controlGoal(input: WebGoalControlInput): Promise<WebGoalControlResult>;
+  // Stop whatever the worker is doing now: the running turn, or -- when the session is busy
+  // with background work that belongs to no turn -- that work instead. Anything the user has
+  // queued behind it deliberately SURVIVES and runs next; the SDK cancels queued input only
+  // when explicitly asked, and QiYan never asks.
+  interruptSession(nickname: string): Promise<{ ok: boolean; error?: string }>;
   openGoalAdmission(): void;
   closeGoalAdmission(): void;
   waitForGoalControls(): Promise<void>;
@@ -334,6 +339,12 @@ export function createWebServer(options: WebServerOptions): WebServer {
         request.off("aborted", cancel);
         response.off("close", cancel);
       }
+      return;
+    }
+    const stop = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/interrupt$/u.exec(url.pathname);
+    if (request.method === "POST" && stop) {
+      const result = await options.interruptSession(stop[1]!);
+      json(response, result.ok ? 200 : 400, result);
       return;
     }
     const goal = /^\/api\/sessions\/([a-z0-9][a-z0-9_-]{0,63})\/goal$/u.exec(url.pathname);
