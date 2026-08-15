@@ -642,6 +642,11 @@ export function recoverableOperationTarget(
           operation.receipt, operation.recoveryProtocol,
         ) === "retire_no_effect" ? { policy: "local" } : sessionTarget(args.nickname);
     case "send_to_session":
+      // Same reasoning as interrupt_session: retiring a no-dispatch send is a local ledger write,
+      // and routing it through the endpoint would park it exactly when the endpoint is unreachable.
+      return operation.state !== undefined && operation.recoveryProtocol !== undefined
+        && sendRecoveryHasNoDispatch(operation.state, args.mode, operation.receipt, operation.recoveryProtocol)
+        ? { policy: "local" } : sessionTarget(args.nickname);
     case "set_goal":
     case "pause_goal":
     case "resume_goal":
@@ -1041,6 +1046,35 @@ export function interruptRecoveryStep(
   // by having made it so — the interrupt the owner asked for would silently never happen.
   if (state !== "uncertain") return "wait";
   return recoverableOperationHasNoDispatch(receipt, recoveryProtocol) ? "retire_no_effect" : "wait";
+}
+
+// The same no-dispatch proof for sends, which need it for the same reason: an unresolved send is
+// a ready_endpoint operation, so nothing ever retires it and it fences every later restart of its
+// endpoint forever.
+//
+// Both modes qualify, for the same reason from opposite ends. A steer's only dispatch is turn/steer
+// and its checkpoint immediately precedes it. A start checkpoints at the top of its handler, ahead
+// of everything. So in either case an absent receipt proves nothing was sent.
+//
+// An absent receipt IS reachable for a start, despite that top checkpoint: the row is already
+// dispatched when the handler begins, so if the attempt terminalizes while it is still resolving
+// the worker and its pending settings, the checkpoint throws on the moved fence and the row lands
+// uncertain with no receipt. A start that got as far as checkpointing carries at least an empty
+// object, which is not this proof, and falls through to the capacityHint one below.
+//
+// An allowlist, not a denylist: a mode added later must fail safe into the endpoint proof rather
+// than inherit a no-dispatch claim its own dispatch path may not honour. Retiring a message that
+// is actually queued would tell the assistant the send failed while the worker runs it anyway.
+//
+// The claim is about the turn, not the host: prepareInput can copy attachments to the worker
+// before the dispatch point, and retiring does not undo that. This is the same trade the start
+// proof already accepts, and the attachment holds are released either way.
+export function sendRecoveryHasNoDispatch(
+  state: OperationState, mode: unknown, receipt: unknown, recoveryProtocol: number,
+): boolean {
+  if (state !== "uncertain") return false;
+  if (mode !== "steer" && mode !== "start") return false;
+  return recoverableOperationHasNoDispatch(receipt, recoveryProtocol);
 }
 
 export function recoverableOperationHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
@@ -3848,7 +3882,7 @@ export async function buildProductionApp(
           .map((id) => attemptScope.resolveAttachment(context.attemptId, id));
         const holds = resolvedAttachments.map((attachment, index) => ({
           ...attachment,
-          id: `${workerAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId)}:${index}`,
+          id: sendAttachmentHoldId(context.effectiveSourceContextId, context.attemptId, context.callId, index),
         }));
         for (const hold of holds) attachments.retainForOperation(hold.id, hold.contextId, [hold.attachmentId]);
         let result: Awaited<ReturnType<SessionService["send"]>>;
@@ -4927,6 +4961,20 @@ export async function buildProductionApp(
             });
           operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
         } else if (operation.kind === "send_to_session") {
+          // Releasing by derived hold id rather than the resolved holds below: retiring needs no
+          // endpoint and must not depend on an attachment still resolving. Release is idempotent.
+          const releaseOperationHolds = (): void => {
+            (args.attachment_ids as string[]).forEach((_id, index) => attachments.releaseOperation(
+              sendAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId, index),
+            ));
+          };
+          // Ahead of the session lookup and the bounded read on purpose: both need the endpoint,
+          // and this is the case that has to settle without one.
+          if (sendRecoveryHasNoDispatch(operation.state, args.mode, operation.receipt, operation.recoveryProtocol)) {
+            releaseOperationHolds();
+            failRecoveredNoEffect(operation.id, "worker send was not dispatched");
+            return;
+          }
           const session = registry.get(args.nickname);
           if (!session) return;
           const checkpoint = operation.receipt as {
@@ -4939,6 +4987,9 @@ export async function buildProductionApp(
           const hasBaseline = Object.hasOwn(checkpoint ?? {}, "baselineTurnId");
           if (args.mode === "start" && !hasBaseline) {
             if (checkpoint?.capacityHint === undefined) {
+              // Release here too. This proves the start never dispatched, so its holds are dead
+              // weight, and every other no-effect exit from this branch already releases them.
+              releaseOperationHolds();
               failRecoveredNoEffect(operation.id, "worker start was not dispatched");
               return;
             }
@@ -4976,7 +5027,7 @@ export async function buildProductionApp(
           });
           const holds = (args.attachment_ids as string[]).map((id, index) => {
             const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
-            return { ...attachment, id: `${workerAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId)}:${index}` };
+            return { ...attachment, id: sendAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId, index) };
           });
           if (turn) {
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turn.id);
@@ -5810,6 +5861,16 @@ export function isUncertainAssistantTransportFailure(error: unknown, endpointSta
 
 function workerAttachmentHoldId(contextId: string, attemptId: string, callId: string): string {
   return `worker-send:${createHash("sha256").update(`${contextId}\0${attemptId}\0${callId}`).digest("hex")}`;
+}
+
+// The one derivation of a send's per-attachment hold id. The live handler retains under it and
+// recovery releases or transfers under it, so if those ever disagreed the holds would leak
+// silently — the attachment row and its file are pinned until the hold is released. Shared rather
+// than tested so they cannot disagree at all.
+function sendAttachmentHoldId(
+  contextId: string, attemptId: string, callId: string, index: number,
+): string {
+  return `${workerAttachmentHoldId(contextId, attemptId, callId)}:${index}`;
 }
 
 function isProvenSendNoEffect(error: unknown): boolean {

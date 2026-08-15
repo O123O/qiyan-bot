@@ -498,8 +498,8 @@ test("an interrupt that never dispatched is retired instead of fencing its endpo
 // uncertain forever and fenced every later restart of its endpoint — the one action that could
 // clear what it died on. The effect asserted here is "the restart is no longer refused", not
 // "a method ran": the fence is the thing the owner actually hit.
-function interruptFence(row: Record<string, unknown>) {
-  let recoverable = [{ id: "interrupt-wedged", sequence: 1, kind: "interrupt_session",
+function wedgedFence(row: Record<string, unknown>) {
+  let recoverable = [{ id: "wedged", sequence: 1, kind: "interrupt_session",
     args: { nickname: "sparse-att-scale" }, ...row }];
   return {
     stillFencing: (): string[] => recoverable.map((operation) => operation.id as string),
@@ -527,23 +527,62 @@ function interruptFence(row: Record<string, unknown>) {
 
 test("an interrupt that never dispatched stops fencing the restart that would clear it", async () => {
   // The exact ledger shape of the incident row: uncertain, protocol 1, no receipt at all.
-  assert.equal(await interruptFence({ state: "uncertain", recoveryProtocol: 1 }).run(), "proceed");
+  assert.equal(await wedgedFence({ state: "uncertain", recoveryProtocol: 1 }).run(), "proceed");
 });
 
 test("an interrupt that may have dispatched still fences", async () => {
   // Dispatched: genuinely in flight, and with two instances sharing one ledger the live call may
   // belong to the other one. Retiring it would make "never dispatched" true by making it so.
-  const inFlight = interruptFence({ state: "dispatched", recoveryProtocol: 1 });
+  const inFlight = wedgedFence({ state: "dispatched", recoveryProtocol: 1 });
   await assert.rejects(inFlight.run(), (error: any) => error.code === "OPERATION_CONFLICT");
-  assert.deepEqual(inFlight.stillFencing(), ["interrupt-wedged"]);
+  assert.deepEqual(inFlight.stillFencing(), ["wedged"]);
 
   // A receipt proves it reached the endpoint, so its outcome is unknown and it must be proven.
-  const dispatched = interruptFence({ state: "uncertain", recoveryProtocol: 1, receipt: { turnId: "turn-1" } });
+  const dispatched = wedgedFence({ state: "uncertain", recoveryProtocol: 1, receipt: { turnId: "turn-1" } });
   await assert.rejects(dispatched.run(), (error: any) => error.code === "OPERATION_CONFLICT");
 
   // A pre-protocol row carries no checkpoint-before-dispatch guarantee, so absence proves nothing.
-  const legacy = interruptFence({ state: "uncertain", recoveryProtocol: 0 });
+  const legacy = wedgedFence({ state: "uncertain", recoveryProtocol: 0 });
   await assert.rejects(legacy.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+});
+
+// A steer checkpoints only at the dispatch point, so one that died before it — an unreachable
+// endpoint is enough — left no receipt, nothing in history to reconcile against, and no proof it
+// could ever acquire. It stayed uncertain forever and fenced every later restart of its endpoint,
+// exactly as the interrupt did. send_to_session is the most-used tool in the system.
+test("a send that never dispatched stops fencing the restart that would clear it", async () => {
+  const send = (mode: string) => wedgedFence({
+    kind: "send_to_session", state: "uncertain", recoveryProtocol: 1, args: { nickname: "worker", mode },
+  });
+  // A steer's only dispatch is preceded by its checkpoint, so no receipt means nothing was sent.
+  assert.equal(await send("steer").run(), "proceed");
+  // A start checkpoints ahead of everything, but the row is already dispatched when the handler
+  // begins: terminalize the attempt while it is still resolving the worker and the checkpoint
+  // throws on the moved fence, leaving exactly this shape. The proof is stronger here, not weaker.
+  assert.equal(await send("start").run(), "proceed");
+});
+
+test("a send that may have dispatched still fences", async () => {
+  const fence = (row: Record<string, unknown>) =>
+    wedgedFence({ kind: "send_to_session", state: "uncertain", recoveryProtocol: 1, ...row });
+  // A start that got as far as checkpointing carries at least an empty object, and an empty object
+  // is not the no-dispatch proof — that shape belongs to the capacityHint check, which reads history.
+  await assert.rejects(fence({ args: { nickname: "worker", mode: "start" }, receipt: {} }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
+  // A receipt means the steer reached the endpoint; its outcome must be proven against history.
+  await assert.rejects(fence({ args: { nickname: "worker", mode: "steer" }, receipt: { turnId: "turn-1" } }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
+  // In flight, possibly in the other instance sharing this ledger.
+  await assert.rejects(fence({ args: { nickname: "worker", mode: "steer" }, state: "dispatched" }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
+  // Pre-protocol rows carry no checkpoint-before-dispatch guarantee.
+  await assert.rejects(fence({ args: { nickname: "worker", mode: "steer" }, recoveryProtocol: 0 }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
+  // Allowlist: a mode added later must fail safe into the endpoint proof rather than inherit a
+  // no-dispatch claim its own dispatch path may not honour. Retiring a queued message would tell
+  // the assistant the send failed while the worker went on to run it.
+  await assert.rejects(fence({ args: { nickname: "worker", mode: "queue" } }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
 });
 
 test("create recovery terminalizes only exact no-dispatch and lost-empty-thread proofs", () => {
