@@ -1073,8 +1073,21 @@ export function sendRecoveryHasNoDispatch(
   state: OperationState, mode: unknown, receipt: unknown, recoveryProtocol: number,
 ): boolean {
   if (state !== "uncertain") return false;
-  if (mode !== "steer" && mode !== "start") return false;
-  return recoverableOperationHasNoDispatch(receipt, recoveryProtocol);
+  if (mode === "steer") return recoverableOperationHasNoDispatch(receipt, recoveryProtocol);
+  if (mode !== "start") return false;
+  // A start has a second, stronger proof that needs no protocol gate, because it reads positive
+  // evidence out of the receipt rather than inferring from its absence: the dispatch-point
+  // checkpoint writes capacityHint unconditionally and the top-of-handler one runs before it, so a
+  // start receipt can only ever gain that key. No capacityHint and no baseline therefore means the
+  // dispatch point was never reached.
+  //
+  // No protocol gate because there is no version window for one to protect: capacityHint predates
+  // the recovery_protocol column (2026-07-05 vs 2026-07-09) and was written unconditionally from
+  // its first version, so every row the ledger can hold, protocol 0 or 1, came from a build whose
+  // start dispatch wrote it. That is what separates this from the steer proof, which infers from
+  // an absent receipt and so genuinely depends on the discipline protocol 1 marks.
+  if (Object.hasOwn(receipt ?? {}, "baselineTurnId")) return false;
+  return (receipt as { capacityHint?: unknown } | undefined)?.capacityHint === undefined;
 }
 
 export function recoverableOperationHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
@@ -4990,6 +5003,8 @@ export async function buildProductionApp(
             settingsObservationSequence?: number;
           } | undefined;
           const hasBaseline = Object.hasOwn(checkpoint ?? {}, "baselineTurnId");
+          // Still reached by dispatched rows, which the early retirement above deliberately leaves
+          // alone; for uncertain ones it has already fired, without needing this endpoint lease.
           if (args.mode === "start" && !hasBaseline) {
             if (checkpoint?.capacityHint === undefined) {
               // Release here too. This proves the start never dispatched, so its holds are dead

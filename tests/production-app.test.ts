@@ -562,13 +562,28 @@ test("a send that never dispatched stops fencing the restart that would clear it
   assert.equal(await send("start").run(), "proceed");
 });
 
+// The commoner start failure: the top-of-handler checkpoint landed, then the endpoint went away
+// before the dispatch point. capacityHint is written unconditionally at that point and a receipt
+// can only gain it, so its absence proves no dispatch -- the same predicate that already retires
+// this row. It was still endpoint-routed though, so with the endpoint down it parked on
+// wait_for_endpoint and fenced the restart that was the only way back.
+test("a start that checkpointed but never dispatched stops fencing too", async () => {
+  const start = (receipt: unknown) => wedgedFence({
+    kind: "send_to_session", state: "uncertain", recoveryProtocol: 1,
+    args: { nickname: "worker", mode: "start" }, receipt,
+  });
+  assert.equal(await start({}).run(), "proceed");
+  assert.equal(await start({ pendingSettings: { model: "opus" } }).run(), "proceed");
+  // A baseline was captured, so the dispatch point was reached; history has to settle it.
+  await assert.rejects(start({ baselineTurnId: null }).run(), (error: any) => error.code === "OPERATION_CONFLICT");
+  // capacityHint is written at the dispatch point itself.
+  await assert.rejects(start({ capacityHint: { phase: "provisional-start" } }).run(),
+    (error: any) => error.code === "OPERATION_CONFLICT");
+});
+
 test("a send that may have dispatched still fences", async () => {
   const fence = (row: Record<string, unknown>) =>
     wedgedFence({ kind: "send_to_session", state: "uncertain", recoveryProtocol: 1, ...row });
-  // A start that got as far as checkpointing carries at least an empty object, and an empty object
-  // is not the no-dispatch proof — that shape belongs to the capacityHint check, which reads history.
-  await assert.rejects(fence({ args: { nickname: "worker", mode: "start" }, receipt: {} }).run(),
-    (error: any) => error.code === "OPERATION_CONFLICT");
   // A receipt means the steer reached the endpoint; its outcome must be proven against history.
   await assert.rejects(fence({ args: { nickname: "worker", mode: "steer" }, receipt: { turnId: "turn-1" } }).run(),
     (error: any) => error.code === "OPERATION_CONFLICT");
