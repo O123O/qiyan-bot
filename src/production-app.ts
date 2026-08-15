@@ -4961,12 +4961,17 @@ export async function buildProductionApp(
             });
           operations.succeed(operation.id, { deliveries: result.map((item) => item.deliveryId), count: args.count, nickname: args.nickname });
         } else if (operation.kind === "send_to_session") {
-          // Releasing by derived hold id rather than the resolved holds below: retiring needs no
-          // endpoint and must not depend on an attachment still resolving. Release is idempotent.
+          // Derived, never resolved. A hold id is a pure function of the operation's identity, so
+          // recovery does not need the attachment to still be admitted to the attempt in order to
+          // release or transfer its hold — and it must not, because by recovery time it usually is
+          // not: an attempt that fails with an operation still in flight supersedes its own
+          // sources, and resolveAttachment admits only submitted or completed ones. Resolving here
+          // threw ATTACHMENT_INVALID on every pass, so a send carrying attachments could never
+          // settle and fenced its endpoint forever.
+          const holdIds = (args.attachment_ids as string[]).map((_id, index) =>
+            sendAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId, index));
           const releaseOperationHolds = (): void => {
-            (args.attachment_ids as string[]).forEach((_id, index) => attachments.releaseOperation(
-              sendAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId, index),
-            ));
+            for (const holdId of holdIds) attachments.releaseOperation(holdId);
           };
           // Ahead of the session lookup and the bounded read on purpose: both need the endpoint,
           // and this is the case that has to settle without one.
@@ -5025,10 +5030,6 @@ export async function buildProductionApp(
           const turn = selectRecoveredSendTurn(history.thread.turns, clientId, {
             provider: sessionProvider(session.endpoint),
           });
-          const holds = (args.attachment_ids as string[]).map((id, index) => {
-            const attachment = attemptScope.resolveAttachment(operation.attemptId, id);
-            return { ...attachment, id: sendAttachmentHoldId(operation.contextId, operation.attemptId, operation.callId, index) };
-          });
           if (turn) {
             managedEpochs.recordFirstTurn(session.endpoint, session.thread_id, session.mapping_id, turn.id);
             // Same for the receipt path. Recording a steer late is safe by construction: the
@@ -5045,8 +5046,8 @@ export async function buildProductionApp(
               });
               await eventWakeBoundary.wakeAfterDurableCommit(origin.reactivatedTerminalEvent);
             }
-            if (holds.length > 0) {
-              for (const hold of holds) attachments.transferOperationToTurn(hold.id, session.endpoint, session.thread_id, turn.id);
+            if (holdIds.length > 0) {
+              for (const holdId of holdIds) attachments.transferOperationToTurn(holdId, session.endpoint, session.thread_id, turn.id);
               if (isTerminalStatus(turn.status)) attachments.releaseTurn(session.endpoint, session.thread_id, turn.id);
             }
             const appliedSettings = args.mode === "start" && checkpoint && Object.hasOwn(checkpoint, "pendingSettings") ? checkpoint.pendingSettings ?? {} : undefined;
@@ -5061,13 +5062,13 @@ export async function buildProductionApp(
             });
           } else {
             const reconciledStart = reconcileAbsentRecoveredSendStart(operations, operation, history, () => {
-              for (const hold of holds) attachments.releaseOperation(hold.id);
+              releaseOperationHolds();
             });
             if (!reconciledStart && args.mode === "steer") {
               const targetTurnId = checkpoint?.turnId;
               const target = targetTurnId ? history.thread.turns.find((candidate: any) => candidate.id === targetTurnId) : undefined;
               if (target?.itemsView === "full" && isTerminalStatus(target.status)) {
-                for (const hold of holds) attachments.releaseOperation(hold.id);
+                releaseOperationHolds();
                 operations.failAndUnbind(operation.id, { message: "terminal target history proves the requested steer was not appended" });
               }
             }
@@ -5867,7 +5868,7 @@ function workerAttachmentHoldId(contextId: string, attemptId: string, callId: st
 // recovery releases or transfers under it, so if those ever disagreed the holds would leak
 // silently — the attachment row and its file are pinned until the hold is released. Shared rather
 // than tested so they cannot disagree at all.
-function sendAttachmentHoldId(
+export function sendAttachmentHoldId(
   contextId: string, attemptId: string, callId: string, index: number,
 ): string {
   return `${workerAttachmentHoldId(contextId, attemptId, callId)}:${index}`;

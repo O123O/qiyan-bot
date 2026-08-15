@@ -6,6 +6,13 @@ import { ConversationStore } from "../../src/storage/conversation-store.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 import { DeliveryStore } from "../../src/storage/delivery-store.ts";
 import { OperationStore } from "../../src/storage/operation-store.ts";
+import { AssistantRuntime } from "../../src/assistant/runtime.ts";
+import { AttachmentStore } from "../../src/attachments/store.ts";
+import { sendAttachmentHoldId } from "../../src/production-app.ts";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
 
 const binding = { adapterId: "telegram", conversationKey: "telegram:chat", destination: { chatId: "chat" } } as const;
 
@@ -258,4 +265,50 @@ test("an attachment-bearing steer proven absent rejects before preparing an oper
   await assert.rejects(resolving, /not admitted|restored/u);
   assert.equal(operations.listForAttempt(lease.attemptId).length, 0);
   assert.throws(() => scope.resolveAttachment(lease.attemptId, "file"), (error: unknown) => error instanceof AppError && error.code === "ATTACHMENT_INVALID");
+});
+
+// Recovery addresses a send's attachment holds by derived id, never by resolving them through the
+// attempt scope. It must: an attempt that fails while one of its operations is still in flight
+// supersedes its own sources, and resolveAttachment admits only submitted or completed ones. So by
+// the time recovery runs, resolving throws ATTACHMENT_INVALID -- and it threw on every pass, so a
+// send carrying attachments could never settle and fenced its endpoint forever.
+test("a send's holds stay addressable after its attempt supersedes the sources", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-holds-"));
+  const attachments = new AttachmentStore(db, root, { maxFileBytes: 64, maxStoreBytes: 512 });
+  await attachments.initialize();
+  const saved = await attachments.ingest("ctx", Readable.from(["abc"]), { displayName: "a.txt", mediaType: "text/plain" });
+
+  conversations.acceptChatSource({ id: "ctx", nativeSourceId: "n", binding, rawText: "go", attachmentIds: [saved.id], receivedAt: 1 });
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "ctx" });
+  conversations.reserveStart(lease.attemptId, "ctx");
+  conversations.markSubmitted(lease.attemptId, "ctx", "turn-1");
+  const scope = new AttemptScope(db, operations, { maxCollectCount: 20 });
+  assert.deepEqual(scope.resolveAttachment(lease.attemptId, saved.id), { contextId: "ctx", attachmentId: saved.id });
+
+  // The live handler retains the hold under an id derived from the operation's identity.
+  const holdId = sendAttachmentHoldId("ctx", lease.attemptId, "call-1", 0);
+  attachments.retainForOperation(holdId, "ctx", [saved.id]);
+  const refCount = (): number => (db.prepare("SELECT ref_count FROM attachments WHERE id = ?").get(saved.id) as any).ref_count;
+  assert.equal(refCount(), 1);
+
+  // The send is in flight when the bot dies, so the attempt fails with an effect outstanding.
+  const operation = operations.prepare({
+    contextId: "ctx", attemptId: lease.attemptId, callId: "call-1", kind: "send_to_session",
+    args: { nickname: "worker", mode: "steer", attachment_ids: [saved.id] },
+  });
+  operations.markDispatched(operation.id);
+  operations.markAttemptOperationsUncertain(lease.attemptId);
+  new AssistantRuntime(db, operations, new DeliveryStore(db), { binding } as never).handleTerminal("turn-1", "failed");
+
+  // The precondition: the scope can no longer resolve it, so recovery must not ask.
+  assert.throws(() => scope.resolveAttachment(lease.attemptId, saved.id),
+    (error: unknown) => error instanceof AppError && error.code === "ATTACHMENT_INVALID");
+
+  // The derived id still addresses the same hold, and releasing it drops the reference for real.
+  assert.equal(sendAttachmentHoldId("ctx", lease.attemptId, "call-1", 0), holdId);
+  attachments.releaseOperation(holdId);
+  assert.equal(refCount(), 0);
 });
