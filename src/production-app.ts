@@ -595,7 +595,8 @@ function stringField(value: unknown, key: string): string | undefined {
 }
 
 export function recoverableOperationTarget(
-  operation: Pick<RecoverableOperation, "kind" | "args" | "receipt">,
+  operation: Pick<RecoverableOperation, "kind" | "args" | "receipt">
+    & Partial<Pick<RecoverableOperation, "state" | "recoveryProtocol">>,
   resolver: OperationRecoveryTargetResolver,
 ): OperationRecoveryTarget {
   const args = operation.args && typeof operation.args === "object" ? operation.args as Record<string, unknown> : {};
@@ -625,15 +626,26 @@ export function recoverableOperationTarget(
     case "prepare_chat_attachment":
       return args.owner === "assistant" ? { policy: "local" } : sessionTarget(args.owner);
     case "create_session":
-      return recoverableCreateHasNoDispatch(operation.receipt, 0) ? { policy: "local" } : projectTarget();
+      return recoverableOperationHasNoDispatch(operation.receipt, 0) ? { policy: "local" } : projectTarget();
     case "adopt_session":
       return projectTarget();
+    case "interrupt_session":
+      // Retiring a no-dispatch interrupt is a local ledger write. Routing it through the session's
+      // endpoint would park it on wait_for_endpoint exactly when the endpoint is unreachable —
+      // the case where the fence it holds is doing the most damage, since a restart is then the
+      // only way out and this row is what refuses it.
+      //
+      // A caller that supplies no state cannot prove no-dispatch, so it keeps the endpoint route.
+      return operation.state !== undefined && operation.recoveryProtocol !== undefined
+        && interruptRecoveryStep(
+          operation.state, interruptRecoveryTurnId(args, operation.receipt),
+          operation.receipt, operation.recoveryProtocol,
+        ) === "retire_no_effect" ? { policy: "local" } : sessionTarget(args.nickname);
     case "send_to_session":
     case "set_goal":
     case "pause_goal":
     case "resume_goal":
     case "cancel_goal":
-    case "interrupt_session":
       return sessionTarget(args.nickname);
     case "unadopt_session":
     case "archive_session": {
@@ -991,7 +1003,47 @@ export function operationRecoveryPreflight(
   return "attempt";
 }
 
-export function recoverableCreateHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
+export type InterruptRecoveryStep = "prove_turn" | "stop_background_work" | "retire_no_effect" | "wait";
+
+// What recovery can do with an interrupt, given only what the ledger recorded.
+//
+// Both native dispatch paths checkpoint before they touch the endpoint — the turn id before
+// pool.interrupt, backgroundStop before thread/tasks/stop — so a receipt with neither proves the
+// interrupt never reached the endpoint and had no effect. That case has no turn to prove terminal
+// and no stop to re-issue, so without "retire_no_effect" it stays uncertain forever, and an
+// unresolved operation fences every later restart of its endpoint — including the restart that is
+// often the only way to clear whatever the interrupt died on.
+//
+// The proof rests on every interrupt operation carrying a tool fence, which production guarantees,
+// and on OperationStore.checkpoint being fail-closed: under a tool fence it throws
+// rather than returning when its UPDATE matches no row, so a checkpoint that loses its fence
+// aborts the call before dispatching. If that ever becomes best-effort, this reads an absent
+// receipt as no-dispatch while the interrupt did in fact fire — and so would routing this tool
+// through a fence-less ToolCallContext, since the unfenced checkpoint accepts an uncertain row.
+// The discipline is older than the
+// recovery protocol for this kind — every version of the handler since the protocol landed
+// checkpoints before dispatching — so protocol 1 is a sound gate here and not a create-only one.
+// One derivation, used by both the routing decision and the recovery branch. They must agree: a
+// row routed to local policy runs no endpoint work, so a branch that disagreed would probe an
+// endpoint without a lease.
+export function interruptRecoveryTurnId(args: unknown, receipt: unknown): string | undefined {
+  return stringField(args, "turn_id") ?? stringField(receipt, "turnId");
+}
+
+export function interruptRecoveryStep(
+  state: OperationState, turnId: string | undefined, receipt: unknown, recoveryProtocol: number,
+): InterruptRecoveryStep {
+  if (turnId) return "prove_turn";
+  if ((receipt as { backgroundStop?: boolean } | undefined)?.backgroundStop === true) return "stop_background_work";
+  // A dispatched row is genuinely in flight, and in a deployment where two instances share one
+  // ledger the live call may belong to the other one, where this process's active-tool check
+  // cannot see it. Retiring it there would race that call and make "never dispatched" true only
+  // by having made it so — the interrupt the owner asked for would silently never happen.
+  if (state !== "uncertain") return "wait";
+  return recoverableOperationHasNoDispatch(receipt, recoveryProtocol) ? "retire_no_effect" : "wait";
+}
+
+export function recoverableOperationHasNoDispatch(receipt: unknown, recoveryProtocol: number): boolean {
   if (receipt === undefined) return recoveryProtocol >= 1;
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return false;
   return Object.hasOwn(receipt, "dispatchStarted")
@@ -5024,7 +5076,7 @@ export async function buildProductionApp(
           else failRecoveredNoEffect(operation.id, "pending session setting was not committed");
         } else if (["create_session", "adopt_session"].includes(operation.kind)) {
           const checkpoint = operation.receipt as ({ endpoint?: string; threadId?: string; mappingId?: string; dispatchStarted?: boolean } & Record<string, unknown>) | undefined;
-          if (operation.kind === "create_session" && recoverableCreateHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
+          if (operation.kind === "create_session" && recoverableOperationHasNoDispatch(operation.receipt, operation.recoveryProtocol)) {
             failRecoveredNoEffect(operation.id, "worker dispatch was never started");
             return;
           }
@@ -5189,19 +5241,25 @@ export async function buildProductionApp(
             if (operation.kind === "cancel_goal") dashboardStore.markDirty();
           });
         } else if (operation.kind === "interrupt_session") {
+          const turnId = interruptRecoveryTurnId(args, operation.receipt);
+          const step = interruptRecoveryStep(operation.state, turnId, operation.receipt, operation.recoveryProtocol);
+          if (step === "wait") return;
+          // Ahead of the session lookup on purpose: an interrupt that never dispatched needs no
+          // session, endpoint or lease to retire, and an archived worker must not strand the row.
+          if (step === "retire_no_effect") {
+            failRecoveredNoEffect(operation.id, "interrupt was never dispatched to the endpoint");
+            return;
+          }
           const session = registry.get(args.nickname);
           if (!session) return;
-          const receipt = operation.receipt as { turnId?: string; backgroundStop?: boolean } | undefined;
-          const turnId = args.turn_id ?? receipt?.turnId;
-          // An interrupt that was stopping background work has no turn to prove terminal, and
-          // the session's own status is a belief this process lost across the crash. Re-issue
-          // the stop: it is idempotent, it finishes the job if the crash landed mid-dispatch,
-          // and the endpoint answers from the host, which outlived the restart.
-          //
-          // The re-issue is unscoped — the receipt records no task ids — so it stops whatever
-          // is running now, which may include work started after the crash.
-          if (!turnId) {
-            if (!receipt?.backgroundStop) return;
+          if (step === "stop_background_work") {
+            // An interrupt that was stopping background work has no turn to prove terminal, and
+            // the session's own status is a belief this process lost across the crash. Re-issue
+            // the stop: it is idempotent, it finishes the job if the crash landed mid-dispatch,
+            // and the endpoint answers from the host, which outlived the restart.
+            //
+            // The re-issue is unscoped — the receipt records no task ids — so it stops whatever
+            // is running now, which may include work started after the crash.
             const stopped = backgroundStopReport(await pool.request<unknown>(
               session.endpoint, "thread/tasks/stop", { threadId: session.thread_id }, undefined, recoveryLease,
             ));
@@ -5227,6 +5285,10 @@ export async function buildProductionApp(
             await renderDashboardSafely();
             return;
           }
+          // Exhaustiveness: the three branches above narrow step to "prove_turn", so a fifth step
+          // added later fails to compile here rather than silently falling through to the probe.
+          if (step !== "prove_turn") { const unreachable: never = step; void unreachable; return; }
+          if (!turnId) return;
           const turn = await pool.historyReader(session.endpoint, recoveryLease).findTurn(
             session.thread_id, turnId, createHistoryScanBudget(),
           );

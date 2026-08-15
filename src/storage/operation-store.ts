@@ -261,6 +261,11 @@ export class OperationStore {
       : this.db.prepare(`UPDATE operations SET receipt_json = ?, updated_at = ? WHERE id = ? AND state = 'dispatched'
           AND EXISTS (SELECT 1 FROM assistant_attempts a WHERE a.id = operations.attempt_id AND a.accepting_tools = 1 AND a.tool_fence = ?)`)
         .run(JSON.stringify(receipt), Date.now(), id, toolFence).changes;
+    // Must stay fail-closed: this THROWS on a lost fence, it does not return. Callers checkpoint
+    // immediately before dispatching, so throwing here is what stops a dispatch whose receipt
+    // could not be recorded. Recovery reads an absent receipt as proof that nothing was
+    // dispatched (see interruptRecoveryStep); making this best-effort would turn that proof into
+    // a guess and silently retire operations that really did take effect.
     if (changed !== 1) this.uncertainTransition(id, "checkpoint");
   }
 

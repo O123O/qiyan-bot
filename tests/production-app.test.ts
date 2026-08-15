@@ -28,7 +28,8 @@ import {
   OperationRecoveryPendingError,
   operationRecoveryFailureDisposition,
   operationRecoveryPreflight,
-  recoverableCreateHasNoDispatch,
+  interruptRecoveryStep,
+  recoverableOperationHasNoDispatch,
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
   prepareAssistantWebCommentary,
@@ -467,13 +468,91 @@ test("shutdown closes Web goal admission and drains Web and MCP handlers with op
   await assert.rejects(rejected, /recovery stop failed/u);
 });
 
+// An interrupt that died while still resolving its target -- reading the session's native status
+// is the usual place -- checkpointed nothing, so it has no turn to prove terminal and no stop to
+// re-issue. Recovery used to return on that shape and leave it uncertain forever, which fenced
+// every later restart of its endpoint: the one action that could clear what the interrupt died on.
+test("an interrupt that never dispatched is retired instead of fencing its endpoint forever", () => {
+  // The exact ledger shape of a status-read failure: no turn id anywhere, no receipt at all.
+  assert.equal(interruptRecoveryStep("uncertain", undefined, undefined, 1), "retire_no_effect");
+
+  // Only an uncertain row is settled. A dispatched one is in flight — in the other instance of a
+  // shared ledger, where this process cannot see its active tools.
+  assert.equal(interruptRecoveryStep("dispatched", undefined, undefined, 1), "wait");
+  // A pre-protocol row carries no such guarantee, so absence proves nothing and it must wait.
+  assert.equal(interruptRecoveryStep("uncertain", undefined, undefined, 0), "wait");
+  // A receipt that exists but records neither dispatch is not the protocol's no-dispatch proof.
+  assert.equal(interruptRecoveryStep("uncertain", undefined, {}, 1), "wait");
+
+  // Both dispatch paths checkpoint first, so a receipt still routes to its own proof. The stop
+  // path is reached from either state and regardless of protocol: the receipt itself is the proof.
+  assert.equal(interruptRecoveryStep("uncertain", undefined, { backgroundStop: true }, 1), "stop_background_work");
+  assert.equal(interruptRecoveryStep("dispatched", undefined, { backgroundStop: true }, 0), "stop_background_work");
+  assert.equal(interruptRecoveryStep("uncertain", "turn-1", undefined, 1), "prove_turn");
+  // A turn id outranks a background stop: the turn is the more exact proof of the two.
+  assert.equal(interruptRecoveryStep("uncertain", "turn-1", { backgroundStop: true }, 1), "prove_turn");
+});
+
+// The incident this fixes, at the level where it hurt. An interrupt died in the native status
+// read, so it checkpointed nothing: no turn to prove terminal, no stop to re-issue. It stayed
+// uncertain forever and fenced every later restart of its endpoint — the one action that could
+// clear what it died on. The effect asserted here is "the restart is no longer refused", not
+// "a method ran": the fence is the thing the owner actually hit.
+function interruptFence(row: Record<string, unknown>) {
+  let recoverable = [{ id: "interrupt-wedged", sequence: 1, kind: "interrupt_session",
+    args: { nickname: "sparse-att-scale" }, ...row }];
+  return {
+    stillFencing: (): string[] => recoverable.map((operation) => operation.id as string),
+    run: () => settleEarlierEndpointOperations({
+      operations: {
+        listRecoverable: () => recoverable as any,
+        get: () => ({ ...recoverable[0] }) as any,
+        fail: (id: string, _error: unknown, uncertain = false) => {
+          if (!uncertain) recoverable = recoverable.filter((operation) => operation.id !== id);
+        },
+      },
+      currentSequence: 2, endpointId: "prenyx", currentKind: "restart_endpoint",
+      resolver: { defaultProjectEndpointId: "local", session: () => ({ endpoint: "prenyx" }) },
+      reconcile: async () => {}, isEndpointReady: () => true, isAwaitingAuthentication: () => false,
+      // A stuck operation never reaches terminal, which is exactly why the join used to time out
+      // and become the refusal the owner saw. Honours the abort signal like the real one, or the
+      // join would hang here instead of failing.
+      waitForTerminal: (_id: string, signal?: AbortSignal) => new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
+      }),
+      waitTimeoutMs: 20,
+    } as any),
+  };
+}
+
+test("an interrupt that never dispatched stops fencing the restart that would clear it", async () => {
+  // The exact ledger shape of the incident row: uncertain, protocol 1, no receipt at all.
+  assert.equal(await interruptFence({ state: "uncertain", recoveryProtocol: 1 }).run(), "proceed");
+});
+
+test("an interrupt that may have dispatched still fences", async () => {
+  // Dispatched: genuinely in flight, and with two instances sharing one ledger the live call may
+  // belong to the other one. Retiring it would make "never dispatched" true by making it so.
+  const inFlight = interruptFence({ state: "dispatched", recoveryProtocol: 1 });
+  await assert.rejects(inFlight.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+  assert.deepEqual(inFlight.stillFencing(), ["interrupt-wedged"]);
+
+  // A receipt proves it reached the endpoint, so its outcome is unknown and it must be proven.
+  const dispatched = interruptFence({ state: "uncertain", recoveryProtocol: 1, receipt: { turnId: "turn-1" } });
+  await assert.rejects(dispatched.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+
+  // A pre-protocol row carries no checkpoint-before-dispatch guarantee, so absence proves nothing.
+  const legacy = interruptFence({ state: "uncertain", recoveryProtocol: 0 });
+  await assert.rejects(legacy.run(), (error: any) => error.code === "OPERATION_CONFLICT");
+});
+
 test("create recovery terminalizes only exact no-dispatch and lost-empty-thread proofs", () => {
-  assert.equal(recoverableCreateHasNoDispatch(undefined, 1), true);
-  assert.equal(recoverableCreateHasNoDispatch(undefined, 0), false);
-  assert.equal(recoverableCreateHasNoDispatch({ dispatchStarted: false }, 0), true);
-  assert.equal(recoverableCreateHasNoDispatch({ dispatchStarted: true }, 1), false);
-  assert.equal(recoverableCreateHasNoDispatch({}, 1), false);
-  assert.equal(recoverableCreateHasNoDispatch(null, 1), false);
+  assert.equal(recoverableOperationHasNoDispatch(undefined, 1), true);
+  assert.equal(recoverableOperationHasNoDispatch(undefined, 0), false);
+  assert.equal(recoverableOperationHasNoDispatch({ dispatchStarted: false }, 0), true);
+  assert.equal(recoverableOperationHasNoDispatch({ dispatchStarted: true }, 1), false);
+  assert.equal(recoverableOperationHasNoDispatch({}, 1), false);
+  assert.equal(recoverableOperationHasNoDispatch(null, 1), false);
 
   const exact = new AppError("THREAD_NOT_FOUND", "thread is no longer restorable", {
     recovery: "thread_not_durable", threadId: "thread-1",

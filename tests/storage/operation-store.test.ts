@@ -213,3 +213,35 @@ test("chat source bindings persist and recovery inherits the route as internal w
   assert.deepEqual(recovery.binding, source?.binding);
   assert.equal((db.prepare("SELECT source_class FROM source_contexts WHERE id = ?").get(recovery.id) as any).source_class, "internal");
 });
+
+// The whole no-dispatch proof in recovery (interruptRecoveryStep) reads an absent receipt as
+// evidence that a tool never reached its endpoint. That inference is only sound because a
+// checkpoint whose fence has moved THROWS instead of returning: callers checkpoint immediately
+// before dispatching, so throwing is what stops a dispatch whose receipt cannot be recorded. If
+// this ever became best-effort, recovery would retire operations that really did take effect.
+test("a checkpoint whose attempt was fenced refuses rather than losing the receipt", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  const binding = { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } };
+  const conversations = new ConversationStore(db, new DeliveryStore(db));
+  conversations.acceptChatSource({ id: "ctx", nativeSourceId: "1", binding, rawText: "go", attachmentIds: [], receivedAt: 1 });
+  const lease = conversations.createAttempt({ kind: "chat", contextId: "ctx" });
+  conversations.reserveStart(lease.attemptId, "ctx");
+  const runtime = new AssistantRuntime(db, store, new DeliveryStore(db), { binding } as never);
+  runtime.activateAttempt(lease.attemptId);
+  const fence = runtime.registerTool(lease.attemptId);
+
+  const operation = store.prepare({
+    contextId: "ctx", attemptId: lease.attemptId, callId: "call", kind: "interrupt_session",
+    args: { nickname: "worker" },
+  });
+  store.markDispatched(operation.id);
+  // The turn terminalizes while the tool is still inside its endpoint call.
+  store.markAttemptOperationsUncertain(lease.attemptId);
+
+  assert.throws(() => store.checkpoint(operation.id, { turnId: "turn-1" }, fence),
+    (error: any) => error.code === "OPERATION_UNCERTAIN");
+  // The receipt was not written, which is what lets recovery read its absence as proof.
+  assert.equal(store.get(operation.id)?.receipt, undefined);
+  assert.equal(store.get(operation.id)?.state, "uncertain");
+});
