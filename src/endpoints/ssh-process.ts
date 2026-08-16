@@ -3,6 +3,32 @@ import { once } from "node:events";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 import { AppError } from "../core/errors.ts";
 
+// Short enough that a chatty login shell never accumulates the whole budget inside one window;
+// long enough that the sustained rate this permits (64 KiB/min, about 1 KiB/s) is low enough that
+// anything above it is fairly called a runaway. The window does NOT govern how fast a runaway dies: a stream at rate
+// r hits the budget in budget/r seconds whatever the window is. It sets the rate threshold above
+// which something counts as runaway at all.
+const DEFAULT_DIAGNOSTIC_WINDOW_MS = 60_000;
+
+export interface DiagnosticBudget { windowStart: number; bytes: number }
+
+// Charge a stderr chunk against a tumbling window anchored to chunk arrival. Split out because the
+// alternative is asserting on pipe timing, and a stalled event loop coalesces a child's separate
+// writes into one chunk, which makes any such test a coin flip on a loaded machine.
+//
+// A backwards reading starts a fresh window rather than freezing one. The default clock is
+// monotonic so it cannot regress; this guards the injected-clock case, and the failure it prevents
+// is bad enough to be worth a branch: treating a backwards step as "no time has passed" would
+// silently reinstate the lifetime budget this replaced, for the length of the step.
+export function chargeDiagnosticBytes(
+  state: DiagnosticBudget, chunkBytes: number, now: number, windowMs: number, budget: number,
+): { state: DiagnosticBudget; exceeded: boolean } {
+  const elapsed = now - state.windowStart;
+  const rolled = elapsed >= windowMs || elapsed < 0;
+  const bytes = (rolled ? 0 : state.bytes) + chunkBytes;
+  return { state: { windowStart: rolled ? now : state.windowStart, bytes }, exceeded: bytes > budget };
+}
+
 export interface BoundedProcessResult { stdout: Buffer; stderr: Buffer }
 
 export interface ReadyProcessStream {
@@ -15,19 +41,37 @@ export interface ReadyProcessStream {
 export function openReadyProcessStream(
   command: string,
   args: readonly string[],
-  options: { readyMarker: Uint8Array; timeoutMs: number; maxPreludeBytes: number },
+  options: {
+    readyMarker: Uint8Array;
+    timeoutMs: number;
+    maxPreludeBytes: number;
+    // After readiness the budget is per-window, not per-lifetime: a healthy endpoint lives for
+    // days and its login shell may emit a line per reconnect, which must never add up to a kill.
+    diagnosticWindowMs?: number;
+    clock?: { now(): number };
+  },
 ): Promise<ReadyProcessStream> {
   if (options.readyMarker.byteLength < 1 || options.readyMarker.byteLength > 256
     || options.maxPreludeBytes < options.readyMarker.byteLength) {
     return Promise.reject(new AppError("CONFIGURATION_ERROR", "invalid process readiness marker"));
+  }
+  // Written as !(x > 0) so it rejects NaN too. A non-positive window rolls on every chunk and
+  // permits an unbounded sustained rate; NaN makes every comparison false so the window never
+  // rolls at all, which silently restores the per-lifetime budget this replaced.
+  if (options.diagnosticWindowMs !== undefined && !(options.diagnosticWindowMs > 0)) {
+    return Promise.reject(new AppError("CONFIGURATION_ERROR", "invalid diagnostic window"));
   }
   return new Promise((resolve, reject) => {
     const child = spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], shell: false });
     const marker = Buffer.from(options.readyMarker);
     const output = new PassThrough();
     const closeListeners = new Set<(error?: Error) => void>();
+    // Monotonic: performance.now() cannot step backwards the way wall time can.
+    const clock = options.clock ?? performance;
+    const diagnosticWindowMs = options.diagnosticWindowMs ?? DEFAULT_DIAGNOSTIC_WINDOW_MS;
     let prelude = Buffer.alloc(0);
     let stderrBytes = 0;
+    let diagnosticWindowStart = clock.now();
     let ready = false;
     let startupSettled = false;
     let intentional = false;
@@ -112,17 +156,37 @@ export function openReadyProcessStream(
       const following = prelude.subarray(boundary + marker.byteLength);
       prelude = Buffer.alloc(0);
       ready = true;
+      // Startup noise is spent, so the live window starts clean. Best-effort: if the event loop
+      // was stalled, libuv may deliver this stdout chunk before stderr the child wrote first, and
+      // that banner is charged to the live window instead. Harmless at real banner sizes.
+      stderrBytes = 0;
+      diagnosticWindowStart = clock.now();
       startupSettled = true;
       clearTimeout(timeout);
       resolve(handle);
       if (following.byteLength > 0) forwardOutput(following);
     });
     child.stderr.on("data", (chunk: Buffer) => {
+      if (terminal) return;
+      // Before readiness the budget bounds total startup volume. After readiness it bounds a
+      // *rate*: counting for the lifetime of the channel meant a healthy endpoint died once its
+      // remote login shell had emitted 64 KiB in total — days of one warning per reconnect — and
+      // the failure carried the runaway-stream message.
+      if (ready) {
+        const charged = chargeDiagnosticBytes(
+          { windowStart: diagnosticWindowStart, bytes: stderrBytes },
+          chunk.byteLength, clock.now(), diagnosticWindowMs, options.maxPreludeBytes,
+        );
+        diagnosticWindowStart = charged.state.windowStart;
+        stderrBytes = charged.state.bytes;
+        if (charged.exceeded) {
+          failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its diagnostic output limit"));
+        }
+        return;
+      }
       stderrBytes += chunk.byteLength;
       if (stderrBytes > options.maxPreludeBytes) {
-        failStartup(new AppError("ENDPOINT_UNAVAILABLE", ready
-          ? "SSH process exceeded its diagnostic output limit"
-          : "SSH process exceeded its readiness output limit"));
+        failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its readiness output limit"));
       }
     });
     child.stdin.on("error", () => {

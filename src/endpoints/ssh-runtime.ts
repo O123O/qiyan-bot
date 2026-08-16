@@ -24,6 +24,13 @@ export const REMOTE_HELPER_SHA256 = "c1e80e3786c9976b55cd0dd6fd2d8db9c2ec7f2a843
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "21f7daee98675a79d1f5d8216e78a88b0c64e00818ff74ee01701c25ca0ad4b7";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
+// Shared by both proxies, which are the same kind of channel and have no reason to diverge.
+// maxPreludeBytes is spent twice over: as a one-shot budget for startup output, and after
+// readiness as a PER-WINDOW budget for diagnostics (see DEFAULT_DIAGNOSTIC_WINDOW_MS in
+// ssh-process.ts) -- so 64 KiB here means 64 KiB per minute once the channel is live, not
+// 64 KiB for its lifetime.
+const PROXY_STREAM_LIMITS = { timeoutMs: 10_000, maxPreludeBytes: 64 * 1024 } as const;
+
 export const REMOTE_APP_SERVER_PROXY_READY = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 export const REMOTE_CLAUDE_HOST_PROXY_READY = Buffer.from("qiyan-claude-host-proxy-v1-ready\n");
 
@@ -438,8 +445,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     try {
       return await (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
         readyMarker: REMOTE_APP_SERVER_PROXY_READY,
-        timeoutMs: 10_000,
-        maxPreludeBytes: 64 * 1024,
+        ...PROXY_STREAM_LIMITS,
       });
     } catch (error) {
       return this.throwFreshChannelFailure(error);
@@ -465,8 +471,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     try {
       return await (this.options.openStream ?? openReadyProcessStream)(this.options.sshBinary ?? "ssh", args, {
         readyMarker: REMOTE_CLAUDE_HOST_PROXY_READY,
-        timeoutMs: 10_000,
-        maxPreludeBytes: 64 * 1024,
+        ...PROXY_STREAM_LIMITS,
       });
     } catch (error) {
       return this.throwFreshChannelFailure(error);

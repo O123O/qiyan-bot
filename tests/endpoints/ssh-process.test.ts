@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 import { AppError } from "../../src/core/errors.ts";
-import { openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
+import { chargeDiagnosticBytes, openReadyProcessStream, runBoundedProcess } from "../../src/endpoints/ssh-process.ts";
 
 const readyMarker = Buffer.from("qiyan-app-server-proxy-v1-ready\n");
 
@@ -213,14 +213,76 @@ test("a ready process stream rejects unbounded output before its marker", async 
   );
 });
 
-test("a ready process stream terminates after bounded diagnostic output is exceeded", async () => {
+
+// The window arithmetic is tested directly rather than through pipes: a stalled event loop
+// coalesces a child's separate writes into one chunk, so any test that infers windows from write
+// timing is a coin flip on a loaded machine. These assert the accounting itself.
+test("diagnostic bytes accumulate inside a window and reset once it elapses", () => {
+  const B = 1024, W = 1000;
+  let state = { windowStart: 0, bytes: 0 };
+  // Two sub-budget chunks inside one window do add up, and the second one trips it.
+  let charged = chargeDiagnosticBytes(state, 600, 0, W, B);
+  assert.equal(charged.exceeded, false);
+  charged = chargeDiagnosticBytes(charged.state, 600, 999, W, B);
+  assert.equal(charged.exceeded, true, "1200 bytes inside one window exceeds a 1024 budget");
+
+  // The same two chunks either side of the boundary do not: the window resets at exactly W.
+  charged = chargeDiagnosticBytes({ windowStart: 0, bytes: 600 }, 600, 1000, W, B);
+  assert.equal(charged.exceeded, false, "the window resets at exactly windowMs, not after it");
+  assert.deepEqual(charged.state, { windowStart: 1000, bytes: 600 });
+});
+
+// The drip that used to kill a healthy endpoint: far past the budget in total, never within one
+// window. This is the whole point of the change.
+test("a slow drip never accumulates across windows", () => {
+  const B = 1024, W = 1000;
+  let state = { windowStart: 0, bytes: 0 };
+  let total = 0;
+  for (let i = 0; i < 100; i += 1) {
+    const charged = chargeDiagnosticBytes(state, 400, i * W, W, B);
+    assert.equal(charged.exceeded, false, `drip chunk ${i} must not trip the budget`);
+    state = charged.state;
+    total += 400;
+  }
+  assert.ok(total > B * 30, "the drip really did exceed the old lifetime budget many times over");
+});
+
+test("a burst inside one window is still cut off", () => {
+  const charged = chargeDiagnosticBytes({ windowStart: 0, bytes: 0 }, 2048, 0, 60_000, 1024);
+  assert.equal(charged.exceeded, true);
+});
+
+// Idle time earns no credit: a stream silent for hours gets one fresh budget at the burst, not
+// one per elapsed window.
+test("a long silence grants exactly one fresh window, not accrued credit", () => {
+  const charged = chargeDiagnosticBytes({ windowStart: 0, bytes: 900 }, 1025, 3_600_000, 1000, 1024);
+  assert.equal(charged.exceeded, true, "the fresh window is one budget, not many");
+  assert.deepEqual(charged.state.windowStart, 3_600_000);
+});
+
+// Wall clocks step backwards under NTP. Treating that as "no time has passed" would freeze the
+// window and silently reinstate the lifetime budget for the length of the step.
+test("a backwards clock starts a fresh window instead of freezing one", () => {
+  const charged = chargeDiagnosticBytes({ windowStart: 5_000, bytes: 1000 }, 100, 4_000, 1000, 1024);
+  assert.equal(charged.exceeded, false, "a backwards step must not keep charging the old window");
+  assert.deepEqual(charged.state, { windowStart: 4_000, bytes: 100 });
+});
+
+test("a non-positive diagnostic window is refused rather than degrading to per-chunk", async () => {
+  await assert.rejects(openReadyProcessStream(process.execPath, ["-e", ""], {
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024, diagnosticWindowMs: 0,
+  }), /invalid diagnostic window/u);
+});
+
+// Kept as an end-to-end regression guard: a genuine runaway still terminates the live stream.
+test("a ready process stream terminates on a runaway burst", async () => {
   const program = [
     `process.stdout.write(${JSON.stringify(readyMarker.toString())});`,
-    "setTimeout(() => process.stderr.write('x'.repeat(2048)), 10);",
+    "setTimeout(() => process.stderr.write('x'.repeat(4096)), 10);",
     "setInterval(() => {}, 10000);",
   ].join("\n");
   const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
-    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+    readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024, diagnosticWindowMs: 60_000,
   });
   const closed = new Promise<Error | undefined>((resolve) => stream.onClose(resolve));
 
