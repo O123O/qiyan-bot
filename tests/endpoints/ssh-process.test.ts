@@ -58,12 +58,23 @@ test("hard timeout closes inherited output pipes after the direct child exits", 
 });
 
 test("times out without returning child output in the error", async () => {
-  const started = Date.now();
+  // Asserts the SIGTERM was actually delivered rather than that the wall clock advanced past the
+  // escalation. The clock version assumed the child had installed its handler before the timeout
+  // fired, but under load Node's own startup outruns a short timeout: the child then dies to the
+  // default disposition and the rejection lands early, failing a test that measured scheduling
+  // rather than behaviour. The timeout is also generous enough that startup is never the race.
+  const marker = join(await mkdtemp(join(tmpdir(), "qiyan-bounded-timeout-")), "signal");
+  const program = [
+    `process.on('SIGTERM',()=>{ require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'sigterm'); });`,
+    "process.stderr.write('SECRET');",
+    "setTimeout(() => {}, 10000);",
+  ].join("\n");
   await assert.rejects(
-    runBoundedProcess(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); process.stderr.write('SECRET'); setTimeout(() => {}, 10000)"], { timeoutMs: 100, maxOutputBytes: 1024 }),
+    runBoundedProcess(process.execPath, ["-e", program], { timeoutMs: 1_000, maxOutputBytes: 1024 }),
     (error: unknown) => error instanceof Error && /timed out/u.test(error.message) && !error.message.includes("SECRET"),
   );
-  assert.ok(Date.now() - started >= 200, "the timeout waits for bounded child termination");
+  // The child ignored SIGTERM and had to be escalated, which is what "bounded termination" means.
+  assert.equal(await readFile(marker, "utf8"), "sigterm");
 });
 
 test("reports a nonzero process exit structurally without returning diagnostic output", async () => {
