@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { isDatabaseIntegrityFailure, markDatabaseClosedCleanly, openDatabase } from "../../src/storage/database.ts";
+import { inReadTransaction, inTransaction, isDatabaseIntegrityFailure, markDatabaseClosedCleanly, openDatabase } from "../../src/storage/database.ts";
 import { migrations } from "../../src/storage/migrations.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { preflightConversationCutover } from "../../src/storage/conversation-cutover.ts";
@@ -433,3 +433,52 @@ function databaseArtifactBytesSync(path: string): Record<string, string> {
   }
   return result;
 }
+
+// Batched reads exist because the database is on an NFS home, where every implicit transaction
+// costs a lock cycle and a change-counter re-read over the wire. This asserts what the batch
+// actually guarantees, which is narrower than "writers are unaffected":
+//
+// BEGIN DEFERRED takes no lock at all until the first read, so a test that writes before reading
+// proves nothing -- an earlier version of this test did exactly that and passed for that reason.
+// Once a read has happened the batch holds SHARED, which a writer's RESERVED coexists with but its
+// COMMIT (EXCLUSIVE) does not. So a concurrent writer buffers fine and is fenced only at commit,
+// for the batch's duration.
+//
+// Within one process that window is unreachable: the batch is synchronous, so no other JS runs
+// during it. It matters when a second instance shares this database, which is why the window being
+// short is the whole point -- batching cut it from ~1.6s to ~5ms.
+test("a read batch holds no write lock, and fences a writer only at commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-bot-db-read-batch-"));
+  const path = join(root, "read-batch.sqlite3");
+  const db = openDatabase(path);
+  const writer = openDatabase(path);
+  db.exec("CREATE TABLE probe (x INTEGER)");
+  // Fail fast rather than waiting out the 5s busy_timeout.
+  writer.exec("PRAGMA busy_timeout=0");
+
+  inReadTransaction(db, () => {
+    // The read comes first, exactly as the production snapshot does; SHARED is held from here.
+    db.prepare("SELECT count(*) FROM probe").get();
+    // No write lock is held by the batch, so the writer still takes RESERVED and buffers its work.
+    writer.exec("BEGIN IMMEDIATE");
+    writer.exec("INSERT INTO probe VALUES (1)");
+    // Its COMMIT needs EXCLUSIVE, which waits on the batch's SHARED. This is the real cost, stated
+    // rather than hidden: a batch longer than a competing writer's busy_timeout fails that write.
+    assert.throws(() => { writer.exec("COMMIT"); }, /lock|busy/iu);
+    // Nesting is a no-op: callers batch without knowing whether they are already inside one.
+    inReadTransaction(db, () => { assert.equal(db.isTransaction, true); });
+  });
+  assert.equal(db.isTransaction, false, "the batch closed its transaction");
+
+  // With the batch closed the same commit goes through, so the write was delayed, not lost.
+  writer.exec("COMMIT");
+  assert.equal((db.prepare("SELECT count(*) AS n FROM probe").get() as { n: number }).n, 1);
+
+  // A throw must roll back rather than strand an open transaction that would fence later writes.
+  assert.throws(() => inReadTransaction(db, () => { throw new Error("read failed"); }), /read failed/u);
+  assert.equal(db.isTransaction, false, "a failed batch leaves no transaction open");
+
+  writer.close();
+  db.close();
+  await rm(root, { recursive: true, force: true });
+});

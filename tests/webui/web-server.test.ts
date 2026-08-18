@@ -12,6 +12,8 @@ import type { WebGoalControlInput } from "../../src/webui/web-goal-control.ts";
 const TOKEN = "test-token-abc";
 
 const reads: WebReadsDeps = {
+  // No database here, so reads run directly; production wraps these in one transaction.
+  readBatch: (action) => action(),
   nativeSession: () => ({ availability: "ready", status: "idle", activeTurnId: null, backgroundWork: false, endpointGeneration: 1, lifecycleRevision: 1, receiveSequence: 1, observedAt: 1 }),
   registrySnapshot: () => ({ version: 3, assistant: { endpoint: "assistant-local", thread_id: "a", project_dir: "/a", mapping_id: "m", lifecycle_state: "managed" }, sessions: {
     payments: { endpoint: "local", thread_id: "t1", project_dir: "/p", mapping_id: "m1", lifecycle_state: "managed" },

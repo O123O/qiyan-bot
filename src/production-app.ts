@@ -91,7 +91,7 @@ import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
-import { markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
+import { inReadTransaction, markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
 import { acquireDatabaseLease, type DatabaseLease } from "./storage/database-lease.ts";
 import { openStateDatabaseWithAutomaticRecovery } from "./storage/automatic-dashboard-recovery.ts";
 import { DeliveryStore, type DeliveryRecord } from "./storage/delivery-store.ts";
@@ -3661,6 +3661,7 @@ export async function buildProductionApp(
       reads: {
         registrySnapshot: () => registry.snapshot(),
         dashboardSnapshot: () => dashboard.snapshot(),
+        readBatch: (action) => inReadTransaction(db, action),
         assistantSession: assistantSessionSummary,
         nativeSession: (endpointId, threadId, mappingId) => nativeSessions.view({ endpointId, threadId, mappingId }),
         onSessionsChanged: (listener) => {
