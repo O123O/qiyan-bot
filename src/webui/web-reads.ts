@@ -22,6 +22,14 @@ export interface WebReadsDeps {
   historyReadable?(endpointId: string, threadId: string): boolean;
   // Lease-free display label: local process hostname or configured SSH alias.
   host(endpointId: string): string;
+  // Runs a read path as one database transaction. The browser polls the session snapshot, and each
+  // implicit transaction on the NFS-hosted database costs a lock cycle over the wire, so a snapshot
+  // built from a statement per session per fact was seconds of round trips.
+  //
+  // Required rather than optional: omitting it silently restores that cost, and while it was
+  // optional deleting the production wiring left every test green. Callers with no database pass
+  // through with (action) => action().
+  readBatch<T>(action: () => T): T;
 }
 
 export interface OwnerConversationMessage {
@@ -107,7 +115,7 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
 }
 
 export function sessionSnapshot(deps: WebReadsDeps): { sessions: WebSessionSummary[]; assistant: WebSessionSummary } {
-  return { sessions: listSessions(deps), assistant: deps.assistantSession() };
+  return deps.readBatch(() => ({ sessions: listSessions(deps), assistant: deps.assistantSession() }));
 }
 
 // The QiYan conversation (your chat + the assistant's replies), lease-free, oldest → newest, one

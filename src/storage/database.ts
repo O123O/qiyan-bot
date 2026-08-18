@@ -330,6 +330,41 @@ function migrate(db: Database): void {
   }
 }
 
+// Batches many reads into one transaction. On this deployment the database sits on an NFS home so
+// it can be shared across nodes, and every implicit transaction there costs a byte-range lock
+// cycle plus a change-counter re-read over the wire -- about 16ms per statement, measured. A read
+// path built from ~100 small statements therefore took ~1.7s of pure round trips; the same
+// statements inside one transaction took 1ms.
+//
+// DEFERRED, not IMMEDIATE: the batch must not take a write lock, so a concurrent writer still
+// acquires RESERVED and buffers its work. Be precise about what this does NOT promise -- once the
+// batch's first read has taken SHARED, a writer's COMMIT needs EXCLUSIVE and waits for the batch
+// to finish. Within one process that is unreachable, because the batch is synchronous and no other
+// JS runs during it; the window equals the event-loop block this exists to shrink. It is reachable
+// for a second instance sharing the database, and a batch outlasting that writer's busy_timeout
+// fails its write outright -- which is why keeping batches short matters, not just fast.
+//
+// The reads also become mutually consistent, which is a correctness gain rather than a cost.
+//
+// Nested use is a no-op so callers can batch without knowing their context. That is sound only
+// because no path reaches a batch with a WRITE transaction already open; if one ever does, the
+// batch would read that writer's uncommitted rows and lengthen its lock window.
+export function inReadTransaction<T>(db: Database, action: () => T): T {
+  if (db.isTransaction) return action();
+  db.exec("BEGIN DEFERRED");
+  try {
+    const result = action();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    // Preserve the read failure, but do not hide a failed rollback: it leaves the transaction open,
+    // and every later write on this connection then fails until restart.
+    try { db.exec("ROLLBACK"); }
+    catch (rollbackFailure) { (error as { rollbackFailed?: unknown }).rollbackFailed = rollbackFailure; }
+    throw error;
+  }
+}
+
 export function inTransaction<T>(db: Database, action: () => T): T {
   db.exec("BEGIN IMMEDIATE");
   try {
