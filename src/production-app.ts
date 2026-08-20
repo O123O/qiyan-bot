@@ -269,6 +269,74 @@ export function reportAssistantTerminalFailure(
   finally { dispatcher?.requestRecovery(); }
 }
 
+// Records an assistant message the web panel just rendered, so the owner transcript holds what was
+// actually shown. Deliberately ungated: prepareAssistantWebCommentary below decides who to SEND to,
+// which is a different question and the one that used to decide whether anything was kept at all.
+// A turn QiYan starts itself has no chat recipient, so it sent nothing and stored nothing, and its
+// output vanished from the panel as soon as the next turn replaced the live state.
+//
+// Rows are keyed per item, so a turn emitting several answers keeps all of them. Commentary keeps
+// the delivery's own id so an identically-id'd delivery hides it; a final answer does NOT match any
+// delivery id and is hidden by TURN instead, because completeAttempt joins a turn's answers into
+// one delivery. Either way a turn that had a recipient is read back exactly once.
+export function recordAssistantPanelMessage(
+  conversations: { recordOwnerTranscriptEntry(input: { id: string; turnId: string; kind: "final" | "commentary"; body: string; at: number }): void },
+  expectedThreadId: string,
+  now: () => number,
+  method: string,
+  params: unknown,
+): void {
+  if (method !== "item/completed" || !params || typeof params !== "object" || Array.isArray(params)) return;
+  const notification = params as Record<string, unknown>;
+  if (notification.threadId !== expectedThreadId || typeof notification.turnId !== "string"
+    || !notification.item || typeof notification.item !== "object" || Array.isArray(notification.item)) return;
+  const item = notification.item as Record<string, unknown>;
+  if (item.type !== "agentMessage" || typeof item.text !== "string" || item.text.trim().length === 0) return;
+  if (typeof item.id !== "string") return;
+  // The panel applies no phase filter -- it renders every agent message with a body -- and phase is
+  // nullable in the wire type. So anything that is not explicitly commentary is treated as part of
+  // the answer, rather than dropped for lacking a phase the owner never sees.
+  const commentary = item.phase === "commentary";
+  // Keyed per ITEM, not per turn. A turn can emit several final answers, and a turn-keyed id made
+  // the second silently overwrite the first -- unrecoverable on internal turns, which have no
+  // delivery to fall back on. The read hides final rows per turn instead.
+  const id = commentary
+    ? `assistant-commentary:${notification.turnId}:${item.id}`
+    : `assistant-final:${notification.turnId}:${item.id}`;
+  conversations.recordOwnerTranscriptEntry({
+    id, turnId: notification.turnId, kind: commentary ? "commentary" : "final", body: item.text, at: now(),
+  });
+}
+
+// The assistant notification path, as one testable unit. Recording what the panel showed and
+// deciding who to send it to are different questions, and keeping them together here is what makes
+// "the record happens even when the delivery gate declines" assertable without standing up the
+// app -- that property is the whole point of this path and was previously wired but never pinned.
+//
+// The record runs first and is contained: it is the first write in a chain that continues into
+// lifecycle routing and the relay, on a database that lives on an NFS home under
+// synchronous=EXTRA, so a transient busy error must not abandon the rest of the notification or
+// trip a spurious assistant recovery. A missing transcript row is worth less than the routing.
+export function handleAssistantPanelNotification(
+  deps: {
+    conversations: Parameters<typeof recordAssistantPanelMessage>[0]
+      & Parameters<typeof prepareAssistantWebCommentary>[0];
+    deliveries: Parameters<typeof prepareAssistantWebCommentary>[1];
+    now: () => number;
+    onRecordFailed: (error: unknown) => void;
+    isActiveTurn: (turnId: string) => boolean;
+  },
+  expectedThreadId: string,
+  method: string,
+  params: unknown,
+): boolean {
+  try { recordAssistantPanelMessage(deps.conversations, expectedThreadId, deps.now, method, params); }
+  catch (error) { deps.onRecordFailed(error); }
+  return prepareAssistantWebCommentary(
+    deps.conversations, deps.deliveries, expectedThreadId, deps.isActiveTurn, method, params,
+  );
+}
+
 export function prepareAssistantWebCommentary(
   conversations: { bindingForTurn(turnId: string): ConversationBinding | undefined },
   deliveries: { prepare(input: { id: string; kind: string; binding: ConversationBinding; body: string; mandatory: boolean }): unknown },
@@ -4606,11 +4674,16 @@ export async function buildProductionApp(
       return;
     }
     if (endpointId === identity.endpoint && params?.threadId === identity.thread_id && method === "thread/status/changed") return;
-    if (endpointId === identity.endpoint
-      && prepareAssistantWebCommentary(conversations, deliveries, identity.thread_id, (turnId) => {
+    if (endpointId === identity.endpoint && handleAssistantPanelNotification({
+      conversations,
+      deliveries,
+      now: () => Date.now(),
+      onRecordFailed: () => report({ level: "warn", code: "owner_transcript_record_failed", reason: "insert_failed" }),
+      isActiveTurn: (turnId) => {
         const live = nativeSessions.view({ endpointId: identity.endpoint, threadId: identity.thread_id, mappingId: assistantMappingId });
         return live?.availability === "ready" && live.status === "active" && live.activeTurnId === turnId;
-      }, method, params)) return;
+      },
+    }, identity.thread_id, method, params)) return;
     if (await routeLifecycleNotification({
       assistant: (notification) => assistantLifecycleBuffer.accept(notification, handleAssistantLifecycleNotification),
       worker: (targetEndpointId, targetMethod, targetParams) => processWorkerTerminalNotification({

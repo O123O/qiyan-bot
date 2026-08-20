@@ -25,6 +25,7 @@ export const RECOVERY_TABLES = [
   "managed_epochs",
   "operation_attachment_refs",
   "operations",
+  "owner_transcript_entries",
   "qiyan_state",
   "scheduled_sends",
   "schema_migrations",
