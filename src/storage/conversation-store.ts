@@ -140,18 +140,44 @@ export class ConversationStore {
     const clamped = Math.max(1, Math.min(50, limit));
     const cursor = before !== undefined && Number.isFinite(before);
     const NORM = "(CASE WHEN created_at < 1000000000000 THEN created_at * 1000 ELSE created_at END)";
+    // Three sources, not two. Deliveries are what was SENT somewhere; owner_transcript_entries are
+    // what the panel DISPLAYED, which includes turns QiYan started itself and therefore never sent
+    // to any chat surface.
+    //
+    // An entry is hidden when the same message was also delivered: commentary by matching id, a
+    // final answer by its TURN, because several final items can collapse into one delivery. NOT
+    // EXISTS rather than NOT IN -- with NOT IN, a single NULL delivery id would make the whole
+    // branch return nothing and silently restore the bug this fixes.
     const rows = this.db.prepare(`SELECT id, role, body, at, delivery_kind FROM (
         SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at, kind AS delivery_kind FROM deliveries
           WHERE kind <> 'queue_notice'${cursor ? ` AND ${NORM} <= ?` : ""}
         UNION ALL
+        SELECT id AS id, 'assistant' AS role, body AS body, ${NORM} AS at, 'assistant_panel' AS delivery_kind
+          FROM owner_transcript_entries AS entry
+          WHERE NOT EXISTS (
+            SELECT 1 FROM deliveries AS sent
+              WHERE sent.id = entry.id
+                 OR (entry.kind = 'final' AND sent.id = 'assistant:' || entry.turn_id)
+          )${cursor ? ` AND ${NORM} <= ?` : ""}
+        UNION ALL
         SELECT id AS id, 'you' AS role, raw_text AS body, ${NORM} AS at, NULL AS delivery_kind FROM source_contexts
           WHERE source_class = 'chat'${cursor ? ` AND ${NORM} <= ?` : ""}
       ) ORDER BY at DESC, id DESC LIMIT ?`)
-      .all(...(cursor ? [before, before, clamped] : [clamped])) as Array<{ id: string; role: string; body: string; at: number; delivery_kind: string | null }>;
+      .all(...(cursor ? [before, before, before, clamped] : [clamped])) as Array<{ id: string; role: string; body: string; at: number; delivery_kind: string | null }>;
     return rows.reverse().map((row) => ({
       id: String(row.id), role: row.role === "you" ? "you" : "assistant", body: String(row.body), at: Number(row.at),
       ...(row.delivery_kind ? { deliveryKind: String(row.delivery_kind) } : {}),
     }));
+  }
+
+  // Records something the web panel showed the owner. Separate from the delivery queue on purpose:
+  // this must happen even when there is no chat recipient, which is exactly the case that used to
+  // leave no record. Idempotent because an item can be notified more than once.
+  recordOwnerTranscriptEntry(input: { id: string; turnId: string; kind: "final" | "commentary"; body: string; at: number }): void {
+    this.db.prepare(`INSERT INTO owner_transcript_entries (id, turn_id, kind, body, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET body = excluded.body`)
+      .run(input.id, input.turnId, input.kind, input.body, input.at);
   }
 
   createInternalSource(input: InternalSource): string {

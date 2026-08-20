@@ -851,4 +851,29 @@ export const migrations: readonly Migration[] = [
   // Ordered by created_at so the queue drains in commit order off the index itself, with no
   // temp b-tree. Covers the 'dispatched' recovery scan on the same shape.
   `CREATE INDEX IF NOT EXISTS deliveries_state_created_idx ON deliveries(state, created_at, id);`,
+  // The owner transcript is what the web panel shows you; `deliveries` is an outbound queue that
+  // says "send this text to Slack / web / WeChat". They coincided only by accident, for turns that
+  // had a chat recipient. A turn QiYan starts itself -- goal awareness, a worker event, a schedule
+  // -- has no recipient, so nothing was queued, and because the transcript was READ from that
+  // queue the turn left no record either. The panel streams every turn live regardless, so its
+  // output appeared once and was gone on reload. Measured on a live bot: internal-triggered
+  // attempts 11, durable records 0; user-triggered 65, records 64.
+  //
+  // This table records what the panel displayed, whether or not anything was sent anywhere, and is
+  // unioned with the delivery queue on read without duplicating a turn that did have a recipient.
+  // kind distinguishes the two exclusion rules below. Commentary is one row per item and is hidden
+  // by an identically-id'd delivery. A final answer is one row per ITEM but a turn can emit several
+  // (measured: 5 of 1340 turns), which completeAttempt joins into ONE delivery keyed by turn -- so
+  // final rows are hidden per TURN. Keying final rows by turn instead would have let the second
+  // answer overwrite the first, losing it outright on exactly the turns this fixes.
+  //
+  // No index: the only reader filters and orders on a CASE expression over created_at, not the
+  // column, so an index on it is never used and only costs a write per row.
+  `CREATE TABLE IF NOT EXISTS owner_transcript_entries (
+      id TEXT PRIMARY KEY,
+      turn_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('final', 'commentary')),
+      body TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );`,
 ];
