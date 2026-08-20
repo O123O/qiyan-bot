@@ -22,7 +22,7 @@ import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } fro
 
 export const REMOTE_HELPER_SHA256 = "c1e80e3786c9976b55cd0dd6fd2d8db9c2ec7f2a8433f910923a6f880c4178b2";
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
-export const REMOTE_CLAUDE_HOST_SHA256 = "21f7daee98675a79d1f5d8216e78a88b0c64e00818ff74ee01701c25ca0ad4b7";
+export const REMOTE_CLAUDE_HOST_SHA256 = "80bb089d05704386d8250ab68d63c32e3d9f068f665048abdfda7734643ee708";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 // Shared by both proxies, which are the same kind of channel and have no reason to diverge.
 // maxPreludeBytes is spent twice over: as a one-shot budget for startup output, and after
