@@ -18,7 +18,7 @@ var AppError = class extends Error {
 // package.json
 var package_default = {
   name: "qiyan-bot",
-  version: "1.0.4",
+  version: "1.0.5",
   type: "module",
   bin: {
     "qiyan-bot": "dist/qiyan-bot"

@@ -11,6 +11,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # v1.0.4 hung in "Verify source" and ran until GitHub's 6-hour ceiling cancelled it, so the
+    # tag shipped a release with no tarball attached. Every healthy release here finishes in under
+    # two minutes; a stall should surface as a fast failure, not a silent half-published version.
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@v6
