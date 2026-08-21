@@ -21,6 +21,7 @@ import { WorkspaceRouter } from "../../src/endpoints/workspace-router.ts";
 import { LocalWorkspaceHost, type WorkspaceHost } from "../../src/endpoints/ssh-host.ts";
 import { ProjectWorkspacePolicy } from "../../src/sessions/project-workspace.ts";
 import { createManagedSessionRecoveryOwner, managedRetryKey } from "../../src/production-app.ts";
+import { EndpointAuthenticationRequiredError } from "../../src/app-server/managed-endpoint.ts";
 
 class LifecycleEndpoint implements AppServerEndpoint {
   constructor(readonly id = "local") {}
@@ -152,7 +153,13 @@ async function fixture(options: {
       assertDispatchable: async (prepared) => { checked.push(prepared.path); },
     },
     gate,
-    options.endpoints,
+    options.endpoints === undefined ? undefined : {
+      desiredState: () => "automatic",
+      isClosing: () => false,
+      awaitingAuthentication: () => false,
+      endpointGeneration: (id: string) => pool.endpointGeneration(id),
+      ...options.endpoints,
+    } as never,
     options.beforeManagedReady,
     options.provider,
   );
@@ -1336,4 +1343,209 @@ test("a rename waiting on the gate cannot rename a reused nickname generation", 
   await assert.rejects(rename, /mapping changed|managed/iu);
   assert.equal(required(registry).mapping_id, "mapping-replacement");
   assert.equal(registry.get("billing"), undefined);
+});
+
+// Unadopt releases a session without archiving its thread or touching project files, so it is
+// bookkeeping -- yet it took a work lease on the session's endpoint and could not run at all while
+// the host was unreachable. A cluster that goes down for maintenance (or for good) then leaves
+// entries that can never be removed. Seen with two workers on a cluster whose SSH was refusing auth.
+test("unadopt releases a session whose endpoint cannot be reached", async () => {
+  const unreachable = new AppError("ENDPOINT_UNAVAILABLE", "endpoint is unreachable: local");
+  const { registry, endpoint, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw unreachable; },
+      runWithWorkLease: async () => { throw unreachable; },
+      // The endpoint's own state is what proves unreachability; the error only raises the question.
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-unreachable" });
+  endpoint.calls.length = 0;
+
+  const checkpoints: string[] = [];
+  await lifecycle.unadopt("payments", (checkpoint) => { checkpoints.push(checkpoint.step); });
+
+  assert.equal(registry.get("payments"), undefined, "the mapping is released even though the host never answered");
+  // No native_unsubscribed step: there is no connection to unsubscribe from, and claiming one
+  // would assert something about the host that was never true. No `transitioned` step either --
+  // removal is a single durable write, so a crash mid-release leaves the session `managed` and
+  // recovery retires it as no-effect, instead of stranding an `unadopting` row that would fence
+  // every later restart of the endpoint.
+  assert.deepEqual(checkpoints, ["transition_intent", "removed"]);
+  assert.equal(endpoint.calls.length, 0, "an unreachable endpoint is never called");
+});
+
+// The fallback must be reserved for an unreachable ENDPOINT. Work inside the lease can raise the
+// same error code -- an idleness read on a reachable host that reports unknown state does exactly
+// that -- and treating it as unreachable would drop the idle check on a session that may be running.
+test("unadopt still refuses when the endpoint answers but the session is not idle", async () => {
+  const { registry, lifecycle, endpoint, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+  endpoint.status = "active";
+  setNative(session, "active", "active-turn");
+  endpoint.failTurnsList = true;
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  assert.equal(required(registry).lifecycle_state, "managed", "a busy session is left exactly as it was");
+});
+
+// An attempt that lost its endpoint mid-transition leaves the session in `unadopting`. That must be
+// completable, not stranded: requireManaged alone would refuse it forever.
+test("unadopt completes a session already left part-way through", async () => {
+  const unreachable = new AppError("ENDPOINT_UNAVAILABLE", "endpoint is unreachable: local");
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw unreachable; },
+      runWithWorkLease: async () => { throw unreachable; },
+      // The endpoint's own state is what proves unreachability; the error only raises the question.
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-unreachable" });
+  await registry.transition("payments", required(registry), "unadopting");
+  assert.equal(required(registry).lifecycle_state, "unadopting");
+
+  await lifecycle.unadopt("payments");
+  assert.equal(registry.get("payments"), undefined);
+});
+
+// The `entered` guard, pinned. A reachable endpoint whose native state is unknown raises the SAME
+// ENDPOINT_UNAVAILABLE code as a host that never answered -- requireCurrentNativeIdle does exactly
+// that. Classifying on the code alone would fall back and release a session that may be mid-turn on
+// a host we can still talk to. Only failing to reach the endpoint at all may take the local path.
+test("unadopt does not release when the endpoint answers but native state is unknown", async () => {
+  const { registry, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  // Reachable endpoint, but the native session reports unknown -- the shape that made a live
+  // worker unreadable earlier, where the host answered and the thread state did not.
+  setNative(required(registry), "unknown");
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+  assert.equal(required(registry).lifecycle_state, "managed",
+    "an unknown-but-reachable session is left registered, not silently released");
+});
+
+// The error code alone cannot decide this. withWorkLease raises ENDPOINT_UNAVAILABLE for a manager
+// shutting down, for an endpoint deliberately drained, and for a generation that moved mid-acquire
+// -- the last two describe a HEALTHY host. A concurrent restart drains before it checks idleness,
+// so an unadopt racing one would otherwise release a running session's mapping, and the relay would
+// then discard that turn's answer. The endpoint's own state is what settles it.
+test("unadopt refuses a drained endpoint, which is healthy despite the same error code", async () => {
+  const drained = new AppError("ENDPOINT_UNAVAILABLE", "endpoint is draining: local");
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw drained; },
+      runWithWorkLease: async () => { throw drained; },
+      desiredState: () => "draining",
+      endpointGeneration: () => ({ endpoint: { state: "ready" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-drained" });
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+  assert.equal(required(registry).lifecycle_state, "managed", "a drained endpoint is not an absent one");
+});
+
+// A caller-supplied lease never runs ensureReady, so a failure there means the LEASE is stale, not
+// that the host is gone. Releasing locally on that would be a release against a reachable endpoint.
+test("unadopt refuses to release locally when given a stale caller lease", async () => {
+  const stale = new AppError("ENDPOINT_UNAVAILABLE", "invalid endpoint work lease");
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw stale; },
+      runWithWorkLease: async () => { throw stale; },
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-lease" });
+
+  await assert.rejects(
+    lifecycle.unadopt("payments", undefined, { endpointId: "local", endpointGeneration: 1 } as never),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+  assert.equal(required(registry).lifecycle_state, "managed");
+});
+
+// A concurrent archive claims the mapping WHILE our lease attempt is failing -- after the initial
+// state check has already passed. Removing it then would retire a thread that was never archived,
+// and settle the archive's own recovery as though it had succeeded. The stub performs the
+// transition mid-attempt, which is the only way to reach the re-check inside the gate.
+test("unadopt refuses a mapping a concurrent archive claims mid-attempt", async () => {
+  const unreachable = new AppError("ENDPOINT_UNAVAILABLE", "endpoint is unreachable: local");
+  let onLeaseAttempt: () => Promise<void> = async () => {};
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { await onLeaseAttempt(); throw unreachable; },
+      runWithWorkLease: async () => { await onLeaseAttempt(); throw unreachable; },
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-archiving" });
+  onLeaseAttempt = async () => { await registry.transition("payments", required(registry), "archiving"); };
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");
+  assert.equal(required(registry).lifecycle_state, "archiving", "the archive's claim is left intact");
+});
+
+// Shutdown closes every connection, so each endpoint reports not-ready. That is us stopping, not
+// the host vanishing, and it must not licence a durable removal during teardown -- the distinction
+// this guard exists to make is exactly the one that disappears once connections are closed.
+test("unadopt refuses during shutdown, when every endpoint looks not-ready", async () => {
+  const stopping = new AppError("ENDPOINT_UNAVAILABLE", "endpoint manager is shutting down");
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw stopping; },
+      runWithWorkLease: async () => { throw stopping; },
+      isClosing: () => true,
+      endpointGeneration: () => ({ endpoint: { state: "stopped" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-closing" });
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+  assert.equal(required(registry).lifecycle_state, "managed", "teardown is not absence");
+});
+
+// Ordering: the registry write commits before the epoch is ended. Recovery keeps a session whose
+// removal did not commit, and an epoch ended ahead of that write would leave that kept session
+// unable to deliver at all -- the relay requires a current epoch. Forcing the epoch write to throw
+// is what makes the order observable: the mapping is gone only if it was removed first.
+test("unadopt commits the removal before ending the epoch", async () => {
+  const unreachable = new AppError("ENDPOINT_UNAVAILABLE", "endpoint is unreachable: local");
+  const { registry, lifecycle, epochs } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw unreachable; },
+      runWithWorkLease: async () => { throw unreachable; },
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-order" });
+  (epochs as { end: unknown }).end = () => { throw new Error("epoch store unavailable"); };
+
+  await assert.rejects(lifecycle.unadopt("payments"), /epoch store unavailable/u);
+  assert.equal(registry.get("payments"), undefined,
+    "the mapping was already removed, so the epoch write came after it");
+});
+
+// Codex authentication expiring raises CONFIGURATION_ERROR, not ENDPOINT_UNAVAILABLE, and is thrown
+// during start() so the connection never reaches ready. Deliberately re-admitted after a review
+// found the earlier version had stopped covering it, so it gets a test rather than an assumption.
+test("unadopt releases when the endpoint needs authentication it cannot get", async () => {
+  const { registry, lifecycle } = await fixture({
+    endpoints: {
+      withWorkLease: async () => { throw new EndpointAuthenticationRequiredError("local"); },
+      runWithWorkLease: async () => { throw new EndpointAuthenticationRequiredError("local"); },
+      endpointGeneration: () => ({ endpoint: { state: "unavailable" }, generation: 1 }),
+    } as never,
+  });
+  await registry.createManaged("payments", { endpoint: "local", thread_id: "thread-1", project_dir: "/projects/payments", mapping_id: "mapping-auth" });
+
+  const released = await lifecycle.unadopt("payments");
+  assert.equal(registry.get("payments"), undefined);
+  assert.deepEqual(released, { endpointUnreachable: true }, "the caller is told idleness was never proven");
 });

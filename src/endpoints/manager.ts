@@ -494,6 +494,11 @@ export class EndpointManager {
     await Promise.allSettled(closing);
   }
 
+  // "We are tearing down" is not "the host is gone". A caller deciding whether an endpoint is
+  // unreachable must be able to tell those apart: after closeConnections() every endpoint reports
+  // not-ready, which would otherwise read as absence.
+  isClosing(): boolean { return this.closing; }
+
   desiredState(id: string): EndpointDesiredState { return this.record(id).gate.desiredState; }
 
   // True while automatic recovery is parked waiting for a human to re-authenticate (an SSH

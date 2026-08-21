@@ -3193,3 +3193,38 @@ test("managed recovery selects unavailable sessions when requested", () => {
   assert.equal(managedSessionNeedsRecovery(undefined, true), false);
   assert.equal(managedSessionNeedsRecovery({ managementState: "managed" }, false), true);
 });
+
+// The ledger half of releasing a session whose host is gone. The reported symptom was the operation
+// settling as "durable removal transition was not committed" while the session stayed registered,
+// so what matters is that a completed local release settles SUCCEEDED, and an interrupted one is
+// retired as no-effect rather than left to fence the endpoint it could not reach.
+test("a release performed without the endpoint settles from its own checkpoints", async () => {
+  const identity = { nickname: "worker", endpoint: "ptyche02", thread_id: "thread-1", project_dir: "/p", mapping_id: "mapping-1" };
+  const decide = async (receipt: Record<string, unknown>, current: unknown) => {
+    let succeeded = 0, failed = 0, endpointCalls = 0;
+    const operation = { id: "op", kind: "unadopt_session", args: { nickname: "worker" }, receipt } as const;
+    const decision = await recoverRemovalOperation({
+      operation: operation as never,
+      registry: { get: () => current } as never,
+      lifecycle: { reconcileRemoval: async () => { endpointCalls += 1; } } as never,
+      succeed: async () => { succeeded += 1; },
+      failNoEffect: () => { failed += 1; },
+    });
+    return { decision, succeeded, failed, endpointCalls };
+  };
+
+  // Completed: the mapping is gone, and the release wrote `removed` without ever reaching the host.
+  assert.deepEqual(
+    await decide({ ...identity, lifecycle_state: "unadopting", step: "removed" }, undefined),
+    { decision: "succeeded", succeeded: 1, failed: 0, endpointCalls: 0 },
+  );
+
+  // Interrupted mid-release. Removal is a single durable write, so the session is still `managed`
+  // with only the intent checkpoint -- retired as no-effect, which is what keeps it from fencing
+  // every later restart of an endpoint that is already unreachable.
+  assert.deepEqual(
+    await decide({ ...identity, lifecycle_state: "managed", step: "transition_intent" },
+      { ...identity, lifecycle_state: "managed" }),
+    { decision: "no_effect", succeeded: 0, failed: 1, endpointCalls: 0 },
+  );
+});

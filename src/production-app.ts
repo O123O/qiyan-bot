@@ -3938,9 +3938,12 @@ export async function buildProductionApp(
         const session = registry.get(args.nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
-        await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        const released = await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
         await reconcileDashboard();
-        return { nickname: args.nickname, mapping_id: session.mapping_id };
+        // Reported, not buried: released against an unreachable host means idleness was never
+        // proven, the remote subscription is still there, and any turn still running will have its
+        // answer discarded. The assistant can only say so if it is told.
+        return { nickname: args.nickname, mapping_id: session.mapping_id, ...(released.endpointUnreachable ? { endpoint_unreachable: true } : {}) };
       },
       archive_session: async (args, context) => {
         const session = registry.get(args.nickname);
