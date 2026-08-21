@@ -14,6 +14,7 @@ import type { NativeRefreshToken, NativeSessionIdentity } from "./native-session
 import { NativeSessionState } from "./native-session-state.ts";
 import { repairActiveTurnIdentity } from "./native-session-probe.ts";
 import { DISCOVERY_SOURCE_KINDS } from "./discovery.ts";
+import { EndpointAuthenticationRequiredError } from "../app-server/managed-endpoint.ts";
 
 interface ThreadView {
   id: string;
@@ -60,7 +61,8 @@ export class SessionLifecycle {
     private readonly clock: Clock,
     private readonly workspaces: Pick<ProjectWorkspacePolicy, "prepareExisting" | "assertDispatchable">,
     private readonly gate: ThreadGate,
-    private readonly endpoints?: Pick<EndpointManager, "withWorkLease" | "runWithWorkLease">,
+    private readonly endpoints?: Pick<EndpointManager,
+      "withWorkLease" | "runWithWorkLease" | "desiredState" | "endpointGeneration" | "awaitingAuthentication" | "isClosing">,
     private readonly beforeManagedReady?: (
       identity: MappingIdentity,
       lease?: EndpointWorkLease,
@@ -184,23 +186,122 @@ export class SessionLifecycle {
     nickname: string,
     checkpoint?: (value: LifecycleCheckpoint) => void,
     existingLease?: EndpointWorkLease,
+  ): Promise<{ endpointUnreachable: boolean }> {
+    const expected = this.requireRemovable(nickname);
+    {
+      // `entered` is the discriminator, and it has to be: the fallback below is only correct when
+      // the ENDPOINT could not be reached. Work inside the lease can also raise
+      // ENDPOINT_UNAVAILABLE -- requireCurrentNativeIdle does exactly that when a reachable host
+      // reports unknown state -- and falling back there would drop the idle check on a session
+      // that might well be running.
+      let entered = false;
+      try {
+        await this.withMutationLease(expected.endpoint, (lease) => {
+          entered = true;
+          return this.gate.run(expected.endpoint, expected.thread_id, async () => {
+            const current = this.registry.get(nickname);
+            if (current && current.mapping_id === expected.mapping_id && current.lifecycle_state === "unadopting") {
+              // Left part-way by an earlier attempt, and the host is answering -- proven by having
+              // reached it rather than inferred from cached state. Refuse, so reconciliation
+              // finishes it with the native unsubscribe the local path cannot perform.
+              throw new AppError("OPERATION_CONFLICT", `${nickname} is ${current.lifecycle_state}`);
+            }
+            const session = this.assertExact(nickname, expected, "managed");
+            this.requireCurrentNativeIdle(nickname, session, lease);
+            checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transition_intent"));
+            await this.registry.transition(nickname, session, "unadopting");
+            checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transitioned"));
+            await this.unsubscribeOrConfirmAbsent(session.endpoint, session.thread_id, lease);
+            checkpoint?.(this.checkpoint(nickname, session, "unadopting", "native_unsubscribed"));
+            this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
+            this.native.unregister(this.nativeIdentity(session));
+            if (!await this.registry.removeIfMatch(nickname, session)) {
+              throw new AppError("OPERATION_UNCERTAIN", "native unadoption completed but the exact session mapping was not removed");
+            }
+            checkpoint?.(this.checkpoint(nickname, session, "unadopting", "removed"));
+          });
+        }, existingLease);
+        return { endpointUnreachable: false };
+      } catch (error) {
+        if (entered || existingLease || !this.endpointIsUnreachable(expected.endpoint, error)) throw error;
+      }
+    }
+    await this.releaseWithoutEndpoint(nickname, expected, checkpoint);
+    return { endpointUnreachable: true };
+  }
+
+  // Proves the endpoint could not be reached, rather than inferring it from an error code.
+  //
+  // ENDPOINT_UNAVAILABLE is far broader than "the host is down": withWorkLease raises it for a
+  // manager that is shutting down, for an endpoint deliberately drained or disconnected, and for a
+  // generation that moved while the lease was being acquired -- the last two describe a HEALTHY
+  // host. Releasing locally on those would skip the idle check on a reachable endpoint: a
+  // concurrent restart drains first and checks idleness second, so an unadopt racing it would drop
+  // a running session's mapping and the relay would then discard that turn's answer.
+  //
+  // So the error only opens the question; the endpoint's own state answers it. Automatic means
+  // nobody asked it to stop, so a not-ready endpoint under automatic intent is genuinely
+  // unreachable -- as is one parked waiting for a human to re-authenticate.
+  private endpointIsUnreachable(endpointId: string, error: unknown): boolean {
+    // Codex authentication expiring raises CONFIGURATION_ERROR, not ENDPOINT_UNAVAILABLE, and it is
+    // thrown during start() so the connection never reaches ready -- as unreachable as a dead host.
+    const shape = error instanceof EndpointAuthenticationRequiredError
+      || (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+    return shape && this.endpointCannotBeReached(endpointId);
+  }
+
+  private endpointCannotBeReached(endpointId: string): boolean {
+    if (!this.endpoints) return false;
+    // Shutdown closes every connection, so each endpoint reports not-ready. That is us stopping,
+    // not the host vanishing, and it must not licence a durable removal during teardown.
+    if (this.endpoints.isClosing()) return false;
+    if (this.endpoints.awaitingAuthentication(endpointId)) return true;
+    if (this.endpoints.desiredState(endpointId) !== "automatic") return false;
+    try { return this.endpoints.endpointGeneration(endpointId).endpoint.state !== "ready"; }
+    catch { return true; }
+  }
+
+  // Unadopt releases a session WITHOUT archiving its thread or touching project files -- it stays
+  // discoverable and re-adoptable. So it is bookkeeping, and requiring a live host to do it meant a
+  // decommissioned or long-down cluster left entries that could never be removed.
+  //
+  // Everything the leased path does to the endpoint is unobtainable here and moot: there is no
+  // connection to unsubscribe from, and native idleness cannot be read from a host that will not
+  // answer. Work already running there keeps running -- unadopt never stopped work -- and re-adopt
+  // is how it comes back. Recovery settles a completed release as succeeded; an interrupted one is
+  // retired as no-effect, which is what the single registry write below is for.
+  private async releaseWithoutEndpoint(
+    nickname: string,
+    expected: RegistrySession,
+    checkpoint?: (value: LifecycleCheckpoint) => void,
   ): Promise<void> {
-    const expected = this.requireManaged(nickname);
-    await this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
-      const session = this.assertExact(nickname, expected, "managed");
-      this.requireCurrentNativeIdle(nickname, session, lease);
+    await this.gate.run(expected.endpoint, expected.thread_id, async () => {
+      const session = this.registry.get(nickname);
+      // Already gone, or replaced by a different mapping: nothing of ours left to release.
+      if (!session || session.mapping_id !== expected.mapping_id) return;
+      // Re-checked under the gate: a concurrent archive may have moved this mapping to `archiving`
+      // while the lease attempt was failing, and removing it here would retire a thread that was
+      // never archived -- and settle that archive's recovery as though it had succeeded.
+      if (session.lifecycle_state !== "managed" && session.lifecycle_state !== "unadopting") {
+        throw new AppError("OPERATION_CONFLICT", `${nickname} is ${session.lifecycle_state}`);
+      }
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transition_intent"));
-      await this.registry.transition(nickname, session, "unadopting");
-      checkpoint?.(this.checkpoint(nickname, session, "unadopting", "transitioned"));
-      await this.unsubscribeOrConfirmAbsent(session.endpoint, session.thread_id, lease);
-      checkpoint?.(this.checkpoint(nickname, session, "unadopting", "native_unsubscribed"));
+      // Deliberately NO intermediate transition write. Removal is one durable write, so a crash
+      // here leaves the session `managed` with only an intent checkpoint, which recovery retires as
+      // no-effect. Transitioning first would leave an `unadopting` row that recovery cannot settle
+      // without the endpoint, and that row fences every later restart of it -- the repair that is
+      // the only way out.
+      // Registry first. A crash before it leaves a session recovery keeps as managed, and an epoch
+      // ended ahead of that write would leave that kept session silently unable to deliver -- the
+      // relay requires a current epoch. After the write, a leaked epoch or native entry for a
+      // mapping that no longer exists is inert.
+      if (!await this.registry.removeIfMatch(nickname, session)) {
+        throw new AppError("OPERATION_UNCERTAIN", "local unadoption did not remove the exact session mapping");
+      }
       this.epochs.end(session.endpoint, session.thread_id, session.mapping_id, this.clock.now());
       this.native.unregister(this.nativeIdentity(session));
-      if (!await this.registry.removeIfMatch(nickname, session)) {
-        throw new AppError("OPERATION_UNCERTAIN", "native unadoption completed but the exact session mapping was not removed");
-      }
       checkpoint?.(this.checkpoint(nickname, session, "unadopting", "removed"));
-    }), existingLease);
+    });
   }
 
   async archive(nickname: string, checkpoint?: (value: LifecycleCheckpoint) => void): Promise<void> {
@@ -397,6 +498,18 @@ export class SessionLifecycle {
   private requireAvailable(nickname: string, endpointId: string, threadId: string): void {
     if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
     if (this.registry.getByIdentity(endpointId, threadId)) throw new AppError("OPERATION_CONFLICT", `thread is already registered: ${threadId}`);
+  }
+
+  // Admits a session already part-way through unadoption so it is not stranded in `unadopting`
+  // forever. Whether it may actually be finished is decided later, after dialling the endpoint:
+  // reachable hosts are refused inside the lease so reconciliation completes them properly.
+  private requireRemovable(nickname: string): RegistrySession {
+    const session = this.registry.get(nickname);
+    if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${nickname}`);
+    if (session.lifecycle_state !== "managed" && session.lifecycle_state !== "unadopting") {
+      throw new AppError("OPERATION_CONFLICT", `${nickname} is ${session.lifecycle_state}`);
+    }
+    return session;
   }
 
   private requireManaged(nickname: string): RegistrySession {
