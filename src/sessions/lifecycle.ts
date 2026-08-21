@@ -79,6 +79,7 @@ export class SessionLifecycle {
     onDispatching?: () => void,
     mappingId = `mapping_${randomUUID()}`,
     existingLease?: EndpointWorkLease,
+    onNotMaterialized?: () => void,
   ): Promise<CurrentSessionSettings> {
     return this.withMutationLease(endpointId, async (lease) => {
     if (this.registry.get(nickname)) throw new AppError("OPERATION_CONFLICT", `nickname already exists: ${nickname}`);
@@ -86,6 +87,23 @@ export class SessionLifecycle {
     onDispatching?.();
     const response = await this.pool.request<ThreadResponse>(endpointId, "thread/start", workerThreadStartParams(project.path, threadSource), undefined, lease);
     this.requireFreshThread(response.thread, threadSource, project.path);
+    // Materialize before anyone can observe the mapping. thread/start alone writes NO rollout --
+    // measured against a live app-server -- and a Codex rollout appears only at the first turn.
+    // Until then thread/resume fails with "no rollout", which managed reconciliation reads as an
+    // unrestorable thread and removes the mapping for. That deleted brand-new workers whenever a
+    // reconnect landed before the owner had sent anything: created, healthy, then simply gone.
+    //
+    // Naming the thread writes the rollout immediately, so the window never exists. The assistant
+    // has always done this for its own thread (createAssistantThread names the result
+    // "materialized"); workers were the ones left in the gap.
+    // Codex only. Claude refuses thread/name/set deliberately -- renaming needs a host protocol
+    // bump -- and its resume recreates an unmaterialized thread anyway, so it never had this window.
+    // Calling it there would be a guaranteed-to-throw round trip whose refusal we then swallow,
+    // which is exactly the "cannot tell unsupported from no-op" ambiguity that refusal exists to
+    // avoid.
+    const materialized = this.provider(endpointId) !== "codex"
+      || await this.materializeThread(endpointId, response.thread.id, nickname, lease);
+    if (!materialized) onNotMaterialized?.();
     const settings = currentSessionSettings(response);
     onThreadCreated?.(response.thread, settings);
     await this.gate.run(endpointId, response.thread.id, async () => {
@@ -586,6 +604,24 @@ export class SessionLifecycle {
 
   private resumeParams(threadId: string): { threadId: string; excludeTurns: true } {
     return { threadId, excludeTurns: true };
+  }
+
+  // Best-effort by design: a name that does not stick is cosmetic, but a creation that fails
+  // because of one is not. The rollout is what matters, and any answer at all means it was written.
+  // Non-fatal, but never silent. Refusing to create a worker because a label failed would be worse
+  // than the window this closes -- yet a failure here means precisely that this worker is being
+  // born into that window, which is how the bug survived two incidents unnoticed. Note the failure
+  // can even be "no rollout found for thread id ...", the same signal reconciliation later reaps on.
+  private async materializeThread(
+    endpointId: string,
+    threadId: string,
+    nickname: string,
+    lease?: EndpointWorkLease,
+  ): Promise<boolean> {
+    try {
+      await this.pool.request(endpointId, "thread/name/set", { threadId, name: nickname }, undefined, lease);
+      return true;
+    } catch { return false; }
   }
 
   private managedResumeParams(session: MappingIdentity & { project_dir: string }): {

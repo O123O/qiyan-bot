@@ -1,6 +1,8 @@
 export type OperationalEventCode =
   // Recording what the web panel displayed is best-effort; routing the notification is not.
   | "owner_transcript_record_failed"
+  // A created worker whose thread was not materialized is one reconcile away from being reaped.
+  | "worker_thread_not_materialized"
   | "chat_ingress_started"
   | "chat_input_accepted"
   | "direct_to_delivered"
