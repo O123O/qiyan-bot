@@ -3868,7 +3868,12 @@ export async function buildProductionApp(
           }, () => {
             dispatchStarted = true;
             context.checkpoint({ endpoint: endpointId, mappingId, ...workspaceReceipt, dispatchStarted });
-          }, mappingId, lease);
+          }, mappingId, lease, () => {
+            // The worker exists and works, but its thread has no rollout yet, so a reconcile before
+            // its first turn will read it as unrestorable and remove it. Say so rather than let it
+            // vanish quietly the way it did twice before.
+            reportOperationalSafely(report, { level: "warn", code: "worker_thread_not_materialized", endpoint: endpointId, reason: "name_set_failed" });
+          });
           dashboardStore.markDirty();
           observeCurrentSettings(args.nickname, settings, Date.now(), settingsObservationSequence);
           await renderDashboardSafely();

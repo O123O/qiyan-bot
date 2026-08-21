@@ -45,6 +45,11 @@ class LifecycleEndpoint implements AppServerEndpoint {
   listError: Error | undefined;
   unsubscribeError: Error | undefined;
   archiveError: Error | undefined;
+  nameError: Error | undefined;
+  // Mirrors the measured app-server: thread/start writes no rollout, so resume fails until the
+  // thread is materialized (by naming it, or by taking a turn). Keyed by thread id, because one
+  // endpoint-wide flag would make an unrelated pre-registered mapping resume spuriously.
+  unmaterializedThreads = new Set<string>();
   onResume: (() => void) | undefined;
   resumeBarrier: Promise<void> | undefined;
 
@@ -52,6 +57,7 @@ class LifecycleEndpoint implements AppServerEndpoint {
     this.calls.push({ method, params });
     const thread = { id: this.threadId, cwd: this.cwd, path: this.path, threadSource: this.createdThreadSource, status: { type: this.status }, turns: this.turns };
     if (method === "thread/start") {
+      this.unmaterializedThreads.add(String(thread.id));
       this.createdThreadSource = this.startThreadSource === undefined ? params?.threadSource ?? null : this.startThreadSource;
       return {
       thread: {
@@ -77,6 +83,11 @@ class LifecycleEndpoint implements AppServerEndpoint {
         backwardsCursor: null,
       } as T;
     }
+    if (method === "thread/name/set") {
+      if (this.nameError) throw this.nameError;
+      this.unmaterializedThreads.delete(String((params as { threadId?: unknown }).threadId ?? ""));
+      return {} as T;
+    }
     if (method === "thread/list") {
       if (this.listError) throw this.listError;
       return {
@@ -89,6 +100,13 @@ class LifecycleEndpoint implements AppServerEndpoint {
       this.onResume?.();
       await this.resumeBarrier;
       if (this.resumeError) throw this.resumeError;
+      // An unmaterialized thread has no rollout to resume from. This is the production behaviour
+      // that made reconciliation reap brand-new workers, so the stub has to reproduce it or a test
+      // for that bug asserts nothing.
+      const resumeId = String((params as { threadId?: unknown }).threadId ?? "");
+      if (this.unmaterializedThreads.has(resumeId)) {
+        throw new JsonRpcResponseError(-32600, `no rollout found for thread id ${resumeId}`);
+      }
       if (this.failResume) throw new Error("resume response lost");
       const resumedThread = {
         ...thread,
@@ -1063,7 +1081,9 @@ test("successful remote thread/start performs no later SSH workspace checks", as
   await lifecycle.create("payments", "devbox", project, "operation-remote", undefined, () => { dispatchStarted = true; });
 
   assert.equal(dispatchStarted, true);
-  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/start"]);
+  // thread/name/set is what materializes the rollout; the property this test guards is that no
+  // workspace check follows the start, and none does.
+  assert.deepEqual(endpoint.calls.map((call) => call.method), ["thread/start", "thread/name/set"]);
   assert.equal(required(registry).lifecycle_state, "managed");
 });
 
@@ -1548,4 +1568,59 @@ test("unadopt releases when the endpoint needs authentication it cannot get", as
   const released = await lifecycle.unadopt("payments");
   assert.equal(registry.get("payments"), undefined);
   assert.deepEqual(released, { endpointUnreachable: true }, "the caller is told idleness was never proven");
+});
+
+// The bug this closes: thread/start writes NO rollout -- measured against a live app-server -- and
+// a Codex rollout only appears at the first turn. Until then thread/resume fails with "no rollout",
+// which managed reconciliation reads as an unrestorable thread and removes the mapping for. A
+// worker created and not yet used was therefore deleted by the next reconnect: created, healthy,
+// gone. Naming the thread writes the rollout immediately, so the window never opens.
+test("a created worker is materialized, so reconciliation can resume it before first use", async () => {
+  const { dir, registry, endpoint, lifecycle, project } = await fixture();
+  await lifecycle.create("payments", "local", project, "operation-1");
+  const named = endpoint.calls.find((call) => call.method === "thread/name/set");
+  assert.ok(named, "creation names the thread, which is what writes the rollout");
+  assert.equal((named.params as { name?: string }).name, "payments");
+
+  // The consequence that matters: a reconcile immediately after creation resumes rather than reaps.
+  endpoint.calls.length = 0;
+  const resumed = await lifecycle.reconcileManaged("payments", required(registry));
+  assert.equal(resumed.thread.id, required(registry).thread_id);
+  assert.equal(required(registry).lifecycle_state, "managed", "the brand-new worker survives");
+  assert.equal(dir.length > 0, true);
+});
+
+// Materializing is a courtesy, not a precondition. An endpoint that cannot name a thread should
+// still produce a worker -- refusing to create one because a label failed would be worse than the
+// window this closes.
+test("creation still succeeds when the endpoint cannot name the thread, and says so", async () => {
+  const { registry, endpoint, lifecycle, project } = await fixture();
+  endpoint.nameError = new JsonRpcResponseError(-32601, "unknown method thread/name/set");
+  let warned = 0;
+
+  await lifecycle.create("payments", "local", project, "operation-1", undefined, undefined,
+    undefined, undefined, () => { warned += 1; });
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  // Not silent: this worker was born into the unresumable window, which is the one warning that
+  // predicts the loss. Note the failure can itself be "no rollout found for thread id ...", the
+  // same signal reconciliation later reaps on -- swallowing it is how this survived two incidents.
+  assert.equal(warned, 1, "a worker that could not be materialized is reported");
+});
+
+// Claude refuses thread/name/set deliberately: renaming there needs a host protocol bump, and its
+// resume recreates an unmaterialized thread anyway, so it never had this window. Calling it would
+// be a guaranteed-to-throw round trip whose refusal is then swallowed -- exactly the "cannot tell
+// unsupported from a silent no-op" ambiguity that refusal exists to prevent.
+test("a Claude worker is created without attempting to name its thread", async () => {
+  const { registry, endpoint, lifecycle, project } = await fixture({ provider: () => "claude" });
+  let warned = 0;
+
+  await lifecycle.create("payments", "local", project, "operation-1", undefined, undefined,
+    undefined, undefined, () => { warned += 1; });
+
+  assert.equal(required(registry).lifecycle_state, "managed");
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/name/set"), false,
+    "no round trip to a method this provider refuses");
+  assert.equal(warned, 0, "and no warning, because nothing needed materializing");
 });
