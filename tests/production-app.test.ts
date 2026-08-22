@@ -18,6 +18,7 @@ import {
   isUncertainAssistantTransportFailure,
   managedRecoveryDisposition,
   managedRetryKey,
+  parkReasonToken,
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
   lifecycleRecoveryExhausted,
@@ -83,7 +84,7 @@ import type { ManagementState } from "../src/core/types.ts";
 import { ChatAdapterRegistry } from "../src/chat-apps/shared/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
-import { RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
+import { JsonRpcResponseError, RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
 import { HistoryScanBudgetExhaustedError } from "../src/app-server/thread-history.ts";
 import { createTestDatabase } from "../src/storage/database.ts";
 import { OperationStore } from "../src/storage/operation-store.ts";
@@ -3227,4 +3228,158 @@ test("a release performed without the endpoint settles from its own checkpoints"
       { ...identity, lifecycle_state: "managed" }),
     { decision: "no_effect", succeeded: 0, failed: 1, endpointCalls: 0 },
   );
+});
+
+// Two sessions parking together on one endpoint is the ordinary shape -- it is what 2026-08-22
+// looked like -- and the report was emitted from inside the loop over failures, so it named
+// whichever session happened to fail first and nothing at all about the other.
+test("a batch that parks two sessions reports both, with the reason behind them", async () => {
+  const lease = { endpointId: "prenyx", endpointGeneration: 1 } as never;
+  const first = managedRetryKey("prenyx", "thread-1", "mapping-1");
+  const second = managedRetryKey("prenyx", "thread-2", "mapping-2");
+  const seen: Array<{ endpointId: string; keys: readonly string[]; reason: string }> = [];
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId: string, run: (lease: never) => unknown) => run(lease) } as never,
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId: string, keys: readonly ManagedRetryKey[]) => ({
+      restored: false,
+      restoredKeys: [],
+      settledKeys: [],
+      failures: keys.map((key) => ({ key, disposition: "permanent" as const, reason: "session_busy" })),
+    }),
+    wakeShared: async () => undefined,
+    onSafetyFailure: ({ endpointId, keys, reason }) => {
+      seen.push({ endpointId, keys: [...keys], reason });
+    },
+    onError: () => undefined,
+  });
+
+  owner.recordFailure(first, "endpoint");
+  owner.recordFailure(second, "endpoint");
+  await owner.endpointReady("prenyx", lease);
+  await owner.stop();
+
+  assert.equal(seen.length, 1, "the park is reported once per endpoint per episode");
+  assert.equal(seen[0]?.endpointId, "prenyx", "the report names the endpoint");
+  assert.deepEqual([...(seen[0]?.keys ?? [])].sort(), [first, second].sort(),
+    "and every session that stopped recovering, not just the first one to fail");
+  assert.equal(seen[0]?.reason, "session_busy",
+    "and why -- the owner classifies dispositions but never sees the error behind them");
+});
+
+// Everything the remote app-server rejects arrives as JsonRpcResponseError with code -32600, so
+// the class alone would make every remote park read identically -- which is the state this ends.
+test("a park reason distinguishes the remote failures that actually park sessions", () => {
+  const rpc = (message: string): unknown => new JsonRpcResponseError(-32600, message);
+  assert.equal(parkReasonToken(rpc("thread-store conflict: already has an active writer")), "thread_writer_locked");
+  assert.equal(parkReasonToken(rpc("no rollout found for thread id 0199")), "thread_no_rollout");
+  assert.equal(parkReasonToken(rpc("thread not loaded: 0199")), "thread_not_loaded");
+  assert.equal(parkReasonToken(rpc("something new upstream")), "rpc_error_32600",
+    "an unrecognized rejection still says more than the class name");
+  assert.equal(parkReasonToken(new AppError("SESSION_BUSY", "busy")), "session_busy");
+  assert.equal(parkReasonToken(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })), "econnreset",
+    "node system errors carry name \"Error\" and would otherwise be indistinguishable");
+});
+
+// The operational log replaces anything outside [a-z0-9_-] with "unknown", and `name` is a
+// writable string, so the alphabet is checked rather than assumed.
+test("a park reason that is not a renderable token degrades to unknown_error", () => {
+  assert.equal(parkReasonToken(Object.assign(new Error("x"), { name: "Weird Name!" })), "unknown_error");
+  assert.equal(parkReasonToken(Object.assign(new Error("x"), { name: "" })), "unknown_error");
+  assert.equal(parkReasonToken(Object.assign(new Error("x"), { name: `E${"x".repeat(80)}` })), "unknown_error");
+  assert.equal(parkReasonToken("not an error"), "unknown_error");
+});
+
+// A lease failure parks every pending session, but the caller applies it one stage at a time and
+// the report is deduplicated per endpoint -- so counting the first stage alone understates the
+// park on the one path where no per-session notice is issued and the event is all there is.
+// Driven through the retry timer because that is the only production caller that arrives without
+// a lease, and so the only one that reaches the two-stage catch.
+test("one failure split across stages reports every session it parked", async () => {
+  type Timer = { callback: () => void; cleared: boolean };
+  const timers: Timer[] = [];
+  const lease: EndpointWorkLease = {
+    endpointId: "prenyx", lifecycleGeneration: 1, endpointGeneration: 2, leaseId: "park-split",
+  };
+  const first = managedRetryKey("prenyx", "thread-1", "mapping-1");
+  const second = managedRetryKey("prenyx", "thread-2", "mapping-2");
+  const seen: Array<readonly string[]> = [];
+  let leaseAvailable = true;
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: {
+      withReadyWorkLease: async (_endpointId, run) => {
+        if (!leaseAvailable) throw new AppError("SESSION_BUSY", "endpoint lease refused");
+        return run(lease);
+      },
+    },
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId, keys) => ({
+      restored: true,
+      restoredKeys: keys.filter((key) => key === first),
+      settledKeys: [],
+      failures: keys.filter((key) => key !== first).map((key) => ({ key, disposition: "retry" as const })),
+    }),
+    // Timing out leaves `first` pending at stage "shared" instead of settling it, which is what
+    // splits this failure across two stages.
+    wakeShared: async () => { throw new RpcRequestTimeoutError("thread/read"); },
+    onSafetyFailure: ({ keys }) => { seen.push([...keys]); },
+    onError: () => undefined,
+    timers: {
+      setTimeout: (callback) => {
+        const timer = { callback, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer: Timer) => { timer.cleared = true; },
+    },
+    retryMs: 50,
+  });
+
+  owner.recordFailure(first, "endpoint");
+  owner.recordFailure(second, "endpoint");
+  await owner.endpointReady("prenyx", lease);
+
+  leaseAvailable = false;
+  const scheduled = timers.find((timer) => !timer.cleared);
+  assert.ok(scheduled, "the sessions left pending are scheduled for retry");
+  scheduled.callback();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  await owner.stop();
+
+  assert.equal(seen.length, 1, "the park is reported once");
+  assert.deepEqual([...(seen[0] ?? [])].sort(), [first, second].sort(),
+    "covering both stages, not just the one that happened to be applied first");
+});
+
+// One reason attributed to several sessions is a claim about sessions that may have parked for a
+// different reason entirely.
+test("a batch parking sessions for different reasons does not attribute one reason to all", async () => {
+  const lease = { endpointId: "prenyx", endpointGeneration: 1 } as never;
+  const first = managedRetryKey("prenyx", "thread-1", "mapping-1");
+  const second = managedRetryKey("prenyx", "thread-2", "mapping-2");
+  const reasons: string[] = [];
+  const owner = createManagedSessionRecoveryOwner({
+    endpoints: { withReadyWorkLease: async (_endpointId: string, run: (lease: never) => unknown) => run(lease) } as never,
+    isLeaseCurrent: () => true,
+    recover: async (_endpointId: string, keys: readonly ManagedRetryKey[]) => ({
+      restored: false,
+      restoredKeys: [],
+      settledKeys: [],
+      failures: keys.map((key, index) => ({
+        key,
+        disposition: "permanent" as const,
+        reason: index === 0 ? "thread_writer_locked" : "session_busy",
+      })),
+    }),
+    wakeShared: async () => undefined,
+    onSafetyFailure: ({ reason }) => { reasons.push(reason); },
+    onError: () => undefined,
+  });
+
+  owner.recordFailure(first, "endpoint");
+  owner.recordFailure(second, "endpoint");
+  await owner.endpointReady("prenyx", lease);
+  await owner.stop();
+
+  assert.deepEqual(reasons, ["mixed"], "two different reasons cannot be reported as either one");
 });

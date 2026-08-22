@@ -1,5 +1,8 @@
 export type OperationalEventCode =
   // Recording what the web panel displayed is best-effort; routing the notification is not.
+  // Managed sessions stopped being retried on this endpoint, with the reason they stopped. The
+  // next reconnect re-enters them, so this is not a terminal state and may repeat.
+  | "managed_session_parked"
   | "owner_transcript_record_failed"
   // A created worker whose thread was not materialized is one reconcile away from being reaped.
   | "worker_thread_not_materialized"
@@ -40,6 +43,7 @@ export interface OperationalEvent {
   reason?: string;
   component?: string;
   consecutiveFailures?: number;
+  sessions?: number;
   phase?: string;
   elapsedMs?: number;
 }
@@ -56,6 +60,7 @@ export function createOperationalLogSink(
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
     if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
     if (event.consecutiveFailures !== undefined) fields.push(`consecutive_failures=${safeCount(event.consecutiveFailures)}`);
+    if (event.sessions !== undefined) fields.push(`sessions=${safeCount(event.sessions)}`);
     if (event.phase !== undefined) fields.push(`phase=${safeToken(event.phase)}`);
     if (event.elapsedMs !== undefined) fields.push(`elapsed_ms=${safeCount(event.elapsedMs)}`);
     try { write(`qiyan-bot: ${event.level.toUpperCase()} ${fields.join(" ")}\n`); }

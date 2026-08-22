@@ -29,7 +29,7 @@ import {
   isHistoryScanBudgetExhausted,
   type ThreadHistoryReader,
 } from "./app-server/thread-history.ts";
-import { RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
+import { JsonRpcResponseError, RpcRequestTimeoutError } from "./app-server/rpc-client.ts";
 import { MINIMUM_SUPPORTED_CODEX_VERSION } from "./app-server/protocol.ts";
 import { composeApp, type AppPhase, type BotApp } from "./app.ts";
 import type { BotConfig } from "./config.ts";
@@ -1694,6 +1694,36 @@ export function managedRecoveryDisposition(error: unknown, currentReadyLease = f
   return "permanent";
 }
 
+// managedRecoveryDisposition answers "retry or not" and deliberately says nothing about why.
+// This says why, in the only alphabet the operational log accepts -- validated here rather than
+// assumed, because `name` is a writable string and safeToken silently renders "unknown".
+export function parkReasonToken(error: unknown): string {
+  const token = classifyParkReason(error);
+  return /^[a-z][a-z0-9_-]{0,63}$/u.test(token) ? token : "unknown_error";
+}
+
+function classifyParkReason(error: unknown): string {
+  if (error instanceof AppError) return error.code.toLowerCase();
+  // Everything the remote app-server rejects arrives as one class, so the class name alone would
+  // make every remote park read identically -- which is the state this is meant to end. The code
+  // varies, which is what makes it a useful fallback; the message is what identifies the cause.
+  // These messages are also matched, with behavioural consequences, in app-server/thread-errors.ts;
+  // if codex rewords them both places need updating, and only that one will fail loudly.
+  if (error instanceof JsonRpcResponseError) {
+    if (/already has an active writer/u.test(error.rpcMessage)) return "thread_writer_locked";
+    if (/no rollout found for thread id/u.test(error.rpcMessage)) return "thread_no_rollout";
+    if (/is not materialized yet/u.test(error.rpcMessage)) return "thread_not_materialized";
+    if (/thread not loaded/u.test(error.rpcMessage)) return "thread_not_loaded";
+    return `rpc_error_${Math.abs(Math.trunc(error.code))}`;
+  }
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code; // ECONNRESET and friends carry name "Error"
+    if (typeof code === "string" && code.length > 0) return code.toLowerCase();
+    if (error.name !== "Error") return error.name.toLowerCase();
+  }
+  return "unknown_error";
+}
+
 export type ManagedRetryKey = `${string}\0${string}\0${string}`;
 
 export function managedRetryKey(endpointId: string, threadId: string, mappingId: string): ManagedRetryKey {
@@ -1762,7 +1792,9 @@ export interface ManagedSessionRecoveryBatchResult {
   restored: boolean;
   restoredKeys: readonly ManagedRetryKey[];
   settledKeys: readonly ManagedRetryKey[];
-  failures: readonly { key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }[];
+  // The owner never sees the error behind a disposition, so a park it reports could only be
+  // described as "permanent". reason is what lets that report name something.
+  failures: readonly { key: ManagedRetryKey; disposition: ManagedRecoveryDisposition; reason?: string }[];
 }
 
 export interface ManagedEndpointReadyOutcome {
@@ -1972,7 +2004,14 @@ export function createManagedSessionRecoveryOwner(options: {
   ): Promise<ManagedSessionRecoveryBatchResult>;
   wakeShared(endpointId: string, lease: EndpointWorkLease, isCurrent: () => boolean): Promise<void>;
   onRecovered?(endpointId: string): void;
-  onSafetyFailure(error: unknown): void;
+  // A parked session stays parked until its endpoint republishes or the process restarts. It
+  // carries the endpoint, every affected key, and a reason, because a report that cannot name
+  // what stopped working is indistinguishable from noise.
+  onSafetyFailure(park: {
+    endpointId: string;
+    keys: readonly ManagedRetryKey[];
+    reason: string;
+  }): void;
   onError(error: unknown): void;
   timers?: ManagedRecoveryTimers;
   retryMs?: number;
@@ -2021,6 +2060,10 @@ export function createManagedSessionRecoveryOwner(options: {
     error: unknown,
     stage: PendingTarget["stage"],
     currentReadyLease = false,
+    // One failure can be split across stages by the caller, but it parks every key it covers. The
+    // report is deduplicated per endpoint, so counting only the first stage's share understates
+    // exactly the case the count exists to describe.
+    reportedKeys: readonly ManagedRetryKey[] = keys,
   ): void => {
     const disposition = managedRecoveryDisposition(error, currentReadyLease);
     for (const key of keys) {
@@ -2034,7 +2077,7 @@ export function createManagedSessionRecoveryOwner(options: {
       const endpointId = managedRetryEndpoint(keys[0]!);
       if (!safetyReported.has(endpointId)) {
         safetyReported.add(endpointId);
-        try { options.onSafetyFailure(error); }
+        try { options.onSafetyFailure({ endpointId, keys: reportedKeys, reason: parkReasonToken(error) }); }
         catch { /* A safety callback must not change recovery. */ }
       }
     }
@@ -2094,17 +2137,22 @@ export function createManagedSessionRecoveryOwner(options: {
         if (current) pending.set(key, { ...current, stage: "shared" });
       }
       for (const key of batch.settledKeys) pending.delete(key);
+      const parked: ManagedSessionRecoveryBatchResult["failures"][number][] = [];
       for (const failure of batch.failures) {
         if (failure.disposition === "retry" || failure.disposition === "endpoint") {
           pending.set(failure.key, { disposition: failure.disposition, stage: "managed" });
         } else if (failure.disposition === "permanent") {
           pending.set(failure.key, { disposition: "safety", stage: "managed" });
-          if (!safetyReported.has(endpointId)) {
-            safetyReported.add(endpointId);
-            try { options.onSafetyFailure(new Error("permanent managed recovery failure")); }
-            catch { /* An isolation callback must not change recovery. */ }
-          }
+          parked.push(failure);
         }
+      }
+      if (parked.length > 0 && !safetyReported.has(endpointId)) {
+        safetyReported.add(endpointId);
+        const keys = parked.map(({ key }) => key);
+        const reasons = new Set(parked.map(({ reason: value }) => value ?? "unknown_error"));
+        const reason = reasons.size === 1 ? [...reasons][0]! : "mixed";
+        try { options.onSafetyFailure({ endpointId, keys, reason }); }
+        catch { /* An isolation callback must not change recovery. */ }
       }
       if (batch.failures.some(({ disposition }) => disposition === "endpoint")) markEndpointWaiting(endpointId);
       if (!isCurrent()) return pendingWake();
@@ -2134,9 +2182,10 @@ export function createManagedSessionRecoveryOwner(options: {
       try { result = await options.endpoints.withReadyWorkLease(endpointId, recover); }
       catch (error) {
         if (!stopped && endpointEpoch(endpointId) === epoch) {
+          const parked = targets.map(([key]) => key);
           for (const stage of ["managed", "shared"] as const) {
             const keys = targets.filter(([, target]) => target.stage === stage).map(([key]) => key);
-            if (keys.length > 0) applyFailure(keys, error, stage);
+            if (keys.length > 0) applyFailure(keys, error, stage, false, parked);
           }
         }
         result = {
@@ -3439,8 +3488,9 @@ export async function buildProductionApp(
           }),
           wakeShared: wakeRestoredEndpoint,
           onRecovered: (endpointId) => runtimeRestartRecovery.endpointReady(endpointId),
-          onSafetyFailure: () => reportOperationalSafely(report, {
-            level: "warn", code: "background_task_failed", component: "managed_session_recovery_isolated",
+          onSafetyFailure: ({ endpointId, keys, reason }) => reportOperationalSafely(report, {
+            level: "warn", code: "managed_session_parked", endpoint: endpointId, reason,
+            sessions: keys.length,
           }),
           onError: () => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "managed_session_recovery",
@@ -5615,7 +5665,7 @@ export async function buildProductionApp(
     const exactKeys = options.keys ? new Set(options.keys) : undefined;
     const restoredKeys: ManagedRetryKey[] = [];
     const settledKeys: ManagedRetryKey[] = [];
-    const failures: Array<{ key: ManagedRetryKey; disposition: ManagedRecoveryDisposition }> = [];
+    const failures: Array<{ key: ManagedRetryKey; disposition: ManagedRecoveryDisposition; reason?: string }> = [];
     const seenKeys = new Set<ManagedRetryKey>();
     for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
       if (options.isCurrent && !options.isCurrent()) break;
@@ -5661,11 +5711,12 @@ export async function buildProductionApp(
           error,
           Boolean(options.lease && isManagedRecoveryLeaseCurrent(session.endpoint, options.lease)),
         );
-        failures.push({ key, disposition });
+        const reason = parkReasonToken(error);
+        failures.push({ key, disposition, reason });
         if (!exactKeys) managedRecoveryOwner?.recordFailure(key, disposition);
         if (current?.mapping_id === session.mapping_id && current.endpoint === session.endpoint
           && current.thread_id === session.thread_id && current.lifecycle_state === "managed"
-          && disposition === "permanent") warnSessionUnavailable(nickname, session.endpoint, session.thread_id);
+          && disposition === "permanent") warnSessionUnavailable(nickname, session.endpoint, session.thread_id, reason);
       }
     }
     if (exactKeys) for (const key of exactKeys) if (!seenKeys.has(key)) settledKeys.push(key);
@@ -5877,12 +5928,15 @@ export async function buildProductionApp(
     });
   }
 
-  function warnSessionUnavailable(nickname: string, endpointId: string, threadId: string): void {
+  // The one signal that reaches the owner rather than stderr. It named the session but never what
+  // went wrong, so every park read identically no matter which error caused it.
+  function warnSessionUnavailable(nickname: string, endpointId: string, threadId: string, reason?: string): void {
     deliveries.prepare({
       id: `session-unavailable:${endpointId}:${threadId}:${endpointRecoveryIncidents.latestSequence}`,
       kind: "worker_warning",
       binding: currentOwnerBinding(),
-      body: `[${nickname}] unavailable; its registered thread and project directory require verification`,
+      body: `[${nickname}] unavailable; its registered thread and project directory require verification`
+        + (reason ? ` (${reason})` : ""),
       mandatory: true,
     });
   }
