@@ -456,6 +456,34 @@ test("the exact production MCP map succeeds for every local and remote manager a
       WHERE endpoint_id = ? AND thread_id = ? AND mapping_id = ?`)
       .get(fixture.endpoint, session.thread_id, session.mapping_id) as { goal_controlled: number };
     assert.equal(goalMarker.goal_controlled, 0, `${fixture.endpoint} restart retained a stale goal marker`);
+    // The reconcile branch for recover_endpoint has no exported seam, but recovery drives a full
+    // reconciliation pass inside this very call. Inject an unresolved row from an attempt that
+    // holds no tools and assert the pass retires it: without the branch the chain matches nothing,
+    // neither succeed nor fail runs, and the row stays uncertain forever.
+    const strandedContext = `acceptance-recover:${fixture.endpoint}`;
+    operations.createSourceContext({
+      id: strandedContext, kind: "slack", sourceId: `recover-${fixture.endpoint}`,
+      rawText: "/recover", attachmentIds: [], binding: adapter.primaryBinding,
+    });
+    const stranded = operations.prepare({
+      contextId: strandedContext, attemptId: `${strandedContext}:attempt`,
+      callId: "recover", kind: "recover_endpoint", args: { endpoint: fixture.endpoint },
+    });
+    operations.markDispatched(stranded.id);
+    operations.fail(stranded.id, { message: "endpoint recovery was interrupted" }, true);
+    assert.equal(operations.listRecoverable().some(({ id }) => id === stranded.id), true,
+      `${fixture.endpoint} stranded recovery was not left unresolved, so the assertion below is vacuous`);
+
+    // Recovery that stops nothing must still leave the managed thread idle, exactly as the restart
+    // above does, and must report that per session rather than report that the call returned.
+    const recoverResult = await call("recover_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
+    assert.equal(operations.get(stranded.id)?.state, "failed",
+      `${fixture.endpoint} recovery reconciliation left a recover_endpoint row unresolved`);
+    assert.equal(recoverResult.state, "recovered", `${fixture.endpoint} recover_endpoint did not reach the endpoint`);
+    assert.equal(recoverResult.sessions[fixture.nickname]?.native_status, "idle",
+      `${fixture.endpoint} recover_endpoint did not report an idle managed thread`);
+    const afterRecover = (await registryDocument(config.sessionRegistryPath)).sessions[fixture.nickname];
+    assert.deepEqual(afterRecover, beforeRestart, `${fixture.endpoint} recover changed the mapping`);
     await call("disconnect_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
     await call("restart_endpoint", { endpoint: fixture.endpoint }, fixture.endpoint);
     const recovered = await call("get_session_status", { nickname: fixture.nickname }, fixture.endpoint);

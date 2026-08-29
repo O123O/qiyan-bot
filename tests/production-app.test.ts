@@ -656,6 +656,11 @@ test("recoverable operation targets are exhaustive and fail closed", () => {
   for (const kind of ["unadopt_session", "archive_session"]) {
     assert.deepEqual(target(kind, { nickname: "worker-a" }, { endpoint: "endpoint-b" }), { policy: "local" }, kind);
   }
+  // recover_endpoint stops nothing, so it is not an endpoint_lifecycle operation and is not
+  // fenced by one. It must still be classified: the default is "unknown", which recovery maps to
+  // "sleep", so the tool meant to unwedge a stuck endpoint would itself leave an unresolved row.
+  assert.deepEqual(target("recover_endpoint", { endpoint: "endpoint-a" }), { policy: "local" },
+    "recover_endpoint retires locally rather than sleeping forever");
   for (const kind of ["disconnect_endpoint", "restart_endpoint"]) {
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-a" }, kind);
     assert.deepEqual(target(kind, { endpoint: "endpoint-a" }, { endpoint: "endpoint-b" }), { policy: "endpoint_lifecycle", endpointId: "endpoint-b" }, `${kind} checkpoint`);
@@ -722,6 +727,31 @@ test("a proven no-dispatch create recovery terminalizes without an endpoint leas
 
   assert.equal(endpointCalls, 0);
   assert.equal(store.get(operation.id)?.state, "failed");
+});
+
+// The tool exists to break a wedge, so it must not be able to create one. Classifying it
+// ready_endpoint would have: an unresolved ready_endpoint row is "earlier" for
+// settleEarlierEndpointOperations, and subsumedByLifecycle refuses to supersede a non-lifecycle
+// kind, so one failed recovery would block every later restart and disconnect on that endpoint.
+test("an unresolved recover_endpoint does not fence a later endpoint restart", () => {
+  const store = new OperationStore(createTestDatabase());
+  store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/recover", attachmentIds: [] });
+  const recovery = store.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "recover",
+    kind: "recover_endpoint", args: { endpoint: "devbox" },
+  });
+  store.markDispatched(recovery.id);
+  store.fail(recovery.id, { message: "endpoint recovery failed" }, true);
+  assert.equal(store.listRecoverable().some(({ id }) => id === recovery.id), true,
+    "the failed recovery is genuinely unresolved, so the fencing question is real");
+
+  const restart = store.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "restart",
+    kind: "restart_endpoint", args: { endpoint: "devbox" },
+  });
+  assert.equal(hasEarlierEndpointOperation(store.listRecoverable(), restart.sequence, "devbox", {
+    defaultProjectEndpointId: "local", session: () => undefined,
+  }), false, "a stuck recovery must not block the restart that could still repair the endpoint");
 });
 
 test("adoption recovery resolves the checkpointed registry identity before endpoint access", async () => {
