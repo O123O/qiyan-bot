@@ -1,7 +1,7 @@
 # Fix plan: endpoints that stay down
 
-Status: step 1 implemented (this commit). Steps 2 and 3 are proposals; no
-behavioural code has changed.
+Status: step 1 implemented, plus step 2a (`recover_endpoint`). Steps 2 and 3
+remain proposals.
 
 ## What happens today
 
@@ -111,6 +111,7 @@ into permanent 1 Hz load on a remote host. Not now.
 | 1 | **Say why a session parked.** *Done in this commit.* `onSafetyFailure` discarded the `error` argument and its event carried no endpoint, so a park rendered as `background_task_failed` on stderr. The reason now travels with the disposition, and the event names the endpoint, the reason, and how many sessions the failure parked. *Corrected during review:* a durable per-session notice already existed -- `warnSessionUnavailable` fires on exactly this condition, keyed per session per incident -- so step 1 added the missing reason to it rather than a second notice. | Zero behavioural risk, existing machinery, and it produces the per-cause data that settles everything below |
 | 2 | **Narrow option A**, in one function (`requireManagedThreadsIdle`, `manager.ts:641-668`): refuse **only** when a thread is provably active at the current generation. Every other shape proceeds, and the result reports that idleness was not proven. | Fixes the `adopting`-session and down-endpoint deadlocks, which have no other repair. Does NOT fix the writer-lock case |
 | 3 | **Deferred**: bounded retry (B), and only after `schedule` has a cap and backoff. | Right direction, wrong order |
+| 2a | **`recover_endpoint`** *(done, shipped ahead of step 2)*. A manager tool that re-enters recovery without stopping the runtime. | Discovered while step 2 was still unbuilt: the guard was never the only problem. Only the destructive verbs were reachable, so every stuck session became "restart the service" — including for causes a restart cannot reach. This needs no idle proof because it stops nothing, so it is safe by construction rather than by narrowing a safety check. It does not replace step 2: a thread that cannot prove idle still wedges `restart_endpoint`/`disconnect_endpoint`. |
 
 **Where the per-cause data actually comes from.** The stderr event is
 deduplicated to one report per endpoint per episode, so a batch that parks

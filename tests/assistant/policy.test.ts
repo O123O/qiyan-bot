@@ -7,7 +7,7 @@ import { SessionDashboardDocumentSchema } from "../../src/assistant/dashboard-sc
 
 const policyPath = fileURLToPath(new URL("../../assets/assistant/AGENTS.md", import.meta.url));
 const catalog = [
-  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session", "disconnect_endpoint", "restart_endpoint"]],
+  ["Session discovery and lifecycle", ["list_managed_sessions", "discover_sessions", "get_session_status", "create_session", "adopt_session", "rename_session", "unadopt_session", "archive_session", "recover_endpoint", "disconnect_endpoint", "restart_endpoint"]],
   ["Work and results", ["send_to_session", "read_worker_message", "inspect_worker_conversation", "collect_messages", "interrupt_session", "compact_session"]],
   ["Model, goal, and management memory", ["list_models", "set_session_model", "set_reasoning_effort", "get_goal", "set_goal", "pause_goal", "resume_goal", "cancel_goal", "update_session_notes"]],
   ["User output and attachments", ["send_chat_message", "prepare_chat_attachment", "send_chat_attachment"]],
@@ -117,7 +117,17 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   // fact a Claude worker cannot be supervised without: its goal and background work are
   // native and unobservable, so the absence of both is not evidence of an idle or finished
   // worker. Paid for by consolidating it into a single line; the doc stays concise.
-  assert.ok(Buffer.byteLength(policy, "utf8") < 8_100, "assistant policy exceeded the concise prompt budget");
+  //
+  // Raised to 8_500 for recover_endpoint. Only the destructive verbs were reachable before, so a
+  // stuck session was repeatedly answered with a restart -- which interrupts live work, is
+  // refused while any thread is unprovable, and cannot clear a stale remote writer lock anyway.
+  // Naming the tool in the catalog is not enough: that alone leaves restart the obvious move, so
+  // the line that ranks them against each other is the part that changes behaviour. Raised again
+  // to 8_700 for what the tool does NOT do -- it cannot repair a session already reporting error,
+  // and no endpoint tool clears a stale remote writer lock. Those two clauses are the expensive
+  // half of the line and the reason it works: a tool ranked first without its limits just moves
+  // the futile retry from one verb to another.
+  assert.ok(Buffer.byteLength(policy, "utf8") < 8_700, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 3, sessions: {} });

@@ -732,6 +732,17 @@ export function recoverableOperationTarget(
       const endpointId = stringField(saved, "endpoint") ?? current?.endpoint;
       return endpointId ? { policy: "ready_endpoint", endpointId } : { policy: "unknown" };
     }
+    // Retried recovery is idempotent and leaves nothing half-done externally: startup resumes
+    // every managed endpoint anyway, so re-dispatching this would duplicate work the recovery
+    // path already does. Without a case here it falls to "unknown" -> "sleep", and the one tool
+    // whose purpose is to unwedge things would leave a row that never resolves.
+    //
+    // "local" rather than "ready_endpoint" is load-bearing: an unresolved ready_endpoint row is
+    // "earlier" for settleEarlierEndpointOperations, and subsumedByLifecycle refuses to supersede
+    // a non-lifecycle kind -- so one uncertain recovery would fence every later restart and
+    // disconnect on that endpoint. That is precisely the wedge this tool exists to break.
+    case "recover_endpoint":
+      return { policy: "local" };
     case "disconnect_endpoint":
       return {
         policy: "endpoint_lifecycle",
@@ -4160,6 +4171,47 @@ export async function buildProductionApp(
         await endpointManager.disconnect(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
         return { endpoint: endpointId, state: "disconnected" };
       },
+      // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
+      // is the same path an automatic reconnect takes, and it is deliberately NOT an endpoint
+      // lifecycle operation: the idle proof exists to protect an in-flight turn from a runtime
+      // being stopped, and nothing here stops one. Only the destructive verbs were reachable
+      // before, so a session parked behind a stale remote lock could only be answered with a
+      // restart -- which interrupts live work and does not clear the lock.
+      recover_endpoint: async (args) => {
+        const endpointId = projectEndpoint(args.endpoint);
+        let state: "recovered" | "unreachable" | "superseded" = "recovered";
+        try {
+          await recoverProjectEndpoint(endpointId);
+        } catch (error) {
+          // An unreachable endpoint is the most likely reason to call this, so it has to be an
+          // answer rather than OPERATION_UNCERTAIN. Nothing here is left half-done and retrying
+          // is idempotent, so reporting uncertainty would strand a row describing a call that
+          // provably finished -- and tell the caller to wait rather than to look at the host.
+          if (!(error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE")) throw error;
+          // The same code covers conditions that mean the opposite of unreachable: a generation
+          // that moved because the endpoint reconnected mid-recovery, and a gate refusing while
+          // something else drains or disconnects it. Reporting those as unreachable sends the
+          // caller to the host when the answer is "call it again" or "you disconnected it" --
+          // the same misdirection this catch exists to remove, one step further along.
+          state = isRecoveryEndpointReady(endpointId) ? "superseded" : "unreachable";
+        }
+        // Reads the view recovery just refreshed instead of a live status per session: status()
+        // goes through ensureReady and a goal read, so on an endpoint that dropped again it pays
+        // a connect timeout per worker. Reports the resulting state rather than that the call
+        // returned, because recovery can complete with a session still unavailable.
+        const recovered: Record<string, unknown> = {};
+        for (const [nickname, session] of Object.entries(registry.managedSnapshot().sessions)) {
+          if (session.endpoint !== endpointId) continue;
+          const view = nativeSessions.view({
+            endpointId, threadId: session.thread_id, mappingId: session.mapping_id,
+          });
+          recovered[nickname] = {
+            native_status: view?.status ?? null,
+            availability: view?.availability ?? null,
+          };
+        }
+        return { endpoint: endpointId, state, sessions: recovered };
+      },
       restart_endpoint: async (args, context) => {
         if (args.endpoint === assistantEndpoint.id) {
           const runtimeIdentity = await assistantEndpoint.runtimeIdentity();
@@ -5438,6 +5490,25 @@ export async function buildProductionApp(
             else setGoalControlled(args.nickname, false);
             observeGoal(args.nickname, current);
             if (operation.kind === "cancel_goal") dashboardStore.markDirty();
+          });
+        } else if (operation.kind === "recover_endpoint") {
+          // Retrying recovery leaves nothing half-done externally, and startup resumes every
+          // managed endpoint anyway -- re-dispatching would only duplicate that. Without this
+          // branch the classification alone is inert: the chain would match nothing, neither
+          // succeed nor fail would be called, and the row would stay uncertain forever. The one
+          // verb built to unwedge an endpoint would manufacture the rows it exists to prevent.
+          //
+          // "did not complete" rather than "no effect": a recovery that resumed two of five
+          // sessions before the process died did have effects. The cost of retiring it failed is
+          // that runtime effect receipts exclude failed rows, so those resumes are reported as
+          // nothing happened -- benign, because resuming is idempotent and list_managed_sessions
+          // shows the truth. Reconciliation-flavoured so the dispatch error that stopped the
+          // recovery survives beside it; that cause is the whole diagnostic here.
+          //
+          // Retires its own row only because operationRecoveryAction returns "wait_for_tool"
+          // while this very call still holds an active tool. This pass runs inside the tool.
+          operations.failAndUnbindWithReconciliation(operation.id, {
+            message: "endpoint recovery did not complete",
           });
         } else if (operation.kind === "interrupt_session") {
           const turnId = interruptRecoveryTurnId(args, operation.receipt);

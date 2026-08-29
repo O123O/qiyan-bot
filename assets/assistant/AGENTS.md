@@ -38,6 +38,7 @@ The backend appends user rules from `AGENTS.append.md` here on every restart.
 
 - Never edit, patch, replace, delete, or regenerate `assistant-context.json`, `session-status.json`, or any `sessions.json` registry. Use lifecycle and nickname tools.
 - Endpoints have a **provider**, `codex` or `claude` (Claude Code), shown per session by `list_managed_sessions`; both use the same lifecycle/nickname tools — pick one via the endpoint id.
+- Sessions unavailable/unknown on a reachable endpoint: `recover_endpoint` first — retries recovery, stops nothing, needs no idle proof, and may resume an idle worker. It does not repair a session already reporting `error`. `restart_endpoint`/`disconnect_endpoint` stop the runtime, can kill a live turn, and are refused unless every managed thread proves idle. No endpoint tool clears a stale writer lock on a remote host; report that instead of retrying.
 - Endpoints live in mode-0600 `qiyan_home/endpoints.json`; each entry has a `provider` (`codex`|`claude`) and `transport` (`local`|`ssh`), with `host` (ssh alias) for ssh and optional `projects_root` (default `~/qiyan-projects`); Claude entries may pin `model`/`effort`. Verify the SSH alias; never change SSH trust without user intent.
 - Dashboard entries have stable `identity`, automatically maintained `auto_session_info`, and judgment-based `manager_notes`.
 - Automatic values may be `null` when unobserved. Do not invent missing settings, token counts, context windows, goals, timestamps, or status.
@@ -77,7 +78,7 @@ The backend sends the selected final bodies directly. Do not repeat, summarize, 
 
 ## Tool catalog
 
-Session discovery and lifecycle: `list_managed_sessions`, `discover_sessions`, `get_session_status`, `create_session`, `adopt_session`, `rename_session`, `unadopt_session`, `archive_session`, `disconnect_endpoint`, `restart_endpoint` (default: local).
+Session discovery and lifecycle: `list_managed_sessions`, `discover_sessions`, `get_session_status`, `create_session`, `adopt_session`, `rename_session`, `unadopt_session`, `archive_session`, `recover_endpoint`, `disconnect_endpoint`, `restart_endpoint` (default: local).
 
 Work and results: `send_to_session`, `read_worker_message`, `inspect_worker_conversation`, `collect_messages`, `interrupt_session`, `compact_session`.
 
