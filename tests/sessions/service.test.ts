@@ -293,9 +293,32 @@ test("routine native refresh preserves an idle event snapshot without probing hi
   })?.status, "idle");
 });
 
-test("a fresh native error state cannot admit a new turn", async () => {
+// Inverted deliberately, against a measurement. codex 0.150.1 accepts turn/start on a thread it
+// has marked systemError and the new turn clears the status; a warm thread/resume does not. This
+// test asserted the opposite, and that assumption is what left a worker unreachable on 2026-08-31
+// after one upstream "model is at capacity": send, unadopt, and the restart idle proof all
+// refused, so nothing short of restarting the endpoint -- itself refused while any thread was
+// unprovable -- could repair it. An error view carries activeTurnId === null by construction, so
+// there is provably no turn to collide with.
+test("an errored session with no turn running admits the turn that repairs it", async () => {
   const value = await fixture();
   value.setNative("error");
+
+  const result = await value.service.send("payments", "try again");
+  assert.equal(result.mode, "start");
+  assert.equal(value.endpoint.calls.some((call) => call.method === "turn/start"), true,
+    "the turn that clears the error state has to actually reach the endpoint");
+  // Dispatching is not the repair; leaving the error state is. A regression could keep sending
+  // and still leave the worker unusable, which is what this asserts against.
+  assert.equal(value.native.view({ endpointId: "local", threadId: "thread", mappingId })?.status, "active",
+    "the session must leave the error state, not merely accept the turn");
+});
+
+// The fail-closed case the inversion above must not take with it: a state we could not establish
+// is not proof of an idle session, and still refuses.
+test("an unknown native state still refuses a new turn", async () => {
+  const value = await fixture();
+  value.setNative("unknown");
 
   await assert.rejects(value.service.send("payments", "must not start"), (error: unknown) => (
     error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"

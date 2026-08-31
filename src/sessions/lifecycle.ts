@@ -655,7 +655,12 @@ export class SessionLifecycle {
       throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session state is unavailable`);
     }
     if (current.status === "active") throw new AppError("SESSION_BUSY", `${nickname} has an active turn`);
-    if (current.status !== "idle") {
+    // Releasing a session needs one fact: that no turn is running. An error view carries that by
+    // construction -- thread/status/changed nulls activeTurnId for every non-active status -- so
+    // refusing here withheld the escape hatch precisely when it was the only one left. #45 opened
+    // this for an unreachable endpoint; a reachable endpoint with one failed turn was still
+    // refused, which is the shape that stranded a worker on 2026-08-31.
+    if (current.status !== "idle" && !(current.status === "error" && current.activeTurnId === null)) {
       throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
     }
   }

@@ -123,10 +123,11 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   // refused while any thread is unprovable, and cannot clear a stale remote writer lock anyway.
   // Naming the tool in the catalog is not enough: that alone leaves restart the obvious move, so
   // the line that ranks them against each other is the part that changes behaviour. Raised again
-  // to 8_700 for what the tool does NOT do -- it cannot repair a session already reporting error,
-  // and no endpoint tool clears a stale remote writer lock. Those two clauses are the expensive
-  // half of the line and the reason it works: a tool ranked first without its limits just moves
-  // the futile retry from one verb to another.
+  // to 8_700 for the limits and the alternative: no endpoint tool clears a stale remote writer
+  // lock, and a session reporting error is repaired by sending to it, not by any endpoint verb.
+  // Naming a limit without naming what does work is what produced the 2026-08-31 dead end -- the
+  // assistant read "recovery will not fix it", reached for restart_endpoint, and was refused,
+  // while one send_to_session would have cleared it. Both halves have to be here.
   assert.ok(Buffer.byteLength(policy, "utf8") < 8_700, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));

@@ -57,7 +57,17 @@ export class SessionService {
   } = {}): Promise<{ mode: "start" | "steer"; turnId: string; terminal?: boolean; appliedSettings?: { model?: string; effort?: string } }> {
     return this.runVerifiedExecution(nickname, async (session, cwd, lease) => {
       const current = await this.currentNative(session, lease);
-      if (current.status === "error") {
+      // "error" is the app-server's verdict on the LAST turn, not on the session. Measured against
+      // codex 0.150.1: a warm thread/resume leaves it systemError, but turn/start is accepted and
+      // flips the thread back to active -- the next turn is what clears it. And an error view
+      // provably has no turn running: thread/status/changed nulls activeTurnId for every
+      // non-active status. So refusing here protected nothing and was the whole outage: one
+      // upstream "model is at capacity" left a worker unreachable until its endpoint was
+      // restarted, which is itself refused while any managed thread is unprovable.
+      //
+      // A session that is genuinely broken still fails -- on the dispatch, with the provider's
+      // own reason, which is a better answer than a blanket refusal that names nothing.
+      if (current.status === "error" && current.activeTurnId !== null) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
       }
       const activeTurn = current.status === "active" ? current.activeTurnId ?? undefined : undefined;
@@ -148,7 +158,7 @@ export class SessionService {
         await this.repairNative(session, lease);
       }
       return { mode: "start" as const, turnId: response.turn.id, terminal, appliedSettings: settings };
-    });
+    }, true);
   }
 
   // Returns the interrupted turn's id, or — when the session was busy with work that belongs
@@ -474,12 +484,19 @@ export class SessionService {
     }
   }
 
-  private runVerifiedExecution<T>(nickname: string, mutate: (session: RegistrySession, cwd: string, lease?: EndpointWorkLease) => Promise<T>): Promise<T> {
+  private runVerifiedExecution<T>(
+    nickname: string,
+    mutate: (session: RegistrySession, cwd: string, lease?: EndpointWorkLease) => Promise<T>,
+    // Opt-in per operation, because only starting a turn is measured to clear the error state.
+    // compact/setGoal/resumeGoal keep failing closed until they are measured the same way.
+    admitErroredIdle = false,
+  ): Promise<T> {
     const expected = this.managed(nickname);
     return this.withMutationLease(expected.endpoint, (lease) => this.gate.run(expected.endpoint, expected.thread_id, async () => {
       const session = this.assertExactManaged(nickname, expected.mapping_id);
       const native = await this.currentNative(session, lease);
-      this.assertMutationNativeState(nickname, native.status);
+      this.assertMutationNativeState(nickname, native.status,
+        { erroredIdle: admitErroredIdle, activeTurnId: native.activeTurnId });
       const project = await this.prepareExisting(session.endpoint, session.project_dir, lease);
       await this.assertDispatchable(session.endpoint, project, lease);
       if (project.path !== session.project_dir) throw new AppError("CWD_MISMATCH", "managed thread cwd changed");
@@ -488,13 +505,28 @@ export class SessionService {
     }));
   }
 
-  private assertMutationNativeState(nickname: string, status: unknown): void {
+  // Rejects a session that is running something we cannot see. An errored session is not that:
+  // the status is the app-server's verdict on the LAST turn, and thread/status/changed nulls
+  // activeTurnId for every non-active status, so no turn is in flight. Measured against codex
+  // 0.150.1: a warm thread/resume leaves the thread systemError, but turn/start is accepted and
+  // clears it -- the next turn is the repair. Refusing it here is what turned one upstream
+  // "model is at capacity" into a dead worker.
+  //
+  // The activeTurnId check is belt-and-braces today: the invariant above means an error status
+  // always carries a null turn id. It is kept so that if a status ever preserves one, this fails
+  // closed rather than silently dispatching into a live turn.
+  private assertMutationNativeState(
+    nickname: string,
+    status: unknown,
+    admit?: { erroredIdle: boolean; activeTurnId: string | null },
+  ): void {
     const type = typeof status === "string"
       ? status
       : status && typeof status === "object" && !Array.isArray(status)
         ? (status as { type?: unknown }).type
         : undefined;
-    if (type === "error" || type === "systemError") {
+    if ((type === "error" || type === "systemError")
+      && !(admit?.erroredIdle === true && admit.activeTurnId === null)) {
       throw new AppError("ENDPOINT_UNAVAILABLE", `${nickname} native session is in an error state`);
     }
   }
