@@ -89,6 +89,7 @@ import { backgroundStopReport, SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
 import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
+import { TransientTurnRetry, TRANSIENT_TURN_RETRY_MESSAGE, transientTurnErrorCode } from "./sessions/transient-turn-retry.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { inReadTransaction, markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
@@ -2520,6 +2521,7 @@ export async function buildProductionApp(
   let operationReconciler: OperationReconciliationLoop | undefined;
   let managedRecoveryOwner: ManagedSessionRecoveryOwner | undefined;
   let runtimeRestartRecovery!: RuntimeRestartRecovery;
+  let transientTurnRetry!: TransientTurnRetry;
   let recoveryOwnersStop: Promise<void> | undefined;
   const report = options.onOperationalEvent ?? (() => undefined);
   const eventWakeBoundary = createDurableEventWakeBoundary({
@@ -3448,6 +3450,38 @@ export async function buildProductionApp(
             ? assistantCurrentSettings
             : dashboardStore.facts({ endpointId, threadId }).currentSettings,
         );
+        // An upstream failure that produced nothing is worth trying again; the worker used to be
+        // finished for the day instead. Bounded, because a provider at capacity is not helped by
+        // being asked faster, and an unbounded retry hides a real outage behind a busy-looking
+        // worker.
+        transientTurnRetry = new TransientTurnRetry({
+          retry: ({ nickname, session }) => scheduling!.enqueueRuntimeRecovery({
+            nickname,
+            endpointId: session.endpoint,
+            threadId: session.thread_id,
+            mappingId: session.mapping_id,
+          }, TRANSIENT_TURN_RETRY_MESSAGE),
+          onScheduled: ({ session }, code, attempt) => reportOperationalSafely(report, {
+            level: "warn", code: "turn_retry_scheduled", endpoint: session.endpoint,
+            reason: code.toLowerCase(), consecutiveFailures: attempt,
+          }),
+          onExhausted: ({ nickname, session }, code, attempts) => {
+            reportOperationalSafely(report, {
+              level: "warn", code: "turn_retry_exhausted", endpoint: session.endpoint,
+              reason: code.toLowerCase(), consecutiveFailures: attempts,
+            });
+            // The one thing the owner has to be told: nothing will try again.
+            deliveries.prepare({
+              id: `turn-retry-exhausted:${session.endpoint}:${session.thread_id}:${endpointRecoveryIncidents.latestSequence}`,
+              kind: "worker_warning",
+              binding: currentOwnerBinding(),
+              body: `[${nickname}] stopped retrying after ${attempts} attempts; its turns keep failing upstream`
+                + ` (${code}). Send to it again when the provider recovers.`,
+              mandatory: true,
+            });
+          },
+          onRetryFailed: () => recordBackgroundFailure("transient turn retry"),
+        });
         runtimeRestartRecovery = new RuntimeRestartRecovery({
           listManaged: (endpointId) => Object.entries(registry.managedSnapshot().sessions)
             .filter(([, session]) => session.endpoint === endpointId)
@@ -3721,6 +3755,9 @@ export async function buildProductionApp(
       },
       stop: async () => {
         stopping = true;
+        // Before the awaited scheduler stop, not after: a timer firing during that await would
+        // enqueue into a scheduler that is already shutting down.
+        transientTurnRetry?.stop();
         if (scheduling) await scheduling.stop();
         assistantToolReadiness.stop();
         schedulerAccepting = false;
@@ -4743,6 +4780,16 @@ export async function buildProductionApp(
           requestWorkerNativeRefresh,
         );
         offerWorkerNotification(webWorkerStream, target.id, method, params);
+        if (mapping && method === "turn/completed") {
+          const turn = (params as { turn?: { error?: unknown } })?.turn;
+          // A turn that ran proves the provider is answering, so the budget resets. Only a failure
+          // classified transient schedules anything; a failure the provider would reject
+          // identically next time is left alone.
+          if (transientTurnErrorCode(turn?.error) === undefined) transientTurnRetry.turnObserved(mapping.session);
+          else transientTurnRetry.turnFailed({ nickname: mapping.nickname, session: mapping.session }, turn?.error);
+        }
+        // Anyone starting a turn supersedes a retry we have not delivered yet.
+        if (mapping && method === "turn/started") transientTurnRetry.cancel(mapping.session);
         if (method === "thread/status/changed" && (params as any)?.status?.type === "idle"
           && threadId && before?.availability === "ready" && before.status === "active" && before.activeTurnId) {
           runBackground(() => processWorkerTerminalNotification({

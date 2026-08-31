@@ -3,6 +3,11 @@ export type OperationalEventCode =
   // Managed sessions stopped being retried on this endpoint, with the reason they stopped. The
   // next reconnect re-enters them, so this is not a terminal state and may repeat.
   | "managed_session_parked"
+  // A Codex worker turn failed with a transient upstream error and is being retried, or has run
+  // out of retries. reason is the provider's error code lowercased (safeToken rejects capitals);
+  // consecutive_failures is the attempt number.
+  | "turn_retry_scheduled"
+  | "turn_retry_exhausted"
   | "owner_transcript_record_failed"
   // A created worker whose thread was not materialized is one reconcile away from being reaped.
   | "worker_thread_not_materialized"
