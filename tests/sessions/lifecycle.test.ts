@@ -1111,6 +1111,46 @@ test("unadopt is idle-only, unsubscribes without archive, and removes exactly on
   assert.equal(endpoint.calls.some((call) => call.method === "thread/archive" || call.method === "thread/delete"), false);
 });
 
+// Releasing a session needs one fact: no turn is running. An error view carries that by
+// construction, and #45 already opened this path for an unreachable endpoint -- but a REACHABLE
+// endpoint whose session had failed one turn was still refused, which is what left a worker with
+// no escape hatch at all on 2026-08-31. An active turn must still refuse.
+test("unadopt releases an errored session but still refuses an active one", async () => {
+  const { registry, endpoint, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+
+  setNative(session, "active", "active-turn");
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  assert.equal(required(registry).lifecycle_state, "managed", "an active turn is still protected");
+
+  endpoint.status = "idle";
+  setNative(session, "error");
+  endpoint.calls.length = 0;
+  await lifecycle.unadopt("payments");
+  assert.equal(registry.get("payments"), undefined, "the errored session was releasable");
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), true);
+});
+
+// requireCurrentNativeIdle has two callers, so relaxing it for unadopt relaxed archive too.
+// Stated and pinned rather than left as an unremarked consequence.
+test("archive also releases an errored session but still refuses an active one", async () => {
+  const { registry, endpoint, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+
+  setNative(session, "active", "active-turn");
+  await assert.rejects(lifecycle.archive("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "SESSION_BUSY");
+  assert.equal(required(registry).lifecycle_state, "managed");
+
+  endpoint.status = "idle";
+  setNative(session, "error");
+  await lifecycle.archive("payments");
+  assert.equal(registry.get("payments"), undefined, "an errored session can be archived");
+});
+
 test("unadopt accepts exact native absence from unsubscribe", async () => {
   for (const absence of ["notLoaded", "noRollout"] as const) {
     const { dir, registry, endpoint, lifecycle, setNative } = await fixture();
