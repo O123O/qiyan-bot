@@ -128,7 +128,11 @@ test("packaged assistant policy is concise and reserves examples for exact direc
   // Naming a limit without naming what does work is what produced the 2026-08-31 dead end -- the
   // assistant read "recovery will not fix it", reached for restart_endpoint, and was refused,
   // while one send_to_session would have cleared it. Both halves have to be here.
-  assert.ok(Buffer.byteLength(policy, "utf8") < 8_700, "assistant policy exceeded the concise prompt budget");
+  // Raised to 8_900 for the automatic retry. Without it the assistant sees a failed turn, reads
+  // the session as broken, and reaches for a repair -- during the six minutes the bot is already
+  // retrying. Telling it to wait is what stops an automatic recovery from being pre-empted by a
+  // manual one, which is the same reflex the ranking above exists to break.
+  assert.ok(Buffer.byteLength(policy, "utf8") < 8_900, "assistant policy exceeded the concise prompt budget");
 
   const examplePath = fileURLToPath(new URL("../../assets/assistant/session-status.example.json", import.meta.url));
   assert.deepEqual(SessionDashboardDocumentSchema.parse(JSON.parse(await readFile(examplePath, "utf8"))), { version: 3, sessions: {} });
