@@ -89,7 +89,7 @@ import { backgroundStopReport, SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
 import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
-import { TransientTurnRetry, TRANSIENT_TURN_RETRY_MESSAGE, transientTurnErrorCode } from "./sessions/transient-turn-retry.ts";
+import { TransientTurnRetry, TRANSIENT_TURN_RETRY_MESSAGE, turnRetryDecision } from "./sessions/transient-turn-retry.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { inReadTransaction, markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
@@ -3465,14 +3465,14 @@ export async function buildProductionApp(
             level: "warn", code: "turn_retry_scheduled", endpoint: session.endpoint,
             reason: code.toLowerCase(), consecutiveFailures: attempt,
           }),
-          onExhausted: ({ nickname, session }, code, attempts) => {
+          onExhausted: ({ nickname, session }, code, attempts, turnId) => {
             reportOperationalSafely(report, {
               level: "warn", code: "turn_retry_exhausted", endpoint: session.endpoint,
               reason: code.toLowerCase(), consecutiveFailures: attempts,
             });
             // The one thing the owner has to be told: nothing will try again.
             deliveries.prepare({
-              id: `turn-retry-exhausted:${session.endpoint}:${session.thread_id}:${endpointRecoveryIncidents.latestSequence}`,
+              id: `turn-retry-exhausted:${session.endpoint}:${session.thread_id}:${turnId ?? Date.now()}`,
               kind: "worker_warning",
               binding: currentOwnerBinding(),
               body: `[${nickname}] stopped retrying after ${attempts} attempts; its turns keep failing upstream`
@@ -4781,12 +4781,16 @@ export async function buildProductionApp(
         );
         offerWorkerNotification(webWorkerStream, target.id, method, params);
         if (mapping && method === "turn/completed") {
-          const turn = (params as { turn?: { error?: unknown } })?.turn;
-          // A turn that ran proves the provider is answering, so the budget resets. Only a failure
-          // classified transient schedules anything; a failure the provider would reject
-          // identically next time is left alone.
-          if (transientTurnErrorCode(turn?.error) === undefined) transientTurnRetry.turnObserved(mapping.session);
-          else transientTurnRetry.turnFailed({ nickname: mapping.nickname, session: mapping.session }, turn?.error);
+          const turn = (params as { turn?: { id?: unknown; error?: unknown } })?.turn;
+          const decision = turnRetryDecision(turn);
+          if (decision === "reset") transientTurnRetry.turnObserved(mapping.session);
+          else if (decision === "retry") {
+            transientTurnRetry.turnFailed(
+              { nickname: mapping.nickname, session: mapping.session },
+              turn?.error,
+              typeof turn?.id === "string" ? turn.id : undefined,
+            );
+          }
         }
         // Anyone starting a turn supersedes a retry we have not delivered yet.
         if (mapping && method === "turn/started") transientTurnRetry.cancel(mapping.session);
