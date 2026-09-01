@@ -72,7 +72,10 @@ async function syncRemoteAssetDigests() {
   }
   if (after === before) return;
   await writeFile(source, after);
-  console.log("build: refreshed remote asset digests in src/endpoints/ssh-runtime.ts");
+  // stderr, not stdout: `prepack` runs this build, and the release workflow reads the archive name
+  // from `npm pack --silent` stdout. A diagnostic printed there becomes part of the filename, `mv`
+  // fails, and the release publishes with no tarball -- silently, which is the worst part.
+  console.error("build: refreshed remote asset digests in src/endpoints/ssh-runtime.ts");
 }
 
 if (claudeHostOnly) {
