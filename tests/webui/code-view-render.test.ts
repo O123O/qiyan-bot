@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { STYLES } from "../../webui-client/src/styles.ts";
 import { splitHighlightedLines } from "../../webui-client/src/highlight-lines.ts";
+import { selectedSourceText } from "../../webui-client/src/code-selection.ts";
 
 // Rendered in a real browser, not resolved by hand. A hand-written specificity resolver stood
 // here first and was worse than nothing: it modelled neither inheritance, nor descendant
@@ -207,6 +208,61 @@ test("the file viewer renders correctly in a browser", { skip: chromium && execu
     assert.ok(fallback.hScroll > 1, "the viewer itself must own the horizontal scroll, not the inner code element");
     // 30 source lines must occupy 30 rows. Wrapping showed up as ~198% of that.
     assert.equal(fallback.rows, 30, `wrapped fallback: 30 lines rendered as ${fallback.rows} rows`);
+  } finally {
+    await browser.close();
+  }
+});
+
+
+// Copying is the one thing the rendered view cannot show you is broken: indentation that survives
+// on screen can still be absent from the clipboard, because what a browser serialises out of a CSS
+// grid with `display:contents` rows and a sticky gutter is engine-defined. The fix does not ask the
+// browser -- it rebuilds the text from the code cells -- and this drives the SHIPPED function in a
+// real engine rather than a reimplementation of it.
+test("copying the viewer yields the original source, not what the layout serialises", { skip: chromium && executablePath ? false : "no local chromium available" }, async () => {
+  const browser = await chromium!.launch({ executablePath: executablePath! });
+  try {
+    const view = await browser.newPage();
+    // Tabs, deep indentation and a blank line: everything a whitespace-collapsing copy destroys.
+    const source = "def solve(n):\n    total = 0\n\n    for i in range(n):\n\t\tdeep = 1\n    return total";
+    await view.setContent(modal(viewerMarkup(source, "python")));
+    const copied = await view.evaluate(({ fnSource, expected }: { fnSource: string; expected: string }) => {
+      const selectedSourceText = new Function(`return (${fnSource})`)() as
+        (container: Element, selection: Selection) => string | undefined;
+      const code = document.querySelector(".code-lines")!;
+      const selection = window.getSelection()!;
+      const whole = document.createRange();
+      whole.selectNodeContents(code);
+      selection.removeAllRanges();
+      selection.addRange(whole);
+      const all = selectedSourceText(code, selection);
+
+      // A part-line drag has to give exactly the characters under the cursor, since that is how a
+      // snippet is usually taken out of a file.
+      const cells = [...document.querySelectorAll(".code-text")];
+      const partial = document.createRange();
+      // End at the line element's own end, not at its last child: highlighting makes that child an
+      // element, whose length property is undefined, which silently truncates the range.
+      partial.setStart(cells[1]!.firstChild!, 4);
+      partial.setEnd(cells[1]!, cells[1]!.childNodes.length);
+      selection.removeAllRanges();
+      selection.addRange(partial);
+      const dragged = selectedSourceText(code, selection);
+
+      // A selection that reaches outside the viewer stays the browser's to serialise; rewriting it
+      // would corrupt copies of the surrounding page.
+      const outside = document.createRange();
+      outside.selectNodeContents(document.body);
+      selection.removeAllRanges();
+      selection.addRange(outside);
+      return { all, dragged, foreign: selectedSourceText(code, selection), expected };
+    }, { fnSource: selectedSourceText.toString(), expected: source });
+
+    assert.equal(copied.all, source, "a whole-file copy must reproduce the source exactly");
+    assert.ok(copied.all!.includes("\t\tdeep"), "tabs must survive the clipboard, not become spaces");
+    assert.ok(copied.all!.includes("\n\n"), "a blank line is part of the source");
+    assert.equal(copied.dragged, "total = 0", "a part-line drag copies exactly what was dragged");
+    assert.equal(copied.foreign, undefined, "a selection beyond the viewer is left to the browser");
   } finally {
     await browser.close();
   }

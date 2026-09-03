@@ -12,6 +12,7 @@ import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkdownRef } from "./filesystem-path";
 import { splitHighlightedLines } from "./highlight-lines";
+import { selectedSourceText } from "./code-selection";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
@@ -200,20 +201,33 @@ function CodeView({ text, title, lang: forced }: { text: string; title: string; 
     const highlighted = lang ? hljs.highlight(source, { language: lang, ignoreIllegals: true }).value : escapeHtml(source);
     return splitHighlightedLines(highlighted);
   }, [source, lang]);
+  const codeRef = useRef<HTMLElement | null>(null);
+  // What the browser copies out of this grid is its own business, and a clipboard that lost the
+  // indentation looks identical in the rendered view -- you only find out when you paste. So the
+  // copied text is rebuilt from the code cells, which hold the source verbatim.
+  const onCopy = useCallback((event: React.ClipboardEvent<HTMLElement>) => {
+    const container = codeRef.current;
+    const selection = window.getSelection();
+    if (!container || !selection) return;
+    const text = selectedSourceText(container, selection);
+    if (text === undefined) return;
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+  }, []);
   // Numbering a huge file costs ~7 elements per line, built synchronously in the click that
   // opened it. Past this the gutter is not worth freezing the tab for, so fall back to the
   // single block, which is what this rendered before line numbers existed.
   if (lines.length > MAX_NUMBERED_LINES) {
     return (
-      <pre className="code-view">
-        <code className="hljs" dangerouslySetInnerHTML={{ __html: lines.join("\n") }} />
+      <pre className="code-view" onCopy={onCopy}>
+        <code ref={codeRef} className="hljs" dangerouslySetInnerHTML={{ __html: lines.join("\n") }} />
       </pre>
     );
   }
   const width = `${String(lines.length).length}ch`;
   return (
-    <pre className="code-view">
-      <code className="hljs code-lines" style={{ ["--gutter" as string]: width }}>
+    <pre className="code-view" onCopy={onCopy}>
+      <code ref={codeRef} className="hljs code-lines" style={{ ["--gutter" as string]: width }}>
         {lines.map((line, index) => (
           <span className="code-line" key={index}>
             {/* aria-hidden and unselectable: a number copied into the middle of pasted code is
