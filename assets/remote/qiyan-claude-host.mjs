@@ -630,7 +630,8 @@ var CLAUDE_PERMISSION_MODES = [
   "acceptEdits",
   "bypassPermissions",
   "plan",
-  "dontAsk"
+  "dontAsk",
+  "auto"
 ];
 function settingsCandidates(cwd, home) {
   return [

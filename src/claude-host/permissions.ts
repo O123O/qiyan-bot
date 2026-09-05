@@ -13,8 +13,16 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// Must track the SDK's own PermissionMode union. A mode missing here is not rejected loudly: the
+// resolver skips it and falls through to `default`, where every tool is denied -- so a user who
+// configured a perfectly valid mode sees a worker that cannot read, run, or reach the web, and
+// nothing names the cause. "auto" was missing for exactly that reason on 2026-09-05: the CLI and
+// SDK both accepted it, this list did not, and a worker ran denied under a correct config.
+//
+// "auto" is escalating in the same sense as bypassPermissions and acceptEdits, and like them needs
+// no in-process opt-in -- that flag is specific to bypassPermissions.
 export const CLAUDE_PERMISSION_MODES = [
-  "default", "acceptEdits", "bypassPermissions", "plan", "dontAsk",
+  "default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto",
 ] as const;
 export type ClaudePermissionMode = typeof CLAUDE_PERMISSION_MODES[number];
 

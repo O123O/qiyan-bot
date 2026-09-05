@@ -78,6 +78,22 @@ test("a malformed settings file neither crashes nor escalates", async () => {
   assert.equal(resolved.permissionMode, "acceptEdits", "falls through to the next layer");
 });
 
+// "auto" is a real mode in both the CLI and the SDK, and the harness's own auto-approve mode is
+// what a user reaches for when they want an unattended worker without going all the way to
+// bypass. It was absent from the allowlist, so a correct config fell through to `default` and the
+// worker had every tool denied -- including the web -- while nothing said why.
+test("the user's auto mode is forwarded, needs no opt-in, and produces no warning", async () => {
+  const { cwd, home } = await workspace();
+  await writeFile(join(home, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { defaultMode: "auto" } }));
+
+  const resolved = await resolveClaudePermissions(cwd, { home });
+  assert.equal(resolved.permissionMode, "auto");
+  assert.equal(resolved.allowDangerouslySkipPermissions, undefined, "the opt-in is bypassPermissions-only");
+  assert.equal(resolved.source, "user");
+  assert.equal(permissionWarning(resolved), undefined);
+});
+
 test("an unrecognised mode is ignored rather than passed through", async () => {
   const { cwd, home } = await workspace();
   await writeFile(join(cwd, ".claude", "settings.json"),
