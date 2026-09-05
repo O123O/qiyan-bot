@@ -105,7 +105,15 @@ export function createWorkerStream(deps: { bus: WebBus; resolveSession(nickname:
       if (!METHODS.has(method)) return;
       const params = record(rawParams);
       const threadId = string(params?.threadId);
-      if (!params || !threadId || !deps.bus.hasWorkerSubscriber(endpointId, threadId)) return;
+      if (!params || !threadId) return;
+      // Before the subscriber gate on purpose. Task counts are the session's current state, and
+      // the gate below drops everything when no panel is open -- so recording only past it would
+      // leave the snapshot stale over exactly the interval a later subscriber needs it for.
+      if (method === "thread/tasks/updated") {
+        const tasks = normalize(method, params);
+        if (tasks) deps.bus.recordWorkerTasks(endpointId, threadId, tasks);
+      }
+      if (!deps.bus.hasWorkerSubscriber(endpointId, threadId)) return;
 
       deps.bus.pruneWorkerSubscriptions(endpointId, threadId, (subscription) => {
         const current = deps.resolveSession(subscription.nickname);

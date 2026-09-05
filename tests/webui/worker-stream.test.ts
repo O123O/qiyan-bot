@@ -42,6 +42,65 @@ test("active worker notifications are normalized without retaining raw events", 
   assert.equal((events[0] as any).subscriptionId, sub.subscriptionId);
 });
 
+// Background work is state, not an occurrence: it stays true until it changes. It was only sent as
+// a change event, so a panel opened after a subagent started showed nothing until the next change
+// -- and with no panel open the stream drops notifications entirely, so the interval that most
+// needs covering was exactly the one nothing recorded.
+test("a panel opened while work is already running is told the current counts", () => {
+  const bus = new WebBus();
+  const stream = createWorkerStream({ bus, resolveSession: resolveWorker() });
+
+  // Nobody is watching yet -- the case the old code discarded.
+  stream.handleNotification("local", "thread/tasks/updated",
+    { threadId: "thread", background: 2, subagents: 1, descriptions: ["build", "scan", "review"] });
+
+  const events: unknown[] = []; const ws = fakeSocket(events);
+  bus.add(ws);
+  const sub = bus.subscribe(ws, { nickname: "worker", endpointId: "local", threadId: "thread", mappingId: "m1", requestId: crypto.randomUUID() });
+
+  assert.equal(events.length, 1, "the subscriber is told on arrival, not on the next change");
+  assert.deepEqual((events[0] as any).event,
+    { kind: "tasks-updated", background: 2, subagents: 1, descriptions: ["build", "scan", "review"] });
+  // Numbered like any other event, so the client's sequence and replay stay consistent.
+  assert.equal((events[0] as any).seq, 1);
+  assert.equal(sub.latestSeq, 1);
+});
+
+// A snapshot that stops tracking while unwatched would report work that has since finished, which
+// is worse than reporting none: it makes a finished worker look busy forever.
+test("the snapshot follows changes made while nobody was subscribed", () => {
+  const bus = new WebBus();
+  const stream = createWorkerStream({ bus, resolveSession: resolveWorker() });
+
+  stream.handleNotification("local", "thread/tasks/updated",
+    { threadId: "thread", background: 2, subagents: 1, descriptions: ["build"] });
+  stream.handleNotification("local", "thread/tasks/updated",
+    { threadId: "thread", background: 0, subagents: 0, descriptions: [] });
+
+  const events: unknown[] = []; const ws = fakeSocket(events);
+  bus.add(ws);
+  bus.subscribe(ws, { nickname: "worker", endpointId: "local", threadId: "thread", mappingId: "m1", requestId: crypto.randomUUID() });
+
+  assert.deepEqual((events[0] as any).event,
+    { kind: "tasks-updated", background: 0, subagents: 0, descriptions: [] },
+    "the latest state wins, so finished work is not reported as running");
+});
+
+// Only task activity is state; a turn or an item is an occurrence and replaying one to a new
+// subscriber would invent history it did not witness.
+test("only task activity is snapshotted to a new subscriber", () => {
+  const bus = new WebBus();
+  const stream = createWorkerStream({ bus, resolveSession: resolveWorker() });
+
+  stream.handleNotification("local", "turn/started", { threadId: "thread", turn: { id: "turn" } });
+
+  const events: unknown[] = []; const ws = fakeSocket(events);
+  bus.add(ws);
+  bus.subscribe(ws, { nickname: "worker", endpointId: "local", threadId: "thread", mappingId: "m1", requestId: crypto.randomUUID() });
+
+  assert.deepEqual(events, [], "a turn that happened unwatched is not replayed as if it just started");
+});
+
 test("a rebound mapping is invalidated before message text is extracted", () => {
   const bus = new WebBus(); const events: unknown[] = []; const ws = fakeSocket(events);
   bus.add(ws);
@@ -112,6 +171,7 @@ test("task activity reaches the Web UI without a turn id", () => {
       pruneWorkerSubscriptions: () => {},
       publishWorker: (_endpointId: string, _threadId: string, event: unknown) => { published.push(event); },
       publishWorkerDiscontinuity: () => {},
+      recordWorkerTasks: () => {},
     } as never,
     resolveSession: () => ({ endpointId: "claude-local", threadId: "t1", mappingId: "m1" }),
   });

@@ -52,6 +52,7 @@ export class WebBus {
   private readonly sockets = new Set<WebSocket>();
   private readonly subscriptions = new Map<WebSocket, SubscriptionState>();
   private readonly subscriptionsById = new Map<string, SubscriptionState>();
+  private readonly workerTasks = new Map<string, WorkerChatEvent>();
   private readonly subscriptionsByWorker = new Map<string, Set<SubscriptionState>>();
   private readonly removalListeners = new Set<(subscription: WorkerSubscription) => void>();
   private readonly maxReplayEvents: number;
@@ -103,7 +104,11 @@ export class WebBus {
     const subscriptions = this.subscriptionsByWorker.get(key) ?? new Set<SubscriptionState>();
     subscriptions.add(state);
     this.subscriptionsByWorker.set(key, subscriptions);
-    return { ...subscription, resumed: false, replayGap: false, latestSeq: 0 };
+    // Through the ordinary numbered path rather than out of band, so it lands in this
+    // subscription's replay buffer and cannot arrive out of order with what follows.
+    const tasks = this.workerTasks.get(key);
+    if (tasks) this.publishSubscription(state, tasks);
+    return { ...subscription, resumed: false, replayGap: false, latestSeq: state.latestSeq };
   }
 
   replay(subscriptionId: string, afterSeq: number): void {
@@ -161,6 +166,18 @@ export class WebBus {
     for (const socket of this.sockets) {
       if (socket.readyState === 1) { try { socket.send(payload); } catch { /* drop on a broken socket */ } }
     }
+  }
+
+  // Task activity is STATE, not an occurrence: "2 background tasks, 1 subagent" stays true until
+  // it changes. It was only ever sent as a change event, so a panel opened after the work started
+  // showed nothing until the next change -- which is why the indicator appeared to populate only
+  // when a new question was asked, that being the next thing to change it.
+  //
+  // Recorded even with no subscribers, deliberately: the stream drops notifications when nobody is
+  // watching, so a cache filled only while watched would go stale across exactly the interval it
+  // exists to cover.
+  recordWorkerTasks(endpointId: string, threadId: string, event: WorkerChatEvent): void {
+    this.workerTasks.set(workerKey(endpointId, threadId), event);
   }
 
   publishWorker(endpointId: string, threadId: string, event: WorkerChatEvent): void {
