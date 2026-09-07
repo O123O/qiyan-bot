@@ -276,16 +276,16 @@ async function stop(value) {
   // being torn down. Nothing downstream depended on the old ordering: the session was going to die
   // at the end of every successful stop anyway.
   //
-  // SIGTERM first, so the server still sees the signal it saw before this ordering changed: tmux
-  // sends SIGHUP when it kills the session, and while both default to terminate, a handler that
-  // flushes on SIGTERM would silently stop running. Best-effort and already ESRCH-tolerant, so it
-  // costs nothing when the group is already gone.
+  // Deliberately no signal before this point. Every kill below is gated on a surviving member
+  // still carrying our token, because that is the only proof the process group is still ours: a
+  // pgid recycled onto someone else's work looks identical in `identity.json`, which describes a
+  // runtime that died days ago. Signalling ahead of that gate would take the user's own processes
+  // with it -- the one thing the gate exists to prevent -- and it buys nothing anyway, since
+  // tmux's own SIGHUP follows microseconds later and would cut short any flush it enabled.
   //
-  // `survivors` below therefore counts what outlived SIGTERM, SIGHUP, SIGTERM and SIGKILL --
-  // the same meaning as before, and a strictly stronger one.
-  if (identity) {
-    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-  }
+  // One consequence worth naming: the pane's process group takes that SIGHUP before the signals
+  // below, so `survivors` counts what outlived SIGHUP, SIGTERM and SIGKILL. Same meaning as
+  // before this teardown was hoisted, and a strictly stronger one.
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
   if (identity) {

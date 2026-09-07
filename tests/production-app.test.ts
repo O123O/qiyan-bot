@@ -1729,14 +1729,22 @@ test("an unreachable endpoint's stuck send stops refusing the restart, and is no
 
 // A `dispatched` row is genuinely in flight, whatever its kind, and a second lifecycle action
 // would race it. Releasing the fence for non-lifecycle rows must not reach those.
+//
+// The uncertain row in front of it is what makes this test about the release path at all: with
+// the dispatched send alone it is the OLDEST row and gets refused before the release is reached,
+// so the test would pass while proving nothing about it.
 test("a dispatched send still refuses the restart behind it", async () => {
-  const send = {
-    id: "send-live", sequence: 1, kind: "send_to_session",
-    args: { nickname: "w3a16-mmlu" }, state: "dispatched" as const,
-  };
+  const rows = [
+    { id: "send-stuck", sequence: 1, kind: "send_to_session", args: { nickname: "a" }, state: "uncertain" as const },
+    { id: "send-live", sequence: 2, kind: "send_to_session", args: { nickname: "b" }, state: "dispatched" as const },
+  ];
   await assert.rejects(settleEarlierEndpointOperations({
-    operations: { listRecoverable: () => [send] as any, get: () => ({ ...send }) as any, fail: () => {} },
-    currentSequence: 2, endpointId: "ptyche02", currentKind: "restart_endpoint",
+    operations: {
+      listRecoverable: () => rows as any,
+      get: (id: string) => rows.find((row) => row.id === id) as any,
+      fail: () => { throw new Error("nothing may be retired while a dispatched row is in flight"); },
+    },
+    currentSequence: 3, endpointId: "ptyche02", currentKind: "restart_endpoint",
     resolver: { defaultProjectEndpointId: "local", session: () => ({ endpoint: "ptyche02" }) },
     reconcile: async () => {}, isEndpointReady: () => false, isAwaitingAuthentication: () => false,
     waitForTerminal: async () => {},
@@ -1885,7 +1893,7 @@ test("a restart does not supersede a non-lifecycle operation", async () => {
     args: { nickname: "sparse-att-scale" }, state: "uncertain" as const,
   };
   const failed: string[] = [];
-  await (settleEarlierEndpointOperations({
+  await settleEarlierEndpointOperations({
     operations: {
       listRecoverable: () => [send] as any,
       get: () => ({ ...send }) as any,
@@ -1902,7 +1910,7 @@ test("a restart does not supersede a non-lifecycle operation", async () => {
     isEndpointReady: () => false,
     isAwaitingAuthentication: () => false,
     waitForTerminal: async () => {},
-  } as any));
+  } as any);
   assert.deepEqual(failed, [], "an undelivered send is not retired by restarting its endpoint");
 });
 

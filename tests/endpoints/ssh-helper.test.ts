@@ -680,6 +680,50 @@ test("stopping a Claude host tears down its supervising session", async (t) => {
   await assert.rejects(stat(`${runtimeDir}/claude-host-identity.json`), "the tombstone is cleared too");
 });
 
+// The invariant the file states and nothing checked: a process group is only signalled while a
+// surviving member still carries our token. A pgid recycled onto unrelated work looks identical
+// in `identity.json`, which describes a runtime that died days ago -- so an ungated signal takes
+// the worker's own processes with it. This is not hypothetical: hoisting the teardown tempted
+// exactly that edit, and it went in and came back out.
+//
+// Reproduced with a real process in its own group that carries NO token, which is what a recycled
+// pgid looks like from `stop`'s side.
+test("a stop never signals a process group with no surviving member of its own", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-bystander.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const alive = (): boolean => { try { process.kill(bystander.pid!, 0); return true; } catch { return false; } };
+  assert.equal(alive(), true, "the bystander is running before the stop");
+
+  // The dead runtime's recorded identity, whose pgid the kernel has since handed to the bystander.
+  const identity = {
+    kind: "ssh", token: "e".repeat(32), pid: bystander.pid, linuxStartTime: "1",
+    processGroupId: bystander.pid,
+  };
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+
+  const stopArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session, tmuxMode: "explicit", expected: identity,
+  }));
+  const stopped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", stopArg],
+    { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+
+  assert.equal(parseRemoteHelperResponse<{ stopped: boolean }>(stopped.stdout, "stop").stopped, true,
+    "the reclaim still completes — there is nothing of ours left to reap");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(alive(), true,
+    "and the unrelated process group is untouched: no member carried our token, so it was never ours");
+});
+
 // The identity proof stays ABOVE the teardown, and that ordering is the whole safety argument for
 // moving the teardown up: two bot instances share one ledger, so a stop aimed at the other one's
 // runtime must refuse before touching anything at all. Only what happens AFTER this proof passes
