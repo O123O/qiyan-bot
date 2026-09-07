@@ -82,7 +82,12 @@ async function harness(t: { after(fn: () => void | Promise<void>): void }): Prom
   invocations: Array<{ operation: string; value: Record<string, unknown> }>;
   streams: ReadyProcessStream[];
   losses: EndpointLossKind[];
-  live: { identity: RuntimeIdentity; status: "absent" | "unhealthy" | "healthy" };
+  live: {
+    identity: RuntimeIdentity;
+    status: "absent" | "unhealthy" | "healthy";
+    supervised?: boolean;
+    facts?: { serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number };
+  };
 }> {
   const socketPath = join(await mkdtemp(join(tmpdir(), "qiyan-claude-host-")), "claude.sock");
   const queries = new Map<string, FakeQuery>();
@@ -98,9 +103,14 @@ async function harness(t: { after(fn: () => void | Promise<void>): void }): Prom
   const invocations: Array<{ operation: string; value: Record<string, unknown> }> = [];
   const streams: ReadyProcessStream[] = [];
   const sockets: Socket[] = [];
-  const live: { identity: RuntimeIdentity; status: "absent" | "unhealthy" | "healthy" } = {
-    identity, status: "absent",
-  };
+  // `facts` is what an unhealthy-and-supervised inspect adds. Undefined models a worker host still
+  // running an older helper, which reports none of it.
+  const live: {
+    identity: RuntimeIdentity;
+    status: "absent" | "unhealthy" | "healthy";
+    supervised?: boolean;
+    facts?: { serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number };
+  } = { identity, status: "absent" };
   const remote = {
     async bootstrap(): Promise<void> {},
     async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
@@ -109,7 +119,11 @@ async function harness(t: { after(fn: () => void | Promise<void>): void }): Prom
       if (operation === "inspect-claude-host") {
         return (live.status === "absent"
           ? { status: "absent" }
-          : { status: live.status, identity: live.identity }) as T;
+          : {
+            status: live.status, identity: live.identity,
+            ...(live.supervised === undefined ? {} : { supervised: live.supervised }),
+            ...(live.facts ?? {}),
+          }) as T;
       }
       if (operation === "start-claude-host") {
         live.status = "healthy";
@@ -288,6 +302,53 @@ test("a stopped runtime starts again in place and reaches the surviving host", a
     "the session that survived on the worker is reachable again");
   assert.equal(invocations.filter((item) => item.operation === "start-claude-host").length, 1,
     "the healthy host is adopted, not relaunched");
+});
+
+// The four-day wedge, on the other provider. `ensureStarted` refused any unhealthy host that was
+// still supervised, and `start-claude-host` refuses an unhealthy runtime too — so the session that
+// made the leftovers unreachable was also the thing nothing would ever kill. It matters at least
+// as much here as for Codex: Claude runs Bash tools, so a command it started can outlive it
+// holding the process group open.
+test("a live session over a proven-dead Claude host is reclaimed rather than refused", async (t) => {
+  const { runtime, invocations, live } = await harness(t);
+  live.status = "unhealthy";
+  live.supervised = true;
+  live.facts = { serverAlive: false, socketListening: false, sessionAgeMs: 4 * 24 * 60 * 60 * 1000 };
+
+  await runtime.start();
+
+  const stops = invocations.filter((call) => call.operation === "stop-claude-host");
+  assert.equal(stops.length, 1, "the wedged host was torn down, session included");
+  assert.deepEqual(stops[0]!.value.expected, identity,
+    "and the stop proved the recorded identity before signalling anything");
+  assert.equal(invocations.filter((call) => call.operation === "start-claude-host").length, 1,
+    "then a fresh host was started in its place");
+});
+
+// Every clause is required, and each is checked against a value that must be PRESENT: a worker
+// host still running an older helper reports none of them, and omission must read as "not proven"
+// rather than "not alive" — helpers are upgraded per host, so the permissive reading would tear
+// down live hosts everywhere not yet updated.
+test("a live Claude host supervisor is only reclaimed when the proof is complete", async (t) => {
+  for (const mutate of [
+    (facts: any) => { facts.serverAlive = true; },
+    (facts: any) => { facts.socketListening = true; },
+    (facts: any) => { facts.sessionAgeMs = 60_000; },
+    (facts: any) => { delete facts.serverAlive; },
+    (facts: any) => { delete facts.socketListening; },
+    (facts: any) => { delete facts.sessionAgeMs; },
+  ]) {
+    const { runtime, invocations, live } = await harness(t);
+    live.status = "unhealthy";
+    live.supervised = true;
+    const facts: any = { serverAlive: false, socketListening: false, sessionAgeMs: 4 * 24 * 60 * 60 * 1000 };
+    mutate(facts);
+    live.facts = facts;
+
+    await assert.rejects(runtime.start(), /unhealthy/u);
+    assert.equal(invocations.filter((call) => call.operation === "stop-claude-host").length, 0,
+      `a live host was torn down on an incomplete proof: ${JSON.stringify(facts)}`);
+  }
 });
 
 test("closing the connection leaves the remote host running; shutdown stops it by identity", async (t) => {

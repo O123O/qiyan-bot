@@ -284,20 +284,26 @@ export class OperationStore {
   // endpoint for 97 hours survived several restarts -- so a per-process count could only fire if
   // one process happened to stay up for the whole streak, which is precisely when the endpoint is
   // least likely to be wedged.
-  recordRecoveryAttempt(id: string): number {
-    // One statement, so the value returned is the value written. An UPDATE followed by a SELECT
+  recordRecoveryAttempt(id: string, now = Date.now()): { failures: number; startedAt: number } {
+    // One statement, so the values returned are the values written. An UPDATE followed by a SELECT
     // lets another writer -- the two bot instances share this ledger -- land in between, and
-    // while the count stays monotonic the number this reports would not be the one it produced.
-    const row = this.db.prepare(
-      "UPDATE operations SET recovery_attempts = recovery_attempts + 1 WHERE id = ? RETURNING recovery_attempts",
-    ).get(id) as { recovery_attempts?: number } | undefined;
-    return row?.recovery_attempts ?? 0;
+    // while the count stays monotonic the numbers this reports would not be the ones it produced.
+    //
+    // COALESCE, so the timestamp is the start of the CURRENT streak: the first failed attempt
+    // stamps it and every later one leaves it alone, and `clearRecoveryAttempts` clears it with
+    // the count when the row settles. It is not `created_at`, which is when the operation was
+    // created and is therefore already old for every row that outlived a restart.
+    const row = this.db.prepare(`UPDATE operations
+      SET recovery_attempts = recovery_attempts + 1, recovery_started_at = COALESCE(recovery_started_at, ?)
+      WHERE id = ? RETURNING recovery_attempts, recovery_started_at`)
+      .get(now, id) as { recovery_attempts?: number; recovery_started_at?: number } | undefined;
+    return { failures: row?.recovery_attempts ?? 0, startedAt: row?.recovery_started_at ?? now };
   }
 
   // A row that settles starts over: an endpoint that recovers must not carry its old failures into
   // the next lifecycle action and give up on the first one.
   clearRecoveryAttempts(id: string): void {
-    this.db.prepare("UPDATE operations SET recovery_attempts = 0 WHERE id = ?").run(id);
+    this.db.prepare("UPDATE operations SET recovery_attempts = 0, recovery_started_at = NULL WHERE id = ?").run(id);
   }
 
   fail(id: string, error: unknown, uncertain = false, toolFence?: number): void {

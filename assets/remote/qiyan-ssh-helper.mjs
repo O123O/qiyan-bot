@@ -269,6 +269,17 @@ async function stop(value) {
   const identity = await readIdentity(paths.identityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
+  // The supervisor dies FIRST, before anything that can fail or return early. "The restart kills
+  // the old things, including the tmux session" then holds on every path out of this function
+  // rather than only on the ones that reach the bottom -- and it is what the reclaim of a live
+  // session over a dead server needs, where the session is not a reason to refuse, it is the thing
+  // being torn down. Nothing downstream depended on the old ordering: the session was going to die
+  // at the end of every successful stop anyway.
+  //
+  // One consequence worth naming: the pane's process group now takes SIGHUP from tmux before the
+  // signals below. `survivors` therefore counts what outlived SIGHUP, SIGTERM and SIGKILL, which
+  // is the same meaning as before and a strictly stronger one.
+  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
   if (identity) {
     // This gate is the protection against a RECYCLED pgid, not a redundant liveness check:
@@ -297,22 +308,14 @@ async function stop(value) {
       // app-server on the same socket, which is the thing this check is really for. Leftover
       // descendants do not qualify: the replacement gets a new pid, process group and token.
       //
-      // The supervisor half of that is established HERE rather than asserted, by killing the
-      // session first. Asserting it made a reclaim impossible in the one case a reclaim is now
-      // for -- a live session over a dead server -- where the session is not a reason to stop,
-      // it is the thing being torn down. Ordering it before the verdict costs nothing anywhere
-      // else: on every other path the session is already gone.
-      if (survivors > 0) {
-        await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
-        await waitForEmptyGroup(identity.processGroupId, 2_000);
-        survivors = ownedGroupMembers(identity).length;
-        if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
-          throw new Error("runtime process group did not stop");
-        }
+      // The supervisor half of that is already established rather than asserted -- the session was
+      // killed above -- so this is left as one fact about the server itself. Asserting the
+      // supervisor instead made a reclaim impossible in the one case a reclaim is now for.
+      if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
+        throw new Error("runtime process group did not stop");
       }
     }
   }
-  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   // Report what was left behind. A caller that reclaimed over unreapable debris should be able
@@ -342,11 +345,27 @@ async function inspectClaudeHost(value) {
   }
   // The launcher exports QIYAN_RUNTIME_TOKEN before exec, so the environ check proves the
   // live process is the one we started rather than a recycled pid that matches by accident.
+  //
+  // The same three facts the Codex runtime reports, for the same reason and with the same cost
+  // rule: an unhealthy-and-supervised answer is otherwise identical for a host that is DEAD
+  // (reclaimable) and one that is still booting (must be left alone), so a caller could only
+  // refuse both -- and refusing the first is a dead end, because `start-claude-host` will not
+  // touch an unhealthy runtime either.
+  const claudeHostFacts = async () => {
+    if (!identity) return {};
+    const serverAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
+    if (serverAlive) return { serverAlive };
+    return {
+      serverAlive,
+      socketListening: await socketListening(paths.claudeHostSocketPath),
+      ...await sessionAge(paths),
+    };
+  };
   if (!identity || !identityMatches(identity) || !processHasToken(identity.pid, identity.token)) {
-    return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+    return { status: "unhealthy", supervised, ...await claudeHostFacts(), ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, ...await claudeHostFacts(), identity, ownedGroup, groupSize: group.length };
   }
   return { status: "healthy", identity, supervised };
 }
@@ -415,6 +434,12 @@ async function stopClaudeHost(value) {
   const identity = await readIdentity(paths.claudeHostIdentityPath);
   const expected = validIdentity(value?.expected);
   if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  // The supervisor dies FIRST, before anything that can fail or return early, so "the restart
+  // kills the old things, including the tmux session" holds on every path out of this function.
+  // Asserting it below instead made a reclaim impossible in the one case a reclaim is for: a live
+  // session over a dead host, where the session is not a reason to refuse but the thing being
+  // torn down.
+  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
   let members = ownedGroupMembers(identity);
   if (members.length > 0) {
@@ -430,13 +455,10 @@ async function stopClaudeHost(value) {
     // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem —
     // inheriting the host's process group and token, unreapable by any signal, and otherwise
     // refusing this reclaim forever. Insist only that the HOST is gone.
-    if (survivors > 0) {
-      const supervised = (await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true)).code === 0;
-      const hostAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
-      if (supervised || hostAlive) throw new Error("Claude host process group did not stop");
+    if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
+      throw new Error("Claude host process group did not stop");
     }
   }
-  await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   await rm(paths.claudeHostSocketPath, { force: true });
   await rm(paths.claudeHostIdentityPath, { force: true });
   // The tmux socket is deliberately left alone: one tmux server in this runtime directory

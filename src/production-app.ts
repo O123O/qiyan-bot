@@ -179,7 +179,8 @@ const assistantMappingId = "assistant";
 const LIFECYCLE_RECOVERY_MAX_FAILURES = 5;
 // The wall clock the failure count on its own does not measure. Long enough that an endpoint host
 // rebooting, or a network partition, is waited out rather than given up on; short enough that a
-// genuinely wedged endpoint is released without a human. Measured from the row's creation.
+// genuinely wedged endpoint is released without a human. Measured from the start of the current
+// failure streak, which is the interval "has been failing for long enough" actually names.
 const LIFECYCLE_RECOVERY_MIN_ELAPSED_MS = 10 * 60 * 1000;
 // How long startup waits for referenced endpoints to come up before continuing without the
 // stragglers. They keep connecting in the background and publish when they land, so this
@@ -639,19 +640,34 @@ export async function runOperationRecoveryChains<
 >(
   entries: readonly T[],
   targetOf: (entry: T) => OperationRecoveryTarget,
-  attempt: (entry: T, target: OperationRecoveryTarget) => Promise<boolean>,
+  attempt: (entry: T, target: OperationRecoveryTarget) => Promise<boolean | "waiting_for_endpoint">,
 ): Promise<ReadonlySet<string>> {
   const ordered = [...entries].sort((left, right) => left.operation.sequence - right.operation.sequence
     || left.operation.id.localeCompare(right.operation.id));
+  // Two different reasons a row holds its endpoint, and they do not block the same things.
+  //
+  // An unsettled row blocks everything behind it on that endpoint: later work must not overtake
+  // an earlier operation whose outcome is still open. But a row that is merely PARKED waiting for
+  // its endpoint to come back has not started, and it blocks only work that also needs the
+  // endpoint ready. Blocking a lifecycle row there was self-defeating: a restart or disconnect
+  // does not need a ready endpoint -- it is what makes one -- so an unreachable endpoint with a
+  // parked send in front of an uncertain restart left the restart never attempted, never counted,
+  // and therefore unable to reach the give-up that would have released the fence.
   const blockedEndpoints = new Set<string>();
+  const parkedEndpoints = new Set<string>();
   for (const entry of ordered) {
     const target = targetOf(entry);
     const endpointId = target.policy === "ready_endpoint" || target.policy === "endpoint_lifecycle"
       ? target.endpointId
       : undefined;
     if (endpointId && blockedEndpoints.has(endpointId)) continue;
-    if (await attempt(entry, target) && endpointId) blockedEndpoints.add(endpointId);
+    if (endpointId && parkedEndpoints.has(endpointId) && target.policy !== "endpoint_lifecycle") continue;
+    const outcome = await attempt(entry, target);
+    if (!endpointId || outcome === false) continue;
+    (outcome === "waiting_for_endpoint" ? parkedEndpoints : blockedEndpoints).add(endpointId);
   }
+  // Both are "this endpoint has unfinished business", which is what the caller reports.
+  for (const endpointId of parkedEndpoints) blockedEndpoints.add(endpointId);
   return blockedEndpoints;
 }
 
@@ -1049,7 +1065,7 @@ export function settleRecoveryPassVerdict(options: {
   target: OperationRecoveryTarget;
   maxFailures?: number;
   minElapsedMs?: number;
-  onCountFailed?(operationId: string, error: unknown): void;
+  onVerdictWriteFailed?(operationId: string, error: unknown): void;
 }): boolean {
   const { operations, operation, target } = options;
   const current = operations.get(operation.id);
@@ -1070,14 +1086,19 @@ export function settleRecoveryPassVerdict(options: {
   // Guarded for the same reason the `fail` below is: this is two statements against a ledger two
   // bot instances share, and letting a BUSY here escape would abort the whole pass and throw away
   // every other row's attempt -- exactly the outcome the comment below calls worse.
-  let failures: number;
-  try { failures = operations.recordRecoveryAttempt(operation.id); }
-  catch (error) { options.onCountFailed?.(operation.id, error); return true; }
+  let attempt: { failures: number; startedAt: number };
+  try { attempt = operations.recordRecoveryAttempt(operation.id); }
+  catch (error) { options.onVerdictWriteFailed?.(operation.id, error); return true; }
+  const failures = attempt.failures;
   if (lifecycleRecoveryExhausted({
     policy: target.policy,
     state: current.state,
     failures,
-    elapsedMs: Date.now() - current.createdAt,
+    // Since this streak began, NOT since the row was created. `created_at` is already hours old
+    // for every row that outlived a restart, so measuring from it would satisfy the floor
+    // immediately for exactly the rows the durable count exists for, and the conjunction would
+    // collapse back to five passes -- about fifteen seconds.
+    elapsedMs: Date.now() - attempt.startedAt,
     ...(options.maxFailures === undefined ? {} : { maxFailures: options.maxFailures }),
     ...(options.minElapsedMs === undefined ? {} : { minElapsedMs: options.minElapsedMs }),
   })) {
@@ -1096,8 +1117,14 @@ export function settleRecoveryPassVerdict(options: {
           + "blocks later lifecycle actions",
       });
     } catch (error) {
-      if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN")) throw error;
-      /* another writer settled it; nothing left to retire */
+      // The other instance settling it first is ordinary; anything else is a storage failure on
+      // the one path that produces a terminal verdict, and has to be visible. Reported rather
+      // than rethrown either way: aborting the pass would discard every later row's attempt,
+      // which is the outcome the comment above calls worse, and the report is what visibility
+      // actually required.
+      if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN")) {
+        options.onVerdictWriteFailed?.(operation.id, error);
+      }
     }
   }
   return operationUnsettled(operations.get(operation.id)?.state);
@@ -5246,7 +5273,9 @@ export async function buildProductionApp(
       if (preflight === "sleep") return true;
       if (preflight === "wait_for_endpoint") {
         waitingForEndpoint = true;
-        return true;
+        // Distinguished from an unsettled row so it does not hold back a lifecycle action that
+        // needs no ready endpoint -- see runOperationRecoveryChains.
+        return "waiting_for_endpoint";
       }
       attempted = true;
       // The streak is NOT cleared here. The comment that stood in this place said "a run that does
@@ -5761,12 +5790,12 @@ export async function buildProductionApp(
       }
       return settleRecoveryPassVerdict({
         operations, operation, target,
-        // A ledger write that fails is not a quiet retry: this is the count that produces the
-        // only terminal verdict a wedged row will ever get, so a storage failure has to be
-        // visible rather than looking like another ordinary failed attempt.
-        onCountFailed: (operationId, error) => report({
+        // A ledger write that fails is not a quiet retry: this is the path that produces the only
+        // terminal verdict a wedged row will ever get, so a storage failure has to be visible
+        // rather than looking like another ordinary failed attempt.
+        onVerdictWriteFailed: (operationId, error) => report({
           level: "warn",
-          code: "operation_recovery_count_failed",
+          code: "operation_recovery_write_failed",
           component: operationId,
           reason: error instanceof Error ? error.message : String(error),
         }),

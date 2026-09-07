@@ -792,26 +792,43 @@ test("a lifecycle failure streak accumulates in the ledger and survives a restar
   store.markDispatched(operation.id);
 
   // Four failing passes, and the bot restarts between every one of them.
-  const failures = [1, 2, 3, 4].map(() => new OperationStore(db).recordRecoveryAttempt(operation.id));
-  assert.deepEqual(failures, [1, 2, 3, 4], "each failing pass adds to a count no restart resets");
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 4, elapsedMs: 60 * 60 * 1000 }), false,
-    "and the budget is not spent early");
+  // The streak begins on the FIRST failed attempt and is stamped once. The row's own `created_at`
+  // cannot serve: it is when the operation was created, so a row that outlived a restart is
+  // already past any age budget and the budget would collapse back to counting passes -- which is
+  // exactly the class of row a durable count exists for.
+  const firstAttemptAt = Date.now() - 60 * 60 * 1000;
+  const first = store.recordRecoveryAttempt(operation.id, firstAttemptAt);
+  assert.deepEqual(first, { failures: 1, startedAt: firstAttemptAt });
+
+  const attempts = [2, 3, 4].map(() => new OperationStore(db).recordRecoveryAttempt(operation.id, Date.now()));
+  assert.deepEqual(attempts.map((value) => value.failures), [2, 3, 4],
+    "each failing pass adds to a count no restart resets");
+  assert.deepEqual(new Set(attempts.map((value) => value.startedAt)), new Set([firstAttemptAt]),
+    "and none of them moves the start of the streak forward");
+  assert.equal(lifecycleRecoveryExhausted({
+    policy: "endpoint_lifecycle", state: "uncertain", failures: 4, elapsedMs: 60 * 60 * 1000,
+  }), false, "and the budget is not spent early");
 
   const fifth = new OperationStore(db).recordRecoveryAttempt(operation.id);
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: fifth, elapsedMs: 60 * 60 * 1000 }), true,
-    "the give-up fires, which it could not while the streak lived in a per-process Map");
+  assert.equal(lifecycleRecoveryExhausted({
+    policy: "endpoint_lifecycle", state: "uncertain", failures: fifth.failures,
+    elapsedMs: Date.now() - fifth.startedAt,
+  }), true, "the give-up fires, which it could not while the streak lived in a per-process Map");
 
   // A settled row starts over: an endpoint that recovers must not carry old failures into its
-  // next lifecycle action and give up on the first one.
+  // next lifecycle action and give up on the first one. The clock restarts with the count, or a
+  // row that failed an hour ago and recovered would be retired on its next first failure.
   store.clearRecoveryAttempts(operation.id);
-  assert.equal(store.recordRecoveryAttempt(operation.id), 1, "the count was cleared, not merely ignored");
+  const restarted = store.recordRecoveryAttempt(operation.id);
+  assert.equal(restarted.failures, 1, "the count was cleared, not merely ignored");
+  assert.ok(restarted.startedAt > firstAttemptAt, "and so was the streak's start");
 
   // A different row does not inherit another's streak.
   const other = store.prepare({
     contextId: "ctx", attemptId: "attempt", callId: "call-2", kind: "restart_endpoint",
     args: { endpoint: "other" },
   });
-  assert.equal(store.recordRecoveryAttempt(other.id), 1);
+  assert.equal(store.recordRecoveryAttempt(other.id).failures, 1);
 });
 
 // The half of the defect that a counter alone does not fix: the give-up used to be reached only
@@ -878,7 +895,7 @@ test("only an endpoint-lifecycle row is ever retired by the budget", () => {
   // The next increment returning 1 is the proof: had the twelve passes each written, it would be
   // 13. `get` does not project the column, so reading it back through the record would assert
   // nothing at all.
-  assert.equal(operations.recordRecoveryAttempt(record.id), 1,
+  assert.equal(operations.recordRecoveryAttempt(record.id).failures, 1,
     "the ledger is not written for a count nothing reads");
 });
 
@@ -901,7 +918,7 @@ test("settling clears the count the next streak starts from", () => {
 
   operations.succeed(record.id, { ok: true });
   assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), false, "a settled row is done");
-  assert.equal(operations.recordRecoveryAttempt(record.id), 1, "and its next streak starts from zero");
+  assert.equal(operations.recordRecoveryAttempt(record.id).failures, 1, "and its next streak starts from zero");
 });
 
 test("adoption recovery resolves the checkpointed registry identity before endpoint access", async () => {
@@ -1420,6 +1437,52 @@ test("per-endpoint recovery chains preserve durable lifecycle order and unrelate
     return false;
   });
   assert.deepEqual(dynamicSeen, ["restart-a", "rename"], "later targets are resolved after earlier durable mutations");
+});
+
+// The ptyche02 shape, and the reason the give-up could not fire even once it was reachable. An
+// uncertain send on an unreachable endpoint parks at preflight, and a parked row used to hold the
+// endpoint exactly as an unsettled one does -- so the uncertain restart QUEUED BEHIND IT was never
+// attempted, never counted a failure, and could never reach the budget that would have released
+// the fence. A restart does not need a ready endpoint; it is what makes one.
+test("a row parked waiting for its endpoint does not hold back the lifecycle action that repairs it", async () => {
+  const entries = [
+    { operation: { id: "send", sequence: 1 }, target: { policy: "ready_endpoint", endpointId: "ptyche02" } },
+    { operation: { id: "restart", sequence: 2 }, target: { policy: "endpoint_lifecycle", endpointId: "ptyche02" } },
+    { operation: { id: "later-send", sequence: 3 }, target: { policy: "ready_endpoint", endpointId: "ptyche02" } },
+  ] as const;
+  const attempted: string[] = [];
+  const blocked = await runOperationRecoveryChains(entries as never, (entry: any) => entry.target, async (entry: any) => {
+    attempted.push(entry.operation.id);
+    return entry.operation.id === "send" ? "waiting_for_endpoint" : true;
+  });
+
+  assert.deepEqual(attempted, ["send", "restart"],
+    "the restart runs; another send behind the parked one still waits, because it needs the same endpoint ready");
+  assert.deepEqual([...blocked], ["ptyche02"], "the endpoint still reports unfinished business either way");
+
+  // Parked alone, with nothing unsettled behind it: the endpoint is still reported. The two
+  // reasons differ in what they hold back, not in whether the endpoint has work outstanding.
+  const parkedOnly = await runOperationRecoveryChains(
+    [{ operation: { id: "send", sequence: 1 }, target: { policy: "ready_endpoint", endpointId: "ptyche02" } }] as never,
+    (entry: any) => entry.target,
+    async () => "waiting_for_endpoint",
+  );
+  assert.deepEqual([...parkedOnly], ["ptyche02"]);
+});
+
+// The other half: a row that is genuinely UNSETTLED still blocks everything behind it, lifecycle
+// included. Later work must not overtake an operation whose outcome is still open.
+test("an unsettled row still blocks the lifecycle action behind it", async () => {
+  const entries = [
+    { operation: { id: "send", sequence: 1 }, target: { policy: "ready_endpoint", endpointId: "devbox" } },
+    { operation: { id: "restart", sequence: 2 }, target: { policy: "endpoint_lifecycle", endpointId: "devbox" } },
+  ] as const;
+  const attempted: string[] = [];
+  await runOperationRecoveryChains(entries as never, (entry: any) => entry.target, async (entry: any) => {
+    attempted.push(entry.operation.id);
+    return true;
+  });
+  assert.deepEqual(attempted, ["send"], "an in-flight send is not overtaken by a restart of its endpoint");
 });
 
 test("terminalizing a proven no-effect operation lets the next same-endpoint recovery run", async () => {

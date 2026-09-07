@@ -14,7 +14,7 @@ import { CLAUDE_HOST_PROTOCOL_VERSION } from "../claude-host/protocol.ts";
 import { RemoteClaudeHost, type HostChannel } from "../claude-host/transport.ts";
 import type { ClaudePersistentRuntime, ClaudeReattachment } from "./claude-runtime.ts";
 import type { ReadyProcessStream } from "./ssh-process.ts";
-import type { RemoteHost } from "./ssh-runtime.ts";
+import { unservingSupervisor, type RemoteHost } from "./ssh-runtime.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
 // What the channel opener needs from the runtime. Separate from the class so the adapter is
@@ -198,9 +198,14 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
       // gone is dead, and what keeps it reading unhealthy is its own leftovers — a socket, an
       // identity file, or something it spawned that outlived it still holding its process group.
       // Nothing else ever clears those, so the endpoint could not come back without a human on
-      // the worker's machine. `stop` proves the recorded identity first and signals only
-      // processes carrying its token; a host that is still SUPERVISED is left alone.
-      if (current.supervised !== false || !current.identity) {
+      // the worker's machine. `stop-claude-host` proves the recorded identity first and signals
+      // only processes carrying its token.
+      //
+      // And, again as for Codex, a host that is still SUPERVISED is left alone unless the probe
+      // has PROVEN it is not serving. Requirement: the same wedge — a live session over a dead
+      // server, unreachable and unrepairable — is if anything MORE likely here, because Claude
+      // runs Bash tools and a command it started can outlive it holding the group open.
+      if (!current.identity || (current.supervised !== false && !unservingSupervisor(current))) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing remote Claude host is unhealthy: ${this.options.endpointId}`);
       }
       await this.invoke("stop-claude-host", { ...this.runtimeRequest(), expected: current.identity });
@@ -215,16 +220,30 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
 
   private async inspect(): Promise<
     { status: "absent" }
-    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean }
+    | {
+      status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean;
+      serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number;
+    }
     | { status: "healthy"; identity: RuntimeIdentity }
   > {
-    const raw = await this.invoke<{ status?: unknown; identity?: unknown; supervised?: unknown }>("inspect-claude-host", this.runtimeRequest());
+    const raw = await this.invoke<{
+      status?: unknown; identity?: unknown; supervised?: unknown;
+      serverAlive?: unknown; socketListening?: unknown; sessionAgeMs?: unknown;
+    }>("inspect-claude-host", this.runtimeRequest());
     if (raw?.status === "absent") return { status: "absent" };
     if (raw?.status === "unhealthy") {
       return {
         status: "unhealthy",
         ...(typeof raw.supervised === "boolean" ? { supervised: raw.supervised } : {}),
         ...(raw.identity === undefined ? {} : { identity: parseRuntimeIdentity(raw.identity) }),
+        // Forwarded rather than collapsed here, so `unservingSupervisor` is the one place that
+        // decides whether a live supervisor may be torn down, and an absent field stays absent
+        // all the way to it: a host still running an older helper reports none of these, and
+        // omission must read as "not proven" rather than "not alive".
+        ...(typeof raw.serverAlive === "boolean" ? { serverAlive: raw.serverAlive } : {}),
+        ...(typeof raw.socketListening === "boolean" ? { socketListening: raw.socketListening } : {}),
+        ...(typeof raw.sessionAgeMs === "number" && Number.isFinite(raw.sessionAgeMs) && raw.sessionAgeMs >= 0
+          ? { sessionAgeMs: raw.sessionAgeMs } : {}),
       };
     }
     if (raw?.status !== "healthy") throw new AppError("ENDPOINT_UNAVAILABLE", "invalid remote Claude host inspection");

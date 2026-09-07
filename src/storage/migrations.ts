@@ -886,5 +886,12 @@ export const migrations: readonly Migration[] = [
     if (!columns.has("recovery_attempts")) {
       db.exec("ALTER TABLE operations ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0");
     }
+    // When the CURRENT failure streak began. `created_at` cannot answer that: it is when the
+    // operation was created, so any row that outlived a bot restart is already past any age
+    // budget and the budget collapses back to counting passes -- which is precisely the class of
+    // row the durable count exists for.
+    if (!columns.has("recovery_started_at")) {
+      db.exec("ALTER TABLE operations ADD COLUMN recovery_started_at INTEGER");
+    }
   },
 ];

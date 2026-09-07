@@ -497,12 +497,18 @@ test("a stop reclaims a dead runtime whose surviving group members cannot be pro
   await assert.rejects(stat(`${runtimeDir}/identity.json`));
 });
 
-// The case that actually locked an endpoint out: a survivor that IS ours — a descendant which
-// inherited the runtime token and cannot be reaped. `stop` used to call that a failure, so the
-// reclaim never completed and no restart could follow. It now insists only that the server
-// itself is gone, which is the condition under which a replacement cannot become a second live
-// runtime on one socket.
-test("a stop reclaims a dead runtime whose token-carrying descendant survives", async (t) => {
+// What "the restart kills the old things, including the tmux session" means, asserted rather than
+// assumed: the supervisor is gone afterwards. Nothing checked that before -- the suite's only
+// `has-session` assertion asserted one SURVIVES.
+//
+// Named for the session on purpose. An earlier version of this test claimed to cover a
+// token-carrying descendant that "SIGKILL cannot reach because it is not in that group", which was
+// false twice over: a `detached` child's pgid IS `identity.processGroupId`, so the group SIGTERM
+// reaps it, and the survivors branch is therefore never entered. That branch stays uncovered --
+// reaching it needs a token-carrying group member that outlives SIGKILL, i.e. genuine
+// uninterruptible I/O, which cannot be produced from a test. Which is why the session teardown was
+// moved OUT of it: the irreversible half now runs on every path and this test does reach it.
+test("a stop tears down the supervising session, not just the process group", async (t) => {
   const uid = process.getuid?.();
   assert.ok(uid);
   const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
@@ -511,9 +517,8 @@ test("a stop reclaims a dead runtime whose token-carrying descendant survives", 
   await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
 
   const token = "c".repeat(32);
-  // A descendant carrying the token, in its own group, with the recorded "server" pid being a
-  // pid that is dead. SIGKILL to the group cannot reach it because it is not in that group —
-  // which is what an unreapable survivor looks like from `stop`'s side.
+  // A token-carrying process standing in for the runtime, so `stop` gets past its identity proof
+  // and does real work rather than refusing at the door.
   const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token },
   });
@@ -545,7 +550,8 @@ test("a stop reclaims a dead runtime whose token-carrying descendant survives", 
     { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
 
   const result = parseRemoteHelperResponse<{ stopped: boolean; survivors?: number }>(stopped.stdout, "stop");
-  assert.equal(result.stopped, true, "the reclaim completes despite a survivor it cannot reap");
+  assert.equal(result.stopped, true, "the reclaim completes");
+  assert.equal(result.survivors, undefined, "with nothing left of the group — the SIGTERM reached it");
   assert.equal(await hasSession(), false,
     "and the old supervisor is gone, which is what starting freshly requires");
   await assert.rejects(stat(`${runtimeDir}/identity.json`), "and the tombstone is cleared, so a fresh runtime can start");
@@ -629,6 +635,87 @@ test("inspect separates a dead server under a live session from one that is stil
   // iteration would buy an answer that cannot change while the recorded process is alive.
   assert.equal(booting.socketListening, undefined, "a live server is not probed further");
   assert.equal(booting.sessionAgeMs, undefined);
+});
+
+// The teardown has to survive a stop that FAILS, which is the whole reason it was moved off the
+// bottom of the function. A stop whose identity does not match refuses before touching anything;
+// a stop that cannot prove the group stopped throws after. In the second case the endpoint is
+// left for the next attempt, and leaving the old supervisor standing is what made that attempt
+// refuse too -- the loop the reclaim exists to break.
+// The same guarantee for the other provider, run against a real tmux session. It matters at least
+// as much here: Claude runs Bash tools, so a command it started can outlive the host holding its
+// process group open, and the four-day wedge -- a live session over a dead server that nothing
+// would ever kill -- was reachable on this path too.
+test("stopping a Claude host tears down its supervising session", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const tmuxSocket = `${runtimeDir}/tmux.sock`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", tmuxSocket, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+  const hasSession = async (): Promise<boolean> => tmux("has-session", "-t", session).then(() => true, () => false);
+  assert.equal(await hasSession(), true, "the supervisor is up before the stop");
+
+  const token = "d".repeat(32);
+  const host = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token },
+  });
+  t.after(() => { try { process.kill(host.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const identity = { kind: "ssh", token, pid: host.pid, linuxStartTime: "1", processGroupId: host.pid };
+  await writeFile(`${runtimeDir}/claude-host-identity.json`, JSON.stringify(identity), { mode: 0o600 });
+
+  const stopArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session, tmuxMode: "explicit", expected: identity,
+  }));
+  const stopped = await runBoundedProcess(process.execPath,
+    [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop-claude-host", stopArg],
+    { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+
+  assert.equal(parseRemoteHelperResponse<{ stopped: boolean }>(stopped.stdout, "stop-claude-host").stopped, true);
+  assert.equal(await hasSession(), false,
+    "and the old supervisor is gone, which is what starting freshly requires");
+  await assert.rejects(stat(`${runtimeDir}/claude-host-identity.json`), "the tombstone is cleared too");
+});
+
+test("a stop that refuses over a mismatched identity touches nothing", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const tmuxSocket = `${runtimeDir}/tmux.sock`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", tmuxSocket, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  // Valid in every respect, so the ONLY thing the refusal can be about is the token mismatch
+  // below. `validIdentity` rejects pid or pgid under 2, and an identity that fails validation
+  // would take the same early throw for a different reason and prove nothing.
+  const identity = { kind: "ssh", token: "f".repeat(32), pid: 4242, linuxStartTime: "1", processGroupId: 4242 };
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+  // A DIFFERENT identity: the other bot instance's runtime, which this one must not touch.
+  const stopArg = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session, tmuxMode: "explicit",
+    expected: { ...identity, token: "0".repeat(32) },
+  }));
+
+  await assert.rejects(runBoundedProcess(process.execPath,
+    [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", stopArg], { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 }));
+  assert.equal(await tmux("has-session", "-t", session).then(() => true, () => false), true,
+    "an unproven identity kills nothing — that refusal is above the teardown, and must stay there");
+  await stat(`${runtimeDir}/identity.json`);
 });
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {

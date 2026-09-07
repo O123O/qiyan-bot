@@ -421,16 +421,20 @@ async function driveWedgedLifecycleRow(
   operations.fail(record.id, { message: "existing SSH runtime is unhealthy: devbox" }, true);
   // Failing since long before this process, which is the shape that wedges: the row outlives the
   // bot, so a budget that only counts passes inside one lifetime can never be spent.
-  // Failing since long before this process, which is the shape that wedges: the row outlives the
-  // bot, so a budget counting only passes inside one lifetime can never be spent. Aged through a
-  // second connection to the same file rather than a test-only method on the store -- SQLite
-  // allows it, and the ledger has no business carrying a setter nothing in production calls.
+  assert.equal(operations.listRecoverable().some((row: any) => row.id === record.id), true);
+
+  // One pass first, so the ledger stamps when this streak began -- then age THAT. Not
+  // `created_at`: a row that outlived a restart is already old by that clock, so measuring from
+  // it would satisfy the floor immediately for exactly the rows a durable count exists for.
+  // Aged through a second connection to the same file rather than a test-only method on the
+  // store; SQLite allows it, and the ledger has no business carrying a setter production never
+  // calls.
+  await reconcileOnce();
   const aging = new DatabaseSync(databasePath);
   try {
-    aging.prepare("UPDATE operations SET created_at = ? WHERE id = ?")
-      .run(Date.now() - 24 * 60 * 60 * 1000, record.id);
+    aging.prepare("UPDATE operations SET recovery_started_at = ? WHERE id = ?")
+      .run(Date.now() - 60 * 60 * 1000, record.id);
   } finally { aging.close(); }
-  assert.equal(operations.listRecoverable().some((row: any) => row.id === record.id), true);
 
   // Deliberately more passes than the budget: the count has to survive them, and the row has to
   // stop coming back once it is spent.

@@ -38,10 +38,11 @@ export type OperationalEventCode =
   | "endpoint_reconnect_gave_up"
   | "endpoint_connection_lost"
   | "endpoint_runtime_reclaimed"
-  // The durable count that produces a wedged lifecycle row's ONLY terminal verdict could not be
-  // written. Without this the failure is indistinguishable from an ordinary failed attempt, and
-  // the row would sit uncertain with nothing saying why it never reached its budget.
-  | "operation_recovery_count_failed"
+  // A ledger write on the path that produces a wedged lifecycle row's ONLY terminal verdict failed
+  // -- the durable attempt count, or the give-up itself. Neither aborts the pass, because that
+  // would discard every other row's attempt, so without this the row would sit uncertain with
+  // nothing saying why it never reached its budget.
+  | "operation_recovery_write_failed"
   | "background_task_failed";
 
 export interface OperationalEvent {
