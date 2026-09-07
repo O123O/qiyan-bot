@@ -226,6 +226,60 @@ test("a side-effecting failure returns fixed uncertainty while retaining its ori
   assert.equal(calls, 1, "uncertain creation is never redispatched");
 });
 
+// The wedge, at its source. `restart_endpoint` on an endpoint whose runtime cannot be reached
+// fails while resolving its shutdown target -- before `draining`, the FIRST checkpoint, is ever
+// written. Recording that uncertain fenced every later lifecycle action on the endpoint, so the
+// disconnect that would have ended it was refused by the wreckage of the restart that could not
+// happen. One endpoint sat that way for four days, another for 97 hours, and the failure repeats
+// identically on every attempt, so nothing was ever going to settle it.
+test("a lifecycle failure that wrote no checkpoint is definite, not uncertain", async () => {
+  for (const kind of ["restart_endpoint", "disconnect_endpoint"] as const) {
+    const db = createTestDatabase();
+    const operations = new OperationStore(db);
+    operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: kind, rawText: "restart", attachmentIds: [] });
+    let calls = 0;
+    const tools = createAssistantTools(operations, {
+      [kind]: async () => {
+        calls += 1;
+        throw new AppError("ENDPOINT_UNAVAILABLE", "existing SSH runtime is unhealthy: polyphe");
+      },
+    }, { maxCollectCount: 20 });
+    const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" };
+
+    await assert.rejects(tools[kind](context, { endpoint: "polyphe" }), /unhealthy/u);
+    const row = db.prepare("SELECT state, receipt_json FROM operations WHERE call_id = 'first'").get() as
+      { state: string; receipt_json: string | null };
+    assert.equal(row.receipt_json, null, `${kind} really did fail before its first checkpoint`);
+    assert.equal(row.state, "failed", `${kind} left uncertain fences its endpoint forever`);
+    assert.equal(calls, 1);
+
+    // And the endpoint is not fenced: the next lifecycle action on it is admitted.
+    await assert.rejects(tools[kind]({ ...context, callId: "second" }, { endpoint: "polyphe" }), /unhealthy/u);
+    assert.equal(calls, 2, "a definite failure does not block the retry that could repair it");
+  }
+});
+
+// The other half: a lifecycle failure that DID get past its first checkpoint may have stopped a
+// runtime, and that is exactly what the fence is for. Only "nothing was written" is proof --
+// `idle_proven` is checkpointed before a non-atomic stop, so an early phase proves nothing.
+test("a lifecycle failure after any checkpoint stays uncertain", async () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "phase", rawText: "restart", attachmentIds: [] });
+  const tools = createAssistantTools(operations, {
+    restart_endpoint: async (_args, context) => {
+      context.checkpoint({ endpoint: "polyphe", phase: "idle_proven" });
+      throw new AppError("ENDPOINT_UNAVAILABLE", "runtime went away mid-stop");
+    },
+  }, { maxCollectCount: 20 });
+
+  await assert.rejects(
+    tools.restart_endpoint({ sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" }, { endpoint: "polyphe" }),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
+  assert.equal((db.prepare("SELECT state FROM operations WHERE call_id = 'first'").get() as any).state, "uncertain",
+    "a stop that may have completed must still fence its endpoint");
+});
+
 test("a pre-dispatch create checkpoint makes endpoint failure definite", async () => {
   const db = createTestDatabase();
   const operations = new OperationStore(db);

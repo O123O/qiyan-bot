@@ -257,10 +257,30 @@ const provenNoEffectCodes = new Set([
   "UNSUPPORTED_CAPABILITY", "ATTACHMENT_INVALID", "OPERATION_CONFLICT", "CAPACITY_EXCEEDED", "PERMISSION_BLOCKED",
   "CONFIGURATION_ERROR",
 ]);
+// The lifecycle verbs checkpoint `draining` as the FIRST thing they do once a shutdown target is
+// resolved -- before a single managed thread is drained, and long before the runtime is stopped.
+const endpointLifecycleKinds = new Set(["restart_endpoint", "disconnect_endpoint"]);
+
 function isProvenNoEffect(error: unknown, operation?: OperationRecord): boolean {
   if (operation?.kind === "create_session" && isRecord(operation.receipt)) {
     if (operation.receipt.dispatchStarted === true) return false;
     if (operation.receipt.dispatchStarted === false) return true;
   }
+  // No receipt AT ALL on a lifecycle verb means not even `draining` was written, so the failure
+  // happened while resolving the shutdown target and no runtime was stopped. That is the whole
+  // hazard `uncertain` fences an endpoint against: a stop that may or may not have completed.
+  //
+  // Recording it uncertain instead was self-defeating on the exact endpoints it mattered for. An
+  // endpoint whose runtime cannot be reached fails here EVERY time, and while the row is
+  // uncertain it fences every later lifecycle action on that endpoint -- so the disconnect that
+  // would end the situation is refused by the wreckage of the restart that could not happen.
+  // One endpoint spent four days that way and another 97 hours.
+  //
+  // Deliberately an ABSENT receipt, not an early phase. `idle_proven` is checkpointed before a
+  // non-atomic stop, so it can sit on a row whose runtime did go down; only "nothing was written"
+  // is proof. What an absent receipt does NOT prove is that nothing happened at all -- resolving
+  // the target may have STARTED an endpoint for proof -- but a started endpoint is not what the
+  // fence protects against, and the manager reopens or discards it on its own way out.
+  if (operation && endpointLifecycleKinds.has(operation.kind) && operation.receipt === undefined) return true;
   return error instanceof AppError && provenNoEffectCodes.has(error.code);
 }
