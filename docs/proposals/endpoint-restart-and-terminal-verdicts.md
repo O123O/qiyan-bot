@@ -141,6 +141,15 @@ no socket ⇒ `status:"absent"` (`:166`) ⇒ `start` proceeds past its `unhealth
 | 2 | **Reclaim an unserving supervisor.** Relax `ssh-runtime.ts:251`, gated on the revised proof below. | Fixes `polyphe`. `stop` already does the teardown. |
 | 3 | **Retire on an absent receipt** *(open)*. | Would make the budget rarely needed. |
 
+**All five shipped**, on `mxin/lifecycle-terminal-verdict`, one commit each.
+
+| Step | Commit | What landed, where it differs from the plan |
+|---|---|---|
+| 1a | `07b6c81` | As planned. |
+| 1b + 1c | `585703c` | One commit: the durable count and the end-of-pass verdict are the same edit. The count is `operations.recovery_attempts`; the verdict is `settleRecoveryPassVerdict`, extracted so a test drives the code the pass runs, over a real ledger. |
+| 2 | `caa0469` | As planned, plus one thing the plan missed: `stop`'s survivors gate ASSERTED the supervisor was gone, which can never hold on this path. It now kills the session first and judges what survived, establishing the condition instead of demanding it. |
+| 3 | `defc30a` | Absent receipt only, as review restricted it. Note this does NOT reach the unparseable-receipt rows — 1c is what covers those. |
+
 Ordering is 1 → 2 for safety, not because 1 unblocks 2.
 
 ### Ownership proof for step 2
@@ -217,14 +226,14 @@ cover both or refuse explicitly in legacy mode.
 
 ## Open questions for review
 
-1. **Should step 3 exist, or replace step 1?** Restricted by review to *absent receipt only* —
+1. ~~**Should step 3 exist, or replace step 1?**~~ **Both shipped.** Restricted by review to *absent receipt only* —
    note this overlaps step 1c: an unparseable receipt is not an absent one, so step 3 does not
    reach the `:5174` rows either. —
    `idle_proven` is checkpointed **before** a non-atomic stop (`manager.ts:265-266`), so that
    phase can sit on a row whose runtime did go down. Even an absent receipt proves "the runtime
    was not stopped", not "nothing happened": `shutdownTarget` may start an endpoint for proof.
-2. **What is N?** With the reset fixed and backoff capped at 30s, N=5 is ~2.5 minutes. Per-row
-   across both instances, not per process.
+2. ~~**What is N?**~~ **N=5, unchanged, and now durable** — per row in the ledger, so it counts
+   across both bot instances and across restarts rather than per process.
 3. ~~Does step 2 need an `inspect` discriminator?~~ **Answered: yes.** The earlier answer
    ("the probe says it is") was a category error — the probe established *polyphe's state*, not
    *`inspect`'s expressiveness*, and the proof must hold on every endpoint. `inspect` returns an
