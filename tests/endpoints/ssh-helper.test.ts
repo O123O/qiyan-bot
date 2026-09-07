@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -533,6 +533,81 @@ test("a stop reclaims a dead runtime whose token-carrying descendant survives", 
   const result = parseRemoteHelperResponse<{ stopped: boolean; survivors?: number }>(stopped.stdout, "stop");
   assert.equal(result.stopped, true, "the reclaim completes despite a survivor it cannot reap");
   await assert.rejects(stat(`${runtimeDir}/identity.json`), "and the tombstone is cleared, so a fresh runtime can start");
+});
+
+// The endpoint that could not be repaired for four days: a tmux session still alive over an
+// app-server that had died. `inspect` answered `{status:"unhealthy", supervised:true, identity}`
+// for that AND for a runtime still booting, so the caller could only refuse both -- and refusing
+// the first is a dead end, because `start` will not touch an unhealthy runtime either.
+//
+// Run against real processes, a real tmux session and a real stale socket inode, because every
+// fact here is a claim about the operating system: whether a recorded pid is still that process,
+// and whether anything is bound to a socket file that outlived its listener.
+test("inspect separates a dead server under a live session from one that is still alive", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const tmuxSocket = `${runtimeDir}/tmux.sock`;
+  const socketPath = `${runtimeDir}/app-server.sock`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", tmuxSocket, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  // A stale socket INODE with nothing bound to it: the ordinary shape a crashed server leaves,
+  // and the reason `stat` cannot answer this question. Written by a child that is SIGKILLed, so
+  // nothing gets the chance to unlink it.
+  const binder = spawn(process.execPath, ["-e",
+    `require("net").createServer().listen(${JSON.stringify(socketPath)}, () => console.log("up"));`
+    + `process.on("SIGTERM", () => {});`], { stdio: ["ignore", "pipe", "ignore"] });
+  await once(binder.stdout, "data");
+  binder.kill("SIGKILL");
+  await once(binder, "exit");
+  assert.equal((await stat(socketPath)).isSocket(), true, "the socket file outlives its listener");
+
+  const inspect = async (identity: unknown) => {
+    await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit" }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", argument],
+      { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{
+      status: string; supervised?: boolean; serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number;
+    }>(run.stdout, "inspect");
+  };
+  const processFacts = (pid: number) => {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    return { processGroupId: Number(fields[2]), linuxStartTime: fields[19]! };
+  };
+
+  // 1. The dead server. Its recorded process is gone; its session and its socket file are not.
+  const corpse = spawn(process.execPath, ["-e", "0"], { stdio: "ignore" });
+  await once(corpse, "exit");
+  const dead = await inspect({
+    kind: "ssh", token: "d".repeat(32), pid: corpse.pid, linuxStartTime: "1", processGroupId: corpse.pid,
+  });
+  assert.equal(dead.status, "unhealthy");
+  assert.equal(dead.supervised, true, "the session really is still there");
+  assert.equal(dead.serverAlive, false, "and the recorded process really is gone");
+  assert.equal(dead.socketListening, false, "nothing is bound to the socket the crash left behind");
+  assert.ok((dead.sessionAgeMs ?? -1) >= 0, "with an age to bound the boot race against");
+
+  // 2. The same three facts for a runtime whose process IS alive -- a boot that has not bound
+  // its socket yet is the case the reclaim must never touch, and it differs ONLY in serverAlive.
+  const token = "e".repeat(32);
+  const alive = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  t.after(() => { try { process.kill(alive.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const booting = await inspect({ kind: "ssh", token, pid: alive.pid, ...processFacts(alive.pid!) });
+  assert.equal(booting.status, "unhealthy", "still unhealthy: it is not serving yet");
+  assert.equal(booting.serverAlive, true, "but it is alive, and must not be reclaimed");
+  assert.equal(booting.socketListening, false);
 });
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {

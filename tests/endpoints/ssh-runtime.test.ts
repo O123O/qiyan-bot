@@ -9,6 +9,7 @@ import {
   REMOTE_APP_SERVER_PROXY_READY,
   SshRemoteClient,
   SshRuntime,
+  UNSERVING_SUPERVISOR_MIN_AGE_MS,
   attestUserControlMaster,
   decodeRemoteArgument,
   encodeRemoteArgument,
@@ -56,6 +57,11 @@ class FakeRemote implements RemoteRuntimeClient {
   // the field; false is a runtime whose supervisor is gone and whose leftovers are reclaimable.
   supervised: boolean | undefined;
   ownedGroup: number[] | undefined;
+  // The three facts that let a caller tell a dead server under a live session from one still
+  // booting. Undefined models a host still running an older helper, which reports none of them.
+  serverAlive: boolean | undefined;
+  socketListening: boolean | undefined;
+  sessionAgeMs: number | undefined;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
@@ -67,6 +73,9 @@ class FakeRemote implements RemoteRuntimeClient {
         status: this.status,
         ...(this.supervised === undefined ? {} : { supervised: this.supervised }),
         ...(this.ownedGroup === undefined ? {} : { ownedGroup: this.ownedGroup, groupSize: this.ownedGroup.length }),
+        ...(this.serverAlive === undefined ? {} : { serverAlive: this.serverAlive }),
+        ...(this.socketListening === undefined ? {} : { socketListening: this.socketListening }),
+        ...(this.sessionAgeMs === undefined ? {} : { sessionAgeMs: this.sessionAgeMs }),
         ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}),
       } as T;
     }
@@ -562,6 +571,9 @@ test("a reclaim reports how many surviving processes it killed", async () => {
   assert.deepEqual(reclaimed, [{ endpointId: "devbox", survivors: 2 }]);
 });
 
+// A supervised runtime is a live thing, and killing it to make room is what the refusal exists
+// to prevent -- unless the probe has PROVEN it is not serving. "Unhealthy" alone is not that
+// proof: a runtime that is still booting is unhealthy for as long as codex takes to bind.
 test("a supervised unhealthy runtime is still refused rather than reclaimed", async () => {
   const remote = new FakeRemote();
   remote.status = "unhealthy";
@@ -570,6 +582,54 @@ test("a supervised unhealthy runtime is still refused rather than reclaimed", as
 
   await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 0);
+});
+
+// The four-day wedge. The supervisor is alive, and it is exactly what makes the leftovers
+// unreachable: `start` refuses an unhealthy runtime, so nothing ever kills the session and the
+// endpoint cannot come back without a human on the worker's machine.
+test("a live session over a proven-dead server is reclaimed instead of wedging the endpoint", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.supervised = true;
+  remote.serverAlive = false;
+  remote.socketListening = false;
+  remote.sessionAgeMs = 4 * 24 * 60 * 60 * 1000;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  const identity = await runtime.ensureStarted();
+
+  assert.deepEqual(identity, remote.identity, "the endpoint comes back on its own");
+  const stops = remote.calls.filter((call) => call.operation === "stop");
+  assert.equal(stops.length, 1, "the wedged runtime was torn down, session included");
+  assert.deepEqual(JSON.parse(stops[0]!.args[0]!).expected, remote.identity,
+    "and the stop proved the recorded identity before signalling anything");
+  assert.equal(remote.calls.filter((call) => call.operation === "start").length, 1);
+});
+
+// Each clause on its own, because any one of them missing turns a slow boot into a teardown
+// loop: the runtime is killed, restarted, found unhealthy while it boots, and killed again.
+test("a live supervisor is only reclaimed when every clause of the proof is present", async () => {
+  const attempt = async (mutate: (remote: FakeRemote) => void) => {
+    const remote = new FakeRemote();
+    remote.status = "unhealthy";
+    remote.supervised = true;
+    remote.serverAlive = false;
+    remote.socketListening = false;
+    remote.sessionAgeMs = 4 * 24 * 60 * 60 * 1000;
+    mutate(remote);
+    await assert.rejects(new SshRuntime({ endpointId: "devbox", remote }).ensureStarted(), /unhealthy/u);
+    assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 0);
+  };
+
+  await attempt((remote) => { remote.serverAlive = true; });
+  await attempt((remote) => { remote.socketListening = true; });
+  await attempt((remote) => { remote.sessionAgeMs = UNSERVING_SUPERVISOR_MIN_AGE_MS - 1; });
+  // A host still running an older helper reports none of these. Omission has to read as "not
+  // proven", never as "not alive" -- helpers are upgraded per host, so the permissive reading
+  // would tear down live runtimes on every host that had not been updated yet.
+  await attempt((remote) => { remote.serverAlive = undefined; });
+  await attempt((remote) => { remote.socketListening = undefined; });
+  await attempt((remote) => { remote.sessionAgeMs = undefined; });
 });
 
 // A helper that predates the field says nothing about its supervisor, and an unproven guess is

@@ -165,11 +165,63 @@ async function inspect(value) {
     if ((identityFile && !identity) || (!identity && socketFile) || groupAlive) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
     return { status: "absent", supervised };
   }
-  if (!identity || !identityMatches(identity)) return { status: "unhealthy", supervised, ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+  // Why an unhealthy-and-supervised answer has to say MORE than "unhealthy".
+  //
+  // The two returns below are mutually exclusive and were indistinguishable to the caller: a
+  // supervised session whose recorded process is DEAD (reclaimable debris) and one whose process
+  // is alive but not yet serving (a runtime still booting, which must be left alone). Both
+  // reported `{status:"unhealthy", supervised:true, identity, ...}`, so the caller could only
+  // refuse both -- and refusing the first is a dead end, because `start` will not touch an
+  // unhealthy runtime either. One endpoint sat behind a four-day-old session that way.
+  //
+  // `serverAlive` is the load-bearing fact. `socketListening` is decisive where a stat is not:
+  // a unix socket file OUTLIVES its listener, so the ordinary dead-server shape has a stale
+  // socket inode, and only a connect distinguishes it from one being served. `sessionAgeMs`
+  // bounds the window before `identity.json` exists at all -- a boot writes it late -- and the
+  // race against another bot instance calling `start` right now.
+  // Gathered only when there is a recorded identity to judge, because `start` polls this in a
+  // 50ms loop while a runtime boots and the identity file is written LAST: without the guard,
+  // every boot would pay a socket connect and a `tmux` fork per iteration for facts that only a
+  // caller holding an identity can act on.
+  const supervisedFacts = async () => (identity
+    ? {
+      serverAlive: identityMatches(identity) && processHasToken(identity.pid, identity.token),
+      socketListening: await socketListening(paths.socketPath),
+      ...await sessionAge(paths),
+    }
+    : {});
+  if (!identity || !identityMatches(identity)) {
+    return { status: "unhealthy", supervised, ...await supervisedFacts(), ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
+  }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", supervised, identity, ownedGroup, groupSize: group.length };
+    return { status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length };
   }
   return { status: "healthy", identity, supervised };
+}
+
+// Whether anything is accepting on the socket, as opposed to whether a socket file is there.
+// ECONNREFUSED on a unix socket means the inode exists and no process is bound to it, which is
+// exactly the leftover a dead app-server produces; ENOENT means it was cleaned up. A connection
+// that opens is closed immediately -- the app-server treats an empty connection as a client that
+// went away, and nothing else about it is inspected.
+async function socketListening(socketPath) {
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; socket.destroy(); resolve(value); } };
+    const socket = connect(socketPath);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(2_000, () => finish(false));
+  });
+}
+
+// How long the supervising tmux session has existed. Reported in millis of AGE rather than as
+// the creation stamp so the caller does not have to trust the two hosts' clocks to agree.
+async function sessionAge(paths) {
+  const shown = await run("tmux", [...tmuxArgs(paths), "display-message", "-p", "-t", paths.session, "#{session_created}"], true);
+  const created = Number(shown.stdout.toString("utf8").trim());
+  if (shown.code !== 0 || !Number.isSafeInteger(created) || created <= 0) return {};
+  return { sessionAgeMs: Math.max(0, Date.now() - created * 1000) };
 }
 
 async function start(value) {
@@ -244,10 +296,19 @@ async function stop(value) {
       // with it. That is the condition under which a replacement cannot become a second live
       // app-server on the same socket, which is the thing this check is really for. Leftover
       // descendants do not qualify: the replacement gets a new pid, process group and token.
+      //
+      // The supervisor half of that is established HERE rather than asserted, by killing the
+      // session first. Asserting it made a reclaim impossible in the one case a reclaim is now
+      // for -- a live session over a dead server -- where the session is not a reason to stop,
+      // it is the thing being torn down. Ordering it before the verdict costs nothing anywhere
+      // else: on every other path the session is already gone.
       if (survivors > 0) {
-        const supervised = (await run("tmux", [...tmuxArgs(paths), "has-session", "-t", paths.session], true)).code === 0;
-        const serverAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
-        if (supervised || serverAlive) throw new Error("runtime process group did not stop");
+        await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
+        await waitForEmptyGroup(identity.processGroupId, 2_000);
+        survivors = ownedGroupMembers(identity).length;
+        if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
+          throw new Error("runtime process group did not stop");
+        }
       }
     }
   }

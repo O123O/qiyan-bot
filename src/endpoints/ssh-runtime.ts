@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "c1e80e3786c9976b55cd0dd6fd2d8db9c2ec7f2a8433f910923a6f880c4178b2";
+export const REMOTE_HELPER_SHA256 = "c173cd475eea9fc2c8854ba230ec102c0cc10701ee93fd828dad35c5b2d7410d";
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "a871cecb15bacf6c756a1a5e00a3f8623f9a1137cc00a95c356e2e94a14b8537";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -52,9 +52,37 @@ const preflightSchema = z.object({
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent"), supervised: z.boolean().optional() }).strict(),
-  z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional() }).strict(),
+  z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional(), serverAlive: z.boolean().optional(), socketListening: z.boolean().optional(), sessionAgeMs: z.number().int().nonnegative().optional() }).strict(),
   z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional() }).strict(),
 ]);
+
+// How long a tmux session must have existed before its runtime can be reclaimed while the
+// session is still alive. It bounds two windows that no snapshot can see: a boot has a live
+// session and a STALE identity from the previous run (`start` unlinks identity.json only after
+// the capability probe), and another bot instance sharing this ledger may be inside `start`
+// right now. Ten minutes is far longer than any boot and far shorter than the four days the
+// endpoint this exists for spent wedged.
+export const UNSERVING_SUPERVISOR_MIN_AGE_MS = 10 * 60 * 1000;
+
+// Whether a still-supervised runtime has been PROVEN not to be serving, as opposed to merely
+// failing a health check. Reclaiming a live supervisor is otherwise unsafe: a runtime that is
+// booting looks unhealthy for as long as it takes codex to bind its socket, and tearing that
+// down would turn every slow start into a loop.
+//
+// Every clause is required and every one is checked against `=== false` / `>=` on a value that
+// must be PRESENT. A remote host still running an older helper omits these fields entirely, and
+// omission must read as "not proven" rather than as "not alive" -- upgrades are per host, so a
+// permissive default would reclaim live runtimes on every host that had not been updated yet.
+export function unservingSupervisor(current: {
+  serverAlive?: boolean;
+  socketListening?: boolean;
+  sessionAgeMs?: number;
+}): boolean {
+  return current.serverAlive === false
+    && current.socketListening === false
+    && current.sessionAgeMs !== undefined
+    && current.sessionAgeMs >= UNSERVING_SUPERVISOR_MIN_AGE_MS;
+}
 
 export interface RemoteAssets {
   helper: Buffer;
@@ -246,9 +274,15 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // is what protects against a RECYCLED pgid, and it does so through the gate in `stop`,
       // which only signals when a surviving member still carries the identity's token.
       //
-      // A runtime that is still SUPERVISED is a live thing this build does not understand,
-      // and is still left alone.
-      if (current.supervised !== false || !current.identity) {
+      // A runtime that is still SUPERVISED is normally a live thing this build does not
+      // understand, and is left alone -- unless the probe has PROVEN it is not serving: its
+      // recorded process dead, nothing accepting on its socket, and its session old enough that
+      // it cannot be a boot in progress. Refusing that case was its own dead end, because the
+      // supervisor is exactly what makes the leftovers unreachable: `start` will not touch an
+      // unhealthy runtime, and nothing else ever kills the session. One endpoint sat behind a
+      // four-day-old session with a dead app-server, unreachable and unrepairable, for that
+      // reason alone. `stop` does the teardown, session included.
+      if (!current.identity || (current.supervised !== false && !unservingSupervisor(current))) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
       const reclaimed = await this.options.remote.invoke("stop", [JSON.stringify({
@@ -354,7 +388,10 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
 
   private async inspectPrepared(prepared: NonNullable<SshRuntime["prepared"]>): Promise<
     { status: "absent" }
-    | { status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean; survivors?: number }
+    | {
+      status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean; survivors?: number;
+      serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number;
+    }
     | { status: "healthy"; identity: RuntimeIdentity }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
@@ -367,6 +404,12 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
         // The probe already counts what survived; dropping it is what made the kill invisible.
         ...(parsed.ownedGroup === undefined ? {} : { survivors: parsed.ownedGroup.length }),
         ...(parsed.identity === undefined ? {} : { identity: parseRuntimeIdentity(parsed.identity) }),
+        // Forwarded rather than collapsed into a verdict here, so the one place that decides
+        // whether a live supervisor may be torn down is `unservingSupervisor` and a missing
+        // field stays missing all the way to it.
+        ...(parsed.serverAlive === undefined ? {} : { serverAlive: parsed.serverAlive }),
+        ...(parsed.socketListening === undefined ? {} : { socketListening: parsed.socketListening }),
+        ...(parsed.sessionAgeMs === undefined ? {} : { sessionAgeMs: parsed.sessionAgeMs }),
       };
     }
     if (parsed.status !== "healthy") return { status: "absent" };
