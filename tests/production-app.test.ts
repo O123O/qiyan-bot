@@ -794,11 +794,11 @@ test("a lifecycle failure streak accumulates in the ledger and survives a restar
   // Four failing passes, and the bot restarts between every one of them.
   const failures = [1, 2, 3, 4].map(() => new OperationStore(db).recordRecoveryAttempt(operation.id));
   assert.deepEqual(failures, [1, 2, 3, 4], "each failing pass adds to a count no restart resets");
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 4 }), false,
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 4, elapsedMs: 60 * 60 * 1000 }), false,
     "and the budget is not spent early");
 
   const fifth = new OperationStore(db).recordRecoveryAttempt(operation.id);
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: fifth }), true,
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: fifth, elapsedMs: 60 * 60 * 1000 }), true,
     "the give-up fires, which it could not while the streak lived in a per-process Map");
 
   // A settled row starts over: an endpoint that recovers must not carry old failures into its
@@ -835,12 +835,18 @@ test("a silent pass that settles nothing is a failed attempt, and the budget ret
   const operation = { id: record.id, kind: "disconnect_endpoint" };
   const target = { policy: "endpoint_lifecycle", endpointId: "polyphe" } as const;
   // Nothing throws here: this is the guard-return path, scored once per pass at the end.
-  const verdicts = [1, 2, 3, 4].map(() => settleRecoveryPassVerdict({ operations, operation, target }));
+  const verdicts = [1, 2, 3, 4].map(() => settleRecoveryPassVerdict({ operations, operation, target, minElapsedMs: 0 }));
   assert.deepEqual(verdicts, [true, true, true, true], "an unsettled row keeps the pass coming back");
   assert.equal(operations.get(record.id)?.state, "uncertain", "and is not retired before the budget is spent");
 
-  assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), false,
-    "the fifth silent pass spends the budget");
+  // A row created moments ago is waited out however many passes it has burnt: the count on its
+  // own would retire it about fifteen seconds in, which is less than a host reboot.
+  assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), true,
+    "a young row keeps its fence even with the count spent");
+  assert.equal(operations.get(record.id)?.state, "uncertain");
+
+  assert.equal(settleRecoveryPassVerdict({ operations, operation, target, minElapsedMs: 0 }), false,
+    "once it has been failing long enough, the spent budget retires it");
   assert.equal(operations.get(record.id)?.state, "failed", "the row is terminal, with a recorded verdict");
   assert.match(String((operations.get(record.id)?.error as any)?.message), /outcome is unknown/u);
   assert.equal(operations.listRecoverable().some((row) => row.id === record.id), false,
@@ -863,9 +869,17 @@ test("only an endpoint-lifecycle row is ever retired by the budget", () => {
   const operation = { id: record.id, kind: "send_to_session" };
   const target = { policy: "ready_endpoint", endpointId: "devbox" } as const;
   for (let pass = 0; pass < 12; pass += 1) {
-    assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), true, `pass ${pass}`);
+    assert.equal(settleRecoveryPassVerdict({ operations, operation, target, minElapsedMs: 0 }), true, `pass ${pass}`);
   }
   assert.equal(operations.get(record.id)?.state, "uncertain", "a non-lifecycle row is never given up on");
+  // And nothing is written for it. The count is read only for endpoint-lifecycle rows, so
+  // counting every unsettled row of every kind bought nothing and cost one durable UPDATE per row
+  // per pass on a ledger that lives on NFS.
+  // The next increment returning 1 is the proof: had the twelve passes each written, it would be
+  // 13. `get` does not project the column, so reading it back through the record would assert
+  // nothing at all.
+  assert.equal(operations.recordRecoveryAttempt(record.id), 1,
+    "the ledger is not written for a count nothing reads");
 });
 
 // A row that settles by any route must drop its count, or an endpoint that failed four times and
@@ -1682,19 +1696,29 @@ test("a restart still refuses to race an earlier dispatched operation", async ()
 // lifecycle action forever, including the disconnect that would have ended the situation. An
 // operation the system cannot reconcile has to stop being an obstacle on its own.
 test("an unreconcilable lifecycle operation is retired rather than fencing forever", async () => {
-  const exhausted = (failures: number, state = "uncertain"): boolean => lifecycleRecoveryExhausted({
-    policy: "endpoint_lifecycle", state, failures, maxFailures: 3,
-  });
+  const exhausted = (failures: number, state = "uncertain", elapsedMs = 60_000): boolean =>
+    lifecycleRecoveryExhausted({
+      policy: "endpoint_lifecycle", state, failures, elapsedMs, maxFailures: 3, minElapsedMs: 30_000,
+    });
 
   assert.equal(exhausted(2), false, "while attempts are still being spent it stays recoverable");
   assert.equal(exhausted(3), true, "once they are exhausted it stops blocking later lifecycle actions");
-  // Counted in attempts, not elapsed time: `createdAt` is the ledger insert time and is never
-  // refreshed, so after a restart every recovered operation is already past any age budget and
-  // would be retired on its first failure, having tried nothing at all.
   assert.equal(exhausted(3, "dispatched"), false, "a dispatched operation is never retired — it is genuinely running");
   assert.equal(lifecycleRecoveryExhausted({
-    policy: "ready_endpoint", state: "uncertain", failures: 99, maxFailures: 3,
+    policy: "ready_endpoint", state: "uncertain", failures: 99, elapsedMs: 60_000, maxFailures: 3, minElapsedMs: 0,
   }), false, "only endpoint-lifecycle operations are retired this way — a send's effect is not superseded");
+
+  // Attempts AND elapsed time, because attempts alone do not measure what they are standing in
+  // for. Failing lifecycle recoveries retry on a 1s/2s/4s/8s backoff and unrelated events request
+  // passes too, so five failures can complete about fifteen seconds after the first -- less than
+  // an SSH host takes to reboot. Neither half is sufficient: a young row is not retired however
+  // many passes it has burnt, and an old one is not retired until it has actually tried.
+  assert.equal(exhausted(3, "uncertain", 29_999), false, "a row that has barely started is waited out, not given up on");
+  assert.equal(exhausted(1, "uncertain", 24 * 60 * 60 * 1000), false, "and age alone retires nothing");
+  // A caller that cannot say how long the row has been failing has not established the condition.
+  assert.equal(lifecycleRecoveryExhausted({
+    policy: "endpoint_lifecycle", state: "uncertain", failures: 99, maxFailures: 3,
+  }), false, "an unknown elapsed time is not a licence to retire");
 });
 
 // The settle retires the WHOLE list, so checking only the oldest would retire a dispatched

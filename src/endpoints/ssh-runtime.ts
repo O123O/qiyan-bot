@@ -20,7 +20,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "c173cd475eea9fc2c8854ba230ec102c0cc10701ee93fd828dad35c5b2d7410d";
+export const REMOTE_HELPER_SHA256 = "4db7c1bdf202d23ec241d09247d3d26a994dc6b8134012b3b829a9309019f91b";
 export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
 export const REMOTE_CLAUDE_HOST_SHA256 = "a871cecb15bacf6c756a1a5e00a3f8623f9a1137cc00a95c356e2e94a14b8537";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -56,12 +56,13 @@ const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional() }).strict(),
 ]);
 
-// How long a tmux session must have existed before its runtime can be reclaimed while the
-// session is still alive. It bounds two windows that no snapshot can see: a boot has a live
-// session and a STALE identity from the previous run (`start` unlinks identity.json only after
-// the capability probe), and another bot instance sharing this ledger may be inside `start`
-// right now. Ten minutes is far longer than any boot and far shorter than the four days the
-// endpoint this exists for spent wedged.
+// How long a tmux session must have existed before its runtime can be reclaimed while the session
+// is still alive. `serverAlive` is what actually protects a boot -- `start` unlinks identity.json
+// before creating the session, and the launcher writes the new one before it execs codex, so a
+// booting runtime either has no identity or has a live one, never a stale one. This bounds what a
+// single snapshot cannot see: another bot instance sharing this ledger may be inside `start` right
+// now. Ten minutes is far longer than any boot and far shorter than the four days the endpoint
+// this exists for spent wedged.
 export const UNSERVING_SUPERVISOR_MIN_AGE_MS = 10 * 60 * 1000;
 
 // Whether a still-supervised runtime has been PROVEN not to be serving, as opposed to merely

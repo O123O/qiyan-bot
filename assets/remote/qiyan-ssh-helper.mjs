@@ -175,21 +175,21 @@ async function inspect(value) {
   // unhealthy runtime either. One endpoint sat behind a four-day-old session that way.
   //
   // `serverAlive` is the load-bearing fact. `socketListening` is decisive where a stat is not:
-  // a unix socket file OUTLIVES its listener, so the ordinary dead-server shape has a stale
-  // socket inode, and only a connect distinguishes it from one being served. `sessionAgeMs`
-  // bounds the window before `identity.json` exists at all -- a boot writes it late -- and the
-  // race against another bot instance calling `start` right now.
-  // Gathered only when there is a recorded identity to judge, because `start` polls this in a
-  // 50ms loop while a runtime boots and the identity file is written LAST: without the guard,
-  // every boot would pay a socket connect and a `tmux` fork per iteration for facts that only a
-  // caller holding an identity can act on.
-  const supervisedFacts = async () => (identity
-    ? {
-      serverAlive: identityMatches(identity) && processHasToken(identity.pid, identity.token),
-      socketListening: await socketListening(paths.socketPath),
-      ...await sessionAge(paths),
-    }
-    : {});
+  // a unix socket file OUTLIVES its listener, so the ordinary dead-server shape has a stale socket
+  // inode, and only a connect distinguishes it from one being served. `sessionAgeMs` bounds the
+  // race against another bot instance that is inside `start` right now.
+  //
+  // The two corroborating facts are gathered only when `serverAlive` is FALSE, which is both the
+  // only case a caller can act on and what keeps a boot cheap: `start` polls this in a 50ms loop
+  // while a runtime comes up, and the launcher writes identity.json BEFORE it execs codex, so for
+  // the whole of codex's own startup the recorded process is alive and every iteration would
+  // otherwise pay a socket connect and a `tmux` fork for an answer that could not change.
+  const supervisedFacts = async () => {
+    if (!identity) return {};
+    const serverAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
+    if (serverAlive) return { serverAlive };
+    return { serverAlive, socketListening: await socketListening(paths.socketPath), ...await sessionAge(paths) };
+  };
   if (!identity || !identityMatches(identity)) {
     return { status: "unhealthy", supervised, ...await supervisedFacts(), ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }

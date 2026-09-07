@@ -285,9 +285,12 @@ export class OperationStore {
   // one process happened to stay up for the whole streak, which is precisely when the endpoint is
   // least likely to be wedged.
   recordRecoveryAttempt(id: string): number {
-    this.db.prepare("UPDATE operations SET recovery_attempts = recovery_attempts + 1 WHERE id = ?").run(id);
-    const row = this.db.prepare("SELECT recovery_attempts FROM operations WHERE id = ?").get(id) as
-      { recovery_attempts?: number } | undefined;
+    // One statement, so the value returned is the value written. An UPDATE followed by a SELECT
+    // lets another writer -- the two bot instances share this ledger -- land in between, and
+    // while the count stays monotonic the number this reports would not be the one it produced.
+    const row = this.db.prepare(
+      "UPDATE operations SET recovery_attempts = recovery_attempts + 1 WHERE id = ? RETURNING recovery_attempts",
+    ).get(id) as { recovery_attempts?: number } | undefined;
     return row?.recovery_attempts ?? 0;
   }
 

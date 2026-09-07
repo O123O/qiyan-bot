@@ -177,6 +177,10 @@ const assistantMappingId = "assistant";
 // time and is never refreshed, so after a restart every recovered operation is already older
 // than any age budget and would be retired on its first failure, having tried nothing.
 const LIFECYCLE_RECOVERY_MAX_FAILURES = 5;
+// The wall clock the failure count on its own does not measure. Long enough that an endpoint host
+// rebooting, or a network partition, is waited out rather than given up on; short enough that a
+// genuinely wedged endpoint is released without a human. Measured from the row's creation.
+const LIFECYCLE_RECOVERY_MIN_ELAPSED_MS = 10 * 60 * 1000;
 // How long startup waits for referenced endpoints to come up before continuing without the
 // stragglers. They keep connecting in the background and publish when they land, so this
 // bounds the WAIT, not the work — an unreachable host costs its full connect timeout, and
@@ -1005,14 +1009,27 @@ export function operationUnsettled(state: string | undefined): boolean {
 
 // The budget half of the streak; the count itself lives in the ledger, on the row
 // (`operations.recovery_attempts`), because the row it is meant to retire outlives the process.
+//
+// A count alone is not a budget. Failing lifecycle recoveries retry on a 1s/2s/4s/8s backoff, and
+// unrelated events request a pass too, so five failed attempts can complete about fifteen seconds
+// after the first -- less time than an SSH host takes to reboot. A bot that restarted into that
+// window would retire a row whose restart was going to succeed a minute later, and nothing else
+// owes the replacement. So the row must ALSO have been failing for long enough that waiting is
+// not the answer; `elapsedMs` is measured from the row's own creation, which survives restarts
+// exactly as the count does.
 export function lifecycleRecoveryExhausted(options: {
   policy: string;
   state: string | undefined;
   failures: number;
+  elapsedMs?: number;
   maxFailures?: number;
+  minElapsedMs?: number;
 }): boolean {
   if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
-  return options.failures >= (options.maxFailures ?? LIFECYCLE_RECOVERY_MAX_FAILURES);
+  if (options.failures < (options.maxFailures ?? LIFECYCLE_RECOVERY_MAX_FAILURES)) return false;
+  // Absent elapsed time is not a licence to retire: a caller that cannot say how long the row has
+  // been failing has not established the second half of the condition.
+  return (options.elapsedMs ?? -1) >= (options.minElapsedMs ?? LIFECYCLE_RECOVERY_MIN_ELAPSED_MS);
 }
 
 // The one verdict a reconciliation pass reaches for the row it just attempted, wherever the
@@ -1031,35 +1048,57 @@ export function settleRecoveryPassVerdict(options: {
   operation: { id: string; kind: string };
   target: OperationRecoveryTarget;
   maxFailures?: number;
+  minElapsedMs?: number;
+  onCountFailed?(operationId: string, error: unknown): void;
 }): boolean {
   const { operations, operation, target } = options;
-  const state = operations.get(operation.id)?.state;
-  if (!operationUnsettled(state)) {
+  const current = operations.get(operation.id);
+  if (!operationUnsettled(current?.state)) {
     operations.clearRecoveryAttempts(operation.id);
     return false;
   }
+  // Counted only where it is READ. `lifecycleRecoveryExhausted` looks at endpoint-lifecycle rows
+  // in the `uncertain` state and nothing else, so writing the count for every unsettled row of
+  // every kind bought nothing and cost one durable UPDATE per row per pass on a ledger that lives
+  // on NFS. Restricting it also settles what a `dispatched` row's count would have meant: it
+  // accumulated one it could never spend, and would then have been retired on the FIRST pass
+  // after it turned uncertain, with the budget already gone.
+  if (target.policy !== "endpoint_lifecycle" || current?.state !== "uncertain") return true;
   // Still unsettled after an attempted pass: a failed attempt, however that pass ended. The count
   // is on the row rather than in this process because the row outlives the process.
-  const failures = operations.recordRecoveryAttempt(operation.id);
-  if (target.policy === "endpoint_lifecycle" && lifecycleRecoveryExhausted({
+  //
+  // Guarded for the same reason the `fail` below is: this is two statements against a ledger two
+  // bot instances share, and letting a BUSY here escape would abort the whole pass and throw away
+  // every other row's attempt -- exactly the outcome the comment below calls worse.
+  let failures: number;
+  try { failures = operations.recordRecoveryAttempt(operation.id); }
+  catch (error) { options.onCountFailed?.(operation.id, error); return true; }
+  if (lifecycleRecoveryExhausted({
     policy: target.policy,
-    state,
+    state: current.state,
     failures,
+    elapsedMs: Date.now() - current.createdAt,
     ...(options.maxFailures === undefined ? {} : { maxFailures: options.maxFailures }),
+    ...(options.minElapsedMs === undefined ? {} : { minElapsedMs: options.minElapsedMs }),
   })) {
     // Giving up is safe because the ledger is not what prevents a second runtime: the runtime
     // attests its identity on the remote host, and a start refuses over a live supervised runtime
     // whatever the ledger says. What is lost is bookkeeping, and it is recorded as exactly that.
     //
-    // `fail` throws if the state moved under us -- two bot instances share one ledger in the
-    // deployed setup -- and losing the whole pass to that is worse than leaving this one row.
+    // `fail` reports OPERATION_UNCERTAIN if the state moved under us -- the other bot instance
+    // settled it -- and losing the whole pass to that is worse than leaving this one row. Only
+    // that: a storage failure here is the one path that produces the terminal verdict, so
+    // swallowing it silently would be its own unexplained "maybe".
     try {
       operations.fail(operation.id, {
         message: `gave up reconciling ${operation.kind} on endpoint ${target.endpointId} after `
           + `${failures} failed recovery attempts; its outcome is unknown and it no longer `
           + "blocks later lifecycle actions",
       });
-    } catch { /* another writer settled it; nothing left to retire */ }
+    } catch (error) {
+      if (!(error instanceof AppError && error.code === "OPERATION_UNCERTAIN")) throw error;
+      /* another writer settled it; nothing left to retire */
+    }
   }
   return operationUnsettled(operations.get(operation.id)?.state);
 }
@@ -2476,6 +2515,10 @@ export async function buildProductionApp(
         activity: { registerTool(attemptId: string): number; finishTool(attemptId: string): void },
       ): void;
       onWebUiStarted?(url: string): void;
+      onOperationRecoveryReady?(hooks: {
+        reconcileOnce(): Promise<OperationReconciliationPass>;
+        operations: OperationStore;
+      }): Promise<void> | void;
     };
     storage?: {
       acquireDatabaseLease?: (path: string) => Promise<DatabaseLease>;
@@ -3604,6 +3647,14 @@ export async function buildProductionApp(
           isEndpointReady: isRecoveryEndpointReady,
           operationState: (operationId) => operations.get(operationId)?.state,
         });
+        // The reconciliation pass is a closure, and every claim about it -- that a silent pass
+        // counts, that the give-up is reachable at all -- was only ever tested against the
+        // extracted verdict, which is the half that was never broken. Reinstating the original
+        // defect left the whole suite green. Handed out here so a test drives the pass production
+        // runs, over the ledger it runs against.
+        // Awaited: startup goes on to fail on an unreachable endpoint and closes the ledger, so a
+        // test that only captured these would be holding a closed database by the time it ran.
+        await options.testing?.onOperationRecoveryReady?.({ reconcileOnce: reconcileOperationsOnce, operations });
         endpointReadyBuffer = createEndpointReadyBuffer({ recover: recoverProjectEndpoint });
         scheduler = new AssistantScheduler();
         unsubscribers.push(endpointManager.onEndpoint((target, generation) => bindProjectEndpoint(target, generation)));
@@ -5186,6 +5237,9 @@ export async function buildProductionApp(
         fail: (error) => operations.failAndUnbindWithReconciliation(operation.id, error),
       })) {
         attempted = true;
+        // Settled, by the same rule the end-of-pass verdict uses: a row that leaves the
+        // recoverable set starts its next streak from zero.
+        operations.clearRecoveryAttempts(operation.id);
         return false;
       }
       const preflight = operationRecoveryPreflight(target, isRecoveryEndpointReady);
@@ -5705,7 +5759,18 @@ export async function buildProductionApp(
         // The give-up itself is at the end of the pass rather than here, so that a pass which
         // returns WITHOUT throwing and WITHOUT settling counts as the failed attempt it is.
       }
-      return settleRecoveryPassVerdict({ operations, operation, target });
+      return settleRecoveryPassVerdict({
+        operations, operation, target,
+        // A ledger write that fails is not a quiet retry: this is the count that produces the
+        // only terminal verdict a wedged row will ever get, so a storage failure has to be
+        // visible rather than looking like another ordinary failed attempt.
+        onCountFailed: (operationId, error) => report({
+          level: "warn",
+          code: "operation_recovery_count_failed",
+          component: operationId,
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      });
     });
     webGoalControl?.repairAwareness();
     return {

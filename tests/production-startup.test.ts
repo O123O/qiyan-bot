@@ -376,6 +376,75 @@ test("the acceptance hook receives the exact production manager tool map before 
   assert.deepEqual(captured, [...TOOL_NAMES].sort());
 });
 
+// The claim `07b6c81` and `585703c` exist to make true, tested against the pass that has to make
+// it true rather than the verdict extracted out of it. Reinstating the original defect -- clearing
+// the count at the TOP of every pass -- left all 124 tests in tests/production-app.test.ts green,
+// because every one of them called the extracted verdict directly and the extraction was never
+// the broken half. A wedged endpoint-lifecycle row fences every later lifecycle action on its
+// endpoint, so "the give-up is reachable" is the whole point and nothing was checking it.
+test("a wedged lifecycle row is retired by the pass production runs, not just by the verdict", async (t) => {
+  const { config } = await productionFixture(t);
+  let outcome: { state?: string; message?: string; recoverable?: boolean } | undefined;
+  // Everything runs INSIDE the hook: startup goes on to fail on the missing codex binary -- which
+  // is the state this is about, an endpoint that cannot be reached -- and closes the ledger on its
+  // way out, so a captured handle would be a closed database by the time the test used it.
+  const app = await buildProductionApp(config, {
+    chdir: () => undefined,
+    chatAdapters: [fakeTelegramAdapter()],
+    testing: { onOperationRecoveryReady: async ({ operations, reconcileOnce }) => {
+      outcome = await driveWedgedLifecycleRow(operations as any, reconcileOnce, join(config.dataDir, "bot.sqlite3"));
+    } },
+  });
+  await assert.rejects(app.start(), (error: unknown) => error instanceof StartupPhaseError);
+  assert.ok(outcome, "the reconciliation pass was never wired");
+
+  assert.equal(outcome.state, "failed",
+    "the pass never reached its own give-up, so the endpoint stays fenced forever");
+  assert.match(String(outcome.message), /outcome is unknown/u);
+  assert.equal(outcome.recoverable, false,
+    "and the row is out of the recoverable set, so a later disconnect is admitted");
+});
+
+async function driveWedgedLifecycleRow(
+  operations: any,
+  reconcileOnce: () => Promise<unknown>,
+  databasePath: string,
+): Promise<{ state?: string; message?: string; recoverable?: boolean }> {
+  operations.createSourceContext({
+    id: "ctx-wedged", kind: "telegram", sourceId: "wedged", rawText: "/restart", attachmentIds: [],
+  });
+  const record = operations.prepare({
+    contextId: "ctx-wedged", attemptId: "attempt", callId: "call",
+    kind: "restart_endpoint", args: { endpoint: "devbox" },
+  });
+  operations.markDispatched(record.id);
+  operations.fail(record.id, { message: "existing SSH runtime is unhealthy: devbox" }, true);
+  // Failing since long before this process, which is the shape that wedges: the row outlives the
+  // bot, so a budget that only counts passes inside one lifetime can never be spent.
+  // Failing since long before this process, which is the shape that wedges: the row outlives the
+  // bot, so a budget counting only passes inside one lifetime can never be spent. Aged through a
+  // second connection to the same file rather than a test-only method on the store -- SQLite
+  // allows it, and the ledger has no business carrying a setter nothing in production calls.
+  const aging = new DatabaseSync(databasePath);
+  try {
+    aging.prepare("UPDATE operations SET created_at = ? WHERE id = ?")
+      .run(Date.now() - 24 * 60 * 60 * 1000, record.id);
+  } finally { aging.close(); }
+  assert.equal(operations.listRecoverable().some((row: any) => row.id === record.id), true);
+
+  // Deliberately more passes than the budget: the count has to survive them, and the row has to
+  // stop coming back once it is spent.
+  for (let pass = 0; pass < 8 && operations.get(record.id)?.state === "uncertain"; pass += 1) {
+    await reconcileOnce();
+  }
+  const settled = operations.get(record.id);
+  return {
+    state: settled?.state,
+    message: String((settled?.error as any)?.message),
+    recoverable: operations.listRecoverable().some((row: any) => row.id === record.id),
+  };
+}
+
 async function productionFixture(t: TestContext): Promise<{ root: string; config: BotConfig }> {
   const root = await mkdtemp(join(tmpdir(), "qiyan-bot-production-storage-"));
   t.after(() => rm(root, { recursive: true, force: true }));

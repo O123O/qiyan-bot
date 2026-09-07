@@ -524,14 +524,30 @@ test("a stop reclaims a dead runtime whose token-carrying descendant survives", 
   };
   await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
 
+  // A REAL supervising session, because "the restart kills the old tmux session" is the whole
+  // point and nothing asserted it. It is also the case that used to be refused outright: the old
+  // gate demanded the supervisor already be gone before it would finish a stop, so a live session
+  // over unreapable debris failed every attempt, forever, with the session still standing.
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  const tmuxSocket = `${runtimeDir}/tmux.sock`;
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", tmuxSocket, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+  // runBoundedProcess rejects on a non-zero exit, so "does the session exist" is the resolution.
+  const hasSession = async (): Promise<boolean> => tmux("has-session", "-t", session).then(() => true, () => false);
+  assert.equal(await hasSession(), true, "the supervisor is up before the stop");
+
   const stopArg = encodeRemoteArgument(JSON.stringify({
-    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit", expected: identity,
+    runtimeDir, session, tmuxMode: "explicit", expected: identity,
   }));
   const stopped = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", stopArg],
     { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
 
   const result = parseRemoteHelperResponse<{ stopped: boolean; survivors?: number }>(stopped.stdout, "stop");
   assert.equal(result.stopped, true, "the reclaim completes despite a survivor it cannot reap");
+  assert.equal(await hasSession(), false,
+    "and the old supervisor is gone, which is what starting freshly requires");
   await assert.rejects(stat(`${runtimeDir}/identity.json`), "and the tombstone is cleared, so a fresh runtime can start");
 });
 
@@ -607,7 +623,12 @@ test("inspect separates a dead server under a live session from one that is stil
   const booting = await inspect({ kind: "ssh", token, pid: alive.pid, ...processFacts(alive.pid!) });
   assert.equal(booting.status, "unhealthy", "still unhealthy: it is not serving yet");
   assert.equal(booting.serverAlive, true, "but it is alive, and must not be reclaimed");
-  assert.equal(booting.socketListening, false);
+  // And the corroborating facts are not gathered for it. `start` polls inspect every 50ms while a
+  // runtime boots, and the launcher writes identity.json BEFORE it execs codex -- so for the whole
+  // of codex's startup this branch is the hot one, and a socket connect plus a `tmux` fork per
+  // iteration would buy an answer that cannot change while the recorded process is alive.
+  assert.equal(booting.socketListening, undefined, "a live server is not probed further");
+  assert.equal(booting.sessionAgeMs, undefined);
 });
 
 test("the packaged helper bootstraps owner-only assets and inspects an absent isolated session", async (t) => {

@@ -278,9 +278,15 @@ function isProvenNoEffect(error: unknown, operation?: OperationRecord): boolean 
   //
   // Deliberately an ABSENT receipt, not an early phase. `idle_proven` is checkpointed before a
   // non-atomic stop, so it can sit on a row whose runtime did go down; only "nothing was written"
-  // is proof. What an absent receipt does NOT prove is that nothing happened at all -- resolving
-  // the target may have STARTED an endpoint for proof -- but a started endpoint is not what the
-  // fence protects against, and the manager reopens or discards it on its own way out.
+  // is proof.
+  //
+  // An absent receipt does NOT prove that nothing happened. Resolving the shutdown target can
+  // start an endpoint for proof, and it can now also RECLAIM one -- tearing down a tmux session
+  // and signalling a process group, including work the endpoint's own user started. Neither is
+  // what this fence protects against: it exists for a stop that may or may not have completed on
+  // the target runtime, and the reclaim proves the runtime it tore down was not serving. The
+  // manager reopens or discards a started endpoint on its own way out, and a reclaim reports its
+  // collateral through `onReclaimed` rather than through this row.
   if (operation && endpointLifecycleKinds.has(operation.kind) && operation.receipt === undefined) return true;
   return error instanceof AppError && provenNoEffectCodes.has(error.code);
 }
