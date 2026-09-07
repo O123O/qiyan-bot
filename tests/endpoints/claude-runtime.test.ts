@@ -261,7 +261,8 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
   // this, and settles what the host no longer reports.
   forgetTurn(sessionId: string, uuid: string): void {
     const session = this.require(sessionId);
-    session.inFlight.splice(session.inFlight.indexOf(uuid) >>> 0, 1);
+    const index = session.inFlight.indexOf(uuid);
+    if (index >= 0) session.inFlight.splice(index, 1);
   }
 
   private settle(sessionId: string, uuid: string, status: "completed" | "failed" | "interrupted"): void {

@@ -779,7 +779,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return { data, nextCursor: null };
   }
 
-  private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string } }> {
+  private async turnStart(params: Record<string, unknown>): Promise<{ turn: { id: string; status: string; queued?: boolean }; runningTurnId?: string }> {
     const threadId = requireString(params.threadId, "threadId");
     const state = this.threads.get(threadId);
     if (!state) throw noRollout(threadId);
