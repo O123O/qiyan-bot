@@ -996,6 +996,22 @@ export async function settleEarlierEndpointOperations(options: {
 // Whether an endpoint-lifecycle operation has been unreconcilable long enough to retire. Only
 // `uncertain` qualifies: a `dispatched` operation is genuinely in flight and no amount of elapsed
 // time makes it safe to retire one.
+// A row still in these states has NOT settled: it is what `listRecoverable` selects, so it will
+// be picked up again next pass. Naming it keeps the two places that must agree -- the failure
+// streak and the pass's own return -- from drifting apart.
+export function operationUnsettled(state: string | undefined): boolean {
+  return state === "dispatched" || state === "uncertain";
+}
+
+// The accumulation half of the streak, extracted so it is the same code a test drives and
+// production runs. Kept trivial on purpose: the bug was never in the arithmetic, it was that the
+// counter was cleared before this ran.
+export function recordLifecycleFailure(streaks: Map<string, number>, id: string): number {
+  const next = (streaks.get(id) ?? 0) + 1;
+  streaks.set(id, next);
+  return next;
+}
+
 export function lifecycleRecoveryExhausted(options: {
   policy: string;
   state: string | undefined;
@@ -5141,9 +5157,13 @@ export async function buildProductionApp(
         return true;
       }
       attempted = true;
-      // A pass that gets this far will either settle the operation or fail; a run that does not
-      // throw means progress, so the failure streak restarts.
-      lifecycleRecoveryFailures.delete(operation.id);
+      // The streak is NOT cleared here. The comment that stood in this place said "a run that does
+      // not throw means progress", and that is false: several recovery paths return cleanly
+      // without settling the row -- an unparseable lifecycle receipt returns at the
+      // parseEndpointLifecycleCheckpoint guard every pass, forever. Clearing on entry made the
+      // increment below always compute 1, so lifecycleRecoveryExhausted could never fire in any
+      // process of any lifetime, and an endpoint-lifecycle row could sit uncertain indefinitely,
+      // fencing its endpoint. Cleared at the end of the pass instead, and only if the row settled.
       const args = operation.args as any;
       let attemptedEndpointGeneration: number | undefined;
       try {
@@ -5648,8 +5668,7 @@ export async function buildProductionApp(
         // runtime attests its identity on the remote host, and a start refuses over a live
         // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
         // is recorded as exactly that: the outcome is unknown, and said so.
-        const failures = (lifecycleRecoveryFailures.get(operation.id) ?? 0) + 1;
-        lifecycleRecoveryFailures.set(operation.id, failures);
+        const failures = recordLifecycleFailure(lifecycleRecoveryFailures, operation.id);
         if (lifecycleRecoveryExhausted({
           policy: target.policy,
           state: operations.get(operation.id)?.state,
@@ -5669,7 +5688,10 @@ export async function buildProductionApp(
         }
       }
       const current = operations.get(operation.id);
-      return current?.state === "dispatched" || current?.state === "uncertain";
+      const unsettled = operationUnsettled(current?.state);
+      // Progress is the row leaving the recoverable set, not the pass declining to throw.
+      if (!unsettled) lifecycleRecoveryFailures.delete(operation.id);
+      return unsettled;
     });
     webGoalControl?.repairAwareness();
     return {

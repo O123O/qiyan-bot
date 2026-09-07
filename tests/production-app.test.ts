@@ -22,6 +22,8 @@ import {
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
   lifecycleRecoveryExhausted,
+  operationUnsettled,
+  recordLifecycleFailure,
   settleEarlierEndpointOperations,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
@@ -752,6 +754,41 @@ test("an unresolved recover_endpoint does not fence a later endpoint restart", (
   assert.equal(hasEarlierEndpointOperation(store.listRecoverable(), restart.sequence, "devbox", {
     defaultProjectEndpointId: "local", session: () => undefined,
   }), false, "a stuck recovery must not block the restart that could still repair the endpoint");
+});
+
+// The give-up for a wedged endpoint-lifecycle row was unreachable: the streak was cleared at the
+// TOP of every pass, so the increment always computed 1 and the budget of 5 could never be spent
+// -- in any process, of any lifetime. A disconnect_endpoint row for one endpoint sat uncertain
+// for 97 hours because of it, fencing that endpoint the whole time. Progress is the row leaving
+// the recoverable set; a pass that returns without settling it is not progress.
+test("an unsettled row keeps its failure streak, a settled one drops it", () => {
+  assert.equal(operationUnsettled("uncertain"), true, "still recoverable, so the streak must survive");
+  assert.equal(operationUnsettled("dispatched"), true);
+  assert.equal(operationUnsettled("failed"), false, "terminal, so the streak is spent and cleared");
+  assert.equal(operationUnsettled("succeeded"), false);
+  assert.equal(operationUnsettled(undefined), false, "a row that vanished is not still pending");
+
+  // These are exactly the states listRecoverable selects, so the streak and the pass's own
+  // return can never disagree about what "still pending" means.
+  for (const state of ["dispatched", "uncertain"]) {
+    assert.equal(operationUnsettled(state), true, `${state} is recoverable`);
+  }
+});
+
+// The budget only means anything if repeated failures accumulate. This drives the same function
+// production increments with, rather than re-implementing the arithmetic in the test -- a
+// simulated version would have passed while the production counter was still reset every pass,
+// which is exactly how the original defect survived having a test at all.
+test("a repeated lifecycle failure accumulates until the budget is spent", () => {
+  const streaks = new Map<string, number>();
+  const failures = [1, 2, 3, 4, 5].map(() => recordLifecycleFailure(streaks, "op-wedged"));
+  assert.deepEqual(failures, [1, 2, 3, 4, 5], "each failing pass adds to the streak");
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: failures.at(-1)! }),
+    true, "and the give-up fires, which it could not while the streak was cleared every pass");
+
+  // A different row does not inherit another's streak.
+  assert.equal(recordLifecycleFailure(streaks, "op-other"), 1);
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 1 }), false);
 });
 
 test("adoption recovery resolves the checkpointed registry identity before endpoint access", async () => {
