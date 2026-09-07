@@ -1003,15 +1003,8 @@ export function operationUnsettled(state: string | undefined): boolean {
   return state === "dispatched" || state === "uncertain";
 }
 
-// The accumulation half of the streak, extracted so it is the same code a test drives and
-// production runs. Kept trivial on purpose: the bug was never in the arithmetic, it was that the
-// counter was cleared before this ran.
-export function recordLifecycleFailure(streaks: Map<string, number>, id: string): number {
-  const next = (streaks.get(id) ?? 0) + 1;
-  streaks.set(id, next);
-  return next;
-}
-
+// The budget half of the streak; the count itself lives in the ledger, on the row
+// (`operations.recovery_attempts`), because the row it is meant to retire outlives the process.
 export function lifecycleRecoveryExhausted(options: {
   policy: string;
   state: string | undefined;
@@ -1020,6 +1013,55 @@ export function lifecycleRecoveryExhausted(options: {
 }): boolean {
   if (options.policy !== "endpoint_lifecycle" || options.state !== "uncertain") return false;
   return options.failures >= (options.maxFailures ?? LIFECYCLE_RECOVERY_MAX_FAILURES);
+}
+
+// The one verdict a reconciliation pass reaches for the row it just attempted, wherever the
+// attempt ended -- returned, returned early, or threw.
+//
+// Progress is the row leaving the recoverable set, NOT the pass declining to throw. Several
+// recovery paths return cleanly without settling: an unparseable lifecycle receipt returns at the
+// parseEndpointLifecycleCheckpoint guard on every pass, forever. Counting only thrown failures
+// left exactly those rows with no verdict and no count at all, so the rows least able to settle
+// themselves were the ones guaranteed never to reach a budget, and one such row fenced its
+// endpoint for 97 hours across several bot lifetimes.
+//
+// Returns whether the row is still unsettled, which is the pass's own "keep going" answer.
+export function settleRecoveryPassVerdict(options: {
+  operations: Pick<OperationStore, "get" | "recordRecoveryAttempt" | "clearRecoveryAttempts" | "fail">;
+  operation: { id: string; kind: string };
+  target: OperationRecoveryTarget;
+  maxFailures?: number;
+}): boolean {
+  const { operations, operation, target } = options;
+  const state = operations.get(operation.id)?.state;
+  if (!operationUnsettled(state)) {
+    operations.clearRecoveryAttempts(operation.id);
+    return false;
+  }
+  // Still unsettled after an attempted pass: a failed attempt, however that pass ended. The count
+  // is on the row rather than in this process because the row outlives the process.
+  const failures = operations.recordRecoveryAttempt(operation.id);
+  if (target.policy === "endpoint_lifecycle" && lifecycleRecoveryExhausted({
+    policy: target.policy,
+    state,
+    failures,
+    ...(options.maxFailures === undefined ? {} : { maxFailures: options.maxFailures }),
+  })) {
+    // Giving up is safe because the ledger is not what prevents a second runtime: the runtime
+    // attests its identity on the remote host, and a start refuses over a live supervised runtime
+    // whatever the ledger says. What is lost is bookkeeping, and it is recorded as exactly that.
+    //
+    // `fail` throws if the state moved under us -- two bot instances share one ledger in the
+    // deployed setup -- and losing the whole pass to that is worse than leaving this one row.
+    try {
+      operations.fail(operation.id, {
+        message: `gave up reconciling ${operation.kind} on endpoint ${target.endpointId} after `
+          + `${failures} failed recovery attempts; its outcome is unknown and it no longer `
+          + "blocks later lifecycle actions",
+      });
+    } catch { /* another writer settled it; nothing left to retire */ }
+  }
+  return operationUnsettled(operations.get(operation.id)?.state);
 }
 
 // A restart ends with the endpoint stopped and replaced; a disconnect ends with it stopped.
@@ -5121,10 +5163,6 @@ export async function buildProductionApp(
     return operationReconciler?.request() ?? Promise.resolve();
   }
 
-  // Consecutive failed recovery attempts per operation, for this process only. Deliberately not
-  // durable: it counts effort actually spent, and a restart genuinely does start that over.
-  const lifecycleRecoveryFailures = new Map<string, number>();
-
   async function reconcileOperationsOnce(): Promise<OperationReconciliationPass> {
     let attempted = false;
     let waitingForEndpoint = false;
@@ -5664,34 +5702,10 @@ export async function buildProductionApp(
         // when a LATER lifecycle action subsumes it, which a disconnect after a restart
         // deliberately does not.
         //
-        // Giving up is safe because the ledger is not what prevents a second runtime. The
-        // runtime attests its identity on the remote host, and a start refuses over a live
-        // supervised runtime whatever the ledger says. What is lost here is bookkeeping, and it
-        // is recorded as exactly that: the outcome is unknown, and said so.
-        const failures = recordLifecycleFailure(lifecycleRecoveryFailures, operation.id);
-        if (lifecycleRecoveryExhausted({
-          policy: target.policy,
-          state: operations.get(operation.id)?.state,
-          failures,
-        })) {
-          lifecycleRecoveryFailures.delete(operation.id);
-          // `fail` throws if the state moved under us — two bot instances share one ledger in
-          // the deployed setup — and losing the whole reconciliation pass to that would be a
-          // worse outcome than leaving this one operation for the next pass.
-          try {
-            operations.fail(operation.id, {
-              message: `gave up reconciling ${operation.kind} on endpoint ${args?.endpoint ?? "unknown"} after `
-                + `${failures} failed recovery attempts; its outcome is unknown and it no longer `
-                + "blocks later lifecycle actions",
-            });
-          } catch { /* another writer settled it; nothing left to retire */ }
-        }
+        // The give-up itself is at the end of the pass rather than here, so that a pass which
+        // returns WITHOUT throwing and WITHOUT settling counts as the failed attempt it is.
       }
-      const current = operations.get(operation.id);
-      const unsettled = operationUnsettled(current?.state);
-      // Progress is the row leaving the recoverable set, not the pass declining to throw.
-      if (!unsettled) lifecycleRecoveryFailures.delete(operation.id);
-      return unsettled;
+      return settleRecoveryPassVerdict({ operations, operation, target });
     });
     webGoalControl?.repairAwareness();
     return {

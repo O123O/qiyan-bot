@@ -23,7 +23,7 @@ import {
   settleDeferredWorkerNativeRefreshes,
   lifecycleRecoveryExhausted,
   operationUnsettled,
-  recordLifecycleFailure,
+  settleRecoveryPassVerdict,
   settleEarlierEndpointOperations,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
@@ -775,20 +775,119 @@ test("an unsettled row keeps its failure streak, a settled one drops it", () => 
   }
 });
 
-// The budget only means anything if repeated failures accumulate. This drives the same function
-// production increments with, rather than re-implementing the arithmetic in the test -- a
-// simulated version would have passed while the production counter was still reset every pass,
-// which is exactly how the original defect survived having a test at all.
-test("a repeated lifecycle failure accumulates until the budget is spent", () => {
-  const streaks = new Map<string, number>();
-  const failures = [1, 2, 3, 4, 5].map(() => recordLifecycleFailure(streaks, "op-wedged"));
-  assert.deepEqual(failures, [1, 2, 3, 4, 5], "each failing pass adds to the streak");
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: failures.at(-1)! }),
-    true, "and the give-up fires, which it could not while the streak was cleared every pass");
+// The budget only means anything if repeated failures accumulate ACROSS bot restarts. The row
+// that sat uncertain for 97 hours outlived several processes, so a counter held in a Map could
+// never have retired it however the passes were counted -- the process that reached 5 would have
+// had to stay up for five consecutive failing passes. This drives the store production
+// increments, not a re-implementation of the arithmetic: a simulated counter passed happily while
+// the production one was still reset every pass, which is how the original defect kept a test.
+test("a lifecycle failure streak accumulates in the ledger and survives a restart", () => {
+  const db = createTestDatabase();
+  const store = new OperationStore(db);
+  store.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/restart", attachmentIds: [] });
+  const operation = store.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "restart_endpoint",
+    args: { endpoint: "devbox" },
+  });
+  store.markDispatched(operation.id);
+
+  // Four failing passes, and the bot restarts between every one of them.
+  const failures = [1, 2, 3, 4].map(() => new OperationStore(db).recordRecoveryAttempt(operation.id));
+  assert.deepEqual(failures, [1, 2, 3, 4], "each failing pass adds to a count no restart resets");
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 4 }), false,
+    "and the budget is not spent early");
+
+  const fifth = new OperationStore(db).recordRecoveryAttempt(operation.id);
+  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: fifth }), true,
+    "the give-up fires, which it could not while the streak lived in a per-process Map");
+
+  // A settled row starts over: an endpoint that recovers must not carry old failures into its
+  // next lifecycle action and give up on the first one.
+  store.clearRecoveryAttempts(operation.id);
+  assert.equal(store.recordRecoveryAttempt(operation.id), 1, "the count was cleared, not merely ignored");
 
   // A different row does not inherit another's streak.
-  assert.equal(recordLifecycleFailure(streaks, "op-other"), 1);
-  assert.equal(lifecycleRecoveryExhausted({ policy: "endpoint_lifecycle", state: "uncertain", failures: 1 }), false);
+  const other = store.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call-2", kind: "restart_endpoint",
+    args: { endpoint: "other" },
+  });
+  assert.equal(store.recordRecoveryAttempt(other.id), 1);
+});
+
+// The half of the defect that a counter alone does not fix: the give-up used to be reached only
+// from the catch, so a pass that returned WITHOUT throwing and WITHOUT settling was scored as
+// progress. That is the shape of the row that actually wedged -- the guard paths return, they do
+// not throw -- so the endpoint stayed fenced no matter how long it was left. This drives the
+// verdict production runs, with a real ledger, and asserts the row is genuinely out of the
+// recoverable set at the end rather than merely marked.
+test("a silent pass that settles nothing is a failed attempt, and the budget retires the row", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/disconnect", attachmentIds: [] });
+  const record = operations.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "disconnect_endpoint",
+    args: { endpoint: "polyphe" },
+  });
+  operations.markDispatched(record.id);
+  operations.fail(record.id, { message: "endpoint unreachable" }, true);
+  assert.equal(operations.get(record.id)?.state, "uncertain", "the wedged row starts where the real one sat");
+
+  const operation = { id: record.id, kind: "disconnect_endpoint" };
+  const target = { policy: "endpoint_lifecycle", endpointId: "polyphe" } as const;
+  // Nothing throws here: this is the guard-return path, scored once per pass at the end.
+  const verdicts = [1, 2, 3, 4].map(() => settleRecoveryPassVerdict({ operations, operation, target }));
+  assert.deepEqual(verdicts, [true, true, true, true], "an unsettled row keeps the pass coming back");
+  assert.equal(operations.get(record.id)?.state, "uncertain", "and is not retired before the budget is spent");
+
+  assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), false,
+    "the fifth silent pass spends the budget");
+  assert.equal(operations.get(record.id)?.state, "failed", "the row is terminal, with a recorded verdict");
+  assert.match(String((operations.get(record.id)?.error as any)?.message), /outcome is unknown/u);
+  assert.equal(operations.listRecoverable().some((row) => row.id === record.id), false,
+    "and is out of the recoverable set, so it fences no later lifecycle action");
+});
+
+// The give-up is for endpoint-lifecycle rows only. Nothing else fences an endpoint, and failing a
+// send or a note on a schedule would discard work that a later pass could still settle.
+test("only an endpoint-lifecycle row is ever retired by the budget", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/send", attachmentIds: [] });
+  const record = operations.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "send_to_session",
+    args: { nickname: "worker" },
+  });
+  operations.markDispatched(record.id);
+  operations.fail(record.id, { message: "endpoint unreachable" }, true);
+
+  const operation = { id: record.id, kind: "send_to_session" };
+  const target = { policy: "ready_endpoint", endpointId: "devbox" } as const;
+  for (let pass = 0; pass < 12; pass += 1) {
+    assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), true, `pass ${pass}`);
+  }
+  assert.equal(operations.get(record.id)?.state, "uncertain", "a non-lifecycle row is never given up on");
+});
+
+// A row that settles by any route must drop its count, or an endpoint that failed four times and
+// then recovered would give up on the first failure of its next lifecycle action.
+test("settling clears the count the next streak starts from", () => {
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "source", rawText: "/restart", attachmentIds: [] });
+  const record = operations.prepare({
+    contextId: "ctx", attemptId: "attempt", callId: "call", kind: "restart_endpoint",
+    args: { endpoint: "polyphe" },
+  });
+  operations.markDispatched(record.id);
+  operations.fail(record.id, { message: "unreachable" }, true);
+
+  const operation = { id: record.id, kind: "restart_endpoint" };
+  const target = { policy: "endpoint_lifecycle", endpointId: "polyphe" } as const;
+  for (let pass = 0; pass < 4; pass += 1) settleRecoveryPassVerdict({ operations, operation, target });
+
+  operations.succeed(record.id, { ok: true });
+  assert.equal(settleRecoveryPassVerdict({ operations, operation, target }), false, "a settled row is done");
+  assert.equal(operations.recordRecoveryAttempt(record.id), 1, "and its next streak starts from zero");
 });
 
 test("adoption recovery resolves the checkpointed registry identity before endpoint access", async () => {

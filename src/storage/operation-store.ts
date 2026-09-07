@@ -279,6 +279,24 @@ export class OperationStore {
     if (changed !== 1) this.uncertainTransition(id, "success");
   }
 
+  // Consecutive failed recovery attempts, on the row rather than in the process. The row this
+  // budget exists to retire outlives any one bot lifetime -- the disconnect row that fenced an
+  // endpoint for 97 hours survived several restarts -- so a per-process count could only fire if
+  // one process happened to stay up for the whole streak, which is precisely when the endpoint is
+  // least likely to be wedged.
+  recordRecoveryAttempt(id: string): number {
+    this.db.prepare("UPDATE operations SET recovery_attempts = recovery_attempts + 1 WHERE id = ?").run(id);
+    const row = this.db.prepare("SELECT recovery_attempts FROM operations WHERE id = ?").get(id) as
+      { recovery_attempts?: number } | undefined;
+    return row?.recovery_attempts ?? 0;
+  }
+
+  // A row that settles starts over: an endpoint that recovers must not carry its old failures into
+  // the next lifecycle action and give up on the first one.
+  clearRecoveryAttempts(id: string): void {
+    this.db.prepare("UPDATE operations SET recovery_attempts = 0 WHERE id = ?").run(id);
+  }
+
   fail(id: string, error: unknown, uncertain = false, toolFence?: number): void {
     const state = uncertain ? "uncertain" : "failed";
     const changed = toolFence === undefined

@@ -876,4 +876,15 @@ export const migrations: readonly Migration[] = [
       body TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );`,
+  // A recovery-attempt count that survives the process. The give-up for a wedged
+  // endpoint-lifecycle row was counted in memory, so a bot restart inside the retry window lost
+  // the streak and the row could never reach its budget -- one sat uncertain for 97 hours,
+  // fencing its endpoint. Durable because the operation is durable, and because two bot
+  // instances share this ledger: the budget has to mean the same thing to both of them.
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has("recovery_attempts")) {
+      db.exec("ALTER TABLE operations ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0");
+    }
+  },
 ];
