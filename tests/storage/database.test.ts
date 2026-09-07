@@ -55,7 +55,7 @@ test("a cleanly closed database is not re-verified, and any other state still is
 // the reconciliation pass reports and continues, and the wedge the recovery-attempt columns exist
 // to end returns on that database with a log line as its only trace. Every other test in the tree
 // builds a fresh ledger, where the mistake is invisible.
-test("every migration is reachable from a database that stopped at the entry before it", async (t) => {
+test("the newest migration reaches a database that stopped at the entry before it", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-migration-reach-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "bot.sqlite3");
