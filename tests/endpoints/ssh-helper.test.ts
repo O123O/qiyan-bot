@@ -637,11 +637,6 @@ test("inspect separates a dead server under a live session from one that is stil
   assert.equal(booting.sessionAgeMs, undefined);
 });
 
-// The teardown has to survive a stop that FAILS, which is the whole reason it was moved off the
-// bottom of the function. A stop whose identity does not match refuses before touching anything;
-// a stop that cannot prove the group stopped throws after. In the second case the endpoint is
-// left for the next attempt, and leaving the old supervisor standing is what made that attempt
-// refuse too -- the loop the reclaim exists to break.
 // The same guarantee for the other provider, run against a real tmux session. It matters at least
 // as much here: Claude runs Bash tools, so a command it started can outlive the host holding its
 // process group open, and the four-day wedge -- a live session over a dead server that nothing
@@ -685,6 +680,10 @@ test("stopping a Claude host tears down its supervising session", async (t) => {
   await assert.rejects(stat(`${runtimeDir}/claude-host-identity.json`), "the tombstone is cleared too");
 });
 
+// The identity proof stays ABOVE the teardown, and that ordering is the whole safety argument for
+// moving the teardown up: two bot instances share one ledger, so a stop aimed at the other one's
+// runtime must refuse before touching anything at all. Only what happens AFTER this proof passes
+// was moved.
 test("a stop that refuses over a mismatched identity touches nothing", async (t) => {
   const uid = process.getuid?.();
   assert.ok(uid);

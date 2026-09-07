@@ -1688,6 +1688,61 @@ test("an explicit restart joins an earlier uncertain restart after reconnect", a
   assert.equal(result, "satisfied");
 });
 
+// The ptyche02 wedge reached by a different row kind, and the last one with a user-visible
+// symptom: an uncertain SEND on an unreachable endpoint refused every later restart. The branch
+// itself concedes the fence buys nothing there -- an endpoint that does not answer has nothing
+// left to report the send's outcome -- so the row was not being protected, only blocking the one
+// action that could repair the endpoint.
+//
+// Released, NOT retired. Recovery never re-dispatches a send (it proves the turn from the native
+// rollout), so the only way a delivered message is sent twice is an assistant reacting to a
+// `failed` row, and failing one on a timeout invites exactly that. Left uncertain it loses
+// nothing: the rollout outlives the runtime and the endpoint's return still settles it.
+test("an unreachable endpoint's stuck send stops refusing the restart, and is not failed for it", async () => {
+  const send = {
+    id: "send-stuck", sequence: 1, kind: "send_to_session",
+    args: { nickname: "w3a16-mmlu" }, state: "uncertain" as const,
+  };
+  let recoverable: Array<Record<string, unknown>> = [send];
+  const failed: Array<{ id: string; uncertain: boolean }> = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => recoverable as any,
+      get: () => ({ ...send }) as any,
+      fail: (id: string, _error: unknown, uncertain = false) => {
+        failed.push({ id, uncertain });
+        if (!uncertain) recoverable = recoverable.filter((operation) => operation.id !== id);
+      },
+    },
+    currentSequence: 2, endpointId: "ptyche02", currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => ({ endpoint: "ptyche02" }) },
+    reconcile: async () => {}, isEndpointReady: () => false, isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => { throw new Error("must not wait on an endpoint that cannot answer"); },
+  } as any);
+
+  assert.equal(result, "proceed", "the restart is admitted rather than refused by a row it cannot settle");
+  assert.deepEqual(failed, [], "and the send is not failed — a failed send invites a re-send of a delivered message");
+  assert.deepEqual(recoverable.map((operation) => operation.id), ["send-stuck"],
+    "it stays recoverable, so the endpoint's return still settles it");
+});
+
+// A `dispatched` row is genuinely in flight, whatever its kind, and a second lifecycle action
+// would race it. Releasing the fence for non-lifecycle rows must not reach those.
+test("a dispatched send still refuses the restart behind it", async () => {
+  const send = {
+    id: "send-live", sequence: 1, kind: "send_to_session",
+    args: { nickname: "w3a16-mmlu" }, state: "dispatched" as const,
+  };
+  await assert.rejects(settleEarlierEndpointOperations({
+    operations: { listRecoverable: () => [send] as any, get: () => ({ ...send }) as any, fail: () => {} },
+    currentSequence: 2, endpointId: "ptyche02", currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => ({ endpoint: "ptyche02" }) },
+    reconcile: async () => {}, isEndpointReady: () => false, isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => {},
+  } as any), /earlier unresolved operation/u);
+});
+
 // The endpoint most in need of a restart is the one that is down. Refusing because an
 // earlier attempt is stuck `uncertain` deadlocked the only repair — the restart was denied
 // for the very condition it exists to fix — so a restart now supersedes earlier lifecycle
@@ -1820,15 +1875,17 @@ test("a restart refuses when a dispatched operation sits behind an uncertain one
     "neither is retired — a genuinely in-flight operation must survive");
 });
 
-// A restart does not subsume an in-flight send: stopping the endpoint says nothing about
-// whether that message was delivered, so it must not be retired as superseded.
+// A restart does not subsume an in-flight send: stopping the endpoint says nothing about whether
+// that message was delivered, so it must not be retired as superseded. It no longer REFUSES the
+// restart either -- see "an unreachable endpoint's stuck send stops refusing the restart" -- so
+// what is asserted here is the part that has not changed and must not: nothing is retired.
 test("a restart does not supersede a non-lifecycle operation", async () => {
   const send = {
     id: "send-inflight", sequence: 1, kind: "send_to_session",
     args: { nickname: "sparse-att-scale" }, state: "uncertain" as const,
   };
   const failed: string[] = [];
-  await assert.rejects(settleEarlierEndpointOperations({
+  await (settleEarlierEndpointOperations({
     operations: {
       listRecoverable: () => [send] as any,
       get: () => ({ ...send }) as any,
@@ -1845,7 +1902,7 @@ test("a restart does not supersede a non-lifecycle operation", async () => {
     isEndpointReady: () => false,
     isAwaitingAuthentication: () => false,
     waitForTerminal: async () => {},
-  } as any), (error: any) => error.code === "OPERATION_CONFLICT");
+  } as any));
   assert.deepEqual(failed, [], "an undelivered send is not retired by restarting its endpoint");
 });
 

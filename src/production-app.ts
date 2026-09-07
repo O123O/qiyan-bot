@@ -967,18 +967,42 @@ export async function settleEarlierEndpointOperations(options: {
         // stalled restart or disconnect was heading. It is NOT sound for a `ready_endpoint`
         // operation such as an in-flight send, whose effect a restart does not subsume.
         if (options.isAwaitingAuthentication(options.endpointId)) throw conflict();
-        // Every one of them, not just the oldest: the settle below retires the whole list,
-        // so a `dispatched` straggler among them must still refuse. Two bot instances share
-        // one ledger in the deployed setup, so a newer dispatched operation really can sit
-        // behind an older uncertain one.
-        if (!unresolved.every((operation) => operation.state === "uncertain"
-          && subsumedByLifecycle(operation, options.currentKind, options.resolver))) {
-          throw conflict();
+        // Every one of them must be `uncertain`: the settle below retires a whole list, so a
+        // `dispatched` straggler among them must still refuse. Two bot instances share one
+        // ledger in the deployed setup, so a newer dispatched operation really can sit behind
+        // an older uncertain one.
+        if (!unresolved.every((operation) => operation.state === "uncertain")) throw conflict();
+        // Retire only what this action's postcondition actually subsumes. A NON-lifecycle row --
+        // an uncertain send, interrupt or compact -- is neither retired nor a reason to refuse.
+        //
+        // Refusing on it is what this branch already concedes buys nothing: an endpoint that does
+        // not answer has nothing left to report the send's outcome, so the row is not being
+        // protected here, only blocking. And it blocked the one action that could repair the
+        // endpoint, which is the ptyche02 wedge reached by a different row kind -- a stuck send
+        // in front of a restart made the restart permanently impossible.
+        //
+        // Retiring it instead would be worse than refusing. Recovery itself never re-dispatches a
+        // send -- it proves the turn from the native rollout -- so the only way a delivered
+        // message is sent twice is an assistant reacting to `definiteOperationFailure`, and a row
+        // failed on a timeout invites exactly that. Left uncertain, the row loses nothing: the
+        // rollout outlives the runtime, and the endpoint's return still settles it.
+        //
+        // What stops a runtime being pulled from under a live turn is not this fence. It is
+        // `requireManagedThreadsIdle`, which reads live state rather than the ledger.
+        // A LIFECYCLE row that this action does not subsume still refuses: a stalled restart owes
+        // a replacement that a disconnect will not provide, so proceeding would drop the
+        // obligation. Only rows whose policy is not endpoint_lifecycle are released.
+        const subsumed: typeof unresolved = [];
+        for (const operation of unresolved) {
+          if (subsumedByLifecycle(operation, options.currentKind, options.resolver)) subsumed.push(operation);
+          else if (recoverableOperationTarget(operation, options.resolver).policy === "endpoint_lifecycle") {
+            throw conflict();
+          }
         }
-        // Settle them as superseded so they stop fencing every future attempt. This is the
+        // Settle those as superseded so they stop fencing every future attempt. This is the
         // ONLY place an unresolvable lifecycle operation is retired, and it is a proof about
         // postconditions, never a timeout.
-        for (const operation of unresolved) {
+        for (const operation of subsumed) {
           options.operations.fail(operation.id, {
             message: `superseded by a later ${options.currentKind} on endpoint ${options.endpointId}`,
           });

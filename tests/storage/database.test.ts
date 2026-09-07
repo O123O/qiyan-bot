@@ -47,6 +47,75 @@ test("a cleanly closed database is not re-verified, and any other state still is
   assert.equal(inspected, 3, "the marker vouches for exactly one open");
 });
 
+// A schema change appended to an ALREADY-CONSUMED migration is silently absent on every database
+// that has run it. `migrate` skips entries below the recorded version, so the body never executes
+// and the `PRAGMA table_info` guard inside it never runs either.
+//
+// It is silent by construction on this schema: `recordRecoveryAttempt` throws "no such column",
+// the reconciliation pass reports and continues, and the wedge the recovery-attempt columns exist
+// to end returns on that database with a log line as its only trace. Every other test in the tree
+// builds a fresh ledger, where the mistake is invisible.
+test("every migration is reachable from a database that stopped at the entry before it", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-migration-reach-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "bot.sqlite3");
+
+  const built = openDatabase(path);
+  const version = Number((built.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v);
+  assert.equal(version, migrations.length, "a fresh database runs every entry");
+  const columns = (): Set<string> => {
+    const db = new DatabaseSync(path);
+    try {
+      return new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
+    } finally { db.close(); }
+  };
+  assert.equal(columns().has("recovery_started_at"), true);
+
+  // Rewind to the state of a deployed ledger that ran every entry but the last: drop what that
+  // entry adds, and forget it ran.
+  built.exec("ALTER TABLE operations DROP COLUMN recovery_started_at");
+  built.prepare("DELETE FROM schema_migrations WHERE version = ?").run(version);
+  built.close();
+
+  const upgraded = openDatabase(path);
+  t.after(() => { upgraded.close(); });
+  assert.equal(columns().has("recovery_started_at"), true,
+    "the newest migration must be reachable, or an existing database never receives it");
+  const operations = new OperationStore(upgraded);
+  operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: "s", rawText: "/restart", attachmentIds: [] });
+  const record = operations.prepare({
+    contextId: "ctx", attemptId: "a", callId: "c", kind: "restart_endpoint", args: {},
+  });
+  // The observable effect, not the column: the write that a missing column makes throw.
+  assert.equal(operations.recordRecoveryAttempt(record.id).failures, 1);
+
+  // The above proves the newest entry is reachable, but not the mistake that produced this test:
+  // appending DDL to an entry that had ALREADY SHIPPED, which no schema-only check can see --
+  // the damage is a function of what a previous build did, not of what the list contains now.
+  //
+  // What is checkable is the shape that makes it safe. Running the list one entry at a time, the
+  // two recovery columns must appear at DIFFERENT indexes: the first shipped on its own, so the
+  // second could never have travelled with it.
+  const appearsAt = (column: string): number => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const [index, migration] of migrations.entries()) {
+        if (typeof migration === "function") migration(db as never); else db.exec(migration ?? "");
+        const present = (db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>)
+          .some((row) => row.name === column);
+        if (present) return index;
+      }
+      return -1;
+    } finally { db.close(); }
+  };
+  const attempts = appearsAt("recovery_attempts");
+  const startedAt = appearsAt("recovery_started_at");
+  assert.ok(attempts >= 0 && startedAt >= 0, "both recovery columns are created by some migration");
+  assert.ok(startedAt > attempts,
+    "recovery_started_at was added after recovery_attempts shipped, so it needs its own entry: "
+    + "a database that ran the earlier one is past its version and never sees a column appended to it");
+});
+
 test("fresh absent and empty databases receive the QiYan identity marker", async () => {
   for (const kind of ["absent", "empty"]) {
     const root = await mkdtemp(join(tmpdir(), `qiyan-bot-db-${kind}-`));

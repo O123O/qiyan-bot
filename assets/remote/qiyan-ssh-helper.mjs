@@ -276,9 +276,16 @@ async function stop(value) {
   // being torn down. Nothing downstream depended on the old ordering: the session was going to die
   // at the end of every successful stop anyway.
   //
-  // One consequence worth naming: the pane's process group now takes SIGHUP from tmux before the
-  // signals below. `survivors` therefore counts what outlived SIGHUP, SIGTERM and SIGKILL, which
-  // is the same meaning as before and a strictly stronger one.
+  // SIGTERM first, so the server still sees the signal it saw before this ordering changed: tmux
+  // sends SIGHUP when it kills the session, and while both default to terminate, a handler that
+  // flushes on SIGTERM would silently stop running. Best-effort and already ESRCH-tolerant, so it
+  // costs nothing when the group is already gone.
+  //
+  // `survivors` below therefore counts what outlived SIGTERM, SIGHUP, SIGTERM and SIGKILL --
+  // the same meaning as before, and a strictly stronger one.
+  if (identity) {
+    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+  }
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
   if (identity) {

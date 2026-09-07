@@ -886,10 +886,21 @@ export const migrations: readonly Migration[] = [
     if (!columns.has("recovery_attempts")) {
       db.exec("ALTER TABLE operations ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0");
     }
-    // When the CURRENT failure streak began. `created_at` cannot answer that: it is when the
-    // operation was created, so any row that outlived a bot restart is already past any age
-    // budget and the budget collapses back to counting passes -- which is precisely the class of
-    // row the durable count exists for.
+  },
+  // When the CURRENT failure streak began. `created_at` cannot answer that: it is when the
+  // operation was created, so any row that outlived a bot restart is already past any age budget
+  // and the budget collapses back to counting passes -- precisely the class of row a durable
+  // count exists for.
+  //
+  // Its OWN entry, not another statement inside the one above. A database that has already run
+  // that entry is past its version and never runs it again, so a column appended to its body is
+  // never created -- and the `PRAGMA table_info` guard cannot help, because the guard is inside
+  // the body that is not invoked. The failure is silent by construction: `recordRecoveryAttempt`
+  // throws "no such column", the pass reports and continues, and the wedge this whole series
+  // exists to end comes back on that database with a log line as the only trace. No test can
+  // catch it either, because every test builds a fresh ledger.
+  (db) => {
+    const columns = new Set((db.prepare("PRAGMA table_info(operations)").all() as Array<{ name: string }>).map((row) => row.name));
     if (!columns.has("recovery_started_at")) {
       db.exec("ALTER TABLE operations ADD COLUMN recovery_started_at INTEGER");
     }
