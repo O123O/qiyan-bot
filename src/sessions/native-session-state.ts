@@ -227,7 +227,12 @@ export class NativeSessionState {
         }
         continue;
       }
-      if (method.startsWith("item/") && directTurnId
+      // An item is evidence that its turn is executing -- which is why it can name the active
+      // turn at all, and why it recovers a `turn/started` that was missed. A QUEUED item is the
+      // opposite: the endpoint is echoing a send it has accepted but not begun, and adopting it
+      // pointed every later interrupt at a turn that cannot be interrupted. Only an endpoint
+      // that queues sends ever sets this, and only on the echo it has not started.
+      if (method.startsWith("item/") && directTurnId && values?.queued !== true
         && !this.isTerminal(endpointId, endpointGeneration, threadId, directTurnId)) {
         this.apply(current, { status: "active", activeTurnId: directTurnId, receiveSequence: sequence });
         continue;

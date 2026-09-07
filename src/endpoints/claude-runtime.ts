@@ -853,9 +853,17 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       if (state.running[0] === clientId) this.announceHead(threadId, clientId);
       // The user's message is shown immediately even while queued, so a follow-up sent
       // during a long turn does not vanish from the panel until that turn ends.
+      //
+      // Flagged when it is queued, because an item is otherwise read as proof that its turn is
+      // the one executing -- which is how the panel's stop button broke. The runtime withholds
+      // `turn/started` for a queued send for exactly that reason, and then this echo undid it:
+      // the tracked active turn became the queued uuid, and every stop asked to interrupt a turn
+      // the runtime correctly refuses to interrupt ("queued behind ..."). The queue is the
+      // runtime's own knowledge, so it says so here rather than leaving it to be inferred.
       this.emitter.emit("notification", "item/started", {
         threadId,
         turnId: clientId,
+        ...(state.running[0] === clientId ? {} : { queued: true }),
         item: {
           type: "userMessage",
           id: clientId,

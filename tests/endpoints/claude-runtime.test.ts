@@ -11,6 +11,7 @@ import { ClaudeArchiveStore } from "../../src/sessions/claude-archives.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
+import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 // One fake standing in for both halves of a Claude endpoint: the host that runs turns
@@ -1632,6 +1633,65 @@ test("only the executing turn is announced started, and the queue advances", asy
 
   claude.settleTurn(thread.id, "ctx:a", "completed");
   assert.deepEqual(started, ["ctx:a", "ctx:b"], "it is announced when it reaches the head");
+});
+
+// The stop button reported "stop failed: turn <b> is queued behind <a>; interrupt the running
+// turn instead" for every attempt. The runtime was right to refuse and right to withhold
+// `turn/started` for a queued send -- but it also echoes the queued user message as an
+// `item/started` so the panel shows it, and the tracker read ANY item as proof its turn was
+// executing. So the queued uuid became the tracked active turn, and stop asked the runtime to
+// interrupt precisely the turn it refuses to interrupt.
+//
+// Both halves were individually tested and individually correct; only running them against each
+// other shows it, so this drives real runtime notifications into a real tracker.
+test("a queued send never becomes the tracked active turn, so stop keeps working", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  const native = new NativeSessionState();
+  const identity = { endpointId: "claude", threadId: thread.id, mappingId: "mapping" };
+  native.register(identity, 1);
+  rt.onNotification((method, params) => { native.observe("claude", 1, method, params); });
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  assert.equal(native.view(identity)?.activeTurnId, "ctx:a", "the executing turn is tracked");
+
+  // The follow-up the owner types while the worker is still working.
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+  assert.equal(native.view(identity)?.activeTurnId, "ctx:a",
+    "queueing a follow-up must not move the tracked turn onto the send that has not begun");
+
+  // The whole point: stop interrupts the turn the tracker names, and that call must succeed.
+  // Before the fix this raised OPERATION_CONFLICT ("queued behind"), which is the message the
+  // panel printed for every stop.
+  await rt.request("turn/interrupt", { threadId: thread.id, turnId: native.view(identity)!.activeTurnId! });
+  assert.deepEqual(claude.interrupts, [thread.id], "stop reached the executing turn");
+});
+
+// The other half of the same invariant: withholding the queued send from the tracker must not
+// leave it untracked once it starts running, or a stop after the queue advances would find no
+// turn to name and refuse as idle while the worker is plainly working.
+test("the queued send is tracked as soon as it reaches the head", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  const native = new NativeSessionState();
+  const identity = { endpointId: "claude", threadId: thread.id, mappingId: "mapping" };
+  native.register(identity, 1);
+  rt.onNotification((method, params) => { native.observe("claude", 1, method, params); });
+
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+
+  assert.equal(native.view(identity)?.status, "active", "the follow-up is now the running turn");
+  assert.equal(native.view(identity)?.activeTurnId, "ctx:b");
+  await rt.request("turn/interrupt", { threadId: thread.id, turnId: native.view(identity)!.activeTurnId! });
+  assert.deepEqual(claude.interrupts, [thread.id], "and stop reaches it");
 });
 
 test("interrupting a queued turn is refused rather than killing the running one", async () => {
