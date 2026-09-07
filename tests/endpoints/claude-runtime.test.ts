@@ -12,6 +12,7 @@ import { AppError } from "../../src/core/errors.ts";
 import { JsonRpcResponseError } from "../../src/app-server/rpc-client.ts";
 import { createHistoryScanBudget, ThreadHistoryReader } from "../../src/app-server/thread-history.ts";
 import { NativeSessionState } from "../../src/sessions/native-session-state.ts";
+import { repairActiveTurnIdentity } from "../../src/sessions/native-session-probe.ts";
 import { createTestDatabase } from "../../src/storage/database.ts";
 
 // One fake standing in for both halves of a Claude endpoint: the host that runs turns
@@ -1692,13 +1693,17 @@ test("turn/start reports a queued send as queued in its own response", async () 
   await rt.start();
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
 
-  const first = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
+  const first = await rt.request<{ turn: { id: string; queued?: boolean }; runningTurnId?: string }>("turn/start",
     { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
   assert.equal(first.turn.queued, undefined, "the executing turn is not flagged");
 
-  const second = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
+  const second = await rt.request<{ turn: { id: string; queued?: boolean }; runningTurnId?: string }>("turn/start",
     { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
   assert.equal(second.turn.queued, true, "the send behind it is");
+  // And it says WHICH turn is running, because that is the answer the caller needs and this is
+  // the only place that knows it without asking history a question a queue makes unanswerable.
+  assert.equal(second.runningTurnId, "ctx:a");
+  assert.equal(first.runningTurnId, undefined, "nothing to report when the send IS the head");
 
   // And it stops being queued once it is the one running -- the flag describes this moment, not
   // the turn, so a caller cannot cache it and be wrong later.
@@ -1706,6 +1711,13 @@ test("turn/start reports a queued send as queued in its own response", async () 
   const third = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
     { threadId: thread.id, clientUserMessageId: "ctx:c", input: [{ type: "text", text: "third" }] });
   assert.equal(third.turn.queued, true, "ctx:b is running now, so ctx:c queues behind it");
+
+  // A retry of a uuid the host is still holding takes a different return, and it has to say the
+  // same thing: a scheduled fire re-armed from the outbox, or a lost RPC response, reaches this
+  // and the caller cannot tell it apart from a first send.
+  const retry = await rt.request<{ turn: { id: string; queued?: boolean }; runningTurnId?: string }>("turn/start",
+    { threadId: thread.id, clientUserMessageId: "ctx:c", input: [{ type: "text", text: "third" }] });
+  assert.equal(retry.turn.queued, true, "the duplicate is still behind the running turn");
 });
 
 // The other half of the same invariant: withholding the queued send from the tracker must not
@@ -1730,6 +1742,43 @@ test("the queued send is tracked as soon as it reaches the head", async () => {
   assert.equal(native.view(identity)?.activeTurnId, "ctx:b");
   await rt.request("turn/interrupt", { threadId: thread.id, turnId: native.view(identity)!.activeTurnId! });
   assert.deepEqual(claude.interrupts, [thread.id], "and stop reaches it");
+});
+
+// The history channel had the same hole, and it is the one that bites without any send at all.
+// `thread/turns/list` reports every accepted turn non-terminal -- reconstruction would otherwise
+// derive a trailing row with no reply as `interrupted`, and a queued send has not been
+// interrupted. But `latestTurn` reads the NEWEST turn to learn which one is running, and with a
+// queue the newest turn is precisely the one that is not, so the identity repair adopted it and
+// the next stop named a turn the runtime refuses to interrupt.
+test("history marks every accepted turn live but says which one is only queued", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+
+  const page = await rt.request<{ data: Array<{ id: string; status: string; queued?: boolean }> }>(
+    "thread/turns/list", { threadId: thread.id, limit: 10, sortDirection: "asc", itemsView: "notLoaded" });
+  const byId = new Map(page.data.map((turn) => [turn.id, turn]));
+  assert.equal(byId.get("ctx:a")?.status, "inProgress");
+  assert.equal(byId.get("ctx:a")?.queued, undefined, "the head is running, not queued");
+  assert.equal(byId.get("ctx:b")?.status, "inProgress", "a queued turn is not terminal either");
+  assert.equal(byId.get("ctx:b")?.queued, true, "but it is not the one executing");
+
+  // The consumer that matters: the identity repair reads the newest turn, and must not take it.
+  const latest = await new ThreadHistoryReader(async (method, params) =>
+    rt.request(method, params as Record<string, unknown>)).latestTurn(thread.id);
+  assert.equal(latest?.id, "ctx:b", "the newest turn really is the queued one");
+  const native = new NativeSessionState();
+  const identity = { endpointId: "claude-local", threadId: thread.id, mappingId: "mapping" };
+  native.register(identity, 1);
+  native.applyRefresh(native.captureRefresh(identity, 1), { status: "active" });
+  await repairActiveTurnIdentity({
+    native, identity, endpointGeneration: 1, latestTurn: async () => latest,
+  });
+  assert.notEqual(native.view(identity)?.activeTurnId, "ctx:b",
+    "the repair must not put the tracker on a turn the runtime refuses to interrupt");
 });
 
 test("interrupting a queued turn is refused rather than killing the running one", async () => {

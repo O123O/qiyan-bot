@@ -75,7 +75,7 @@ class ServiceEndpoint implements AppServerEndpoint {
       this.lastClientId = params.clientUserMessageId;
       this.status = "active";
       if (this.queuedStart) {
-        return { turn: { id: "queued-1", status: "inProgress", queued: true } } as T;
+        return { turn: { id: "queued-1", status: "inProgress", queued: true }, runningTurnId: "running-1" } as T;
       }
       return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
@@ -260,8 +260,9 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
 test("a start the endpoint has only queued is not adopted as the running turn", async () => {
   const { endpoint, native, service } = await fixture();
   endpoint.queuedStart = true;
-  endpoint.threadTurns = [{ id: "running-1", status: "inProgress", items: [] }];
-
+  // Deliberately NOT a history fixture. History would answer this with its newest turn, and with
+  // a queue the newest turn is the queued one -- so a test that leans on history could pass while
+  // the tracker adopted exactly the id this refuses.
   const started = await service.send("payments", "a follow-up while it works", { clientUserMessageId: "msg-q" });
 
   assert.equal(started.turnId, "queued-1", "the caller still learns the id its message was given");
@@ -269,6 +270,7 @@ test("a start the endpoint has only queued is not adopted as the running turn", 
   assert.notEqual(view?.activeTurnId, "queued-1",
     "a queued send must never become the turn a later interrupt names");
   assert.equal(view?.activeTurnId, "running-1", "the endpoint's own head is what the tracker takes");
+  assert.equal(view?.status, "active", "and the session is not left reading idle while it works");
 });
 
 test("setting effort fails closed until the worker's current model is known", async () => {

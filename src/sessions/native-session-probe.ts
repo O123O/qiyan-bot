@@ -36,8 +36,12 @@ export async function repairActiveTurnIdentity(input: {
   }
 
   const token = input.native.captureRefresh(input.identity, input.endpointGeneration);
+  // "Is the newest turn active?" cannot express a QUEUE: a provider that accepts a send while
+  // another turn runs makes the newest turn the one that has not started. It is reported
+  // non-terminal, so it answers this question wrongly unless it says which it is. Adopting it
+  // put the tracker on a turn the provider refuses to interrupt, and every later stop failed.
   const latest = await input.latestTurn();
-  const activeTurnId = latest && ACTIVE_TURN_STATUSES.has(statusType(latest.status))
+  const activeTurnId = latest && latest.queued !== true && ACTIVE_TURN_STATUSES.has(statusType(latest.status))
     ? latest.id
     : undefined;
   input.native.applyRefresh(token, activeTurnId

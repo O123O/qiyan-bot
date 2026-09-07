@@ -679,10 +679,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       itemsView,
     });
     if (state.running.length === 0) return page;
+    // Every accepted turn is reported non-terminal, because reconstruction derives a trailing
+    // transcript row with no reply as `interrupted` and a queued send has not been interrupted --
+    // it has not started. But only ONE of them is executing, and a consumer that reads the newest
+    // turn to learn which is which would otherwise be handed the queue's tail. `latestTurn` is
+    // exactly that consumer, and it is what repairs a session's active-turn identity; adopting a
+    // queued turn there points the next interrupt at a turn the endpoint refuses to interrupt.
+    //
+    // Same word, same meaning, as on `turn/start`'s response and its queued `item/started`:
+    // accepted, not begun.
     return {
       ...page,
       data: page.data.map((turn) => state.running.includes(turn.id)
-        ? { ...turn, status: "inProgress" }
+        ? { ...turn, status: "inProgress", ...(state.running[0] === turn.id ? {} : { queued: true }) }
         : turn),
     };
   }
@@ -845,12 +854,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     } finally {
       this.startingTurns -= 1;
     }
+    // Whether this send is behind another rather than executing. Every answer below carries it:
+    // a caller that treats an accepted send as the running turn points its next interrupt at a
+    // turn the SDK cannot target, which is how the panel's stop button broke.
+    const queued = state.running[0] !== clientId;
     if (accepted) {
       // turn/started ONLY for the turn actually executing. A queued send announced as
       // started makes it the tracked active turn, and an interrupt then names the queued
       // uuid while the SDK aborts the executing head — killing the wrong work and marking
       // the survivor terminal. The queued one is announced when it reaches the head.
-      const queued = state.running[0] !== clientId;
       if (!queued) this.announceHead(threadId, clientId);
       // The user's message is shown immediately even while queued, so a follow-up sent
       // during a long turn does not vanish from the panel until that turn ends.
@@ -875,9 +887,18 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // Said on the RESPONSE channel too, not only in the notification above. A caller that
       // learns its turn id from the reply and nothing else would otherwise record a send it has
       // not begun as the one executing -- the same wrong answer, reached by the other route.
-      return { turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) } };
+      //
+      // And WHICH turn is executing, because that is the answer the caller actually needs and
+      // this is the only place that knows it without asking. Inferring it from history instead
+      // means asking "is the newest turn active?", which a queue makes unanswerable.
+      return {
+        turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) },
+        ...(queued ? { runningTurnId: state.running[0] } : {}),
+      };
     }
-    if (!alreadySettled) return { turn: { id: clientId, status: "inProgress" } };
+    // A refused-but-still-in-flight duplicate is answered like any other accepted send, so it
+    // carries the same disposition: the uuid the host is holding may well be behind another.
+    if (!alreadySettled) return { turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) } };
     // The duplicate's turn is over. Release the reservation and republish its terminal, so
     // the response it produced while QiYan was away is still delivered instead of lost.
     state.running = state.running.filter((id) => id !== clientId);

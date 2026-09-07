@@ -142,7 +142,10 @@ export class SessionService {
       this.assertExactManaged(nickname, session.mapping_id);
       const generation = this.endpointGeneration(session.endpoint, lease);
       const startToken = this.native.captureStart(this.nativeIdentity(session), generation);
-      const response = await this.pool.startTurn<{ turn: { id: string; status?: string; queued?: boolean } }>(session.endpoint, {
+      const response = await this.pool.startTurn<{
+        turn: { id: string; status?: string; queued?: boolean };
+        runningTurnId?: string;
+      }>(session.endpoint, {
         threadId: session.thread_id, cwd, ...(options.clientUserMessageId ? { clientUserMessageId: options.clientUserMessageId } : {}), input, ...settings,
       }, undefined, lease);
       options.onTurnAccepted?.({ session, mode: "start", turnId: response.turn.id });
@@ -158,14 +161,19 @@ export class SessionService {
         // The endpoint accepted the send but has NOT begun it: it is behind a turn that is still
         // running. Adopting it as the active turn is the same mistake the notification side used
         // to make -- every later interrupt then names a turn the endpoint refuses to interrupt,
-        // which is what broke the panel's stop button. The session IS active, though, so leaving
-        // the tracker alone would strand it on a turn identity nothing corrects; the refresh
-        // reads the endpoint's own head instead of guessing.
+        // which is what broke the panel's stop button.
         //
-        // Passed the revision captured before the dispatch so the probe runs at all: it
-        // otherwise repairs only a view that is ALREADY active-with-no-turn, and this is the
-        // case where the view says idle and the endpoint has just proved it is not.
-        await this.repairNative(session, lease, startToken.lifecycleRevision);
+        // The session IS active though, so leaving the tracker alone strands it on a stale
+        // identity nothing corrects. The endpoint said which turn is running in the same breath,
+        // and that is better than any probe: a history read can only ask "is the newest turn
+        // active?", and with a queue the newest turn is precisely the one that is not.
+        //
+        // Fenced on the revision captured before the dispatch, so a notification that arrived
+        // while this was in flight -- which is fresher evidence than an answer already on the
+        // wire -- wins and this becomes a no-op.
+        if (response.runningTurnId !== undefined) {
+          this.native.applyRefresh(startToken, { status: "active", activeTurnId: response.runningTurnId });
+        }
       } else if (this.native.applyStartResponse(startToken, response.turn.id) === "refresh-required") {
         await this.repairNative(session, lease);
       }
