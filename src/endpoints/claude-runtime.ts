@@ -850,7 +850,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // started makes it the tracked active turn, and an interrupt then names the queued
       // uuid while the SDK aborts the executing head — killing the wrong work and marking
       // the survivor terminal. The queued one is announced when it reaches the head.
-      if (state.running[0] === clientId) this.announceHead(threadId, clientId);
+      const queued = state.running[0] !== clientId;
+      if (!queued) this.announceHead(threadId, clientId);
       // The user's message is shown immediately even while queued, so a follow-up sent
       // during a long turn does not vanish from the panel until that turn ends.
       //
@@ -863,7 +864,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       this.emitter.emit("notification", "item/started", {
         threadId,
         turnId: clientId,
-        ...(state.running[0] === clientId ? {} : { queued: true }),
+        ...(queued ? { queued: true } : {}),
         item: {
           type: "userMessage",
           id: clientId,
@@ -871,7 +872,10 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
           content: [{ type: "text", text: message, text_elements: [] }],
         },
       });
-      return { turn: { id: clientId, status: "inProgress" } };
+      // Said on the RESPONSE channel too, not only in the notification above. A caller that
+      // learns its turn id from the reply and nothing else would otherwise record a send it has
+      // not begun as the one executing -- the same wrong answer, reached by the other route.
+      return { turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) } };
     }
     if (!alreadySettled) return { turn: { id: clientId, status: "inProgress" } };
     // The duplicate's turn is over. Release the reservation and republish its terminal, so

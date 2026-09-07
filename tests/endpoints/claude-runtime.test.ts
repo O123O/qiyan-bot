@@ -73,9 +73,14 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
 
   async interrupt(sessionId: string): Promise<void> {
     this.interrupts.push(sessionId);
-    // interrupt() ends only the active response; the session stays loaded and usable.
+    // interrupt() ends only the ACTIVE RESPONSE. The session stays loaded and usable, and
+    // anything queued behind the interrupted turn survives and runs next -- the SDK keeps queued
+    // commands across an interrupt, which is what the panel's stop tooltip promises. Settling the
+    // whole queue here made the fake disagree with the host it stands in for, and erased the
+    // continuation that matters: stop, the queue advances, the next stop targets the survivor.
     const session = this.require(sessionId);
-    for (const uuid of session.inFlight.splice(0)) this.settle(sessionId, uuid, "interrupted");
+    const head = session.inFlight.shift();
+    if (head !== undefined) this.settle(sessionId, head, "interrupted");
   }
 
   async status(sessionId: string): Promise<SessionStatus> {
@@ -1651,9 +1656,9 @@ test("a queued send never becomes the tracked active turn, so stop keeps working
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
 
   const native = new NativeSessionState();
-  const identity = { endpointId: "claude", threadId: thread.id, mappingId: "mapping" };
+  const identity = { endpointId: "claude-local", threadId: thread.id, mappingId: "mapping" };
   native.register(identity, 1);
-  rt.onNotification((method, params) => { native.observe("claude", 1, method, params); });
+  rt.onNotification((method, params) => { native.observe("claude-local", 1, method, params); });
 
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
   assert.equal(native.view(identity)?.activeTurnId, "ctx:a", "the executing turn is tracked");
@@ -1668,6 +1673,39 @@ test("a queued send never becomes the tracked active turn, so stop keeps working
   // panel printed for every stop.
   await rt.request("turn/interrupt", { threadId: thread.id, turnId: native.view(identity)!.activeTurnId! });
   assert.deepEqual(claude.interrupts, [thread.id], "stop reached the executing turn");
+
+  // The owner's actual sequence: the queued follow-up survives the interrupt and runs next, the
+  // tracker follows it onto the head, and stopping THAT works too.
+  assert.equal(native.view(identity)?.activeTurnId, "ctx:b", "the queue advanced onto the follow-up");
+  await rt.request("turn/interrupt", { threadId: thread.id, turnId: native.view(identity)!.activeTurnId! });
+  assert.deepEqual(claude.interrupts, [thread.id, thread.id], "and the survivor can be stopped in its turn");
+});
+
+// The RESPONSE channel says it too. A caller that learns its turn id from the reply and never
+// sees the notification -- which is every caller going through SessionService.send -- would
+// otherwise record a send it has not begun as the one executing, reaching the same broken stop
+// by the other route. This is the quieter of the two: nothing bumps the lifecycle revision, so
+// the wrong id applies without even asking for a refresh.
+test("turn/start reports a queued send as queued in its own response", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  const first = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
+    { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  assert.equal(first.turn.queued, undefined, "the executing turn is not flagged");
+
+  const second = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
+    { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+  assert.equal(second.turn.queued, true, "the send behind it is");
+
+  // And it stops being queued once it is the one running -- the flag describes this moment, not
+  // the turn, so a caller cannot cache it and be wrong later.
+  claude.settleTurn(thread.id, "ctx:a", "completed");
+  const third = await rt.request<{ turn: { id: string; queued?: boolean } }>("turn/start",
+    { threadId: thread.id, clientUserMessageId: "ctx:c", input: [{ type: "text", text: "third" }] });
+  assert.equal(third.turn.queued, true, "ctx:b is running now, so ctx:c queues behind it");
 });
 
 // The other half of the same invariant: withholding the queued send from the tracker must not
@@ -1680,9 +1718,9 @@ test("the queued send is tracked as soon as it reaches the head", async () => {
   const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
 
   const native = new NativeSessionState();
-  const identity = { endpointId: "claude", threadId: thread.id, mappingId: "mapping" };
+  const identity = { endpointId: "claude-local", threadId: thread.id, mappingId: "mapping" };
   native.register(identity, 1);
-  rt.onNotification((method, params) => { native.observe("claude", 1, method, params); });
+  rt.onNotification((method, params) => { native.observe("claude-local", 1, method, params); });
 
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
   await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });

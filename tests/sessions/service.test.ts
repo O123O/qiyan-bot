@@ -34,6 +34,9 @@ class ServiceEndpoint implements AppServerEndpoint {
   historyTurnStatus: string | undefined;
   threadTurns: any[] | undefined;
   failNextStart = false;
+  // What a Claude endpoint answers when it ACCEPTS a send but has not begun it: the turn is
+  // real and behind one that is still running.
+  queuedStart = false;
   goal: any = null;
   cwd = "";
   goalBarrier: Promise<void> | undefined;
@@ -71,6 +74,9 @@ class ServiceEndpoint implements AppServerEndpoint {
       this.onTurnStart?.();
       this.lastClientId = params.clientUserMessageId;
       this.status = "active";
+      if (this.queuedStart) {
+        return { turn: { id: "queued-1", status: "inProgress", queued: true } } as T;
+      }
       return { turn: { id: "started-1", ...(this.historyTurnStatus ? { status: this.historyTurnStatus } : {}) } } as T;
     }
     if (method === "turn/steer") {
@@ -244,6 +250,25 @@ test("starts idle sessions, steers active sessions, and interrupts the exact tur
   assert.equal((await service.send("payments", "more")).mode, "steer");
   await service.interrupt("payments", "started-1");
   assert.ok(endpoint.calls.some((call) => call.method === "turn/interrupt" && call.params.turnId === "started-1"));
+});
+
+// The other channel into the same failure the notification side already refuses. `turn/start`
+// answers with a turn id for a QUEUED send too -- the send is accepted, it just has not begun --
+// and adopting that as the active turn points every later interrupt at a turn the endpoint
+// refuses to interrupt, which is what broke the panel's stop button. It is the quieter of the
+// two routes: nothing bumps the lifecycle revision, so the wrong id applies without a murmur.
+test("a start the endpoint has only queued is not adopted as the running turn", async () => {
+  const { endpoint, native, service } = await fixture();
+  endpoint.queuedStart = true;
+  endpoint.threadTurns = [{ id: "running-1", status: "inProgress", items: [] }];
+
+  const started = await service.send("payments", "a follow-up while it works", { clientUserMessageId: "msg-q" });
+
+  assert.equal(started.turnId, "queued-1", "the caller still learns the id its message was given");
+  const view = native.view({ endpointId: "local", threadId: "thread", mappingId });
+  assert.notEqual(view?.activeTurnId, "queued-1",
+    "a queued send must never become the turn a later interrupt names");
+  assert.equal(view?.activeTurnId, "running-1", "the endpoint's own head is what the tracker takes");
 });
 
 test("setting effort fails closed until the worker's current model is known", async () => {
