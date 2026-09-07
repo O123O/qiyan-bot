@@ -256,6 +256,14 @@ class FakeClaude implements ClaudeHost, ClaudeCommandRunner {
     this.settle(sessionId, uuid, status);
   }
 
+  // The host stops holding a turn without ever announcing its end -- a stream that closed, or a
+  // turn that finished while QiYan was restarting. `reconcileRunningTurns` exists for exactly
+  // this, and settles what the host no longer reports.
+  forgetTurn(sessionId: string, uuid: string): void {
+    const session = this.require(sessionId);
+    session.inFlight.splice(session.inFlight.indexOf(uuid) >>> 0, 1);
+  }
+
   private settle(sessionId: string, uuid: string, status: "completed" | "failed" | "interrupted"): void {
     this.emit({ type: "turn/completed", sessionId, origin: "human", uuid, status, at: this.clock += 1 });
   }
@@ -1718,6 +1726,36 @@ test("turn/start reports a queued send as queued in its own response", async () 
   const retry = await rt.request<{ turn: { id: string; queued?: boolean }; runningTurnId?: string }>("turn/start",
     { threadId: thread.id, clientUserMessageId: "ctx:c", input: [{ type: "text", text: "third" }] });
   assert.equal(retry.turn.queued, true, "the duplicate is still behind the running turn");
+  assert.equal(retry.runningTurnId, "ctx:b",
+    "and names the head too: telling a caller not to adopt this turn without saying which to adopt "
+    + "instead is what leaves the tracker stale");
+});
+
+// The reservation is made before the first await so a second start cannot orphan this one. A
+// retry of a uuid the host still holds reaches that line again, and a second copy in `running`
+// would make the host reconciliation settle one turn twice -- two identical terminals for the
+// relay to deliver.
+test("a retried send does not reserve its turn twice", async () => {
+  const claude = new FakeClaude();
+  const rt = makeRuntime(claude);
+  await rt.start();
+  const { thread } = await rt.request<{ thread: any }>("thread/start", { cwd: "/w" });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:a", input: [{ type: "text", text: "first" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+  await rt.request("turn/start", { threadId: thread.id, clientUserMessageId: "ctx:b", input: [{ type: "text", text: "second" }] });
+
+  const terminals: string[] = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/completed") terminals.push((params as any).turn.id);
+  });
+  // The host drops both without announcing them, which is what `reconcileRunningTurns` settles --
+  // and it filters the same array the reservation was pushed onto, so a duplicate becomes a
+  // duplicate terminal for the relay to deliver.
+  claude.forgetTurn(thread.id, "ctx:a");
+  claude.forgetTurn(thread.id, "ctx:b");
+  await rt.request("thread/read", { threadId: thread.id });
+
+  assert.deepEqual(terminals, ["ctx:a", "ctx:b"], "one terminal per turn, not one per reservation");
 });
 
 // The other half of the same invariant: withholding the queued send from the tracker must not
@@ -1770,15 +1808,22 @@ test("history marks every accepted turn live but says which one is only queued",
   const latest = await new ThreadHistoryReader(async (method, params) =>
     rt.request(method, params as Record<string, unknown>)).latestTurn(thread.id);
   assert.equal(latest?.id, "ctx:b", "the newest turn really is the queued one");
+  // Set from the head's own `turn/started`, which is the only state a Claude endpoint can present
+  // to this probe with a queue behind it: `publishActivityStatus` returns early while anything is
+  // running, so an id-less active never coexists with a queue. Asserting merely that the tracker
+  // avoids "ctx:b" would also pass on states this endpoint cannot produce, including `unknown` --
+  // which fails every later operation on the session.
   const native = new NativeSessionState();
   const identity = { endpointId: "claude-local", threadId: thread.id, mappingId: "mapping" };
   native.register(identity, 1);
-  native.applyRefresh(native.captureRefresh(identity, 1), { status: "active" });
+  native.observe("claude-local", 1, "turn/started", { threadId: thread.id, turn: { id: "ctx:a", status: "inProgress" } });
   await repairActiveTurnIdentity({
-    native, identity, endpointGeneration: 1, latestTurn: async () => latest,
+    native, identity, endpointGeneration: 1, expectedLifecycleRevision: native.view(identity)!.lifecycleRevision,
+    latestTurn: async () => latest,
   });
-  assert.notEqual(native.view(identity)?.activeTurnId, "ctx:b",
-    "the repair must not put the tracker on a turn the runtime refuses to interrupt");
+  assert.equal(native.view(identity)?.activeTurnId, "ctx:a",
+    "the repair keeps the head rather than adopting a turn the runtime refuses to interrupt");
+  assert.equal(native.view(identity)?.status, "active");
 });
 
 test("interrupting a queued turn is refused rather than killing the running one", async () => {

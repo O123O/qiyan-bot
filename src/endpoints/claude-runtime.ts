@@ -794,7 +794,12 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Reserve the turn BEFORE the first await: opening and sending both suspend, and a
     // second turn/start slipping through in between would orphan this one and lose
     // interrupt control over it.
-    state.running.push(clientId);
+    // Once per uuid. A retry of a send the host is still holding reaches here again, and pushing
+    // a second copy left `running` as [a, b, b] -- harmless for the head test and for the
+    // id-filtered settle, but `reconcileRunningTurns` filters the same array and would emit two
+    // identical `turn/completed` notifications for one turn. If the id is already reserved, the
+    // reservation this line exists to make already exists.
+    if (!state.running.includes(clientId)) state.running.push(clientId);
     // Everything below is fenced against a concurrent closeConnection/archive: a session
     // opened after the endpoint stopped would outlive it (host.shutdown has already walked
     // its session map), running a turn nobody can observe or interrupt.
@@ -854,10 +859,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     } finally {
       this.startingTurns -= 1;
     }
-    // Whether this send is behind another rather than executing. Every answer below carries it:
-    // a caller that treats an accepted send as the running turn points its next interrupt at a
-    // turn the SDK cannot target, which is how the panel's stop button broke.
+    // Whether this send is behind another rather than executing, and if so which turn IS. Both
+    // answers below carry them: a caller that treats an accepted send as the running turn points
+    // its next interrupt at a turn the SDK cannot target, which is how the panel's stop button
+    // broke -- and telling it not to adopt this turn without naming the one to adopt instead
+    // leaves the tracker on a stale identity, which breaks it the same way.
     const queued = state.running[0] !== clientId;
+    const acceptedTurn = {
+      turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) },
+      ...(queued ? { runningTurnId: state.running[0] } : {}),
+    };
     if (accepted) {
       // turn/started ONLY for the turn actually executing. A queued send announced as
       // started makes it the tracked active turn, and an interrupt then names the queued
@@ -884,21 +895,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
           content: [{ type: "text", text: message, text_elements: [] }],
         },
       });
-      // Said on the RESPONSE channel too, not only in the notification above. A caller that
-      // learns its turn id from the reply and nothing else would otherwise record a send it has
-      // not begun as the one executing -- the same wrong answer, reached by the other route.
-      //
-      // And WHICH turn is executing, because that is the answer the caller actually needs and
-      // this is the only place that knows it without asking. Inferring it from history instead
-      // means asking "is the newest turn active?", which a queue makes unanswerable.
-      return {
-        turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) },
-        ...(queued ? { runningTurnId: state.running[0] } : {}),
-      };
+      // Said on the RESPONSE channel too, not only in the notification above: a caller that learns
+      // its turn id from the reply and nothing else would otherwise record a send it has not begun
+      // as the one executing -- the same wrong answer, reached by the other route. And WHICH turn
+      // is executing, because inferring that from history means asking "is the newest turn
+      // active?", which a queue makes unanswerable.
+      return acceptedTurn;
     }
-    // A refused-but-still-in-flight duplicate is answered like any other accepted send, so it
-    // carries the same disposition: the uuid the host is holding may well be behind another.
-    if (!alreadySettled) return { turn: { id: clientId, status: "inProgress", ...(queued ? { queued: true } : {}) } };
+    // A refused-but-still-in-flight duplicate -- an outbox re-arm, or a lost response -- is
+    // answered exactly like any other accepted send, because that is what it is.
+    if (!alreadySettled) return acceptedTurn;
     // The duplicate's turn is over. Release the reservation and republish its terminal, so
     // the response it produced while QiYan was away is still delivered instead of lost.
     state.running = state.running.filter((id) => id !== clientId);
