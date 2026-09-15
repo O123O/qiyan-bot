@@ -220,7 +220,10 @@ test("the selected panel resubscribes when its mapping identity changes", async 
   const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /const selectedSession = selected === null \? assistantSession : sessions\.find\([^;]+\?\? null;/u);
   assert.match(source, /const selectedMappingId = selectedSession\?\.mappingId \?\? null;/u);
-  assert.match(source, /\}, \[selected, selectedMappingId, subscribeWorker, loadDir\]\);/u);
+  // `loadDir` is deliberately absent: the tab-switch effect no longer reads a directory, so the
+  // explorer costs nothing until it is opened. What this pins is unchanged -- a mapping change
+  // still resubscribes the panel.
+  assert.match(source, /\}, \[selected, selectedMappingId, subscribeWorker\]\);/u);
   assert.match(source, /active\?\.nickname === target && active\.mappingId === mappingId/u);
 });
 

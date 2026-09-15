@@ -28,6 +28,9 @@ body { margin:0; }
 .body { flex:1; display:flex; min-height:0; }
 .files { flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .resizer { flex:0 0 5px; cursor:col-resize; background:transparent; } .resizer:hover { background:var(--accent); }
+/* Collapsed explorer: a rail wide enough to click, so the panel is reachable without costing a
+   directory listing until it is opened. */
+.files-rail { flex:0 0 auto; width:34px; border-right:1px solid var(--line); background:var(--panel); display:flex; justify-content:center; padding-top:8px; }
 .tw { display:inline-block; width:1.1em; color:var(--muted); }
 .tabs2 { display:flex; gap:4px; } .tabs2 button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 8px; border-radius:6px; font-weight:600; } .tabs2 button.on { color:var(--text); background:var(--panel2); } .tabs2 button:disabled { opacity:.45; cursor:default; }
 .git-toolbar { display:flex; gap:6px; padding:6px 8px; }

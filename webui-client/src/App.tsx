@@ -11,6 +11,7 @@ import { describeWorkerTasks, formatGoalStatus, selectedWorkerGoal, type WorkerG
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkdownRef } from "./filesystem-path";
+import { explorerRootToLoad } from "./explorer-loading";
 import { splitHighlightedLines } from "./highlight-lines";
 import { selectedSourceText } from "./code-selection";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
@@ -270,6 +271,14 @@ export function App() {
   const [filesystemRoot, setFilesystemRoot] = useState("~");
   const [filesystemPath, setFilesystemPath] = useState("~");
   const [filesWidth, setFilesWidth] = useState<number>(() => Number(localStorage.getItem("qiyan-files-w")) || 300);
+  // Collapsed until asked for. Listing a directory is a round trip to the worker's host -- over ssh
+  // for a remote one -- and it was paid on every tab switch, for a panel most switches never look
+  // at. Remembered per browser so opening it once does not mean re-opening it every visit.
+  const [explorerOpen, setExplorerOpen] = useState<boolean>(() => localStorage.getItem("qiyan-explorer") === "1");
+  const setExplorerOpenPersisted = (open: boolean) => {
+    setExplorerOpen(open);
+    localStorage.setItem("qiyan-explorer", open ? "1" : "0");
+  };
   const [sidebarTab, setSidebarTab] = useState<"files" | "git">("files");
   const [trackedRepos, setTrackedRepos] = useState<string[]>([]);            // repos tracked for this worker (localStorage)
   const [repoStatus, setRepoStatus] = useState<Record<string, GitStatus | { error: string } | "loading">>({});
@@ -633,9 +642,25 @@ export function App() {
     setText(readDraft(selected ?? ASSIST));
     subscribeWorker(wsRef.current, selected);
     setDirs({}); setExpanded(new Set());
-    if (selected) void loadDir(selected, "");
-    else { setSidebarTab("files"); void loadDir(null, "~", true); }
-  }, [selected, selectedMappingId, subscribeWorker, loadDir]);
+    // Deliberately no directory read here. The tree below loads its root when the explorer is
+    // actually open -- see the effect that follows -- so switching tabs costs nothing until you
+    // ask to see files.
+    if (selected === null) setSidebarTab("files");
+  }, [selected, selectedMappingId, subscribeWorker]);
+
+  // The lazy half: load the root only once the explorer is open and has nothing for this tab yet.
+  // Keyed on all of them, so opening the panel loads it, and switching tabs while it is open
+  // reloads it. The rule itself lives in explorerRootToLoad, where it can be tested.
+  useEffect(() => {
+    const request = explorerRootToLoad({
+      open: explorerOpen,
+      tab: sidebarTab,
+      selected,
+      filesystemRoot,
+      isLoaded: (key) => dirs[key] !== undefined,
+    });
+    if (request) void loadDir(request.session, request.path, request.replaceRoot);
+  }, [explorerOpen, sidebarTab, selected, dirs, filesystemRoot, loadDir]);
   useEffect(() => {
     if (selected && sidebarTab === "git") {
       const saved = JSON.parse(localStorage.getItem(`qiyan-git:${selected}`) || "[]") as string[];
@@ -1183,9 +1208,15 @@ export function App() {
       </header>
 
       <div className="body">
-        <aside className="files" style={{ width: filesWidth }}>
+        {!explorerOpen && <aside className="files-rail">
+          <button className="ghost sm" title="Show files" aria-label="Show files" aria-expanded={false}
+            onClick={() => setExplorerOpenPersisted(true)}>📁</button>
+        </aside>}
+        {explorerOpen && <aside className="files" style={{ width: filesWidth }}>
           <div className="files-head">
             <span className="tabs2">
+              <button className="ghost sm" title="Hide files" aria-label="Hide files" aria-expanded
+                onClick={() => setExplorerOpenPersisted(false)}>◀</button>
               <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
               <button className={sidebarTab === "git" ? "on" : ""} disabled={selected === null} onClick={() => setSidebarTab("git")}>Git</button>
             </span>
@@ -1204,8 +1235,8 @@ export function App() {
             <button type="button" className="ghost sm" title="Refresh" onClick={() => openFilesystemPath(filesystemRoot)}>⟳</button>
           </form>}
           {sidebarTab === "files" ? <div className="tree">{renderDir(selected === null ? filesystemRoot : "", 0)}</div> : renderGit()}
-        </aside>
-        <div className="resizer" onMouseDown={startResize} title="Drag to resize" />
+        </aside>}
+        {explorerOpen && <div className="resizer" onMouseDown={startResize} title="Drag to resize" />}
 
         <main className="chat">
           <div className="log" ref={logRef} onScroll={onScroll}>
