@@ -11,7 +11,7 @@ import { describeWorkerTasks, formatGoalStatus, selectedWorkerGoal, type WorkerG
 import { createBrowserUuid } from "./browser-uuid";
 import { assistantMessagePresentation, workerMentionDraft } from "./chat-provenance";
 import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkdownRef } from "./filesystem-path";
-import { explorerRootToLoad } from "./explorer-loading";
+import { explorerRequestSignature, explorerRootToLoad } from "./explorer-loading";
 import { splitHighlightedLines } from "./highlight-lines";
 import { selectedSourceText } from "./code-selection";
 import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
@@ -651,6 +651,11 @@ export function App() {
   // The lazy half: load the root only once the explorer is open and has nothing for this tab yet.
   // Keyed on all of them, so opening the panel loads it, and switching tabs while it is open
   // reloads it. The rule itself lives in explorerRootToLoad, where it can be tested.
+  //
+  // `inFlightRootRef` is what stops it firing twice. This effect and the tab-switch reset above run
+  // in the same commit, so this one first sees the PREVIOUS tab's `dirs`, and then runs again on
+  // the reset `{}` identity -- and `dirs` cannot show a request that has not answered yet.
+  const inFlightRootRef = useRef<string | null>(null);
   useEffect(() => {
     const request = explorerRootToLoad({
       open: explorerOpen,
@@ -659,15 +664,26 @@ export function App() {
       filesystemRoot,
       isLoaded: (key) => dirs[key] !== undefined,
     });
-    if (request) void loadDir(request.session, request.path, request.replaceRoot);
+    if (!request) { inFlightRootRef.current = null; return; }
+    const signature = explorerRequestSignature(request);
+    if (inFlightRootRef.current === signature) return;
+    inFlightRootRef.current = signature;
+    void loadDir(request.session, request.path, request.replaceRoot).finally(() => {
+      // Cleared only if nothing newer was issued meanwhile. Either outcome leaves the key present
+      // in `dirs` -- entries on success, an `{error}` on failure -- so this cannot re-fire.
+      if (inFlightRootRef.current === signature) inFlightRootRef.current = null;
+    });
   }, [explorerOpen, sidebarTab, selected, dirs, filesystemRoot, loadDir]);
+  // Git is the other half of the same collapsed sidebar, and costs a status request per tracked
+  // repo. Switching workers with it selected but the sidebar shut was paying that for a panel
+  // nobody could see.
   useEffect(() => {
-    if (selected && sidebarTab === "git") {
+    if (explorerOpen && selected && sidebarTab === "git") {
       const saved = JSON.parse(localStorage.getItem(`qiyan-git:${selected}`) || "[]") as string[];
       setTrackedRepos(saved); setDiscovered(null);
       saved.forEach((r) => loadRepoStatus(selected, r));
     }
-  }, [selected, sidebarTab]); // eslint-disable-line
+  }, [selected, sidebarTab, explorerOpen]); // eslint-disable-line
 
   // The visible conversation: QiYan uses its durable owner history; the worker uses only the
   // foreground subscription's Codex snapshot/live reducer plus ephemeral exec/error cards.
@@ -1209,14 +1225,16 @@ export function App() {
 
       <div className="body">
         {!explorerOpen && <aside className="files-rail">
-          <button className="ghost sm" title="Show files" aria-label="Show files" aria-expanded={false}
-            onClick={() => setExplorerOpenPersisted(true)}>📁</button>
+          <button className="ghost sm" title="Show sidebar (files and git)" aria-label="Show sidebar"
+            aria-expanded={false} aria-controls="qiyan-sidebar" onClick={() => setExplorerOpenPersisted(true)}>📁</button>
         </aside>}
-        {explorerOpen && <aside className="files" style={{ width: filesWidth }}>
+        {explorerOpen && <aside className="files" id="qiyan-sidebar" style={{ width: filesWidth }}>
           <div className="files-head">
+            {/* Outside `.tabs2`: that selector is more specific than `.ghost`, so a button placed
+                inside it renders as a third tab rather than as the control it is. */}
+            <button className="ghost sm" title="Hide sidebar" aria-label="Hide sidebar" aria-expanded
+              aria-controls="qiyan-sidebar" onClick={() => setExplorerOpenPersisted(false)}>◀</button>
             <span className="tabs2">
-              <button className="ghost sm" title="Hide files" aria-label="Hide files" aria-expanded
-                onClick={() => setExplorerOpenPersisted(false)}>◀</button>
               <button className={sidebarTab === "files" ? "on" : ""} onClick={() => setSidebarTab("files")}>Files</button>
               <button className={sidebarTab === "git" ? "on" : ""} disabled={selected === null} onClick={() => setSidebarTab("git")}>Git</button>
             </span>

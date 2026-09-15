@@ -20,7 +20,9 @@ export function explorerRootToLoad(state: {
   tab: "files" | "git";
   selected: string | null;
   filesystemRoot: string;
-  /** Whether a listing for this tree key is already held (or in flight). */
+  /** Whether a listing for this tree key is already held. In-flight requests are NOT visible here
+   *  -- `dirs` only gains the key when the response lands -- so the caller must also suppress a
+   *  request it has already issued. See `explorerRequestSignature`. */
   isLoaded(key: string): boolean;
 }): ExplorerRootRequest | undefined {
   if (!state.open || state.tab !== "files") return undefined;
@@ -30,4 +32,15 @@ export function explorerRootToLoad(state: {
   }
   // A worker's tree is rooted at "" -- its project directory.
   return state.isLoaded("") ? undefined : { session: state.selected, path: "", replaceRoot: false };
+}
+
+// Identity of a root request, for suppressing one already in flight.
+//
+// The reset on tab switch (`setDirs({})`) and this load live in two effects that run in the SAME
+// commit: the first only QUEUES its reset, so the second sees the previous tab's `dirs`, issues a
+// request, and then runs again on the new `{}` identity -- where `isLoaded` still cannot see the
+// request in flight, because `dirs` gains the key only when the response lands. That fired two
+// concurrent listings per switch, doubling the round trip this whole change exists to remove.
+export function explorerRequestSignature(request: ExplorerRootRequest): string {
+  return `${request.session ?? ""}\u0000${request.path}\u0000${request.replaceRoot}`;
 }
