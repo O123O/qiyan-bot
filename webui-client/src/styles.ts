@@ -42,7 +42,10 @@ body { margin:0; }
 .commit { border-top:1px solid var(--line); margin-top:8px; padding:10px; display:flex; flex-direction:column; gap:6px; }
 .commit textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 8px; resize:none; font:inherit; }
 .commit button { background:var(--accent); color:var(--accent-fg); border:0; border-radius:8px; padding:6px; cursor:pointer; font-weight:600; } .commit button:disabled { opacity:.45; cursor:default; }
-.files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:space-between; }
+/* flex-start + an auto margin on the actions, NOT space-between: the hide button is a third child
+   here and the actions group is conditional, so space-between moved the Files/Git tabs by 113px
+   between the two tabs. */
+.files-head { padding:8px 14px; border-bottom:1px solid var(--line); font-weight:600; display:flex; align-items:center; justify-content:flex-start; gap:8px; }
 .filesystem-nav { display:flex; gap:5px; padding:7px 8px; border-bottom:1px solid var(--line); }
 .filesystem-nav input { min-width:0; flex:1; padding:5px 7px; border:1px solid var(--line); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; }
 .ghost.sm { padding:2px 8px; font-size:15px; line-height:1; }
@@ -185,7 +188,7 @@ code.code-lines {
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:4vh 4vw; }
 .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(1240px,96vw); height:92vh; max-height:100%; display:flex; flex-direction:column; box-shadow:0 12px 44px rgba(0,0,0,.45); }
 .sheet-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); font-family:monospace; word-break:break-all; }
-.head-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
+.head-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; margin-left:auto; }
 .sheet-body { overflow:auto; padding:14px; display:flex; flex-direction:column; min-height:0; } .sheet-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 monospace; }
 .preview-img { max-width:100%; max-height:78vh; object-fit:contain; display:block; margin:0 auto; }
 /* Figures inside rendered markdown. Capped so a full-resolution screenshot cannot push the

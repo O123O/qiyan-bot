@@ -664,7 +664,12 @@ export function App() {
       filesystemRoot,
       isLoaded: (key) => dirs[key] !== undefined,
     });
-    if (!request) { inFlightRootRef.current = null; return; }
+    // Deliberately NOT cleared here. Collapsing while a listing is in flight would drop the ref,
+    // and reopening before the response lands would issue the same request again. `.finally` is the
+    // only thing that clears it -- `loadDir` catches its own errors, so it always runs -- and the
+    // ref is consulted only when the identical request is regenerated, which means it is still
+    // wanted.
+    if (!request) return;
     const signature = explorerRequestSignature(request);
     if (inFlightRootRef.current === signature) return;
     inFlightRootRef.current = signature;
@@ -1225,8 +1230,10 @@ export function App() {
 
       <div className="body">
         {!explorerOpen && <aside className="files-rail">
+          {/* No `aria-controls`: the panel it would name is not in the DOM while collapsed, and an
+              IDREF that resolves to nothing is an ARIA validity error. `aria-expanded` is enough. */}
           <button className="ghost sm" title="Show sidebar (files and git)" aria-label="Show sidebar"
-            aria-expanded={false} aria-controls="qiyan-sidebar" onClick={() => setExplorerOpenPersisted(true)}>📁</button>
+            aria-expanded={false} onClick={() => setExplorerOpenPersisted(true)}>📁</button>
         </aside>}
         {explorerOpen && <aside className="files" id="qiyan-sidebar" style={{ width: filesWidth }}>
           <div className="files-head">

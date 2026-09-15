@@ -88,8 +88,12 @@ test("switching tabs does not itself read a directory", async () => {
 
   // And the lazy effect must still suppress a request it has already issued -- see the signature
   // test above for why. A pure-function test cannot see this; it is an effect-ordering property.
-  const lazyEffect = source.slice(source.indexOf("// The lazy half:"), source.indexOf("// Git is the other half"));
-  assert.ok(lazyEffect.length > 0, "the lazy effect was not found -- this test needs updating");
+  const lazyStart = source.indexOf("// The lazy half:");
+  const lazyEnd = source.indexOf("// Git is the other half");
+  // Both markers asserted: a missing end marker makes indexOf return -1, and slice(start, -1) then
+  // widens to nearly the whole file -- where `assert.match` below would pass on some OTHER effect.
+  assert.ok(lazyStart >= 0 && lazyEnd > lazyStart, "the lazy effect was not found -- this test needs updating");
+  const lazyEffect = source.slice(lazyStart, lazyEnd);
   assert.match(lazyEffect, /if \(inFlightRootRef\.current === signature\) return;/u,
     "without the in-flight guard the reset and the load race, and every switch fetches twice");
 });
