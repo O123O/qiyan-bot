@@ -33,6 +33,9 @@ interface EndpointRecord {
   reconnectAttempt: number;
   gaveUp?: boolean;
   recoveryPause?: EndpointRecoveryPause & { notificationPrepared: boolean };
+  // Latches the one-shot notice for an incident that keeps retrying, so the ramp stays armed
+  // without renotifying on every attempt. Distinct from recoveryPause, which also stops retrying.
+  recoveryNotice?: EndpointRecoveryPause;
   lifecycle?: Promise<void>;
 }
 
@@ -630,6 +633,7 @@ export class EndpointManager {
     record.endpoint = endpoint;
     record.generation += 1;
     delete record.recoveryPause;
+    delete record.recoveryNotice;
     const generation = record.generation;
     record.subscriptions.push(endpoint.onUnavailable((kind) => {
       if (record.endpoint !== endpoint || record.generation !== generation) return;
@@ -754,6 +758,19 @@ export class EndpointManager {
   ): boolean {
     const recovery = endpointRecoveryPause(error);
     if (!recovery || record.generation !== attemptedGeneration) return false;
+    // An absent ControlMaster is only restorable by a human, but the failure that reveals it —
+    // ssh exiting 255 under BatchMode — is indistinguishable from a rebooting host or a network
+    // blip. Stopping on it would turn a 20-second reboot into an outage that no timer ever
+    // clears. So notify once and let the ramp keep retrying: that costs nothing on a host that
+    // comes back, and on a host genuinely waiting for a person the hourly-escalating ramp is
+    // exactly what reconnects it once they act.
+    if (recovery.reason === "ssh_control_master_absent") {
+      if (record.recoveryNotice?.reason !== recovery.reason || record.recoveryNotice.sshHost !== recovery.sshHost) {
+        record.recoveryNotice = recovery;
+        try { this.options.onRecoveryPaused?.(endpointId, recovery); } catch { delete record.recoveryNotice; }
+      }
+      return false;
+    }
     if (record.recoveryPause?.reason !== recovery.reason || record.recoveryPause.sshHost !== recovery.sshHost) {
       record.recoveryPause = { ...recovery, notificationPrepared: false };
     }

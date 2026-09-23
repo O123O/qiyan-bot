@@ -11,7 +11,8 @@ interface DeliveryPreparer {
 
 // The user configured a ControlMaster for this host and it is no longer there, so QiYan fell back
 // to establishing its own — which it cannot do noninteractively on an MFA host. Only the user can
-// restore it, so name the host and point at a master that survives a QiYan restart.
+// restore it, so name the host and point at a master that survives a QiYan restart. Retries
+// continue meanwhile: the failure that raised this is indistinguishable from a rebooting host.
 export function prepareSshControlMasterAbsentNotice(
   deliveries: DeliveryPreparer,
   binding: ConversationBinding,
@@ -21,7 +22,7 @@ export function prepareSshControlMasterAbsentNotice(
     kind: "system_warning",
     binding,
     mandatory: true,
-    body: `[system] endpoint ${input.endpointId} has no SSH ControlMaster for ${input.sshHost}: the one your ssh config points at is gone, and QiYan cannot create one where authentication is interactive. Automatic restarts are paused until you establish it. Start it outside QiYan's service so a bot restart cannot take it down again, for example \`systemd-run --user --pty --unit=ssh-master-${input.sshHost} ssh -N ${input.sshHost}\`, then retry the worker.`,
+    body: `[system] endpoint ${input.endpointId} cannot reach ${input.sshHost}, and the SSH ControlMaster your ssh config points at is gone — QiYan cannot create one where authentication is interactive. It keeps retrying on a slowing schedule, so it reconnects on its own once you restore the master. Start it outside QiYan's service so a bot restart cannot take it down again, for example \`systemd-run --user --pty --unit=ssh-master-${input.sshHost} ssh -N ${input.sshHost}\` in a terminal you can leave open (detach from it rather than interrupting it — Ctrl-C would kill the master you just authenticated).`,
   });
 }
 
