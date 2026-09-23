@@ -762,7 +762,7 @@ export class EndpointManager {
   ): boolean {
     const recovery = endpointRecoveryPause(error);
     if (!recovery || record.generation !== attemptedGeneration) return false;
-    // An absent ControlMaster is only restorable by a human, but the failure that reveals it —
+    // A ControlMaster QiYan cannot use is only restorable by a human, but the failure that reveals it —
     // ssh exiting 255 under BatchMode — is indistinguishable from a rebooting host or a network
     // blip. Stopping on it would turn a 20-second reboot into an outage that no timer ever
     // clears. So notify once and let the ramp keep retrying: that costs nothing on a host that

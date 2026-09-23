@@ -32,7 +32,7 @@ test("the fresh-channel warning is actionable and uses the current cross-chat ow
   assert.match(prepared[0]!.body, /session\/channel policy/u);
 });
 
-test("the absent-master warning names the host and a master that outlives a QiYan restart", () => {
+test("the unusable-master warning names the host and a master that outlives a QiYan restart", () => {
   const binding: ConversationBinding = {
     adapterId: "slack",
     conversationKey: "slack:D123",

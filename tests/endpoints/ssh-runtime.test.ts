@@ -363,7 +363,7 @@ test("an App Server proxy startup failure uses the same fresh-channel diagnostic
   assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : "probe"), ["check", "probe"]);
 });
 
-test("an owned master we only hold because the user's vanished reports the absent master", async (t) => {
+test("an owned master we only hold because the user's is unusable names that master", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-lost-master-"));
   await chmod(root, 0o700);
   t.after(() => rm(root, { recursive: true, force: true }));

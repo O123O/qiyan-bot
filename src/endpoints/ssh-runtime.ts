@@ -549,11 +549,12 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   private async throwFreshChannelFailure(error: unknown): Promise<never> {
     const plan = this.options.plan;
     if (plan.ownsControlMaster) {
-      // We only own this master because the one the user configured was gone. If we then cannot
-      // authenticate, retrying is futile — no automated path can satisfy an MFA prompt — so pause
-      // and say which master needs re-establishing, instead of reporting an unreachable worker.
+      // We only own this master because the one the user configured is unusable — gone, or set to
+      // a mode that demands interactive confirmation. Only they can put that right, so name the
+      // master instead of reporting an unreachable worker. This does NOT stop the retry ramp: the
+      // ssh exit it rides on is equally a reboot or a network blip (see pauseForRecovery).
       if (plan.lostUserControlPath !== undefined && isProcessExit(error, 255)) {
-        throw new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
+        throw new AppError("ENDPOINT_UNAVAILABLE", "QiYan cannot use the SSH ControlMaster configured for this host", {
           recovery: "ssh_control_master_unusable",
           sshHost: plan.alias,
           controlPath: plan.lostUserControlPath,
