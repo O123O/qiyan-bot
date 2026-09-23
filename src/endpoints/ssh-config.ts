@@ -43,7 +43,11 @@ export function parseSshConfig(output: string): EffectiveSshConfig {
     hostname,
     user,
     port,
-    controlMaster: values.get("controlmaster")?.toLowerCase() ?? "no",
+    // `false` is what `ssh -G` prints for an unset ControlMaster, so the default matches the
+    // values above rather than the config-file spelling.
+    controlMaster: values.get("controlmaster")?.toLowerCase() ?? "false",
+    // `ssh -G` omits the line entirely for `ControlPath none` or an unset option, so the `none`
+    // check is belt-and-braces rather than evidence of what it prints.
     ...(controlPath && controlPath !== "none" ? { controlPath } : {}),
   };
 }
@@ -53,8 +57,11 @@ export function parseSshConfig(output: string): EffectiveSshConfig {
 // and `autoask` pass through unchanged. Matching only the file spellings silently ignored a
 // perfectly good `ControlMaster yes` master and built a BatchMode one beside it.
 const CONTROL_MASTER_REUSABLE = new Set(["yes", "true", "auto"]);
-// Modes that ask for a master QiYan cannot use itself: `ask` and `autoask` prompt, and BatchMode
-// has no answer. Excludes `false`/unset, where the host wants no master and needs no diagnosis.
+// Modes that ask for a master QiYan cannot use itself. `ask`/`autoask` make the master demand
+// ssh-askpass confirmation for every control connection it accepts, so each QiYan operation would
+// need a human click, or be refused outright on a headless master — unusable for automation
+// however our own client is configured. Excludes `false`/unset: that host wants no master at all,
+// so an inherited ControlPath is not a dead end and deserves no diagnosis.
 const CONTROL_MASTER_REQUESTED = new Set([...CONTROL_MASTER_REUSABLE, "ask", "autoask"]);
 
 export function planSshConnection(alias: string, effective: EffectiveSshConfig, runtimeDir: string): SshConnectionPlan {
@@ -213,7 +220,7 @@ export class SshGenerationPlanner {
             hostname: effective.hostname,
             user: effective.user,
             port: effective.port,
-            controlMaster: "no",
+            controlMaster: "false",
           }, this.options.runtimeDir),
           ...(effective.controlPath === undefined ? {} : { lostUserControlPath: effective.controlPath }),
         };

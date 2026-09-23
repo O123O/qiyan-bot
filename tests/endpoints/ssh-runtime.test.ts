@@ -383,7 +383,7 @@ test("an owned master we only hold because the user's vanished reports the absen
   // the master. Pause and name it rather than retrying an unreachable-looking worker forever.
   await assert.rejects(client("/private/user-master").invoke("inspect", ["{}"], helperPath), (error: unknown) =>
     error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
-    && error.details?.recovery === "ssh_control_master_absent"
+    && error.details?.recovery === "ssh_control_master_unusable"
     && error.details.sshHost === "devbox" && error.details.controlPath === "/private/user-master");
 
   // A master QiYan owns because the host never configured one carries no such diagnosis.

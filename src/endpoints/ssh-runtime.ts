@@ -554,7 +554,7 @@ export class SshRemoteClient implements RemoteRuntimeClient {
       // and say which master needs re-establishing, instead of reporting an unreachable worker.
       if (plan.lostUserControlPath !== undefined && isProcessExit(error, 255)) {
         throw new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
-          recovery: "ssh_control_master_absent",
+          recovery: "ssh_control_master_unusable",
           sshHost: plan.alias,
           controlPath: plan.lostUserControlPath,
         });

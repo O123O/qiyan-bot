@@ -40,7 +40,7 @@ interface EndpointRecord {
 }
 
 export interface EndpointRecoveryPause {
-  reason: "ssh_fresh_channel_unavailable" | "ssh_control_master_absent";
+  reason: "ssh_fresh_channel_unavailable" | "ssh_control_master_unusable";
   sshHost: string;
 }
 
@@ -751,7 +751,7 @@ export class EndpointManager {
   // loss timer still fires once and then dies without re-arming, and direct use via ensureReady
   // still makes one attempt, which is how such an endpoint recovers after the person acts.
   //
-  // ssh_control_master_absent is not corroborated: the ssh exit it rides on is equally a reboot
+  // ssh_control_master_unusable is not corroborated: the ssh exit it rides on is equally a reboot
   // or a network blip. It returns false so the ramp keeps running to its ~48h give-up, and
   // latches its notice in recoveryNotice instead, which no scheduler treats as a stop.
   private pauseForRecovery(
@@ -768,7 +768,7 @@ export class EndpointManager {
     // clears. So notify once and let the ramp keep retrying: that costs nothing on a host that
     // comes back, and on a host genuinely waiting for a person the hourly-escalating ramp is
     // exactly what reconnects it once they act.
-    if (recovery.reason === "ssh_control_master_absent") {
+    if (recovery.reason === "ssh_control_master_unusable") {
       if (record.recoveryNotice?.reason !== recovery.reason || record.recoveryNotice.sshHost !== recovery.sshHost) {
         record.recoveryNotice = recovery;
         // A false result means the notice was not durably prepared, so the latch must not hold:
@@ -863,7 +863,7 @@ export class EndpointManager {
 
 function endpointRecoveryPause(error: unknown): EndpointRecoveryPause | undefined {
   if (!(error instanceof AppError) || error.code !== "ENDPOINT_UNAVAILABLE"
-    || (error.details?.recovery !== "ssh_fresh_channel_unavailable" && error.details?.recovery !== "ssh_control_master_absent")
+    || (error.details?.recovery !== "ssh_fresh_channel_unavailable" && error.details?.recovery !== "ssh_control_master_unusable")
     || typeof error.details.sshHost !== "string" || error.details.sshHost.length === 0) return undefined;
   return { reason: error.details.recovery, sshHost: error.details.sshHost };
 }

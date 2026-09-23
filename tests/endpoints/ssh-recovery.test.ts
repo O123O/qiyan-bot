@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
-import { prepareSshControlMasterAbsentNotice, prepareSshFreshChannelUnavailableNotice } from "../../src/endpoints/ssh-recovery.ts";
+import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "../../src/endpoints/ssh-recovery.ts";
 
 test("the fresh-channel warning is actionable and uses the current cross-chat owner route", () => {
   const binding: ConversationBinding = {
@@ -40,7 +40,7 @@ test("the absent-master warning names the host and a master that outlives a QiYa
   };
   const prepared: Array<{ kind: string; binding: ConversationBinding; body: string; mandatory: boolean }> = [];
 
-  prepareSshControlMasterAbsentNotice({
+  prepareSshControlMasterUnusableNotice({
     prepare: (input) => { prepared.push(input); },
   }, binding, { endpointId: "prenyx-codex", sshHost: "prenyx" });
 
@@ -49,8 +49,10 @@ test("the absent-master warning names the host and a master that outlives a QiYa
   assert.equal(prepared[0]?.mandatory, true);
   assert.equal(prepared[0]?.binding, binding);
   assert.match(prepared[0]!.body, /prenyx-codex cannot reach prenyx/u);
-  assert.match(prepared[0]!.body, /ControlMaster your ssh config points at is gone/u);
-  assert.match(prepared[0]!.body, /cannot create one where authentication is interactive/u);
+  // An `ask` master may be alive, so the notice must not assert the master is gone, and must
+  // carry the remedy for a prompting mode alongside the one for a missing master.
+  assert.match(prepared[0]!.body, /either it is gone, or its ControlMaster mode needs interactive confirmation/u);
+  assert.match(prepared[0]!.body, /set `ControlMaster auto` for this host/u);
   // The same ssh failure is raised by a rebooting host, so this must never claim retries stopped.
   assert.match(prepared[0]!.body, /keeps retrying/u);
   assert.doesNotMatch(prepared[0]!.body, /paused/u);

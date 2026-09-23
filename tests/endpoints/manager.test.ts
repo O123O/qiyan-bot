@@ -244,7 +244,7 @@ test("a vanished ControlMaster notifies once but keeps retrying", async () => {
   // No automated retry can create this master, so it must pause exactly like a stale one — but
   // carry its own reason, because the operator action that fixes it is different.
   remote.startError = new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
-    recovery: "ssh_control_master_absent",
+    recovery: "ssh_control_master_unusable",
     sshHost: "prenyx",
     controlPath: "/run/user/1000/qiyan-ssh-abc",
   });
@@ -268,7 +268,7 @@ test("a vanished ControlMaster notifies once but keeps retrying", async () => {
   await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
   await settle();
 
-  assert.deepEqual(notifications, [{ id: remote.id, reason: "ssh_control_master_absent", sshHost: "prenyx" }]);
+  assert.deepEqual(notifications, [{ id: remote.id, reason: "ssh_control_master_unusable", sshHost: "prenyx" }]);
   // ssh exit 255 is also how a rebooting host fails. Stopping here would outlive the reboot.
   assert.equal(scheduled.length, 1, "the ramp stays armed so a host that comes back reconnects itself");
 
