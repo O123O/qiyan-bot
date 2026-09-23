@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SshGenerationPlanner,
-  buildControlMasterExitArgs,
   buildSshArgs,
   buildSshReverseForwardArgs,
   buildSshReverseForwardCancelArgs,
@@ -38,7 +37,6 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
   assert.ok(args.includes("ControlMaster=no"));
   assert.doesNotMatch(args.join(" "), /ControlPersist/u);
-  assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
 });
 
 test("the fixed session probe can only reuse an existing user ControlMaster", () => {
@@ -82,7 +80,8 @@ test("falls back to an owned master when the effective ControlPath is unsafe", (
   for (const controlPath of ["relative/socket", "/tmp/bad\npath", `/tmp/${"x".repeat(110)}`]) {
     const plan = planSshConnection("devbox", { ...parseSshConfig(parsed), controlMaster: "auto", controlPath }, "/private/runtime");
     assert.equal(plan.ownsControlMaster, true);
-    assert.ok(buildControlMasterExitArgs(plan).includes("exit"));
+    // An owned master is established to persist; no code path may build a command that ends it.
+    assert.ok(buildSshArgs(plan, []).includes("ControlPersist=yes"));
   }
 });
 

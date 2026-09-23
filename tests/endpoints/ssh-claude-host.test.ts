@@ -155,7 +155,6 @@ async function harness(t: { after(fn: () => void | Promise<void>): void }): Prom
       streams.push(stream);
       return stream;
     },
-    async closeControlMaster(): Promise<void> {},
   };
   const runtime = new SshClaudeHostRuntime({
     endpointId: "claude-remote",

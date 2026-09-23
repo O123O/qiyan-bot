@@ -161,7 +161,6 @@ test("user-owned helper and transfer calls rely on their authoritative SSH opera
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
     assert.ok(args.includes("ControlMaster=no"));
   }
-  await remote.closeControlMaster();
   assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
@@ -431,21 +430,26 @@ test("user-owned ControlMaster attestation accepts a private NFS socket director
   await assert.doesNotReject(attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })));
 });
 
-test("owned transport cleanup exits only its persistent QiYan ControlMaster", async () => {
+test("stopping a runtime never ends the ControlMaster it owns", async (t) => {
   const calls: string[][] = [];
+  const root = await mkdtemp(join(tmpdir(), "qiyan-owned-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
   const remote = new SshRemoteClient({
-    plan: { ...userMasterPlan, ownsControlMaster: true },
+    plan: { ...userMasterPlan, controlPath: join(root, "master"), ownsControlMaster: true },
     helperSource,
     run: async (_command, args) => {
       calls.push([...args]);
-      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      return { stdout: framedOk, stderr: Buffer.alloc(0) };
     },
   });
 
-  await remote.closeControlMaster();
+  // The remote command a runtime shutdown issues. A master QiYan established with
+  // ControlPersist=yes outlives it, so the next start reattaches instead of reauthenticating.
+  await remote.invoke("stop", ["{}"], helperPath);
 
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0]!.slice(calls[0]!.indexOf("-O"), calls[0]!.indexOf("-O") + 2), ["-O", "exit"]);
+  assert.equal(calls.some((args) => args.includes("-O")), false);
+  assert.equal((remote as { closeControlMaster?: unknown }).closeControlMaster, undefined);
 });
 
 test("reuses a healthy detached runtime and changes identity only after replacement", async () => {

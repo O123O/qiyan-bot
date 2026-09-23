@@ -86,18 +86,13 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
     // The host keeps running on the worker's machine — that is the point. Only this client
     // goes away, so an in-flight turn is still there to adopt on the next activation.
     await this.host.shutdown();
-    await this.options.host.remote.closeControlMaster?.();
   }
 
   async shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void> {
     if (expectedIdentity.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
     this.closing = true;
     await this.host.shutdown();
-    try {
-      await this.invoke("stop-claude-host", { ...this.runtimeRequest(), expected: expectedIdentity });
-    } finally {
-      await this.options.host.remote.closeControlMaster?.();
-    }
+    await this.invoke("stop-claude-host", { ...this.runtimeRequest(), expected: expectedIdentity });
   }
 
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {

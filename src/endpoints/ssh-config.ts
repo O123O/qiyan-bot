@@ -157,11 +157,6 @@ export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
   return [...baseArgs(plan, false), "-O", "check", plan.alias];
 }
 
-export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
-  if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
-  return [...baseArgs(plan, false), "-O", "exit", plan.alias];
-}
-
 export class SshGenerationPlanner {
   constructor(private readonly options: {
     sshBinary: string;
@@ -205,6 +200,11 @@ export class SshGenerationPlanner {
   }
 }
 
+// A ControlMaster outlives QiYan by design, whoever established it. An owned one is created
+// with ControlPersist=yes (persist indefinitely) precisely so a restart reattaches to it rather
+// than reauthenticating, and on hosts behind interactive MFA only the user can ever create one.
+// So nothing here builds `-O exit`, and no runtime, transport, or connection close may end a
+// master: releasing our use of it is not the same as destroying it.
 function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): string[] {
   const pinned = ["-o", `HostName=${plan.destination.hostname}`, "-l", plan.destination.user, "-p", String(plan.destination.port)];
   const control = ["-S", plan.controlPath!, ...(plan.ownsControlMaster && establishOwnedMaster

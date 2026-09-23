@@ -7,7 +7,6 @@ import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
   buildControlMasterCheckArgs,
-  buildControlMasterExitArgs,
   buildSshRemoteNodeProgramArgs,
   buildSshSessionProbeArgs,
   type SshConnectionPlan,
@@ -97,7 +96,6 @@ export interface RemoteRuntimeClient {
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string, options?: { signal?: AbortSignal }): Promise<T>;
   openAppServerStream?(request: RemoteAppServerProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
   openClaudeHostStream?(request: RemoteClaudeHostProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
-  closeControlMaster?(): Promise<void>;
 }
 
 export interface RemoteAppServerProxyRequest {
@@ -345,19 +343,14 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
     if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
-    try {
-      await this.options.remote.invoke("stop", [JSON.stringify({
-        runtimeDir: prepared.runtimeDir,
-        session: prepared.session,
-        tmuxMode: prepared.tmuxMode,
-        expected: expectedIdentity,
-      })], prepared.host.remoteHelperPath);
-      if (prepared.tmuxMode === "legacy") delete this.prepared;
-    }
-    finally { await this.closeTransport(); }
+    await this.options.remote.invoke("stop", [JSON.stringify({
+      runtimeDir: prepared.runtimeDir,
+      session: prepared.session,
+      tmuxMode: prepared.tmuxMode,
+      expected: expectedIdentity,
+    })], prepared.host.remoteHelperPath);
+    if (prepared.tmuxMode === "legacy") delete this.prepared;
   }
-
-  async closeTransport(): Promise<void> { await this.options.remote.closeControlMaster?.(); }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
     if (this.prepared) return this.prepared;
@@ -520,14 +513,6 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     } catch (error) {
       return this.throwFreshChannelFailure(error);
     }
-  }
-
-  async closeControlMaster(): Promise<void> {
-    if (!this.options.plan.ownsControlMaster) return;
-    const run = this.options.run ?? runBoundedProcess;
-    await run(this.options.sshBinary ?? "ssh", buildControlMasterExitArgs(this.options.plan), {
-      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
-    }).catch(() => undefined);
   }
 
   private async executeHelper(
