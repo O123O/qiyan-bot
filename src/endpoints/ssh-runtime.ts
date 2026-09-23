@@ -171,6 +171,10 @@ export interface SshRuntimeController {
   openAppServerStream(expected: RuntimeIdentity): Promise<ReadyProcessStream>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
+  // The ordering point for releasing transport-level state once an in-flight open has settled.
+  // No production controller implements it today: SshRuntime's only transport state was its
+  // ControlMaster, which is never torn down. Anything added here must respect that — releasing a
+  // connection is not a reason to end a master.
   closeTransport?(): Promise<void>;
   stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }

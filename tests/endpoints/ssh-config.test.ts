@@ -82,6 +82,9 @@ test("falls back to an owned master when the effective ControlPath is unsafe", (
     assert.equal(plan.ownsControlMaster, true);
     // An owned master is established to persist; no code path may build a command that ends it.
     assert.ok(buildSshArgs(plan, []).includes("ControlPersist=yes"));
+    // The host asked for a master we cannot use. On an MFA host that is as unrecoverable as one
+    // that vanished, so it carries the same diagnosis rather than failing as an offline worker.
+    assert.equal(plan.lostUserControlPath, controlPath);
   }
 });
 

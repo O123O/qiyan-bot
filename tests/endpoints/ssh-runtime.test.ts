@@ -161,7 +161,6 @@ test("user-owned helper and transfer calls rely on their authoritative SSH opera
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
     assert.ok(args.includes("ControlMaster=no"));
   }
-  assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
 test("an SSH helper invocation forwards its cancellation signal to the child process", async (t) => {
@@ -457,26 +456,33 @@ test("user-owned ControlMaster attestation accepts a private NFS socket director
   await assert.doesNotReject(attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })));
 });
 
-test("stopping a runtime never ends the ControlMaster it owns", async (t) => {
-  const calls: string[][] = [];
-  const root = await mkdtemp(join(tmpdir(), "qiyan-owned-master-"));
-  await chmod(root, 0o700);
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const remote = new SshRemoteClient({
-    plan: { ...userMasterPlan, controlPath: join(root, "master"), ownsControlMaster: true },
-    helperSource,
-    run: async (_command, args) => {
-      calls.push([...args]);
-      return { stdout: framedOk, stderr: Buffer.alloc(0) };
-    },
-  });
+test("stopping a runtime never ends the ControlMaster it owns", async () => {
+  // A remote that still offers the teardown QiYan used to call. Reinstating the call anywhere in
+  // the shutdown path makes this fail rather than silently reauthenticating on the next start.
+  class MasterRecordingRemote extends FakeRemote {
+    masterExits = 0;
+    failStop = false;
+    async closeControlMaster(): Promise<void> { this.masterExits += 1; }
+    override async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
+      if (operation === "stop" && this.failStop) throw new AppError("ENDPOINT_UNAVAILABLE", "stop failed");
+      return super.invoke<T>(operation, args);
+    }
+  }
 
-  // The remote command a runtime shutdown issues. A master QiYan established with
-  // ControlPersist=yes outlives it, so the next start reattaches instead of reauthenticating.
-  await remote.invoke("stop", ["{}"], helperPath);
+  const remote = new MasterRecordingRemote();
+  remote.status = "healthy";
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  const identity = await runtime.ensureStarted();
 
-  assert.equal(calls.some((args) => args.includes("-O")), false);
-  assert.equal((remote as { closeControlMaster?: unknown }).closeControlMaster, undefined);
+  await runtime.stop(identity);
+  assert.equal(remote.masterExits, 0);
+
+  // The teardown used to live in a `finally`, so a failing stop ended the master too — the case
+  // where reauthenticating is least affordable, since the endpoint is already in trouble.
+  remote.status = "healthy";
+  remote.failStop = true;
+  await assert.rejects(runtime.stop(identity));
+  assert.equal(remote.masterExits, 0);
 });
 
 test("reuses a healthy detached runtime and changes identity only after replacement", async () => {

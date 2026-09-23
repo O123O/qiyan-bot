@@ -53,6 +53,10 @@ export function planSshConnection(alias: string, effective: EffectiveSshConfig, 
   const userMaster = effective.controlPath !== undefined
     && new Set(["yes", "auto"]).has(effective.controlMaster)
     && usableControlPath(effective.controlPath);
+  // The user asked for a master here but we cannot use the socket they named (relative, aliased,
+  // too long for a Unix path, or an interactive ControlMaster mode). That is the same dead end as
+  // a master that vanished, and on an MFA host it is just as unrecoverable without them.
+  const unusableConfiguredMaster = !userMaster && effective.controlPath !== undefined && effective.controlMaster !== "no";
   const ownedPath = join(runtimeDir, "ssh", createHash("sha256").update(`${alias}\0${effective.hostname}\0${effective.user}\0${effective.port}`).digest("hex").slice(0, 24));
   if (!userMaster && Buffer.byteLength(ownedPath) > 100) throw new AppError("CONFIGURATION_ERROR", "QiYan SSH control path is too long");
   return {
@@ -67,6 +71,7 @@ export function planSshConnection(alias: string, effective: EffectiveSshConfig, 
     ],
     controlPath: userMaster ? effective.controlPath! : ownedPath,
     ownsControlMaster: !userMaster,
+    ...(unusableConfiguredMaster ? { lostUserControlPath: effective.controlPath! } : {}),
   };
 }
 
@@ -208,11 +213,19 @@ export class SshGenerationPlanner {
   }
 }
 
-// A ControlMaster outlives QiYan by design, whoever established it. An owned one is created
-// with ControlPersist=yes (persist indefinitely) precisely so a restart reattaches to it rather
-// than reauthenticating, and on hosts behind interactive MFA only the user can ever create one.
-// So nothing here builds `-O exit`, and no runtime, transport, or connection close may end a
-// master: releasing our use of it is not the same as destroying it.
+// A ControlMaster outlives the work that needed it, whoever established it. An owned one is
+// created with ControlPersist=yes (persist indefinitely) so reactivating an endpoint reattaches
+// rather than reauthenticating, and on hosts behind interactive MFA only the user can ever create
+// one. So nothing here builds `-O exit`, and no runtime, transport, or connection close may end a
+// master: releasing our use of it is not the same as destroying it. Surviving a QiYan restart is
+// a separate matter — a master we spawn lives in our systemd cgroup and dies with it, which is
+// why docs/ssh-workers.md tells the operator to run theirs in its own unit.
+//
+// Known consequence: the owned control path is keyed by alias+destination, so rebinding an
+// endpoint to a new host leaves the old master running until its host reboots. That is the one
+// case where exiting would be right — our own key-authenticated master to a destination we will
+// never use again — and it is bounded by (endpoints x destination changes). Left alone for now
+// rather than reintroducing a teardown path that could reach a master we did not create.
 function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): string[] {
   const pinned = ["-o", `HostName=${plan.destination.hostname}`, "-l", plan.destination.user, "-p", String(plan.destination.port)];
   const control = ["-S", plan.controlPath!, ...(plan.ownsControlMaster && establishOwnedMaster

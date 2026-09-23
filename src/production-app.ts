@@ -118,7 +118,7 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshControlMasterAbsentNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
@@ -3478,10 +3478,11 @@ export async function buildProductionApp(
               reason: recovery.reason,
             });
             try {
-              const prepareNotice = recovery.reason === "ssh_control_master_absent"
-                ? prepareSshControlMasterAbsentNotice
-                : prepareSshFreshChannelUnavailableNotice;
-              prepareNotice(deliveries, currentOwnerBinding(), {
+              const notices: Record<EndpointRecoveryPause["reason"], typeof prepareSshFreshChannelUnavailableNotice> = {
+                ssh_fresh_channel_unavailable: prepareSshFreshChannelUnavailableNotice,
+                ssh_control_master_absent: prepareSshControlMasterAbsentNotice,
+              };
+              notices[recovery.reason](deliveries, currentOwnerBinding(), {
                 endpointId: id,
                 sshHost: recovery.sshHost,
               });
