@@ -543,7 +543,21 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   }
 
   private async throwFreshChannelFailure(error: unknown): Promise<never> {
-    if (this.options.plan.ownsControlMaster || !isProcessExit(error, 255)) throw error;
+    const plan = this.options.plan;
+    if (plan.ownsControlMaster) {
+      // We only own this master because the one the user configured was gone. If we then cannot
+      // authenticate, retrying is futile — no automated path can satisfy an MFA prompt — so pause
+      // and say which master needs re-establishing, instead of reporting an unreachable worker.
+      if (plan.lostUserControlPath !== undefined && isProcessExit(error, 255)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
+          recovery: "ssh_control_master_absent",
+          sshHost: plan.alias,
+          controlPath: plan.lostUserControlPath,
+        });
+      }
+      throw error;
+    }
+    if (!isProcessExit(error, 255)) throw error;
     const run = this.options.run ?? runBoundedProcess;
     const command = this.options.sshBinary ?? "ssh";
     try {

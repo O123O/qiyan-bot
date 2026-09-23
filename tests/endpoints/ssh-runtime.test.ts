@@ -364,6 +364,33 @@ test("an App Server proxy startup failure uses the same fresh-channel diagnostic
   assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : "probe"), ["check", "probe"]);
 });
 
+test("an owned master we only hold because the user's vanished reports the absent master", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-lost-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const authFailure = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+  const client = (lostUserControlPath?: string) => new SshRemoteClient({
+    plan: {
+      ...userMasterPlan,
+      controlPath: join(root, "master"),
+      ownsControlMaster: true,
+      ...(lostUserControlPath === undefined ? {} : { lostUserControlPath }),
+    },
+    helperSource,
+    run: async () => { throw authFailure; },
+  });
+
+  // BatchMode cannot answer an MFA prompt, so this endpoint stays down until the user restores
+  // the master. Pause and name it rather than retrying an unreachable-looking worker forever.
+  await assert.rejects(client("/private/user-master").invoke("inspect", ["{}"], helperPath), (error: unknown) =>
+    error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
+    && error.details?.recovery === "ssh_control_master_absent"
+    && error.details.sshHost === "devbox" && error.details.controlPath === "/private/user-master");
+
+  // A master QiYan owns because the host never configured one carries no such diagnosis.
+  await assert.rejects(client().invoke("inspect", ["{}"], helperPath), (error: unknown) => error === authFailure);
+});
+
 test("a missing socket in a safe local parent reaches the authoritative helper operation", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-missing-master-"));
   await chmod(root, 0o700);

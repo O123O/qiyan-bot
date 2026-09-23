@@ -120,7 +120,7 @@ import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
+import { prepareSshControlMasterAbsentNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
@@ -1366,7 +1366,8 @@ export function operationRecoveryFailureDisposition(
     return target?.policy === "ready_endpoint" && !exactGenerationReady ? "wait_for_endpoint" : "retry";
   }
   if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
-    && error.details?.recovery === "ssh_fresh_channel_unavailable") {
+    && (error.details?.recovery === "ssh_fresh_channel_unavailable"
+      || error.details?.recovery === "ssh_control_master_absent")) {
     return target?.policy === "endpoint_lifecycle" || target?.policy === "ready_endpoint"
       ? "wait_for_endpoint"
       : "sleep";
@@ -3477,7 +3478,10 @@ export async function buildProductionApp(
               reason: recovery.reason,
             });
             try {
-              prepareSshFreshChannelUnavailableNotice(deliveries, currentOwnerBinding(), {
+              const prepareNotice = recovery.reason === "ssh_control_master_absent"
+                ? prepareSshControlMasterAbsentNotice
+                : prepareSshFreshChannelUnavailableNotice;
+              prepareNotice(deliveries, currentOwnerBinding(), {
                 endpointId: id,
                 sshHost: recovery.sshHost,
               });

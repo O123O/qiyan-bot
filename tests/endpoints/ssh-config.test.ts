@@ -144,12 +144,16 @@ test("generation reuses a live user master and falls back to an owned master whe
   const reused = await planner.createGeneration("devbox", "devbox");
   assert.equal(reused.plan.ownsControlMaster, false);
   assert.equal(reused.plan.controlPath, "/private/user-master");
+  assert.equal(reused.plan.lostUserControlPath, undefined);
 
   userMasterAvailable = false;
   const fallback = await planner.createGeneration("devbox", "devbox");
   assert.equal(fallback.plan.ownsControlMaster, true);
   assert.match(fallback.plan.controlPath!, /^\/private\/runtime\/ssh\/[a-f0-9]{24}$/u);
   assert.ok(buildSshArgs(fallback.plan, []).includes("ControlMaster=auto"));
+  // The fallback is only reachable because the configured master vanished. Remember that, so an
+  // authentication failure on this plan can say which master the host actually needs.
+  assert.equal(fallback.plan.lostUserControlPath, "/private/user-master");
   assert.deepEqual(calls.map((args) => args[0] === "-G" ? "config" : args[args.indexOf("-O") + 1]), [
     "config", "check", "config", "check",
   ]);

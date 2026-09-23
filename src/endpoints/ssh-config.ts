@@ -15,6 +15,11 @@ export interface SshConnectionPlan {
   commonArgs: readonly string[];
   controlPath?: string;
   ownsControlMaster: boolean;
+  // Set when the user configured a ControlMaster for this host but it was absent or unusable,
+  // so QiYan fell back to owning one. Behind interactive MFA it can never establish that master
+  // itself, and the authentication failure that follows must name this cause rather than read
+  // as an offline worker.
+  lostUserControlPath?: string;
 }
 
 export interface PendingDestinationBinding { endpointId: string; destination: SshDestination }
@@ -188,12 +193,15 @@ export class SshGenerationPlanner {
         });
       } catch (error) {
         if (signal?.aborted) throw error;
-        plan = planSshConnection(host, {
-          hostname: effective.hostname,
-          user: effective.user,
-          port: effective.port,
-          controlMaster: "no",
-        }, this.options.runtimeDir);
+        plan = {
+          ...planSshConnection(host, {
+            hostname: effective.hostname,
+            user: effective.user,
+            port: effective.port,
+            controlMaster: "no",
+          }, this.options.runtimeDir),
+          ...(effective.controlPath === undefined ? {} : { lostUserControlPath: effective.controlPath }),
+        };
       }
     }
     return { plan, pendingBinding: { endpointId, destination: { ...plan.destination } } };

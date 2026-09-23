@@ -9,6 +9,22 @@ interface DeliveryPreparer {
   }): unknown;
 }
 
+// The user configured a ControlMaster for this host and it is no longer there, so QiYan fell back
+// to establishing its own — which it cannot do noninteractively on an MFA host. Only the user can
+// restore it, so name the host and point at a master that survives a QiYan restart.
+export function prepareSshControlMasterAbsentNotice(
+  deliveries: DeliveryPreparer,
+  binding: ConversationBinding,
+  input: { endpointId: string; sshHost: string },
+): void {
+  deliveries.prepare({
+    kind: "system_warning",
+    binding,
+    mandatory: true,
+    body: `[system] endpoint ${input.endpointId} has no SSH ControlMaster for ${input.sshHost}: the one your ssh config points at is gone, and QiYan cannot create one where authentication is interactive. Automatic restarts are paused until you establish it. Start it outside QiYan's service so a bot restart cannot take it down again, for example \`systemd-run --user --pty --unit=ssh-master-${input.sshHost} ssh -N ${input.sshHost}\`, then retry the worker.`,
+  });
+}
+
 export function prepareSshFreshChannelUnavailableNotice(
   deliveries: DeliveryPreparer,
   binding: ConversationBinding,

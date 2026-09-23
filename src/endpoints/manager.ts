@@ -37,7 +37,7 @@ interface EndpointRecord {
 }
 
 export interface EndpointRecoveryPause {
-  reason: "ssh_fresh_channel_unavailable";
+  reason: "ssh_fresh_channel_unavailable" | "ssh_control_master_absent";
   sshHost: string;
 }
 
@@ -838,9 +838,9 @@ export class EndpointManager {
 
 function endpointRecoveryPause(error: unknown): EndpointRecoveryPause | undefined {
   if (!(error instanceof AppError) || error.code !== "ENDPOINT_UNAVAILABLE"
-    || error.details?.recovery !== "ssh_fresh_channel_unavailable"
+    || (error.details?.recovery !== "ssh_fresh_channel_unavailable" && error.details?.recovery !== "ssh_control_master_absent")
     || typeof error.details.sshHost !== "string" || error.details.sshHost.length === 0) return undefined;
-  return { reason: "ssh_fresh_channel_unavailable", sshHost: error.details.sshHost };
+  return { reason: error.details.recovery, sshHost: error.details.sshHost };
 }
 
 function sameRuntimeIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {
