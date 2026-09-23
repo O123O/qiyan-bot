@@ -257,7 +257,11 @@ test("a vanished ControlMaster notifies once but keeps retrying", async () => {
     hasIdentityReferences: () => true,
     managedThreadIds: () => [],
     schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
-    onRecoveryPaused: (id, recovery) => { notifications.push({ id, ...recovery }); return true; },
+    onRecoveryPaused: (id, recovery) => {
+      notifications.push({ id, ...recovery });
+      // The first delivery fails to prepare, so the notice is owed again.
+      return notifications.length > 1;
+    },
   });
 
   const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
@@ -270,8 +274,12 @@ test("a vanished ControlMaster notifies once but keeps retrying", async () => {
 
   scheduled.shift()!.run();
   await settle();
-  assert.equal(notifications.length, 1, "the notice is latched for the incident, not repeated per attempt");
+  assert.equal(notifications.length, 2, "an unprepared notice is owed again; the give-up is ~48h away");
   assert.equal(scheduled.length, 1, "and each failed attempt re-arms the next one");
+
+  scheduled.shift()!.run();
+  await settle();
+  assert.equal(notifications.length, 2, "once prepared it is latched, not repeated per attempt");
 
   remote.failStart = false;
   scheduled.shift()!.run();

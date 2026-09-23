@@ -743,13 +743,17 @@ export class EndpointManager {
     delete record.reconnect;
   }
 
-  // Records that recovery is blocked on a human (an ssh host with no fresh channel — MFA)
-  // and notifies once. It deliberately does NOT stop the reconnect backoff: the backoff
-  // already escalates to hourly and gives up after ~48h, which is the right cadence for a
-  // host waiting on a person, whereas stopping entirely meant nothing ever retried after
-  // the person acted. The pause was cleared only by a successful publish, and no publish
-  // could happen while every scheduler refused to run — so an endpoint stayed unreachable
-  // to QiYan long after it was reachable again.
+  // Records that recovery is blocked on a human and notifies once. The two reasons differ in
+  // what they do to the retry loop, because they differ in how certain the diagnosis is.
+  //
+  // ssh_fresh_channel_unavailable is corroborated — the master is live, `-O check` passes, and
+  // only a fresh session is refused — so returning true stops the schedulers; an already-armed
+  // loss timer still fires once and then dies without re-arming, and direct use via ensureReady
+  // still makes one attempt, which is how such an endpoint recovers after the person acts.
+  //
+  // ssh_control_master_absent is not corroborated: the ssh exit it rides on is equally a reboot
+  // or a network blip. It returns false so the ramp keeps running to its ~48h give-up, and
+  // latches its notice in recoveryNotice instead, which no scheduler treats as a stop.
   private pauseForRecovery(
     endpointId: string,
     record: EndpointRecord,
@@ -767,7 +771,11 @@ export class EndpointManager {
     if (recovery.reason === "ssh_control_master_absent") {
       if (record.recoveryNotice?.reason !== recovery.reason || record.recoveryNotice.sshHost !== recovery.sshHost) {
         record.recoveryNotice = recovery;
-        try { this.options.onRecoveryPaused?.(endpointId, recovery); } catch { delete record.recoveryNotice; }
+        // A false result means the notice was not durably prepared, so the latch must not hold:
+        // this endpoint's only other signal is the give-up ~48h later.
+        try {
+          if (!(this.options.onRecoveryPaused?.(endpointId, recovery) ?? true)) delete record.recoveryNotice;
+        } catch { delete record.recoveryNotice; }
       }
       return false;
     }

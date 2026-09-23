@@ -88,6 +88,29 @@ test("falls back to an owned master when the effective ControlPath is unsafe", (
   }
 });
 
+test("classifies the tokens ssh -G emits, not the spellings from the config file", () => {
+  // `ssh -G` normalizes: `ControlMaster yes` prints as `true`, and both `no` and an unset option
+  // print as `false`. Matching the file spellings ignored a live authenticated master.
+  const plan = (controlMaster: string) => planSshConnection(
+    "devbox",
+    { ...parseSshConfig(parsed), controlMaster, controlPath: "/private/user-master" },
+    "/private/runtime",
+  );
+
+  assert.equal(plan("true").ownsControlMaster, false, "ControlMaster yes must be reused, not shadowed");
+  assert.equal(plan("auto").ownsControlMaster, false);
+
+  // No master was asked for, so a ControlPath inherited from a `Host *` block is not a dead end
+  // and must not accuse the operator of losing a master they never had.
+  const unwanted = plan("false");
+  assert.equal(unwanted.ownsControlMaster, true);
+  assert.equal(unwanted.lostUserControlPath, undefined);
+
+  // A prompting mode does ask for a master, and BatchMode has no answer for it.
+  assert.equal(plan("ask").ownsControlMaster, true);
+  assert.equal(plan("ask").lostUserControlPath, "/private/user-master");
+});
+
 test("interactive ControlMaster modes use QiYan's noninteractive fallback", () => {
   for (const controlMaster of ["ask", "autoask"]) {
     const plan = planSshConnection("devbox", { ...parseSshConfig(parsed), controlMaster, controlPath: "/tmp/user-master" }, "/private/runtime");

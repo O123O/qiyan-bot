@@ -48,15 +48,25 @@ export function parseSshConfig(output: string): EffectiveSshConfig {
   };
 }
 
+// `ssh -G` reports its own normalized values, not the tokens from the config file: it prints
+// `true` for `ControlMaster yes` and `false` for `no` or an unset option, while `auto`, `ask`,
+// and `autoask` pass through unchanged. Matching only the file spellings silently ignored a
+// perfectly good `ControlMaster yes` master and built a BatchMode one beside it.
+const CONTROL_MASTER_REUSABLE = new Set(["yes", "true", "auto"]);
+// Modes that ask for a master QiYan cannot use itself: `ask` and `autoask` prompt, and BatchMode
+// has no answer. Excludes `false`/unset, where the host wants no master and needs no diagnosis.
+const CONTROL_MASTER_REQUESTED = new Set([...CONTROL_MASTER_REUSABLE, "ask", "autoask"]);
+
 export function planSshConnection(alias: string, effective: EffectiveSshConfig, runtimeDir: string): SshConnectionPlan {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(alias)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
   const userMaster = effective.controlPath !== undefined
-    && new Set(["yes", "auto"]).has(effective.controlMaster)
+    && CONTROL_MASTER_REUSABLE.has(effective.controlMaster)
     && usableControlPath(effective.controlPath);
   // The user asked for a master here but we cannot use the socket they named (relative, aliased,
   // too long for a Unix path, or an interactive ControlMaster mode). That is the same dead end as
   // a master that vanished, and on an MFA host it is just as unrecoverable without them.
-  const unusableConfiguredMaster = !userMaster && effective.controlPath !== undefined && effective.controlMaster !== "no";
+  const unusableConfiguredMaster = !userMaster && effective.controlPath !== undefined
+    && CONTROL_MASTER_REQUESTED.has(effective.controlMaster);
   const ownedPath = join(runtimeDir, "ssh", createHash("sha256").update(`${alias}\0${effective.hostname}\0${effective.user}\0${effective.port}`).digest("hex").slice(0, 24));
   if (!userMaster && Buffer.byteLength(ownedPath) > 100) throw new AppError("CONFIGURATION_ERROR", "QiYan SSH control path is too long");
   return {
