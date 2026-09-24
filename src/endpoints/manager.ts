@@ -33,11 +33,14 @@ interface EndpointRecord {
   reconnectAttempt: number;
   gaveUp?: boolean;
   recoveryPause?: EndpointRecoveryPause & { notificationPrepared: boolean };
+  // Latches the one-shot notice for an incident that keeps retrying, so the ramp stays armed
+  // without renotifying on every attempt. Distinct from recoveryPause, which also stops retrying.
+  recoveryNotice?: EndpointRecoveryPause;
   lifecycle?: Promise<void>;
 }
 
 export interface EndpointRecoveryPause {
-  reason: "ssh_fresh_channel_unavailable";
+  reason: "ssh_fresh_channel_unavailable" | "ssh_control_master_unusable";
   sshHost: string;
 }
 
@@ -630,6 +633,7 @@ export class EndpointManager {
     record.endpoint = endpoint;
     record.generation += 1;
     delete record.recoveryPause;
+    delete record.recoveryNotice;
     const generation = record.generation;
     record.subscriptions.push(endpoint.onUnavailable((kind) => {
       if (record.endpoint !== endpoint || record.generation !== generation) return;
@@ -739,13 +743,17 @@ export class EndpointManager {
     delete record.reconnect;
   }
 
-  // Records that recovery is blocked on a human (an ssh host with no fresh channel — MFA)
-  // and notifies once. It deliberately does NOT stop the reconnect backoff: the backoff
-  // already escalates to hourly and gives up after ~48h, which is the right cadence for a
-  // host waiting on a person, whereas stopping entirely meant nothing ever retried after
-  // the person acted. The pause was cleared only by a successful publish, and no publish
-  // could happen while every scheduler refused to run — so an endpoint stayed unreachable
-  // to QiYan long after it was reachable again.
+  // Records that recovery is blocked on a human and notifies once. The two reasons differ in
+  // what they do to the retry loop, because they differ in how certain the diagnosis is.
+  //
+  // ssh_fresh_channel_unavailable is corroborated — the master is live, `-O check` passes, and
+  // only a fresh session is refused — so returning true stops the schedulers; an already-armed
+  // loss timer still fires once and then dies without re-arming, and direct use via ensureReady
+  // still makes one attempt, which is how such an endpoint recovers after the person acts.
+  //
+  // ssh_control_master_unusable is not corroborated: the ssh exit it rides on is equally a reboot
+  // or a network blip. It returns false so the ramp keeps running to its ~48h give-up, and
+  // latches its notice in recoveryNotice instead, which no scheduler treats as a stop.
   private pauseForRecovery(
     endpointId: string,
     record: EndpointRecord,
@@ -754,6 +762,23 @@ export class EndpointManager {
   ): boolean {
     const recovery = endpointRecoveryPause(error);
     if (!recovery || record.generation !== attemptedGeneration) return false;
+    // A ControlMaster QiYan cannot use is only restorable by a human, but the failure that reveals it —
+    // ssh exiting 255 under BatchMode — is indistinguishable from a rebooting host or a network
+    // blip. Stopping on it would turn a 20-second reboot into an outage that no timer ever
+    // clears. So notify once and let the ramp keep retrying: that costs nothing on a host that
+    // comes back, and on a host genuinely waiting for a person the hourly-escalating ramp is
+    // exactly what reconnects it once they act.
+    if (recovery.reason === "ssh_control_master_unusable") {
+      if (record.recoveryNotice?.reason !== recovery.reason || record.recoveryNotice.sshHost !== recovery.sshHost) {
+        record.recoveryNotice = recovery;
+        // A false result means the notice was not durably prepared, so the latch must not hold:
+        // this endpoint's only other signal is the give-up ~48h later.
+        try {
+          if (!(this.options.onRecoveryPaused?.(endpointId, recovery) ?? true)) delete record.recoveryNotice;
+        } catch { delete record.recoveryNotice; }
+      }
+      return false;
+    }
     if (record.recoveryPause?.reason !== recovery.reason || record.recoveryPause.sshHost !== recovery.sshHost) {
       record.recoveryPause = { ...recovery, notificationPrepared: false };
     }
@@ -838,9 +863,9 @@ export class EndpointManager {
 
 function endpointRecoveryPause(error: unknown): EndpointRecoveryPause | undefined {
   if (!(error instanceof AppError) || error.code !== "ENDPOINT_UNAVAILABLE"
-    || error.details?.recovery !== "ssh_fresh_channel_unavailable"
+    || (error.details?.recovery !== "ssh_fresh_channel_unavailable" && error.details?.recovery !== "ssh_control_master_unusable")
     || typeof error.details.sshHost !== "string" || error.details.sshHost.length === 0) return undefined;
-  return { reason: "ssh_fresh_channel_unavailable", sshHost: error.details.sshHost };
+  return { reason: error.details.recovery, sshHost: error.details.sshHost };
 }
 
 function sameRuntimeIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {

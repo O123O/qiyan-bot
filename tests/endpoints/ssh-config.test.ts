@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SshGenerationPlanner,
-  buildControlMasterExitArgs,
   buildSshArgs,
   buildSshReverseForwardArgs,
   buildSshReverseForwardCancelArgs,
@@ -38,7 +37,6 @@ test("honors a usable user ControlMaster without taking ownership", () => {
   assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", "/tmp/user-master"]);
   assert.ok(args.includes("ControlMaster=no"));
   assert.doesNotMatch(args.join(" "), /ControlPersist/u);
-  assert.throws(() => buildControlMasterExitArgs(plan), /user-owned/u);
 });
 
 test("the fixed session probe can only reuse an existing user ControlMaster", () => {
@@ -82,8 +80,35 @@ test("falls back to an owned master when the effective ControlPath is unsafe", (
   for (const controlPath of ["relative/socket", "/tmp/bad\npath", `/tmp/${"x".repeat(110)}`]) {
     const plan = planSshConnection("devbox", { ...parseSshConfig(parsed), controlMaster: "auto", controlPath }, "/private/runtime");
     assert.equal(plan.ownsControlMaster, true);
-    assert.ok(buildControlMasterExitArgs(plan).includes("exit"));
+    // An owned master is established to persist; no code path may build a command that ends it.
+    assert.ok(buildSshArgs(plan, []).includes("ControlPersist=yes"));
+    // The host asked for a master we cannot use. On an MFA host that is as unrecoverable as one
+    // that vanished, so it carries the same diagnosis rather than failing as an offline worker.
+    assert.equal(plan.lostUserControlPath, controlPath);
   }
+});
+
+test("classifies the tokens ssh -G emits, not the spellings from the config file", () => {
+  // `ssh -G` normalizes: `ControlMaster yes` prints as `true`, and both `no` and an unset option
+  // print as `false`. Matching the file spellings ignored a live authenticated master.
+  const plan = (controlMaster: string) => planSshConnection(
+    "devbox",
+    { ...parseSshConfig(parsed), controlMaster, controlPath: "/private/user-master" },
+    "/private/runtime",
+  );
+
+  assert.equal(plan("true").ownsControlMaster, false, "ControlMaster yes must be reused, not shadowed");
+  assert.equal(plan("auto").ownsControlMaster, false);
+
+  // No master was asked for, so a ControlPath inherited from a `Host *` block is not a dead end
+  // and must not accuse the operator of losing a master they never had.
+  const unwanted = plan("false");
+  assert.equal(unwanted.ownsControlMaster, true);
+  assert.equal(unwanted.lostUserControlPath, undefined);
+
+  // A prompting mode does ask for a master, and BatchMode has no answer for it.
+  assert.equal(plan("ask").ownsControlMaster, true);
+  assert.equal(plan("ask").lostUserControlPath, "/private/user-master");
 });
 
 test("interactive ControlMaster modes use QiYan's noninteractive fallback", () => {
@@ -145,12 +170,16 @@ test("generation reuses a live user master and falls back to an owned master whe
   const reused = await planner.createGeneration("devbox", "devbox");
   assert.equal(reused.plan.ownsControlMaster, false);
   assert.equal(reused.plan.controlPath, "/private/user-master");
+  assert.equal(reused.plan.lostUserControlPath, undefined);
 
   userMasterAvailable = false;
   const fallback = await planner.createGeneration("devbox", "devbox");
   assert.equal(fallback.plan.ownsControlMaster, true);
   assert.match(fallback.plan.controlPath!, /^\/private\/runtime\/ssh\/[a-f0-9]{24}$/u);
   assert.ok(buildSshArgs(fallback.plan, []).includes("ControlMaster=auto"));
+  // The fallback is only reachable because the configured master vanished. Remember that, so an
+  // authentication failure on this plan can say which master the host actually needs.
+  assert.equal(fallback.plan.lostUserControlPath, "/private/user-master");
   assert.deepEqual(calls.map((args) => args[0] === "-G" ? "config" : args[args.indexOf("-O") + 1]), [
     "config", "check", "config", "check",
   ]);

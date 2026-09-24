@@ -237,6 +237,56 @@ test("a fresh-channel activation failure pauses retries, notifies once, and re-a
   assert.equal(notifications.length, 2, "a fresh incident after recovery notifies again");
 });
 
+test("a vanished ControlMaster notifies once but keeps retrying", async () => {
+  const local = new FakeEndpoint("local");
+  const remote = new FakeEndpoint("prenyx-codex");
+  remote.failStart = true;
+  // No automated retry can create this master, so it must pause exactly like a stale one — but
+  // carry its own reason, because the operator action that fixes it is different.
+  remote.startError = new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
+    recovery: "ssh_control_master_unusable",
+    sshHost: "prenyx",
+    controlPath: "/run/user/1000/qiyan-ssh-abc",
+  });
+  const scheduled: Array<{ delay: number; run: () => void }> = [];
+  const notifications: Array<{ id: string; reason: string; sshHost: string }> = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: { reload: async () => undefined, require: () => ({ id: remote.id, provider: "codex" as const, transport: "ssh" as const, host: "prenyx", projectsRoot: "~/qiyan-projects" }) },
+    createRemote: async () => ({ endpoint: remote }),
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    schedule: (delay, run) => { scheduled.push({ delay, run }); return { cancel: () => undefined }; },
+    onRecoveryPaused: (id, recovery) => {
+      notifications.push({ id, ...recovery });
+      // The first delivery fails to prepare, so the notice is owed again.
+      return notifications.length > 1;
+    },
+  });
+
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  await assert.rejects(manager.ensureReady(remote.id), (error) => error === remote.startError);
+  await settle();
+
+  assert.deepEqual(notifications, [{ id: remote.id, reason: "ssh_control_master_unusable", sshHost: "prenyx" }]);
+  // ssh exit 255 is also how a rebooting host fails. Stopping here would outlive the reboot.
+  assert.equal(scheduled.length, 1, "the ramp stays armed so a host that comes back reconnects itself");
+
+  scheduled.shift()!.run();
+  await settle();
+  assert.equal(notifications.length, 2, "an unprepared notice is owed again; the give-up is ~48h away");
+  assert.equal(scheduled.length, 1, "and each failed attempt re-arms the next one");
+
+  scheduled.shift()!.run();
+  await settle();
+  assert.equal(notifications.length, 2, "once prepared it is latched, not repeated per attempt");
+
+  remote.failStart = false;
+  scheduled.shift()!.run();
+  await settle();
+  assert.equal(manager.endpointGeneration(remote.id).endpoint.state, "ready");
+});
+
 test("a loss-triggered retry pauses immediately when activation reports a fresh-channel failure", async () => {
   const local = new FakeEndpoint("local");
   const remote = new FakeEndpoint("prenyx-codex");

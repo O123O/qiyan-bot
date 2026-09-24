@@ -1597,6 +1597,13 @@ test("operation recovery retries only transport failures", () => {
     }),
     lifecycleTarget,
   ), "wait_for_endpoint");
+  // A master only the user can re-establish is no more retryable than a stale one.
+  assert.equal(operationRecoveryFailureDisposition(
+    new AppError("ENDPOINT_UNAVAILABLE", "the SSH ControlMaster configured for this host is gone", {
+      recovery: "ssh_control_master_unusable", sshHost: "prenyx",
+    }),
+    lifecycleTarget,
+  ), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "offline"), ordinaryTarget), "wait_for_endpoint");
   assert.equal(operationRecoveryFailureDisposition(new AppError("ENDPOINT_UNAVAILABLE", "helper"), ordinaryTarget, true), "retry");
   assert.equal(operationRecoveryFailureDisposition(new AppError("OPERATION_UNCERTAIN", "permanent")), "sleep");

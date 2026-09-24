@@ -7,7 +7,6 @@ import { z } from "zod";
 import { AppError } from "../core/errors.ts";
 import {
   buildControlMasterCheckArgs,
-  buildControlMasterExitArgs,
   buildSshRemoteNodeProgramArgs,
   buildSshSessionProbeArgs,
   type SshConnectionPlan,
@@ -97,7 +96,6 @@ export interface RemoteRuntimeClient {
   invoke<T>(operation: string, args: readonly string[], installedHelperPath?: string, options?: { signal?: AbortSignal }): Promise<T>;
   openAppServerStream?(request: RemoteAppServerProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
   openClaudeHostStream?(request: RemoteClaudeHostProxyRequest, installedHelperPath: string): Promise<ReadyProcessStream>;
-  closeControlMaster?(): Promise<void>;
 }
 
 export interface RemoteAppServerProxyRequest {
@@ -173,6 +171,10 @@ export interface SshRuntimeController {
   openAppServerStream(expected: RuntimeIdentity): Promise<ReadyProcessStream>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
+  // The ordering point for releasing transport-level state once an in-flight open has settled.
+  // No production controller implements it today: SshRuntime's only transport state was its
+  // ControlMaster, which is never torn down. Anything added here must respect that — releasing a
+  // connection is not a reason to end a master.
   closeTransport?(): Promise<void>;
   stop(expectedIdentity: RuntimeIdentity): Promise<void>;
 }
@@ -345,19 +347,14 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
     const prepared = await this.prepare();
     if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
-    try {
-      await this.options.remote.invoke("stop", [JSON.stringify({
-        runtimeDir: prepared.runtimeDir,
-        session: prepared.session,
-        tmuxMode: prepared.tmuxMode,
-        expected: expectedIdentity,
-      })], prepared.host.remoteHelperPath);
-      if (prepared.tmuxMode === "legacy") delete this.prepared;
-    }
-    finally { await this.closeTransport(); }
+    await this.options.remote.invoke("stop", [JSON.stringify({
+      runtimeDir: prepared.runtimeDir,
+      session: prepared.session,
+      tmuxMode: prepared.tmuxMode,
+      expected: expectedIdentity,
+    })], prepared.host.remoteHelperPath);
+    if (prepared.tmuxMode === "legacy") delete this.prepared;
   }
-
-  async closeTransport(): Promise<void> { await this.options.remote.closeControlMaster?.(); }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {
     if (this.prepared) return this.prepared;
@@ -522,14 +519,6 @@ export class SshRemoteClient implements RemoteRuntimeClient {
     }
   }
 
-  async closeControlMaster(): Promise<void> {
-    if (!this.options.plan.ownsControlMaster) return;
-    const run = this.options.run ?? runBoundedProcess;
-    await run(this.options.sshBinary ?? "ssh", buildControlMasterExitArgs(this.options.plan), {
-      timeoutMs: 5_000, maxOutputBytes: 64 * 1024,
-    }).catch(() => undefined);
-  }
-
   private async executeHelper(
     operation: string,
     encodedArgs: readonly string[],
@@ -558,7 +547,22 @@ export class SshRemoteClient implements RemoteRuntimeClient {
   }
 
   private async throwFreshChannelFailure(error: unknown): Promise<never> {
-    if (this.options.plan.ownsControlMaster || !isProcessExit(error, 255)) throw error;
+    const plan = this.options.plan;
+    if (plan.ownsControlMaster) {
+      // We only own this master because the one the user configured is unusable — gone, or set to
+      // a mode that demands interactive confirmation. Only they can put that right, so name the
+      // master instead of reporting an unreachable worker. This does NOT stop the retry ramp: the
+      // ssh exit it rides on is equally a reboot or a network blip (see pauseForRecovery).
+      if (plan.lostUserControlPath !== undefined && isProcessExit(error, 255)) {
+        throw new AppError("ENDPOINT_UNAVAILABLE", "QiYan cannot use the SSH ControlMaster configured for this host", {
+          recovery: "ssh_control_master_unusable",
+          sshHost: plan.alias,
+          controlPath: plan.lostUserControlPath,
+        });
+      }
+      throw error;
+    }
+    if (!isProcessExit(error, 255)) throw error;
     const run = this.options.run ?? runBoundedProcess;
     const command = this.options.sshBinary ?? "ssh";
     try {

@@ -118,9 +118,9 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
-import { prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
+import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
 import { SshClaudeCommandRunner } from "./endpoints/ssh-claude-command-runner.ts";
@@ -1366,7 +1366,8 @@ export function operationRecoveryFailureDisposition(
     return target?.policy === "ready_endpoint" && !exactGenerationReady ? "wait_for_endpoint" : "retry";
   }
   if (error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
-    && error.details?.recovery === "ssh_fresh_channel_unavailable") {
+    && (error.details?.recovery === "ssh_fresh_channel_unavailable"
+      || error.details?.recovery === "ssh_control_master_unusable")) {
     return target?.policy === "endpoint_lifecycle" || target?.policy === "ready_endpoint"
       ? "wait_for_endpoint"
       : "sleep";
@@ -3477,7 +3478,11 @@ export async function buildProductionApp(
               reason: recovery.reason,
             });
             try {
-              prepareSshFreshChannelUnavailableNotice(deliveries, currentOwnerBinding(), {
+              const notices: Record<EndpointRecoveryPause["reason"], typeof prepareSshFreshChannelUnavailableNotice> = {
+                ssh_fresh_channel_unavailable: prepareSshFreshChannelUnavailableNotice,
+                ssh_control_master_unusable: prepareSshControlMasterUnusableNotice,
+              };
+              notices[recovery.reason](deliveries, currentOwnerBinding(), {
                 endpointId: id,
                 sshHost: recovery.sshHost,
               });

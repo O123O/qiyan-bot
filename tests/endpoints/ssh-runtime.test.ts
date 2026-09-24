@@ -161,8 +161,6 @@ test("user-owned helper and transfer calls rely on their authoritative SSH opera
     assert.deepEqual(args.slice(args.indexOf("-S"), args.indexOf("-S") + 2), ["-S", plan.controlPath]);
     assert.ok(args.includes("ControlMaster=no"));
   }
-  await remote.closeControlMaster();
-  assert.equal(calls.some(({ args }) => args.includes("exit")), false);
 });
 
 test("an SSH helper invocation forwards its cancellation signal to the child process", async (t) => {
@@ -365,6 +363,33 @@ test("an App Server proxy startup failure uses the same fresh-channel diagnostic
   assert.deepEqual(calls.map((args) => args.includes("-O") ? "check" : "probe"), ["check", "probe"]);
 });
 
+test("an owned master we only hold because the user's is unusable names that master", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-lost-master-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const authFailure = new AppError("ENDPOINT_UNAVAILABLE", "SSH process failed (exit 255)", { exitCode: 255 });
+  const client = (lostUserControlPath?: string) => new SshRemoteClient({
+    plan: {
+      ...userMasterPlan,
+      controlPath: join(root, "master"),
+      ownsControlMaster: true,
+      ...(lostUserControlPath === undefined ? {} : { lostUserControlPath }),
+    },
+    helperSource,
+    run: async () => { throw authFailure; },
+  });
+
+  // BatchMode cannot answer an MFA prompt, so this endpoint stays down until the user restores
+  // the master. Pause and name it rather than retrying an unreachable-looking worker forever.
+  await assert.rejects(client("/private/user-master").invoke("inspect", ["{}"], helperPath), (error: unknown) =>
+    error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE"
+    && error.details?.recovery === "ssh_control_master_unusable"
+    && error.details.sshHost === "devbox" && error.details.controlPath === "/private/user-master");
+
+  // A master QiYan owns because the host never configured one carries no such diagnosis.
+  await assert.rejects(client().invoke("inspect", ["{}"], helperPath), (error: unknown) => error === authFailure);
+});
+
 test("a missing socket in a safe local parent reaches the authoritative helper operation", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "qiyan-missing-master-"));
   await chmod(root, 0o700);
@@ -431,21 +456,33 @@ test("user-owned ControlMaster attestation accepts a private NFS socket director
   await assert.doesNotReject(attestUserControlMaster(nfsPlan, async () => ({ type: 0x6969 })));
 });
 
-test("owned transport cleanup exits only its persistent QiYan ControlMaster", async () => {
-  const calls: string[][] = [];
-  const remote = new SshRemoteClient({
-    plan: { ...userMasterPlan, ownsControlMaster: true },
-    helperSource,
-    run: async (_command, args) => {
-      calls.push([...args]);
-      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
-    },
-  });
+test("stopping a runtime never ends the ControlMaster it owns", async () => {
+  // A remote that still offers the teardown QiYan used to call. Reinstating the call anywhere in
+  // the shutdown path makes this fail rather than silently reauthenticating on the next start.
+  class MasterRecordingRemote extends FakeRemote {
+    masterExits = 0;
+    failStop = false;
+    async closeControlMaster(): Promise<void> { this.masterExits += 1; }
+    override async invoke<T>(operation: string, args: readonly string[]): Promise<T> {
+      if (operation === "stop" && this.failStop) throw new AppError("ENDPOINT_UNAVAILABLE", "stop failed");
+      return super.invoke<T>(operation, args);
+    }
+  }
 
-  await remote.closeControlMaster();
+  const remote = new MasterRecordingRemote();
+  remote.status = "healthy";
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  const identity = await runtime.ensureStarted();
 
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0]!.slice(calls[0]!.indexOf("-O"), calls[0]!.indexOf("-O") + 2), ["-O", "exit"]);
+  await runtime.stop(identity);
+  assert.equal(remote.masterExits, 0);
+
+  // The teardown used to live in a `finally`, so a failing stop ended the master too — the case
+  // where reauthenticating is least affordable, since the endpoint is already in trouble.
+  remote.status = "healthy";
+  remote.failStop = true;
+  await assert.rejects(runtime.stop(identity));
+  assert.equal(remote.masterExits, 0);
 });
 
 test("reuses a healthy detached runtime and changes identity only after replacement", async () => {

@@ -15,6 +15,11 @@ export interface SshConnectionPlan {
   commonArgs: readonly string[];
   controlPath?: string;
   ownsControlMaster: boolean;
+  // Set when the user configured a ControlMaster for this host but it was absent or unusable,
+  // so QiYan fell back to owning one. Behind interactive MFA it can never establish that master
+  // itself, and the authentication failure that follows must name this cause rather than read
+  // as an offline worker.
+  lostUserControlPath?: string;
 }
 
 export interface PendingDestinationBinding { endpointId: string; destination: SshDestination }
@@ -38,16 +43,37 @@ export function parseSshConfig(output: string): EffectiveSshConfig {
     hostname,
     user,
     port,
-    controlMaster: values.get("controlmaster")?.toLowerCase() ?? "no",
+    // `false` is what `ssh -G` prints for an unset ControlMaster, so the default matches the
+    // values above rather than the config-file spelling.
+    controlMaster: values.get("controlmaster")?.toLowerCase() ?? "false",
+    // `ssh -G` omits the line entirely for `ControlPath none` or an unset option, so the `none`
+    // check is belt-and-braces rather than evidence of what it prints.
     ...(controlPath && controlPath !== "none" ? { controlPath } : {}),
   };
 }
 
+// `ssh -G` reports its own normalized values, not the tokens from the config file: it prints
+// `true` for `ControlMaster yes` and `false` for `no` or an unset option, while `auto`, `ask`,
+// and `autoask` pass through unchanged. Matching only the file spellings silently ignored a
+// perfectly good `ControlMaster yes` master and built a BatchMode one beside it.
+const CONTROL_MASTER_REUSABLE = new Set(["yes", "true", "auto"]);
+// Modes that ask for a master QiYan cannot use itself. `ask`/`autoask` make the master demand
+// ssh-askpass confirmation for every control connection it accepts, so each QiYan operation would
+// need a human click, or be refused outright on a headless master — unusable for automation
+// however our own client is configured. Excludes `false`/unset: that host wants no master at all,
+// so an inherited ControlPath is not a dead end and deserves no diagnosis.
+const CONTROL_MASTER_REQUESTED = new Set([...CONTROL_MASTER_REUSABLE, "ask", "autoask"]);
+
 export function planSshConnection(alias: string, effective: EffectiveSshConfig, runtimeDir: string): SshConnectionPlan {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(alias)) throw new AppError("CONFIGURATION_ERROR", "invalid SSH endpoint alias");
   const userMaster = effective.controlPath !== undefined
-    && new Set(["yes", "auto"]).has(effective.controlMaster)
+    && CONTROL_MASTER_REUSABLE.has(effective.controlMaster)
     && usableControlPath(effective.controlPath);
+  // The user asked for a master here but we cannot use the socket they named (relative, aliased,
+  // too long for a Unix path, or an interactive ControlMaster mode). That is the same dead end as
+  // a master that vanished, and on an MFA host it is just as unrecoverable without them.
+  const unusableConfiguredMaster = !userMaster && effective.controlPath !== undefined
+    && CONTROL_MASTER_REQUESTED.has(effective.controlMaster);
   const ownedPath = join(runtimeDir, "ssh", createHash("sha256").update(`${alias}\0${effective.hostname}\0${effective.user}\0${effective.port}`).digest("hex").slice(0, 24));
   if (!userMaster && Buffer.byteLength(ownedPath) > 100) throw new AppError("CONFIGURATION_ERROR", "QiYan SSH control path is too long");
   return {
@@ -62,6 +88,7 @@ export function planSshConnection(alias: string, effective: EffectiveSshConfig, 
     ],
     controlPath: userMaster ? effective.controlPath! : ownedPath,
     ownsControlMaster: !userMaster,
+    ...(unusableConfiguredMaster ? { lostUserControlPath: effective.controlPath! } : {}),
   };
 }
 
@@ -157,11 +184,6 @@ export function buildControlMasterCheckArgs(plan: SshConnectionPlan): string[] {
   return [...baseArgs(plan, false), "-O", "check", plan.alias];
 }
 
-export function buildControlMasterExitArgs(plan: SshConnectionPlan): string[] {
-  if (!plan.ownsControlMaster) throw new AppError("OPERATION_CONFLICT", "cannot stop a user-owned SSH ControlMaster");
-  return [...baseArgs(plan, false), "-O", "exit", plan.alias];
-}
-
 export class SshGenerationPlanner {
   constructor(private readonly options: {
     sshBinary: string;
@@ -193,18 +215,34 @@ export class SshGenerationPlanner {
         });
       } catch (error) {
         if (signal?.aborted) throw error;
-        plan = planSshConnection(host, {
-          hostname: effective.hostname,
-          user: effective.user,
-          port: effective.port,
-          controlMaster: "no",
-        }, this.options.runtimeDir);
+        plan = {
+          ...planSshConnection(host, {
+            hostname: effective.hostname,
+            user: effective.user,
+            port: effective.port,
+            controlMaster: "false",
+          }, this.options.runtimeDir),
+          ...(effective.controlPath === undefined ? {} : { lostUserControlPath: effective.controlPath }),
+        };
       }
     }
     return { plan, pendingBinding: { endpointId, destination: { ...plan.destination } } };
   }
 }
 
+// A ControlMaster outlives the work that needed it, whoever established it. An owned one is
+// created with ControlPersist=yes (persist indefinitely) so reactivating an endpoint reattaches
+// rather than reauthenticating, and on hosts behind interactive MFA only the user can ever create
+// one. So nothing here builds `-O exit`, and no runtime, transport, or connection close may end a
+// master: releasing our use of it is not the same as destroying it. Surviving a QiYan restart is
+// a separate matter — a master we spawn lives in our systemd cgroup and dies with it, which is
+// why docs/ssh-workers.md tells the operator to run theirs in its own unit.
+//
+// Known consequence: the owned control path is keyed by alias+destination, so rebinding an
+// endpoint to a new host leaves the old master running until its host reboots. That is the one
+// case where exiting would be right — our own key-authenticated master to a destination we will
+// never use again — and it is bounded by (endpoints x destination changes). Left alone for now
+// rather than reintroducing a teardown path that could reach a master we did not create.
 function baseArgs(plan: SshConnectionPlan, establishOwnedMaster: boolean): string[] {
   const pinned = ["-o", `HostName=${plan.destination.hostname}`, "-l", plan.destination.user, "-p", String(plan.destination.port)];
   const control = ["-S", plan.controlPath!, ...(plan.ownsControlMaster && establishOwnedMaster
