@@ -4370,7 +4370,11 @@ export async function buildProductionApp(
         if (await settleEndpointLifecycleOrder(
           context.operationSequence, endpointId, "disconnect_endpoint", context.signal,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
-        await endpointManager.disconnect(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        await endpointManager.disconnect(
+          endpointId,
+          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
+          args.force,
+        );
         return { endpoint: endpointId, state: "disconnected" };
       },
       // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
@@ -4432,7 +4436,11 @@ export async function buildProductionApp(
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
-        await endpointManager.restart(endpointId, (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }));
+        await endpointManager.restart(
+          endpointId,
+          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
+          args.force,
+        );
         await resumeManagedEndpoint(endpointId, true);
         prepareToolSystemNotice(context.operationId, context.attemptId, `endpoint ${endpointId} restarted`);
         return { endpoint: endpointId, state: "ready" };

@@ -30,9 +30,11 @@ test("session nicknames are safe and create_session may use the backend fallback
   }
 });
 
-test("endpoint lifecycle tools default to local", () => {
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.disconnect_endpoint.parse({}), { endpoint: "local" });
-  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.restart_endpoint.parse({ endpoint: "devbox" }), { endpoint: "devbox" });
+test("endpoint lifecycle tools default to local and never force by accident", () => {
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.disconnect_endpoint.parse({}), { endpoint: "local", force: false });
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.restart_endpoint.parse({ endpoint: "devbox" }), { endpoint: "devbox", force: false });
+  // Interrupting a running turn has to be asked for explicitly.
+  assert.deepEqual(ASSISTANT_TOOL_SCHEMAS.restart_endpoint.parse({ endpoint: "devbox", force: true }), { endpoint: "devbox", force: true });
 });
 
 test("chat history has one bounded platform-neutral read-only schema", () => {

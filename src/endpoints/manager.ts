@@ -249,13 +249,13 @@ export class EndpointManager {
     return { unavailable: unavailable.sort() };
   }
 
-  async disconnect(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
+  async disconnect(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
-    return this.enqueueLifecycle(endpointId, record, () => this.disconnectInternal(endpointId, record, checkpoint));
+    return this.enqueueLifecycle(endpointId, record, () => this.disconnectInternal(endpointId, record, checkpoint, force));
   }
 
-  private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
+  private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     if (record.gate.desiredState === "disconnected") return;
     this.cancelReconnect(record);
     const drain = await record.gate.beginDrain();
@@ -264,7 +264,7 @@ export class EndpointManager {
     try {
       target = await this.shutdownTarget(endpointId, record);
       checkpoint?.({ phase: "draining", identity: target.identity });
-      await this.requireManagedThreadsIdle(endpointId, target.endpoint);
+      await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
       await this.stopEndpointRuntime(target);
       runtimeStopped = true;
@@ -276,10 +276,10 @@ export class EndpointManager {
     }
   }
 
-  async restart(id?: string, checkpoint?: (value: unknown) => void): Promise<void> {
+  async restart(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
-    return this.enqueueLifecycle(endpointId, record, () => this.restartInternal(endpointId, record, checkpoint));
+    return this.enqueueLifecycle(endpointId, record, () => this.restartInternal(endpointId, record, checkpoint, force));
   }
 
   async recoverDisconnect(
@@ -435,7 +435,7 @@ export class EndpointManager {
     });
   }
 
-  private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void): Promise<void> {
+  private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     this.cancelReconnect(record);
     if (record.gate.desiredState === "disconnected") {
       record.gate.requestAutomatic();
@@ -463,7 +463,7 @@ export class EndpointManager {
     try {
       target = await this.shutdownTarget(endpointId, record);
       checkpoint?.({ phase: "draining", identity: target.identity });
-      await this.requireManagedThreadsIdle(endpointId, target.endpoint);
+      await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
       await this.stopEndpointRuntime(target);
       runtimeStopped = true;
@@ -642,7 +642,13 @@ export class EndpointManager {
     for (const listener of this.endpointListeners) listener(endpoint, generation);
   }
 
-  private async requireManagedThreadsIdle(endpointId: string, _endpoint: ManagedAppServerEndpoint): Promise<void> {
+  // `force` is the owner saying "restart it anyway". The guard below refuses on any status it
+  // cannot read as idle, which includes `unknown` — and an endpoint whose worker status cannot be
+  // read is exactly the one that needs restarting. Without an override the proof that protects
+  // live work also makes a wedged endpoint unrepairable, so the owner can spend the in-flight
+  // turn deliberately rather than being told no by a status nobody can observe.
+  private async requireManagedThreadsIdle(endpointId: string, _endpoint: ManagedAppServerEndpoint, force = false): Promise<void> {
+    if (force) return;
     const generation = this.record(endpointId).generation;
     for (const threadId of await this.options.managedThreadIds(endpointId)) {
       const state = this.options.managedThreadState?.(endpointId, threadId, generation);
