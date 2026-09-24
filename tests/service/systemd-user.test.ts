@@ -46,6 +46,9 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   assert.match(unit, /^Environment="PATH=\/home\/user\/My Bin:\/opt\/tool%%kit\/bin:\/usr\/bin"$/mu);
   assert.match(unit, /Restart=on-failure/u);
   assert.match(unit, /TimeoutStopSec=30s/u);
+  // A stop must signal the bot, not the whole cgroup: the owner's running jobs and any
+  // interactively authenticated ControlMaster share it, and neither can be recreated by a restart.
+  assert.match(unit, /^KillMode=process$/mu);
   assert.match(unit, /UMask=0077/u);
   assert.match(unit, /^ConditionHost=render-host\.example\.net$/mu);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);

@@ -482,7 +482,7 @@ async function proxyAppServer(value) {
   if (!beforeIdentity || !sameIdentity(beforeIdentity, expected) || !identityMatches(beforeIdentity)) {
     throw new Error("runtime identity changed");
   }
-  const beforeSocket = await privateSocketIdentity(paths.socketPath);
+  const beforeSocket = await privateSocketIdentity(paths.socketPath, true);
   const socket = connect(paths.socketPath);
   try {
     await new Promise((resolveConnection, rejectConnection) => {
@@ -493,10 +493,11 @@ async function proxyAppServer(value) {
       socket.once("error", failed);
     });
     const [afterSocket, afterIdentity] = await Promise.all([
-      privateSocketIdentity(paths.socketPath),
+      privateSocketIdentity(paths.socketPath, true),
       readIdentity(paths.identityPath),
     ]);
     if (afterSocket.device !== beforeSocket.device || afterSocket.inode !== beforeSocket.inode
+      || afterSocket.linkDevice !== beforeSocket.linkDevice || afterSocket.linkInode !== beforeSocket.linkInode
       || !afterIdentity || !sameIdentity(afterIdentity, expected) || !identityMatches(afterIdentity)) {
       throw new Error("runtime changed during connection");
     }
@@ -561,12 +562,26 @@ async function proxyClaudeHost(value) {
   } finally { socket.destroy(); }
 }
 
-async function privateSocketIdentity(path) {
-  const state = await lstat(path, { bigint: true });
+async function privateSocketIdentity(path, allowCodexDaemonLink = false) {
+  const link = await lstat(path, { bigint: true });
   const uid = process.getuid?.();
+  let state = link;
+  if (link.isSymbolicLink()) {
+    if (!allowCodexDaemonLink || uid === undefined || link.uid !== BigInt(uid)) throw new Error("invalid runtime socket");
+    const target = await realpath(path);
+    const daemonDir = `/tmp/codex-daemon-${uid}`;
+    if (dirname(target) !== daemonDir || !/^[a-f0-9]{64}$/u.test(basename(target))) throw new Error("invalid runtime socket");
+    const directory = await lstat(daemonDir, { bigint: true });
+    if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== BigInt(uid)
+      || (directory.mode & 0o077n) !== 0n) throw new Error("invalid runtime socket");
+    state = await lstat(target, { bigint: true });
+  }
   if (!state.isSocket() || state.isSymbolicLink() || (state.mode & 0o077n) !== 0n
     || (uid !== undefined && state.uid !== BigInt(uid))) throw new Error("invalid runtime socket");
-  return { device: state.dev.toString(10), inode: state.ino.toString(10) };
+  return {
+    device: state.dev.toString(10), inode: state.ino.toString(10),
+    linkDevice: link.dev.toString(10), linkInode: link.ino.toString(10),
+  };
 }
 
 async function readFileDescriptor(value) {

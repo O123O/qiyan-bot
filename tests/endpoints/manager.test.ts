@@ -1439,3 +1439,42 @@ test("a successful activation clears the recovery pause", async () => {
   await manager.ensureReady(remote.id);
   assert.equal(manager.awaitingAuthentication(remote.id), false, "and cleared once it comes back");
 });
+
+test("force restarts an endpoint whose worker status cannot be read or is still working", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  let status: "idle" | "active" | "error" = "error";
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    // A fresh runtime per activation, so a restart yields a genuinely new identity.
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    managedThreadState: (_id, _threadId, generation) => ({ availability: "ready", status, endpointGeneration: generation }),
+  });
+
+  await manager.ensureReady("devbox");
+
+  // An unreadable status is exactly the endpoint that needs restarting, and exactly the one the
+  // idle proof refuses to touch — without an override it can never be repaired.
+  await assert.rejects(manager.restart("devbox"), (error: unknown) =>
+    error instanceof AppError && error.code === "OPERATION_CONFLICT" && /prove managed thread idle/u.test(error.message));
+  await manager.restart("devbox", undefined, true);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
+
+  // A worker mid-turn is still protected unless the owner says otherwise.
+  status = "active";
+  await assert.rejects(manager.restart("devbox"), (error: unknown) =>
+    error instanceof AppError && error.code === "OPERATION_CONFLICT" && /not idle/u.test(error.message));
+  await manager.restart("devbox", undefined, true);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
+});

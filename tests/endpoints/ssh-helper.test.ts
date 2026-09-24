@@ -351,6 +351,39 @@ test("the helper proxies App Server bytes without response framing", async (t) =
   await stream.close();
 });
 
+test("the helper proxies through a private Codex daemon socket link", async (t) => {
+  const fixture = await proxyFixture(t, (socket) => socket.pipe(socket), true);
+  const stream = await openReadyProcessStream(process.execPath, [
+    helperPath.pathname,
+    "proxy-app-server",
+    encodeRemoteArgument(JSON.stringify(fixture.request)),
+  ], { readyMarker: REMOTE_APP_SERVER_PROXY_READY, timeoutMs: 2_000, maxPreludeBytes: 64 * 1024 });
+  const received = once(stream.output, "data");
+
+  stream.input.write("daemon-socket-bytes");
+
+  assert.equal(String((await received)[0]), "daemon-socket-bytes");
+  await stream.close();
+});
+
+test("the helper rejects a socket link outside the private Codex daemon directory", async (t) => {
+  const fixture = await proxyFixture(t);
+  const socketPath = String(fixture.request.runtimeDir) + "/app-server.sock";
+  const outsidePath = join(await mkdtemp(join(tmpdir(), "qiyan-untrusted-socket-")), "socket");
+  t.after(() => rm(dirname(outsidePath), { recursive: true, force: true }));
+  await rm(socketPath);
+  await symlink(outsidePath, socketPath);
+
+  await assert.rejects(
+    openReadyProcessStream(process.execPath, [
+      helperPath.pathname,
+      "proxy-app-server",
+      encodeRemoteArgument(JSON.stringify(fixture.request)),
+    ], { readyMarker: REMOTE_APP_SERVER_PROXY_READY, timeoutMs: 2_000, maxPreludeBytes: 64 * 1024 }),
+    /before readiness|closed before readiness/u,
+  );
+});
+
 test("the helper rejects an App Server socket replacement before readiness or byte copying", async (t) => {
   let accepted: Socket | undefined;
   let receivedBytes = 0;
@@ -393,6 +426,7 @@ test("helper response parsing fails closed without exposing output", () => {
 async function proxyFixture(
   t: test.TestContext,
   onConnection: (socket: Socket, socketPath: string) => void = (socket) => socket.pipe(socket),
+  daemonLink = false,
 ): Promise<{ request: Record<string, unknown> }> {
   const uid = process.getuid?.();
   assert.ok(uid);
@@ -423,14 +457,20 @@ async function proxyFixture(
   };
   await writeFile(`${runtimeDir}/identity.json`, `${JSON.stringify(expected)}\n`, { mode: 0o600 });
   const socketPath = `${runtimeDir}/app-server.sock`;
+  const daemonSocketPath = daemonLink
+    ? join(`/tmp/codex-daemon-${uid}`, randomBytes(32).toString("hex"))
+    : socketPath;
+  if (daemonLink) await mkdir(dirname(daemonSocketPath), { mode: 0o700, recursive: true });
   const server = createServer((socket) => onConnection(socket, socketPath));
-  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath, resolve));
-  await chmod(socketPath, 0o600);
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(daemonSocketPath, resolve));
+  await chmod(daemonSocketPath, 0o600);
+  if (daemonLink) await symlink(daemonSocketPath, socketPath);
   t.after(async () => {
     try { process.kill(-holder.pid!, "SIGKILL"); } catch { /* already stopped */ }
     await once(holder, "exit").catch(() => undefined);
     if (server.listening) await closeNetServer(server);
     await rm(runtimeDir, { recursive: true, force: true });
+    if (daemonLink) await rm(daemonSocketPath, { force: true });
   });
   return {
     request: {
