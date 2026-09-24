@@ -45,20 +45,28 @@ ssh devbox true
 ssh -O check devbox
 ```
 
-Start that master **outside QiYan's systemd service**. A master started from a shell that QiYan
-itself spawned lives in the service cgroup, and `systemctl --user restart qiyan-bot` kills the
-whole cgroup — taking the master with it. `ControlPersist` cannot save a killed process, and on an
-MFA host nothing can recreate it without you. Give it its own unit instead:
+Start that master **from your own shell, never from one QiYan spawned**. A master inherits the
+cgroup of whatever started it, and `systemctl --user restart qiyan-bot` kills the service cgroup
+outright — so a master started from a shell QiYan owns dies with the next restart. `ControlPersist`
+cannot save a killed process, and on an MFA host nothing can recreate it without you. Asking QiYan,
+or a worker, to open the connection for you is exactly the case that fails.
+
+Your own terminal or a tmux window is enough, because both sit in your login session rather than
+the service:
+
+```bash
+ssh -N devbox
+```
+
+Leave it running and detach rather than interrupting it: `ssh -N` never exits on its own, and
+Ctrl-C kills the master you just authenticated. If logging out would end it — `KillUserProcesses=yes`
+in `logind.conf`, or no lingering user session — give it its own unit instead, which also gives you
+a name to query and stop:
 
 ```bash
 systemd-run --user --pty --unit=ssh-master-devbox ssh -N devbox
+systemctl --user status ssh-master-devbox
 ```
-
-Run it in a terminal you can leave open and detach from, rather than interrupting it: `ssh -N`
-never exits on its own, and Ctrl-C would kill the master you just authenticated.
-
-It then survives QiYan restarts, and `systemctl --user status ssh-master-devbox` shows whether it
-is still up.
 
 The ControlMaster socket must be in a canonical private filesystem directory owned by the service user. `${XDG_RUNTIME_DIR}` is the preferred location because it is local, private per-user runtime storage on a normal Linux login or systemd user session, so no extra directory is needed. An NFS-backed user-owned ControlMaster is also accepted when its directory and socket pass the same ownership, type, canonical-path, and mode checks; the subsequent `ssh -O check` and real helper/proxy commands remain the authoritative liveness checks. The server-alive settings keep an otherwise idle master active across network timeouts and make a dead connection fail within a bound. Otherwise QiYan falls back without contacting an unsafe socket. A usable master supplies noninteractive MFA; if it is absent, QiYan tries its private BatchMode ControlMaster, so key-authenticated endpoints continue automatically while MFA-only endpoints wait for you to authenticate a user-owned master. QiYan never stops or replaces a ControlMaster, whoever established it: releasing a transport is not a reason to destroy shared, interactively authenticated state.
 
