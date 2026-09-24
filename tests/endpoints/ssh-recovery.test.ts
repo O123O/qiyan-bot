@@ -32,7 +32,7 @@ test("the fresh-channel warning is actionable and uses the current cross-chat ow
   assert.match(prepared[0]!.body, /session\/channel policy/u);
 });
 
-test("the unusable-master warning names the host and a master that outlives a QiYan restart", () => {
+test("the unusable-master warning stays short and states both causes without asserting one", () => {
   const binding: ConversationBinding = {
     adapterId: "slack",
     conversationKey: "slack:D123",
@@ -48,16 +48,16 @@ test("the unusable-master warning names the host and a master that outlives a Qi
   assert.equal(prepared[0]?.kind, "system_warning");
   assert.equal(prepared[0]?.mandatory, true);
   assert.equal(prepared[0]?.binding, binding);
-  assert.match(prepared[0]!.body, /prenyx-codex cannot reach prenyx/u);
-  // An `ask` master may be alive, so the notice must not assert the master is gone, and must
-  // carry the remedy for a prompting mode alongside the one for a missing master.
-  assert.match(prepared[0]!.body, /either it is gone, or its ControlMaster mode needs interactive confirmation/u);
-  assert.match(prepared[0]!.body, /set `ControlMaster auto` for this host/u);
-  // The same ssh failure is raised by a rebooting host, so this must never claim retries stopped.
+  assert.match(prepared[0]!.body, /prenyx-codex is unreachable/u);
+  assert.match(prepared[0]!.body, /no usable SSH ControlMaster for prenyx/u);
+  // An `ask` master may be alive, so the cause is offered, never asserted.
+  assert.match(prepared[0]!.body, /gone, or an `ask` mode QiYan cannot answer/u);
+  assert.match(prepared[0]!.body, /ssh -N prenyx/u);
+  // Retries continue, so the notice must never say they stopped.
   assert.match(prepared[0]!.body, /keeps retrying/u);
   assert.doesNotMatch(prepared[0]!.body, /paused/u);
-  assert.match(prepared[0]!.body, /Ctrl-C would kill the master/u);
-  // Without this the user re-establishes a master that the next restart kills again.
-  assert.match(prepared[0]!.body, /outside QiYan's service/u);
-  assert.match(prepared[0]!.body, /systemd-run --user --pty --unit=ssh-master-prenyx ssh -N prenyx/u);
+
+  // One of these goes out per affected endpoint, so a single incident delivers several at once.
+  // Length is the feature: the full remedies live in docs/ssh-workers.md.
+  assert.ok(prepared[0]!.body.length < 260, `notice is ${prepared[0]!.body.length} chars`);
 });
