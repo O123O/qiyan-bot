@@ -66,6 +66,13 @@ UnsetEnvironment=${unset}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
+# Stop signals the bot, not the cgroup. systemd's default, KillMode=control-group, kills every
+# process under the service — which here means the owner's running jobs (enroot/squashfuse trees
+# for their projects) and any SSH ControlMaster that happened to be started from a shell below
+# us. A ControlPersist master is a detached daemon that keeps the cgroup it was born in, so it
+# looks unrelated and dies anyway. Restarting an assistant must not destroy the work it manages,
+# nor an interactively authenticated master the owner cannot re-create without answering MFA.
+KillMode=process
 UMask=0077
 
 [Install]
