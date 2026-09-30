@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import { AssistantRuntime, classifyAttemptEffects } from "../../src/assistant/runtime.ts";
 import { createAssistantTools } from "../../src/assistant/tools.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
@@ -515,4 +516,28 @@ test("terminal handling delivers the settled turn while preserving an unresolved
   assert.equal(db.prepare("SELECT state FROM assistant_attempt_sources WHERE context_id = 'unresolved'").get()!.state, "steer_submitting");
   assert.equal(db.prepare("SELECT state FROM source_contexts WHERE id = 'unresolved'").get()!.state, "active");
   assert.equal(deliveries.get("assistant:turn")?.body, "final now");
+});
+
+test("a failed attempt reports its cause and the exhaustion notice carries it", () => {
+  const binding: ConversationBinding = { adapterId: "telegram", conversationKey: "telegram:1", destination: { chatId: "1" } };
+  const db = createTestDatabase();
+  const operations = new OperationStore(db);
+  const deliveries = new DeliveryStore(db);
+  const events: Array<{ code: string; reason?: string }> = [];
+  const runtime = new AssistantRuntime(db, operations, deliveries, {
+    binding,
+    maxEffectFreeAttempts: 1,
+    report: (event) => { events.push({ code: event.code, ...(event.reason === undefined ? {} : { reason: event.reason }) }); },
+  });
+
+  operations.createSourceContext({ id: "ctx-why", kind: "telegram", sourceId: "1", rawText: "go", attachmentIds: [], binding });
+  submittedAttempt(db, deliveries, "ctx-why", "chat", "turn-why");
+  runtime.failAttempt("turn-why", new AppError("ENDPOINT_UNAVAILABLE", "assistant app-server is not connected"));
+
+  // The journal takes the error's class as a token; safeToken would degrade a free-form message.
+  assert.deepEqual(events, [{ code: "assistant_attempt_failed", reason: "endpoint_unavailable" }]);
+  // The owner's notice used to say only that retries had stopped, which made a failure that
+  // reproduces on every message look the same as a one-off.
+  const notice = deliveries.listReady().map((item) => item.body).find((body) => body.includes("needs attention"));
+  assert.match(notice ?? "", /Last failure: ENDPOINT_UNAVAILABLE: assistant app-server is not connected/u);
 });

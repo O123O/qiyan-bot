@@ -43,6 +43,10 @@ export type OperationalEventCode =
   // would discard every other row's attempt, so without this the row would sit uncertain with
   // nothing saying why it never reached its budget.
   | "operation_recovery_write_failed"
+  // An assistant attempt failed with no effects. The cause used to be dropped on the floor: the
+  // owner got "needs attention" and the journal recorded only that a turn started and ended, so a
+  // reproducible failure was indistinguishable from a wedged one. reason is the error's class.
+  | "assistant_attempt_failed"
   | "background_task_failed";
 
 export interface OperationalEvent {

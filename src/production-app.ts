@@ -3191,7 +3191,7 @@ export async function buildProductionApp(
       name: "mcp",
       start: async () => {
         attemptScope = new AttemptScope(db, operations, { maxCollectCount: config.maxCollectCount, attachments });
-        assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding });
+        assistant = new AssistantRuntime(db, operations, deliveries, { binding: currentOwnerBinding, report });
         const actions = buildActions();
         const tools = createAssistantTools(operations, actions, {
           maxCollectCount: config.maxCollectCount,
