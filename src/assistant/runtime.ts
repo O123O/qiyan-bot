@@ -5,6 +5,8 @@ import type { Database } from "../storage/database.ts";
 import { inTransaction } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
+import type { OperationalEventSink } from "../core/operational-log.ts";
+import { AppError } from "../core/errors.ts";
 
 export interface ActiveAssistantContext {
   attemptId: string;
@@ -29,13 +31,19 @@ export class AssistantRuntime {
   private readonly allToolsWaiters = new Set<() => void>();
   private readonly ownerBinding: () => ConversationBinding;
   private readonly maxEffectFreeAttempts: number;
+  private readonly report: OperationalEventSink | undefined;
 
   constructor(
     private readonly db: Database,
     private readonly operations: OperationStore,
     private readonly deliveries: DeliveryStore,
-    options: { binding: ConversationBinding | (() => ConversationBinding); maxEffectFreeAttempts?: number },
+    options: {
+      binding: ConversationBinding | (() => ConversationBinding);
+      maxEffectFreeAttempts?: number;
+      report?: OperationalEventSink;
+    },
   ) {
+    this.report = options.report;
     if (typeof options.binding === "function") this.ownerBinding = options.binding;
     else {
       const binding = options.binding;
@@ -217,6 +225,13 @@ export class AssistantRuntime {
 
   private failAttemptGroup(attempt: Record<string, unknown>, error: unknown): { recoveryContextId?: string } {
     const attemptId = String(attempt.id);
+    // Every failed attempt says why, even the ones that will be retried. Without this a failure
+    // that reproduces on every message looked identical to a one-off, and the only signal the
+    // owner got was that retries had stopped.
+    const cause = describeAttemptFailure(error);
+    try {
+      this.report?.({ level: "warn", code: "assistant_attempt_failed", reason: cause.token, component: "assistant_runtime" });
+    } catch { /* reporting must never mask the failure it describes */ }
     const members = this.memberContextIds(attempt);
     const effects = this.operations.listForAttempt(attemptId);
     if (!classifyAttemptEffects(effects)) {
@@ -240,7 +255,7 @@ export class AssistantRuntime {
             id: `assistant-attempts-exhausted:${contextId}`,
             kind: "system_warning",
             binding: warningBinding,
-            body: `[system] assistant work needs attention; automatic retry stopped after ${this.maxEffectFreeAttempts} failed attempts`,
+            body: `[system] assistant work needs attention; automatic retry stopped after ${this.maxEffectFreeAttempts} failed attempts. Last failure: ${cause.detail}`,
             mandatory: true,
           });
         }
@@ -364,4 +379,20 @@ export class AssistantRuntime {
       this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);
     }
   }
+}
+
+// The journal takes a token (safeToken only accepts a lowercase slug); the owner-facing notice
+// takes the readable detail. Splitting them means the chat message can name the actual cause
+// without the journal degrading it to "unknown".
+export function describeAttemptFailure(error: unknown): { token: string; detail: string } {
+  const detail = (value: string): string => {
+    const line = value.replace(/\s+/gu, " ").trim();
+    return line.length > 300 ? `${line.slice(0, 299)}\u2026` : line;
+  };
+  if (error instanceof AppError) return { token: error.code.toLowerCase(), detail: detail(`${error.code}: ${error.message}`) };
+  if (error instanceof Error) return { token: "exception", detail: detail(error.message || error.name) };
+  if (typeof error === "string" && error.length > 0) {
+    return { token: /^[a-z][a-z0-9_-]{0,63}$/u.test(error) ? error : "unknown", detail: detail(error) };
+  }
+  return { token: "unknown", detail: "no cause was recorded" };
 }
