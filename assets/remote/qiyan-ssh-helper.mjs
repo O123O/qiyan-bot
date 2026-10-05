@@ -284,8 +284,11 @@ async function listeningPort(pid) {
   const inodes = socketInodes(pid);
   if (inodes.size === 0) return undefined;
   const uid = process.getuid?.();
-  const candidates = new Set();
-  for (const [file, loopback] of [["/proc/net/tcp", "0100007F"], ["/proc/net/tcp6", "00000000000000000000000001000000"]]) {
+  const candidates = [];
+  for (const [file, loopback, host] of [
+    ["/proc/net/tcp", "0100007F", "127.0.0.1"],
+    ["/proc/net/tcp6", "00000000000000000000000001000000", "::1"],
+  ]) {
     let text;
     try { text = readFileSync(file, "utf8"); } catch { continue; }
     for (const line of text.split("\n").slice(1)) {
@@ -298,11 +301,14 @@ async function listeningPort(pid) {
       if (uid !== undefined && Number(parts[7]) !== uid) continue;
       if (!inodes.has(parts[9])) continue;
       const value = Number.parseInt(port, 16);
-      if (Number.isInteger(value) && value > 0 && value < 65_536) candidates.add(value);
+      // The host travels WITH the port. The probe below and the proxy both have to dial the same
+      // address, and a v6 candidate reached over 127.0.0.1 would fail its probe and leave the
+      // runtime unhealthy forever while its process stayed alive.
+      if (Number.isInteger(value) && value > 0 && value < 65_536) candidates.push({ host, port: value });
     }
   }
   const ready = [];
-  for (const port of candidates) if (await readyzOk(port)) ready.push(port);
+  for (const candidate of candidates) if (await readyzOk(candidate)) ready.push(candidate);
   return ready.length === 1 ? ready[0] : undefined;
 }
 
@@ -310,12 +316,12 @@ async function listeningPort(pid) {
 // handing the capability token to the prober. It is a stronger signal than a completed connect: it
 // reports the server READY, not merely bound. Bounded like socketListening, because `start` polls
 // this in a 50ms loop and an unbounded GET would stall the boot.
-async function readyzOk(port) {
+async function readyzOk({ host, port }) {
   return await new Promise((resolve) => {
     let settled = false;
     let received = "";
     const finish = (value) => { if (!settled) { settled = true; socket.destroy(); resolve(value); } };
-    const socket = connect(port, "127.0.0.1");
+    const socket = connect(port, host);
     socket.setTimeout(2_000, () => finish(false));
     socket.once("error", () => finish(false));
     socket.once("close", () => finish(false));
@@ -360,14 +366,15 @@ async function requireListeningPort(pid) {
 async function danglingDaemonLink(socketPath) {
   const uid = process.getuid?.();
   if (uid === undefined) return false;
-  try {
-    const link = await lstat(socketPath, { bigint: true });
-    if (!link.isSymbolicLink() || link.uid !== BigInt(uid)) return false;
-    const target = await readlink(socketPath);
-    if (dirname(target) !== `/tmp/codex-daemon-${uid}` || !/^[a-f0-9]{64}$/u.test(basename(target))) return false;
-    await stat(target);
-    return false;
-  } catch (error) { return error?.code === "ENOENT"; }
+  const link = await lstat(socketPath, { bigint: true }).catch(() => undefined);
+  if (!link?.isSymbolicLink() || link.uid !== BigInt(uid)) return false;
+  const target = await readlink(socketPath).catch(() => undefined);
+  if (target === undefined || dirname(target) !== `/tmp/codex-daemon-${uid}` || !/^[a-f0-9]{64}$/u.test(basename(target))) return false;
+  // ONLY the target's absence may answer this. An ENOENT from the lstat or the readlink above
+  // means there is no socket yet -- an ordinary slow boot, which is most of what reaches the
+  // timeout path -- and reading that as "this host isolates /tmp" would kill a codex in the middle
+  // of starting up and migrate a perfectly healthy host onto the wrong transport.
+  return await stat(target).then(() => false).catch((error) => error?.code === "ENOENT");
 }
 
 // How long the supervising tmux session has existed. Reported in millis of AGE rather than as
@@ -388,7 +395,7 @@ async function start(value) {
   const capabilityPaths = (capability.stdout ?? "").split(/\r?\n/u).map((line) => line.trim()).filter((line) => SAFE_PATH.test(line));
   if (capability.status !== 0 || capabilityPaths.slice(-3).length !== 3) throw new Error("codex, tmux, and tail are required to start a remote runtime");
   const before = await inspect(value);
-  if (before.status === "healthy") return { identity: before.identity };
+  if (before.status === "healthy") return { identity: before.identity, ...(before.token === undefined ? {} : { token: before.token }) };
   // Reclaiming an unhealthy runtime is `stop`'s job, and ensureStarted routes through it before
   // ever calling start. Starting over one here would race that.
   if (before.status === "unhealthy") throw new Error("existing runtime is unhealthy");
@@ -686,7 +693,8 @@ async function proxyAppServer(value) {
   // side of the connection, the readiness preamble and the byte pipe below are common.
   const listener = await listenerKind(paths);
   const beforeSocket = listener.kind === "unix" ? await privateSocketIdentity(paths.socketPath, true) : undefined;
-  const socket = listener.kind === "unix" ? connect(paths.socketPath) : connect(await requireListeningPort(expected.pid), "127.0.0.1");
+  const listening = listener.kind === "unix" ? undefined : await requireListeningPort(expected.pid);
+  const socket = listening === undefined ? connect(paths.socketPath) : connect(listening.port, listening.host);
   try {
     await new Promise((resolveConnection, rejectConnection) => {
       const connected = () => { cleanup(); resolveConnection(); };

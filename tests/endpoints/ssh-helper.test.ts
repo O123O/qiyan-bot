@@ -1229,3 +1229,79 @@ test("a capability token that cannot be used refuses the proxy instead of connec
     [`${runtimeDir}/qiyan-ssh-helper.mjs`, "proxy-app-server", argument],
     { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 }));
 });
+
+test("start migrates to a loopback listener only when the redirect is real", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const base = `/tmp/qiyan-${uid}`;
+  await mkdir(base, { recursive: true, mode: 0o700 });
+
+  // A stub codex that behaves like the real one on each kind of host. In `unix` mode it either
+  // leaves the daemon-shaped symlink dangling (the host that isolates /tmp) or binds nothing at
+  // all (an ordinary slow boot); in `ws` mode it binds a loopback port and answers /readyz.
+  const stub = async (behaviour: "dangling" | "slow") => {
+    const root = await mkdtemp(join(tmpdir(), "qiyan-start-"));
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    const unixArm = behaviour === "dangling"
+      ? `ln -sfn /tmp/codex-daemon-${uid}/${"a".repeat(64)} "$sock"; sleep 600`
+      : "sleep 600";
+    await writeFile(join(bin, "codex"), [
+      "#!/bin/sh",
+      'case "$*" in',
+      '  *ws://*) exec node -e \'const s=require("http").createServer((q,r)=>{r.writeHead(q.url==="/readyz"?200:404);r.end()});s.listen(0,"127.0.0.1");setInterval(()=>{},1000);\' ;;',
+      "esac",
+      'sock=$(printf %s "$*" | sed "s/.*unix:\\/\\///")',
+      unixArm,
+      "",
+    ].join("\n"), { mode: 0o700 });
+    // The helper runs the launcher through a LOGIN shell, which re-sources the profile and would
+    // put the real codex back on PATH. This one pins the stub.
+    const shell = join(root, "login-shell");
+    // Handles `-lc` itself rather than delegating: a real login shell re-sources the profile and
+    // would put the system codex back in front of the stub.
+    await writeFile(shell, ["#!/bin/sh", `PATH=${bin}:$PATH`, "export PATH", "shift", 'exec /bin/sh -c "$1"', ""].join("\n"), { mode: 0o700 });
+    return { root, bin, shell };
+  };
+
+  const start = async (behaviour: "dangling" | "slow") => {
+    const { root, bin, shell } = await stub(behaviour);
+    const runtimeDir = `${base}/${randomBytes(12).toString("hex")}`;
+    const session = `qiyan-${runtimeDir.slice(-24)}`;
+    await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+    await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+    await cp(launcherPath, `${runtimeDir}/qiyan-app-server-launcher.sh`);
+    await chmod(`${runtimeDir}/qiyan-app-server-launcher.sh`, 0o700);
+    t.after(async () => {
+      await runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", "kill-server"],
+        { timeoutMs: 10_000, maxOutputBytes: 4096 }).catch(() => undefined);
+      await rm(runtimeDir, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+    });
+    const argument = encodeRemoteArgument(JSON.stringify({
+      runtimeDir, session, tmuxMode: "explicit", shell, token: randomBytes(16).toString("hex"),
+    }));
+    const run = runBoundedProcess("env", [`PATH=${bin}:${process.env.PATH ?? ""}`,
+      process.execPath, `${runtimeDir}/qiyan-ssh-helper.mjs`, "start", argument],
+      { timeoutMs: 90_000, maxOutputBytes: 64 * 1024 });
+    return { run, runtimeDir };
+  };
+
+  // The host this change exists for: the socket is a daemon-shaped link to nothing, permanently.
+  const redirected = await start("dangling");
+  const result = parseRemoteHelperResponse<{ identity: { pid: number }; token?: string }>(
+    (await redirected.run).stdout, "start");
+  assert.match(result.token ?? "", /^[a-f0-9]{64}$/u, "the replacement is authenticated, and its token comes back");
+  assert.equal((await stat(`${redirected.runtimeDir}/app-server.token`)).mode & 0o777, 0o600);
+  const listening = await runBoundedProcess("sh", ["-c",
+    `ls -l /proc/${result.identity.pid}/fd 2>/dev/null | grep -c socket`], { timeoutMs: 10_000, maxOutputBytes: 4096 });
+  assert.ok(Number(listening.stdout.toString("utf8").trim()) > 0, "and it really is the process holding the listener");
+
+  // An ordinary slow boot. No socket and no symlink yet is NOT evidence that this host isolates
+  // /tmp, and reading it that way would SIGKILL a codex mid-startup and migrate a healthy host.
+  const slow = await start("slow");
+  await assert.rejects(slow.run, (error: unknown) =>
+    error instanceof Error && /runtime did not become healthy/u.test(error.message));
+  assert.equal(await stat(`${slow.runtimeDir}/app-server.token`).then(() => true).catch(() => false), false,
+    "a slow boot must never be migrated to a WebSocket listener");
+});
