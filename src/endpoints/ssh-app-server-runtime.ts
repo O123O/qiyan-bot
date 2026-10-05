@@ -19,7 +19,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
 
   constructor(private readonly options: {
     runtime: SshRuntimeController;
-    connectWire(stream: ReadyProcessStream): Promise<RpcWire>;
+    connectWire(stream: ReadyProcessStream, token?: string): Promise<RpcWire>;
   }) {}
 
   async open(): Promise<AppServerConnection> {
@@ -41,7 +41,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
       const expected = await this.options.runtime.ensureStarted();
       if (expected.kind !== "ssh") throw new AppError("ENDPOINT_UNAVAILABLE", "remote runtime returned a non-SSH identity");
       stream = await this.options.runtime.openAppServerStream(expected);
-      wire = await this.options.connectWire(stream);
+      wire = await this.options.connectWire(stream, this.options.runtime.appServerToken?.());
       connection = new SshProxyConnection(this, wire, stream, expected);
       stream = undefined;
       this.active = connection;

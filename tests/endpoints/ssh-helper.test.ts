@@ -249,7 +249,7 @@ test("the remote app-server launcher retains one bounded owner-only diagnostic g
   const launch = async () => {
     const result = await runBoundedProcess("env", [
       `PATH=${bin}:${process.env.PATH ?? ""}`,
-      "sh", launcherPath.pathname, token, socketPath, identityPath,
+      "sh", launcherPath.pathname, token, socketPath, identityPath, "unix",
     ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
     assert.equal(result.stdout.byteLength, 0);
     assert.equal(result.stderr.byteLength, 0);
@@ -276,6 +276,37 @@ test("the remote app-server launcher retains one bounded owner-only diagnostic g
   assert.doesNotMatch(log, /filter=.*codex_app_server=info/u);
   assert.match(log, /args=app-server --listen unix:\/\//u);
   assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+});
+
+test("the launcher serves a WebSocket generation on loopback and is told only the digest", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-launcher-ws-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex"), ["#!/bin/sh", "printf 'args=%s\\n' \"$*\"", ""].join("\n"), { mode: 0o700 });
+  const token = "0123456789abcdef0123456789abcdef";
+  const secret = "s".repeat(64);
+  const digest = createHash("sha256").update(secret).digest("hex");
+  const launch = async (...extra: string[]) => await runBoundedProcess("env", [
+    `PATH=${bin}:${process.env.PATH ?? ""}`,
+    "sh", launcherPath.pathname, token, join(root, "app-server.sock"), join(root, "identity.json"), ...extra,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+
+  await launch("ws", digest);
+  const log = await readFile(join(root, "app-server.log"), "utf8");
+  assert.match(log, /--listen ws:\/\/127\.0\.0\.1:0/u);
+  assert.match(log, /--ws-auth capability-token/u);
+  // The digest authenticates and is not a secret; the token itself must never reach a
+  // world-readable /proc/<pid>/cmdline on a shared login node.
+  assert.match(log, new RegExp(`--ws-token-sha256 ${digest}`, "u"));
+  assert.doesNotMatch(log, new RegExp(secret, "u"));
+  assert.doesNotMatch(log, /--ws-token-file/u);
+
+  // The listener is an explicit argument, never inferred: under `set -eu` an empty variable is how
+  // an inference becomes a silently unauthenticated listener.
+  for (const bad of [[], ["ws"], ["ws", "nothex"], ["ws", digest.slice(0, 63)], ["other", digest]]) {
+    await assert.rejects(launch(...bad), (error: unknown) => error instanceof Error && /exit 64/u.test(error.message));
+  }
 });
 
 test("the helper emits one versioned response frame", async () => {

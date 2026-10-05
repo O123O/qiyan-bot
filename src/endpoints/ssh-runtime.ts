@@ -19,8 +19,8 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "a6e666fb730cb6863fa0a37c7de59ef64e339be1f172d37e70cf22828d891586";
-export const REMOTE_LAUNCHER_SHA256 = "822afcd2a07e6738adbf8619fa2c00834108b7a29b376fb550e08e0efb0fa5d2";
+export const REMOTE_HELPER_SHA256 = "9e4e4e1fa9494988132e108aba46a8dbe1c38a1aedef6042215292e61a6bbb7a";
+export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
 export const REMOTE_CLAUDE_HOST_SHA256 = "aa8248a0f5f43b4caff2c363d0c2965361ae5795148276777f1a7d3847c9a77f";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 // Shared by both proxies, which are the same kind of channel and have no reason to diverge.
@@ -52,7 +52,7 @@ const preflightSchema = z.object({
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent"), supervised: z.boolean().optional() }).strict(),
   z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional(), serverAlive: z.boolean().optional(), socketListening: z.boolean().optional(), sessionAgeMs: z.number().int().nonnegative().optional() }).strict(),
-  z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional() }).strict(),
+  z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional(), token: z.string().optional() }).strict(),
 ]);
 
 // How long a tmux session must have existed before its runtime can be reclaimed while the session
@@ -169,6 +169,10 @@ export async function attestUserControlMaster(
 export interface SshRuntimeController {
   ensureStarted(): Promise<RuntimeIdentity>;
   openAppServerStream(expected: RuntimeIdentity): Promise<ReadyProcessStream>;
+  // The capability token of the generation `ensureStarted` last proved, when that generation
+  // listens on an authenticated loopback port rather than a unix socket. Undefined is the ordinary
+  // case and means the stream needs no bearer credential.
+  appServerToken?(): string | undefined;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss?(): Promise<EndpointLossKind>;
   // The ordering point for releasing transport-level state once an in-flight open has settled.
@@ -217,6 +221,7 @@ export async function prepareRemoteHost(options: {
 }
 
 export class SshRuntime implements SshRuntimeController, RemoteHost {
+  private capabilityToken?: string;
   private prepared?: {
     host: RemoteHost;
     runtimeDir: string;
@@ -258,7 +263,13 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   async ensureStarted(retried = false): Promise<RuntimeIdentity> {
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
-    if (current.status === "healthy") return current.identity;
+    // Captured on BOTH paths. `start` is skipped entirely for a runtime that is already healthy,
+    // so `inspect` has to carry the token too or a reconnect to a live WebSocket generation would
+    // have no credential to present.
+    if (current.status === "healthy") {
+      if (current.token === undefined) delete this.capabilityToken; else this.capabilityToken = current.token;
+      return current.identity;
+    }
     if (current.status === "unhealthy") {
       // `supervised: false` means the TMUX SESSION is gone — a statement about the supervisor,
       // not proof the server died. Either way the runtime is unusable: the probe refuses an
@@ -308,15 +319,20 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       delete this.prepared;
       return this.ensureStarted(true);
     }
-    const result = await this.options.remote.invoke<{ identity: unknown }>("start", [JSON.stringify({
+    const result = await this.options.remote.invoke<{ identity: unknown; token?: unknown }>("start", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
       session: prepared.session,
       shell: prepared.shell,
       tmuxMode: prepared.tmuxMode,
       token: randomBytes(16).toString("hex"),
     })], prepared.host.remoteHelperPath);
+    if (typeof result.token === "string") this.capabilityToken = result.token; else delete this.capabilityToken;
     return parseRuntimeIdentity(result.identity);
   }
+
+  // Held for the life of the generation `ensureStarted` proved. A token that outlives its
+  // generation fails closed: codex answers 401 and the endpoint reconnects.
+  appServerToken(): string | undefined { return this.capabilityToken; }
 
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     const prepared = await this.prepare();
@@ -390,7 +406,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean; survivors?: number;
       serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number;
     }
-    | { status: "healthy"; identity: RuntimeIdentity }
+    | { status: "healthy"; identity: RuntimeIdentity; token?: string }
   > {
     const parsed = inspectSchema.parse(await this.options.remote.invoke("inspect", [JSON.stringify({
       runtimeDir: prepared.runtimeDir, session: prepared.session, tmuxMode: prepared.tmuxMode,
@@ -411,7 +427,11 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       };
     }
     if (parsed.status !== "healthy") return { status: "absent" };
-    return { status: "healthy", identity: parseRuntimeIdentity(parsed.identity) };
+    return {
+      status: "healthy",
+      identity: parseRuntimeIdentity(parsed.identity),
+      ...(parsed.token === undefined ? {} : { token: parsed.token }),
+    };
   }
 }
 

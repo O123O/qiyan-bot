@@ -3445,7 +3445,7 @@ export async function buildProductionApp(
               id: definition.id,
               runtime: new SshAppServerRuntime({
                 runtime: remoteRuntime,
-                connectWire: (stream) => WebSocketWire.connectStream(stream, { timeoutMs: 10_000 }),
+                connectWire: (stream, token) => WebSocketWire.connectStream(stream, { timeoutMs: 10_000, ...(token === undefined ? {} : { token }) }),
               }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
             });
