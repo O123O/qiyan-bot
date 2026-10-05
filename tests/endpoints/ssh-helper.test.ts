@@ -1138,3 +1138,94 @@ test("the remote workspace helper returns a structured missing-path error", asyn
   assert.deepEqual(parseRemoteHelperResponse(result.stdout, "workspace"), { error: { code: "ENOENT" } });
   assert.equal(result.stderr.byteLength, 0);
 });
+
+test("a WebSocket generation is healthy by its own listener, and dead proves it is not serving", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  // The token file is the listener kind AND the credential. A WebSocket generation creates no
+  // socket file at all, so nothing else distinguishes it.
+  const secret = "c".repeat(64);
+  await writeFile(`${runtimeDir}/app-server.token`, `${secret}\n`, { mode: 0o600 });
+
+  // Stands in for codex on ws://127.0.0.1:0 — a loopback listener answering /readyz unauthenticated.
+  const serve = (token: string) => spawn(process.execPath, ["-e",
+    'const s=require("http").createServer((q,r)=>{r.writeHead(q.url==="/readyz"?200:404);r.end()});'
+    + 's.listen(0,"127.0.0.1",()=>console.log("up"));setInterval(()=>{},1000);'],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  const processFacts = (pid: number) => {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    return { processGroupId: Number(fields[2]), linuxStartTime: fields[19]! };
+  };
+  const inspect = async (identity: unknown) => {
+    await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit" }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", argument],
+      { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{ status: string; token?: string; serverAlive?: boolean; socketListening?: boolean }>(run.stdout, "inspect");
+  };
+
+  const token = "f".repeat(32);
+  const server = serve(token);
+  t.after(() => { try { process.kill(server.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await once(server.stdout, "data");
+  const identity = { kind: "ssh", token, pid: server.pid, ...processFacts(server.pid!) };
+
+  const healthy = await inspect(identity);
+  assert.equal(healthy.status, "healthy", "a derivable ready loopback listener is what health means here");
+  assert.equal(healthy.token, secret, "and the token comes back, because a healthy runtime never calls start");
+
+  // Only this pid's descriptors are scanned. A listener held by anyone else is not our port, so
+  // the runtime is unhealthy even though its recorded process is alive and well.
+  const stranger = serve("a".repeat(32));
+  t.after(() => { try { process.kill(stranger.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await once(stranger.stdout, "data");
+  const idle = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  t.after(() => { try { process.kill(idle.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const foreign = await inspect({ kind: "ssh", token, pid: idle.pid, ...processFacts(idle.pid!) });
+  assert.equal(foreign.status, "unhealthy", "someone else's listener is not this runtime's port");
+
+  // The reclaim case. `unservingSupervisor` requires socketListening to be literally false —
+  // omission means "not proven" — so a dead WebSocket generation that merely stayed silent would
+  // be unreclaimable forever, which is the wedge this whole change exists to end.
+  process.kill(server.pid!, "SIGKILL");
+  await once(server, "exit");
+  const dead = await inspect(identity);
+  assert.equal(dead.status, "unhealthy");
+  assert.equal(dead.serverAlive, false);
+  assert.equal(dead.socketListening, false, "a dead runtime proves it is not serving; it does not merely omit the fact");
+});
+
+test("a capability token that cannot be used refuses the proxy instead of connecting without it", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  // World-readable: a token anyone on a 219-user login node could have read is not a credential.
+  await writeFile(`${runtimeDir}/app-server.token`, `${"c".repeat(64)}\n`, { mode: 0o644 });
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify({
+    kind: "ssh", token: "f".repeat(32), pid: process.pid, linuxStartTime: "1", processGroupId: process.pid,
+  }), { mode: 0o600 });
+
+  const argument = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
+    expected: { kind: "ssh", token: "f".repeat(32), pid: process.pid, linuxStartTime: "1", processGroupId: process.pid },
+  }));
+  await assert.rejects(runBoundedProcess(process.execPath,
+    [`${runtimeDir}/qiyan-ssh-helper.mjs`, "proxy-app-server", argument],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 }));
+});
