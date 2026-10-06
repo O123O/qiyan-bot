@@ -206,6 +206,11 @@ async function inspect(value) {
   if (!identity || !identityMatches(identity)) {
     return { status: "unhealthy", supervised, ...await supervisedFacts(), ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }
+  // Observable only from a channel OTHER than the one that started codex: the daemon socket lives
+  // in the starting channel's /tmp, so from there the link resolves and everything looks well. A
+  // later channel sees the target missing, and that is the proof this runtime can never be reached
+  // from anywhere but its own birthplace.
+  const socketRedirected = token === undefined && await danglingDaemonLink(paths.socketPath);
   if (token !== undefined) {
     // A WebSocket generation creates no socket file at all, so the unix predicate below would call
     // it unhealthy forever and `start` would never see it come up. Its health is: the token is
@@ -218,7 +223,10 @@ async function inspect(value) {
     return { status: "healthy", identity, supervised, token };
   }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length };
+    return {
+      status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length,
+      ...(socketRedirected ? { socketRedirected } : {}),
+    };
   }
   return { status: "healthy", identity, supervised };
 }
@@ -420,44 +428,32 @@ async function start(value) {
     return "timeout";
   };
 
-  await launch(value.token, "unix");
-  const first = await poll();
-  if (typeof first === "object") return { identity: first.identity };
-  // Only a PERSISTENT redirect counts, which is why this is asked once the window has closed and
-  // not inside the loop: the order in which codex creates the link and its target is not ours to
-  // rely on, and a momentary gap must never migrate a healthy host off a transport that works.
-  // On the `absent` path the launcher failed outright and left no symlink, so there is nothing to
-  // ask.
-  if (first !== "timeout" || !await danglingDaemonLink(paths.socketPath)) {
+  // Which listener to use is the CALLER's instruction, never a decision made here. `start` runs in
+  // the channel that creates the app-server, and codex's daemon socket lives in that channel's
+  // /tmp -- so from in here the link always resolves and the redirect is invisible. Only a later
+  // channel can see it, which is why `inspect` reports it and QiYan asks for `ws` on the restart.
+  if (value?.listener !== undefined && value.listener !== "unix" && value.listener !== "ws") {
+    throw new Error("invalid listener");
+  }
+  if (value?.listener !== "ws") {
+    await launch(value.token, "unix");
+    const unixStart = await poll();
+    if (typeof unixStart === "object") return { identity: unixStart.identity };
     // Say why. The app-server writes its own startup failure to this log and then exits, and
     // without it the caller sees only that the runtime never appeared -- the reason (a state
     // directory on an unresponsive filesystem, say) stays on this host.
     throw new Error(`runtime did not become healthy${await launcherFailureDetail(paths)}`);
   }
 
-  // This host redirects the app-server socket into a /tmp no other channel can see. Replace the
-  // generation with one listening on an authenticated loopback port, which no mount namespace can
-  // hide. See docs/development/app-server-listener-design.md.
-  //
-  // Tear down only what THIS call created. `tmux new-session` ran without allowFailure and fails
-  // on a duplicate name, so no other generation can hold this session -- but prove it rather than
-  // rest on it: the launcher recorded the token we handed it, and an identity carrying any other
-  // token belongs to someone else and must not be killed.
-  const replaced = await readIdentity(paths.identityPath);
-  if (!replaced || replaced.token !== value.token || !identityMatches(replaced)) {
-    throw new Error("cannot replace a runtime this start did not create");
-  }
-  await stop({ ...value, expected: replaced });
-  // A FRESH runtime token rather than a reuse of value.token: an unreapable straggler from the
-  // generation just stopped would otherwise satisfy processHasToken for the replacement.
-  const runtimeToken = randomBytes(16).toString("hex");
+  // An authenticated loopback port, which no mount namespace can hide.
+  // See docs/development/app-server-listener-design.md.
   const token = randomBytes(32).toString("hex");
   // Written BEFORE the launcher starts, so no window exists in which a live WebSocket runtime has
   // no marker and no credential. The launcher receives only the digest.
   await atomicWrite(paths.tokenPath, `${token}\n`, 0o600);
-  await launch(runtimeToken, "ws", createHash("sha256").update(token).digest("hex"));
-  const second = await poll();
-  if (typeof second === "object") return { identity: second.identity, token };
+  await launch(value.token, "ws", createHash("sha256").update(token).digest("hex"));
+  const wsStart = await poll();
+  if (typeof wsStart === "object") return { identity: wsStart.identity, token };
   throw new Error(`websocket runtime did not become healthy${await launcherFailureDetail(paths)}`);
 }
 

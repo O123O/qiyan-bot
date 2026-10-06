@@ -19,7 +19,7 @@ import {
 } from "./ssh-process.ts";
 import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "6d70e9cbcc3159d68e5a5f7d5df90c91bab38e35f6526c638551da14e8a0b65f";
+export const REMOTE_HELPER_SHA256 = "051d76bf7b8e2a945364da4c99d8d867e98a1a48f2ba9605c89dcaba17942ef9";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
 export const REMOTE_CLAUDE_HOST_SHA256 = "aa8248a0f5f43b4caff2c363d0c2965361ae5795148276777f1a7d3847c9a77f";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -51,7 +51,7 @@ const preflightSchema = z.object({
 }).strict();
 const inspectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("absent"), supervised: z.boolean().optional() }).strict(),
-  z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional(), serverAlive: z.boolean().optional(), socketListening: z.boolean().optional(), sessionAgeMs: z.number().int().nonnegative().optional() }).strict(),
+  z.object({ status: z.literal("unhealthy"), supervised: z.boolean().optional(), identity: z.unknown().optional(), ownedGroup: z.array(z.number().int().positive()).optional(), groupSize: z.number().int().nonnegative().optional(), serverAlive: z.boolean().optional(), socketListening: z.boolean().optional(), sessionAgeMs: z.number().int().nonnegative().optional(), socketRedirected: z.boolean().optional() }).strict(),
   z.object({ status: z.literal("healthy"), identity: z.unknown(), supervised: z.boolean().optional(), token: z.string().optional() }).strict(),
 ]);
 
@@ -261,6 +261,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   get remote(): RemoteRuntimeClient { return this.options.remote; }
 
   async ensureStarted(retried = false): Promise<RuntimeIdentity> {
+    let redirected = false;
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
     // Captured on BOTH paths. `start` is skipped entirely for a runtime that is already healthy,
@@ -296,7 +297,12 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // unhealthy runtime, and nothing else ever kills the session. One endpoint sat behind a
       // four-day-old session with a dead app-server, unreachable and unrepairable, for that
       // reason alone. `stop` does the teardown, session included.
-      if (!current.identity || (current.supervised !== false && !unservingSupervisor(current))) {
+      // A runtime whose socket codex redirected into a per-channel /tmp is reclaimable even though
+      // it is alive and serving: it serves only the channel that started it, so from everywhere
+      // else it is permanently unreachable. unservingSupervisor cannot cover this — it requires a
+      // dead server, and this one is healthy from its own side forever.
+      redirected = current.socketRedirected === true;
+      if (!current.identity || (!redirected && current.supervised !== false && !unservingSupervisor(current))) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
       const reclaimed = await this.options.remote.invoke("stop", [JSON.stringify({
@@ -325,6 +331,10 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       shell: prepared.shell,
       tmuxMode: prepared.tmuxMode,
       token: randomBytes(16).toString("hex"),
+      // `start` cannot work this out for itself: it runs in the channel that creates the
+      // app-server, and codex's daemon socket lives in that channel's own /tmp, so from in there
+      // the redirect is invisible. Only `inspect`, which runs in later channels, can see it.
+      ...(redirected ? { listener: "ws" } : {}),
     })], prepared.host.remoteHelperPath);
     if (typeof result.token === "string") this.capabilityToken = result.token; else delete this.capabilityToken;
     return parseRuntimeIdentity(result.identity);
@@ -404,7 +414,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     { status: "absent" }
     | {
       status: "unhealthy"; identity?: RuntimeIdentity; supervised?: boolean; survivors?: number;
-      serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number;
+      serverAlive?: boolean; socketListening?: boolean; sessionAgeMs?: number; socketRedirected?: boolean;
     }
     | { status: "healthy"; identity: RuntimeIdentity; token?: string }
   > {
@@ -424,6 +434,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
         ...(parsed.serverAlive === undefined ? {} : { serverAlive: parsed.serverAlive }),
         ...(parsed.socketListening === undefined ? {} : { socketListening: parsed.socketListening }),
         ...(parsed.sessionAgeMs === undefined ? {} : { sessionAgeMs: parsed.sessionAgeMs }),
+        ...(parsed.socketRedirected === undefined ? {} : { socketRedirected: parsed.socketRedirected }),
       };
     }
     if (parsed.status !== "healthy") return { status: "absent" };

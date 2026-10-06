@@ -71,34 +71,37 @@ beyond "a codex app-server is here".
 The decision, the detection and the secret all live on the remote host, because that is where the
 knowledge and the authority already are. QiYan learns one thing: the bearer token for its handshake.
 
+### Where the symptom is observable
+
+`start` runs in the channel that creates the app-server, and codex's daemon socket lives in **that
+channel's** `/tmp`. From inside it the link resolves and the runtime is healthy; only a later
+channel sees the target missing. Verified on lyris: `start` returned a healthy unix generation,
+and a second channel reading the same path got `resolves: <MISSING>`.
+
+So the helper cannot decide this for itself at start — it is structurally blind to it there. The
+fact belongs to `inspect`, which QiYan runs in fresh channels on every reconnect, and the decision
+belongs to QiYan, which is the only party that sees both the report and the next start.
+
 ### Starting
 
-`start` runs the unix launcher exactly as today and polls as today. **After** the poll window expires
-without reaching `healthy`, one extra question is asked: is the socket path a symlink of exactly the
-codex-daemon shape whose target does not resolve? If so, this host redirects into a `/tmp` we cannot
-see; the helper tears the generation down and restarts it as `ws`, in the same call.
+`inspect` reports `socketRedirected` when the socket is a dangling link of exactly the codex-daemon
+shape. Paired with `serverAlive: true` that is the unreachable-forever runtime: alive, serving, and
+reachable only from a channel that no longer exists.
 
-"Exactly the codex-daemon shape" means the shape `privateSocketIdentity` already encodes: a uid-owned
-link into `/tmp/codex-daemon-<uid>/` with a 64-hex basename, under a `0700` uid-owned daemon
-directory. Reuse that check rather than accepting any broken link — a stray symlink or a half-cleaned
-runtime directory must not migrate a healthy host to ws, which is the outcome the "after the window"
-rule exists to prevent. The check runs on the timeout path only; an immediate launcher failure breaks
-out as `absent` and leaves no symlink to inspect.
+`unservingSupervisor` cannot reclaim it — that guard requires a dead server, and this one stays
+healthy from its own side indefinitely. So `socketRedirected` is its own reclaim trigger in
+`ensureStarted`: stop the generation, then start again with `listener: "ws"`.
 
-The check belongs *after* the window, not inside the loop. Codex creates the link and its target in
-an order we have not pinned and do not control; a momentary "link present, target missing" during a
-normal boot would otherwise migrate `prenyx`, `ptyche` and `polyphe` to ws silently — still working,
-but on the wrong transport, with file-mode access control traded away on hosts that never needed it.
-The symptom this design keys on is the *persistent* resolution failure, so it is tested once, when
-persistence is established.
+The cost is one failed connection per affected host per restart: the first `start` succeeds on
+unix, the first proxy in a new channel fails, and the reconnect that follows carries the redirect
+report and repairs it. Self-healing without memory, which is what keeps a host that stops isolating
+`/tmp` from being punished forever.
 
-For a `ws` start the helper, not QiYan:
+For a `ws` start the helper, not QiYan:For a `ws` start the helper, not QiYan:
 
-1. mints a **fresh** runtime token for the new generation — not a reuse of the unix generation's
-   token, so an unreapable straggler cannot satisfy `processHasToken` for the replacement,
-2. mints ≥128 bits of capability token with `randomBytes` and writes `app-server.token` via
+1. mints ≥128 bits of capability token with `randomBytes` and writes `app-server.token` via
    `atomicWrite(…, 0o600)` **before** the launcher starts, and
-3. invokes the launcher with an explicit `ws` mode argument and the hex SHA-256 digest.
+2. invokes the launcher with an explicit `ws` mode argument and the hex SHA-256 digest.
 
 The launcher adds `--listen ws://127.0.0.1:0 --ws-auth capability-token --ws-token-sha256 "$digest"`.
 It never receives the token itself, and `--ws-token-file` is deliberately unused: the digest already
