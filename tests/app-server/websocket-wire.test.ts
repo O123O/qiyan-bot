@@ -207,3 +207,52 @@ test("the stream HTTP agent rejects a concurrent second request instead of queue
   first.destroy();
   agent.destroy();
 });
+
+test("the wire presents its capability token, and codex's bearer check refuses it without one", async (t) => {
+  const secret = "a".repeat(64);
+  const seen: Array<string | undefined> = [];
+  const server = createServer();
+  // Stands in for a codex app-server started with `--ws-auth capability-token`: it answers the
+  // upgrade only for the right bearer, exactly as the real one does (401 without, 101 with).
+  const websocket = new WebSocketServer({
+    server,
+    verifyClient: ({ req }, done) => {
+      seen.push(req.headers.authorization);
+      done(req.headers.authorization === `Bearer ${secret}`, 401, "missing websocket bearer token");
+    },
+  });
+  websocket.on("connection", (peer) => peer.on("message", (value) => {
+    const rpc = JSON.parse(value.toString()) as { id: number };
+    peer.send(JSON.stringify({ id: rpc.id, result: { authenticated: true } }));
+  }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  t.after(async () => {
+    for (const peer of websocket.clients) peer.terminate();
+    websocket.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  const pipeToServer = (): ReadyProcessStream => {
+    const transport = connect(address.port, "127.0.0.1");
+    const input = new PassThrough();
+    const output = new PassThrough();
+    input.pipe(transport);
+    transport.pipe(output);
+    return { input, output, onClose: () => () => undefined, close: async () => { transport.destroy(); input.destroy(); output.destroy(); } };
+  };
+
+  // The helper on the far side is a byte pipe and can never add a header, so the token has to be
+  // presented here or a WebSocket generation can never be reached at all.
+  const authenticated = new RpcClient(
+    await WebSocketWire.connectStream(pipeToServer(), { timeoutMs: 1_000, token: secret }),
+    { requestTimeoutMs: 1_000 },
+  );
+  assert.deepEqual(await authenticated.request("initialize", {}), { authenticated: true });
+  authenticated.close();
+
+  await assert.rejects(WebSocketWire.connectStream(pipeToServer(), { timeoutMs: 1_000 }));
+  await assert.rejects(WebSocketWire.connectStream(pipeToServer(), { timeoutMs: 1_000, token: "b".repeat(64) }));
+  assert.deepEqual(seen, [`Bearer ${secret}`, undefined, `Bearer ${"b".repeat(64)}`]);
+});

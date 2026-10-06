@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
-import { constants, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { constants, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statfsSync } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, readlink, realpath, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -12,6 +12,7 @@ const SAFE_PATH = /^\/[A-Za-z0-9_./+-]+$/u;
 const SAFE_SDK_PATH = /^\/[A-Za-z0-9_./@+-]+$/u;
 const SAFE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const HEX_128 = /^[a-f0-9]{32}$/u;
+const HEX_256 = /^[a-f0-9]{64}$/u;
 const DECIMAL = /^\d+$/u;
 const MAX_ARGUMENT_BYTES = 96 * 1024;
 // Declared up here with the other constants because the operation dispatch below runs at
@@ -154,6 +155,10 @@ async function inspect(value) {
   const identityFile = await stat(paths.identityPath).catch(() => undefined);
   const socketFile = await stat(paths.socketPath).catch(() => undefined);
   const identity = await readIdentity(paths.identityPath);
+  // The listener kind. Deliberately a FILE and not a property of the process: a generation whose
+  // process has died is still knowably a WebSocket one, which is what lets the reclaim below
+  // report its serving fact as false rather than omitting it.
+  const token = await capabilityToken(paths.tokenPath);
   const group = identity ? membersOfGroup(identity.processGroupId) : [];
   const ownedGroup = identity ? group.filter((pid) => processHasToken(pid, identity.token)) : [];
   const groupAlive = group.length > 0;
@@ -188,13 +193,40 @@ async function inspect(value) {
     if (!identity) return {};
     const serverAlive = identityMatches(identity) && processHasToken(identity.pid, identity.token);
     if (serverAlive) return { serverAlive };
-    return { serverAlive, socketListening: await socketListening(paths.socketPath), ...await sessionAge(paths) };
+    // `socketListening` means "this runtime is accepting on its listener", whichever listener that
+    // is -- so the kinds share one fact and unservingSupervisor needs no second clause.
+    //
+    // It must be FALSE here, never omitted. Omission means "not proven" so that older helpers keep
+    // working, and a dead WebSocket generation that merely stayed silent would be unreclaimable
+    // forever: exactly the wedge that guard exists to break. A dead process has no derivable port,
+    // which is a proof of not-serving, not an absence of evidence.
+    const listening = token !== undefined ? false : await socketListening(paths.socketPath);
+    return { serverAlive, socketListening: listening, ...await sessionAge(paths) };
   };
   if (!identity || !identityMatches(identity)) {
     return { status: "unhealthy", supervised, ...await supervisedFacts(), ...(identity ? { identity, ownedGroup, groupSize: group.length } : {}) };
   }
+  // Observable only from a channel OTHER than the one that started codex: the daemon socket lives
+  // in the starting channel's /tmp, so from there the link resolves and everything looks well. A
+  // later channel sees the target missing, and that is the proof this runtime can never be reached
+  // from anywhere but its own birthplace.
+  const socketRedirected = token === undefined && await danglingDaemonLink(paths.socketPath);
+  if (token !== undefined) {
+    // A WebSocket generation creates no socket file at all, so the unix predicate below would call
+    // it unhealthy forever and `start` would never see it come up. Its health is: the token is
+    // readable (checked above, and its absence would have made this a unix generation), and a
+    // single ready loopback listener is derivable from the recorded process.
+    const port = await listeningPort(identity.pid);
+    if (port === undefined) {
+      return { status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length };
+    }
+    return { status: "healthy", identity, supervised, token };
+  }
   if (!socketFile?.isSocket() || socketFile.uid !== process.getuid?.() || (socketFile.mode & 0o077) !== 0) {
-    return { status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length };
+    return {
+      status: "unhealthy", supervised, ...await supervisedFacts(), identity, ownedGroup, groupSize: group.length,
+      ...(socketRedirected ? { socketRedirected } : {}),
+    };
   }
   return { status: "healthy", identity, supervised };
 }
@@ -215,6 +247,144 @@ async function socketListening(socketPath) {
   });
 }
 
+// The capability token of a WebSocket generation, and by its presence the fact that this runtime
+// IS one. A unix generation has no such file. The token is the bearer credential for codex's
+// WebSocket upgrade, so it is only honoured from a private, uid-owned regular file -- anything
+// else is treated as absent, which fails the generation closed rather than connecting without it.
+async function capabilityToken(tokenPath) {
+  try {
+    const file = await lstat(tokenPath);
+    if (!file.isFile() || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0) return undefined;
+    const value = (await readFile(tokenPath, "utf8")).trim();
+    return HEX_256.test(value) ? value : undefined;
+  } catch { return undefined; }
+}
+
+// The loopback socket inodes this exact process holds open. File descriptors flow parent to child,
+// never the reverse, so scanning only the recorded pid cannot pick up a child's listener -- and on
+// a login node with hundreds of users, scanning all of /proc would mean thousands of unreadable
+// directories on every probe.
+function socketInodes(pid) {
+  const inodes = new Set();
+  let entries;
+  try { entries = readdirSync(`/proc/${pid}/fd`); } catch { return inodes; }
+  for (const entry of entries) {
+    try {
+      const match = /^socket:\[(\d+)\]$/u.exec(readlinkSync(`/proc/${pid}/fd/${entry}`));
+      if (match) inodes.add(match[1]);
+    } catch { /* the descriptor closed under us, or is not ours to read */ }
+  }
+  return inodes;
+}
+
+// The port a WebSocket runtime is serving on, DERIVED from the runtime's own descriptors rather
+// than recorded anywhere. A record written after the bind can be lost -- a dropped channel between
+// the bind and the write would leave a live server with no retrievable address, unhealthy forever.
+// A derivation cannot be lost, and it invalidates itself the moment the process dies.
+//
+// Ownership therefore needs no separate proof: a port found in this pid's fd set is this pid's
+// port by construction.
+//
+// Codex holds one listener today, but a second one (a code-mode host, an MCP transport) must not
+// make us aim the proxy at a service the bearer token does not authenticate. `/readyz` is the
+// discriminator, and anything other than exactly one ready candidate reports no port at all.
+async function listeningPort(pid) {
+  const inodes = socketInodes(pid);
+  if (inodes.size === 0) return undefined;
+  const uid = process.getuid?.();
+  const candidates = [];
+  for (const [file, loopback, host] of [
+    ["/proc/net/tcp", "0100007F", "127.0.0.1"],
+    ["/proc/net/tcp6", "00000000000000000000000001000000", "::1"],
+  ]) {
+    let text;
+    try { text = readFileSync(file, "utf8"); } catch { continue; }
+    for (const line of text.split("\n").slice(1)) {
+      const parts = line.trim().split(/\s+/u);
+      if (parts.length < 10) continue;
+      const [address, port] = parts[1].split(":");
+      // State 0A is LISTEN; a listener has no peer, and a bound-but-connected socket is not ours
+      // to serve from. The uid column is free corroboration.
+      if (parts[3] !== "0A" || !/^0+:0000$/u.test(parts[2]) || address !== loopback) continue;
+      if (uid !== undefined && Number(parts[7]) !== uid) continue;
+      if (!inodes.has(parts[9])) continue;
+      const value = Number.parseInt(port, 16);
+      // The host travels WITH the port. The probe below and the proxy both have to dial the same
+      // address, and a v6 candidate reached over 127.0.0.1 would fail its probe and leave the
+      // runtime unhealthy forever while its process stayed alive.
+      if (Number.isInteger(value) && value > 0 && value < 65_536) candidates.push({ host, port: value });
+    }
+  }
+  const ready = [];
+  for (const candidate of candidates) if (await readyzOk(candidate)) ready.push(candidate);
+  return ready.length === 1 ? ready[0] : undefined;
+}
+
+// Codex answers /readyz unauthenticated, which is what makes it usable as a liveness probe without
+// handing the capability token to the prober. It is a stronger signal than a completed connect: it
+// reports the server READY, not merely bound. Bounded like socketListening, because `start` polls
+// this in a 50ms loop and an unbounded GET would stall the boot.
+async function readyzOk({ host, port }) {
+  return await new Promise((resolve) => {
+    let settled = false;
+    let received = "";
+    const finish = (value) => { if (!settled) { settled = true; socket.destroy(); resolve(value); } };
+    const socket = connect(port, host);
+    socket.setTimeout(2_000, () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.once("close", () => finish(false));
+    socket.once("connect", () => socket.write("GET /readyz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"));
+    socket.on("data", (chunk) => {
+      received += chunk.toString("utf8");
+      if (received.includes("\r\n")) finish(/^HTTP\/1\.[01] 200/u.test(received));
+    });
+  });
+}
+
+// Which listener this generation serves on. The capability token's presence IS the kind, because
+// a WebSocket generation always has one and a unix generation never does.
+//
+// A token file that exists but cannot be used is not a unix generation. Treating it as one would
+// connect without the bearer credential and surface far away as an unexplained handshake refusal,
+// so it fails here, where the cause is still visible.
+async function listenerKind(paths) {
+  const token = await capabilityToken(paths.tokenPath);
+  if (token !== undefined) return { kind: "ws", token };
+  const present = await lstat(paths.tokenPath).then(() => true).catch(() => false);
+  if (present) throw new Error("app-server capability token is unusable");
+  return { kind: "unix" };
+}
+
+async function requireListeningPort(pid) {
+  const port = await listeningPort(pid);
+  if (port === undefined) throw new Error("app-server is not listening on a derivable loopback port");
+  return port;
+}
+
+// Whether codex redirected our socket into a /tmp this channel cannot see. Codex replaces the
+// --listen path with a symlink into /tmp/codex-daemon-<uid>/; where /tmp is shared that resolves
+// and everything works, and privateSocketIdentity accepts exactly this shape. Where /tmp is
+// per-channel the target belongs to the channel that created it and resolves to nothing here,
+// permanently.
+//
+// The shape is checked as narrowly as privateSocketIdentity checks it, minus the daemon
+// directory's own mode: on an affected host that directory is not visible either, and its absence
+// is the symptom rather than a reason to decline. A stray broken symlink must never be read as
+// this, or a healthy host migrates transports for no reason.
+async function danglingDaemonLink(socketPath) {
+  const uid = process.getuid?.();
+  if (uid === undefined) return false;
+  const link = await lstat(socketPath, { bigint: true }).catch(() => undefined);
+  if (!link?.isSymbolicLink() || link.uid !== BigInt(uid)) return false;
+  const target = await readlink(socketPath).catch(() => undefined);
+  if (target === undefined || dirname(target) !== `/tmp/codex-daemon-${uid}` || !/^[a-f0-9]{64}$/u.test(basename(target))) return false;
+  // ONLY the target's absence may answer this. An ENOENT from the lstat or the readlink above
+  // means there is no socket yet -- an ordinary slow boot, which is most of what reaches the
+  // timeout path -- and reading that as "this host isolates /tmp" would kill a codex in the middle
+  // of starting up and migrate a perfectly healthy host onto the wrong transport.
+  return await stat(target).then(() => false).catch((error) => error?.code === "ENOENT");
+}
+
 // How long the supervising tmux session has existed. Reported in millis of AGE rather than as
 // the creation stamp so the caller does not have to trust the two hosts' clocks to agree.
 async function sessionAge(paths) {
@@ -233,26 +403,58 @@ async function start(value) {
   const capabilityPaths = (capability.stdout ?? "").split(/\r?\n/u).map((line) => line.trim()).filter((line) => SAFE_PATH.test(line));
   if (capability.status !== 0 || capabilityPaths.slice(-3).length !== 3) throw new Error("codex, tmux, and tail are required to start a remote runtime");
   const before = await inspect(value);
-  if (before.status === "healthy") return { identity: before.identity };
+  if (before.status === "healthy") return { identity: before.identity, ...(before.token === undefined ? {} : { token: before.token }) };
   // Reclaiming an unhealthy runtime is `stop`'s job, and ensureStarted routes through it before
   // ever calling start. Starting over one here would race that.
   if (before.status === "unhealthy") throw new Error("existing runtime is unhealthy");
   await unlink(paths.socketPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   await unlink(paths.identityPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
-  const inner = `exec ${paths.launcherPath} ${value.token} ${paths.socketPath} ${paths.identityPath}`;
+  // A token left behind by a WebSocket generation that died without a clean stop would make THIS,
+  // unix, generation classify as one: its health predicate would look for a port that does not
+  // exist, and the endpoint would be unhealthy forever.
+  await unlink(paths.tokenPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   if (![paths.launcherPath, paths.socketPath, paths.identityPath].every((item) => SAFE_PATH.test(item))) throw new Error("unsafe launcher path");
-  const command = `${value.shell} -lc '${inner}'`;
-  await run("tmux", [...tmuxArgs(paths), "new-session", "-d", "-s", paths.session, command]);
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const state = await inspect(value);
-    if (state.status === "healthy") return { identity: state.identity };
-    if (state.status === "absent") break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+  const launch = async (runtimeToken, mode, digest) => {
+    const inner = `exec ${paths.launcherPath} ${runtimeToken} ${paths.socketPath} ${paths.identityPath} ${mode}${digest === undefined ? "" : ` ${digest}`}`;
+    await run("tmux", [...tmuxArgs(paths), "new-session", "-d", "-s", paths.session, `${value.shell} -lc '${inner}'`]);
+  };
+  const poll = async () => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const state = await inspect(value);
+      if (state.status === "healthy") return state;
+      if (state.status === "absent") return "absent";
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return "timeout";
+  };
+
+  // Which listener to use is the CALLER's instruction, never a decision made here. `start` runs in
+  // the channel that creates the app-server, and codex's daemon socket lives in that channel's
+  // /tmp -- so from in here the link always resolves and the redirect is invisible. Only a later
+  // channel can see it, which is why `inspect` reports it and QiYan asks for `ws` on the restart.
+  if (value?.listener !== undefined && value.listener !== "unix" && value.listener !== "ws") {
+    throw new Error("invalid listener");
   }
-  // Say why. The app-server writes its own startup failure to this log and then exits, and
-  // without it the caller sees only that the runtime never appeared -- the reason (a state
-  // directory on an unresponsive filesystem, say) stays on this host.
-  throw new Error(`runtime did not become healthy${await launcherFailureDetail(paths)}`);
+  if (value?.listener !== "ws") {
+    await launch(value.token, "unix");
+    const unixStart = await poll();
+    if (typeof unixStart === "object") return { identity: unixStart.identity };
+    // Say why. The app-server writes its own startup failure to this log and then exits, and
+    // without it the caller sees only that the runtime never appeared -- the reason (a state
+    // directory on an unresponsive filesystem, say) stays on this host.
+    throw new Error(`runtime did not become healthy${await launcherFailureDetail(paths)}`);
+  }
+
+  // An authenticated loopback port, which no mount namespace can hide.
+  // See docs/development/app-server-listener-design.md.
+  const token = randomBytes(32).toString("hex");
+  // Written BEFORE the launcher starts, so no window exists in which a live WebSocket runtime has
+  // no marker and no credential. The launcher receives only the digest.
+  await atomicWrite(paths.tokenPath, `${token}\n`, 0o600);
+  await launch(value.token, "ws", createHash("sha256").update(token).digest("hex"));
+  const wsStart = await poll();
+  if (typeof wsStart === "object") return { identity: wsStart.identity, token };
+  throw new Error(`websocket runtime did not become healthy${await launcherFailureDetail(paths)}`);
 }
 
 async function launcherFailureDetail(paths) {
@@ -325,6 +527,7 @@ async function stop(value) {
   }
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
+  await rm(paths.tokenPath, { force: true });
   // Report what was left behind. A caller that reclaimed over unreapable debris should be able
   // to say so rather than presenting the endpoint as cleanly stopped.
   return { stopped: true, ...survivors > 0 ? { survivors } : {} };
@@ -482,8 +685,12 @@ async function proxyAppServer(value) {
   if (!beforeIdentity || !sameIdentity(beforeIdentity, expected) || !identityMatches(beforeIdentity)) {
     throw new Error("runtime identity changed");
   }
-  const beforeSocket = await privateSocketIdentity(paths.socketPath, true);
-  const socket = connect(paths.socketPath);
+  // The only thing that varies by listener kind is what we connect to. The identity proof either
+  // side of the connection, the readiness preamble and the byte pipe below are common.
+  const listener = await listenerKind(paths);
+  const beforeSocket = listener.kind === "unix" ? await privateSocketIdentity(paths.socketPath, true) : undefined;
+  const listening = listener.kind === "unix" ? undefined : await requireListeningPort(expected.pid);
+  const socket = listening === undefined ? connect(paths.socketPath) : connect(listening.port, listening.host);
   try {
     await new Promise((resolveConnection, rejectConnection) => {
       const connected = () => { cleanup(); resolveConnection(); };
@@ -492,13 +699,17 @@ async function proxyAppServer(value) {
       socket.once("connect", connected);
       socket.once("error", failed);
     });
-    const [afterSocket, afterIdentity] = await Promise.all([
-      privateSocketIdentity(paths.socketPath, true),
-      readIdentity(paths.identityPath),
-    ]);
-    if (afterSocket.device !== beforeSocket.device || afterSocket.inode !== beforeSocket.inode
-      || afterSocket.linkDevice !== beforeSocket.linkDevice || afterSocket.linkInode !== beforeSocket.linkInode
-      || !afterIdentity || !sameIdentity(afterIdentity, expected) || !identityMatches(afterIdentity)) {
+    const afterIdentity = await readIdentity(paths.identityPath);
+    // A unix socket file outlives its listener, so the inode has to be compared either side of the
+    // connection to catch a swap. A loopback port cannot be swapped the same way: the port was
+    // derived from this runtime's own descriptors, and an established TCP connection cannot have
+    // been accepted by a different process, so the identity re-read carries the whole proof.
+    const swapped = listener.kind === "unix" && await (async () => {
+      const afterSocket = await privateSocketIdentity(paths.socketPath, true);
+      return afterSocket.device !== beforeSocket.device || afterSocket.inode !== beforeSocket.inode
+        || afterSocket.linkDevice !== beforeSocket.linkDevice || afterSocket.linkInode !== beforeSocket.linkInode;
+    })();
+    if (swapped || !afterIdentity || !sameIdentity(afterIdentity, expected) || !identityMatches(afterIdentity)) {
       throw new Error("runtime changed during connection");
     }
     await new Promise((resolveReady, rejectReady) => {
@@ -815,6 +1026,9 @@ function runtimePaths(value, allowMissing = false) {
     tmuxMode,
     tmuxSocketPath: join(runtimeDir, "tmux.sock"),
     socketPath: join(runtimeDir, "app-server.sock"),
+    // Present only for a WebSocket generation, where it is both the capability token and the
+    // marker of the listener kind. See docs/development/app-server-listener-design.md.
+    tokenPath: join(runtimeDir, "app-server.token"),
     identityPath: join(runtimeDir, "identity.json"),
     launcherPath: join(runtimeDir, "qiyan-app-server-launcher.sh"),
   };

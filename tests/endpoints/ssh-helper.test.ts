@@ -249,7 +249,7 @@ test("the remote app-server launcher retains one bounded owner-only diagnostic g
   const launch = async () => {
     const result = await runBoundedProcess("env", [
       `PATH=${bin}:${process.env.PATH ?? ""}`,
-      "sh", launcherPath.pathname, token, socketPath, identityPath,
+      "sh", launcherPath.pathname, token, socketPath, identityPath, "unix",
     ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
     assert.equal(result.stdout.byteLength, 0);
     assert.equal(result.stderr.byteLength, 0);
@@ -276,6 +276,37 @@ test("the remote app-server launcher retains one bounded owner-only diagnostic g
   assert.doesNotMatch(log, /filter=.*codex_app_server=info/u);
   assert.match(log, /args=app-server --listen unix:\/\//u);
   assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+});
+
+test("the launcher serves a WebSocket generation on loopback and is told only the digest", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qiyan-launcher-ws-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex"), ["#!/bin/sh", "printf 'args=%s\\n' \"$*\"", ""].join("\n"), { mode: 0o700 });
+  const token = "0123456789abcdef0123456789abcdef";
+  const secret = "s".repeat(64);
+  const digest = createHash("sha256").update(secret).digest("hex");
+  const launch = async (...extra: string[]) => await runBoundedProcess("env", [
+    `PATH=${bin}:${process.env.PATH ?? ""}`,
+    "sh", launcherPath.pathname, token, join(root, "app-server.sock"), join(root, "identity.json"), ...extra,
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+
+  await launch("ws", digest);
+  const log = await readFile(join(root, "app-server.log"), "utf8");
+  assert.match(log, /--listen ws:\/\/127\.0\.0\.1:0/u);
+  assert.match(log, /--ws-auth capability-token/u);
+  // The digest authenticates and is not a secret; the token itself must never reach a
+  // world-readable /proc/<pid>/cmdline on a shared login node.
+  assert.match(log, new RegExp(`--ws-token-sha256 ${digest}`, "u"));
+  assert.doesNotMatch(log, new RegExp(secret, "u"));
+  assert.doesNotMatch(log, /--ws-token-file/u);
+
+  // The listener is an explicit argument, never inferred: under `set -eu` an empty variable is how
+  // an inference becomes a silently unauthenticated listener.
+  for (const bad of [[], ["ws"], ["ws", "nothex"], ["ws", digest.slice(0, 63)], ["other", digest]]) {
+    await assert.rejects(launch(...bad), (error: unknown) => error instanceof Error && /exit 64/u.test(error.message));
+  }
 });
 
 test("the helper emits one versioned response frame", async () => {
@@ -1106,4 +1137,211 @@ test("the remote workspace helper returns a structured missing-path error", asyn
 
   assert.deepEqual(parseRemoteHelperResponse(result.stdout, "workspace"), { error: { code: "ENOENT" } });
   assert.equal(result.stderr.byteLength, 0);
+});
+
+test("a WebSocket generation is healthy by its own listener, and dead proves it is not serving", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  // The token file is the listener kind AND the credential. A WebSocket generation creates no
+  // socket file at all, so nothing else distinguishes it.
+  const secret = "c".repeat(64);
+  await writeFile(`${runtimeDir}/app-server.token`, `${secret}\n`, { mode: 0o600 });
+
+  // Stands in for codex on ws://127.0.0.1:0 — a loopback listener answering /readyz unauthenticated.
+  const serve = (token: string) => spawn(process.execPath, ["-e",
+    'const s=require("http").createServer((q,r)=>{r.writeHead(q.url==="/readyz"?200:404);r.end()});'
+    + 's.listen(0,"127.0.0.1",()=>console.log("up"));setInterval(()=>{},1000);'],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  const processFacts = (pid: number) => {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    return { processGroupId: Number(fields[2]), linuxStartTime: fields[19]! };
+  };
+  const inspect = async (identity: unknown) => {
+    await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit" }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", argument],
+      { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{ status: string; token?: string; serverAlive?: boolean; socketListening?: boolean }>(run.stdout, "inspect");
+  };
+
+  const token = "f".repeat(32);
+  const server = serve(token);
+  t.after(() => { try { process.kill(server.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await once(server.stdout, "data");
+  const identity = { kind: "ssh", token, pid: server.pid, ...processFacts(server.pid!) };
+
+  const healthy = await inspect(identity);
+  assert.equal(healthy.status, "healthy", "a derivable ready loopback listener is what health means here");
+  assert.equal(healthy.token, secret, "and the token comes back, because a healthy runtime never calls start");
+
+  // Only this pid's descriptors are scanned. A listener held by anyone else is not our port, so
+  // the runtime is unhealthy even though its recorded process is alive and well.
+  const stranger = serve("a".repeat(32));
+  t.after(() => { try { process.kill(stranger.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await once(stranger.stdout, "data");
+  const idle = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  t.after(() => { try { process.kill(idle.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const foreign = await inspect({ kind: "ssh", token, pid: idle.pid, ...processFacts(idle.pid!) });
+  assert.equal(foreign.status, "unhealthy", "someone else's listener is not this runtime's port");
+
+  // The reclaim case. `unservingSupervisor` requires socketListening to be literally false —
+  // omission means "not proven" — so a dead WebSocket generation that merely stayed silent would
+  // be unreclaimable forever, which is the wedge this whole change exists to end.
+  process.kill(server.pid!, "SIGKILL");
+  await once(server, "exit");
+  const dead = await inspect(identity);
+  assert.equal(dead.status, "unhealthy");
+  assert.equal(dead.serverAlive, false);
+  assert.equal(dead.socketListening, false, "a dead runtime proves it is not serving; it does not merely omit the fact");
+});
+
+test("a capability token that cannot be used refuses the proxy instead of connecting without it", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  // World-readable: a token anyone on a 219-user login node could have read is not a credential.
+  await writeFile(`${runtimeDir}/app-server.token`, `${"c".repeat(64)}\n`, { mode: 0o644 });
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify({
+    kind: "ssh", token: "f".repeat(32), pid: process.pid, linuxStartTime: "1", processGroupId: process.pid,
+  }), { mode: 0o600 });
+
+  const argument = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit",
+    expected: { kind: "ssh", token: "f".repeat(32), pid: process.pid, linuxStartTime: "1", processGroupId: process.pid },
+  }));
+  await assert.rejects(runBoundedProcess(process.execPath,
+    [`${runtimeDir}/qiyan-ssh-helper.mjs`, "proxy-app-server", argument],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 }));
+});
+
+test("start serves the listener it is told to, and never decides for itself", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const base = `/tmp/qiyan-${uid}`;
+  await mkdir(base, { recursive: true, mode: 0o700 });
+  const root = await mkdtemp(join(tmpdir(), "qiyan-start-"));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex"), [
+    "#!/bin/sh",
+    'case "$*" in',
+    '  *ws://*) exec node -e \'const s=require("http").createServer((q,r)=>{r.writeHead(q.url==="/readyz"?200:404);r.end()});s.listen(0,"127.0.0.1");setInterval(()=>{},1000);\' ;;',
+    "esac",
+    "sleep 600",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  // Handles `-lc` itself rather than delegating: a real login shell re-sources the profile and
+  // would put the system codex back in front of the stub.
+  const shell = join(root, "login-shell");
+  await writeFile(shell, ["#!/bin/sh", `PATH=${bin}:$PATH`, "export PATH", "shift", 'exec /bin/sh -c "$1"', ""].join("\n"), { mode: 0o700 });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const start = async (listener?: string) => {
+    const runtimeDir = `${base}/${randomBytes(12).toString("hex")}`;
+    await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+    await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+    await cp(launcherPath, `${runtimeDir}/qiyan-app-server-launcher.sh`);
+    await chmod(`${runtimeDir}/qiyan-app-server-launcher.sh`, 0o700);
+    t.after(async () => {
+      await runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", "kill-server"],
+        { timeoutMs: 10_000, maxOutputBytes: 4096 }).catch(() => undefined);
+      await rm(runtimeDir, { recursive: true, force: true });
+    });
+    const argument = encodeRemoteArgument(JSON.stringify({
+      runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit", shell,
+      token: randomBytes(16).toString("hex"), ...(listener === undefined ? {} : { listener }),
+    }));
+    return {
+      runtimeDir,
+      run: runBoundedProcess("env", [`PATH=${bin}:${process.env.PATH ?? ""}`,
+        process.execPath, `${runtimeDir}/qiyan-ssh-helper.mjs`, "start", argument],
+        { timeoutMs: 90_000, maxOutputBytes: 64 * 1024 }),
+    };
+  };
+
+  const asked = await start("ws");
+  const result = parseRemoteHelperResponse<{ identity: { pid: number }; token?: string }>((await asked.run).stdout, "start");
+  assert.match(result.token ?? "", /^[a-f0-9]{64}$/u, "the generation is authenticated and its token comes back");
+  assert.equal((await stat(`${asked.runtimeDir}/app-server.token`)).mode & 0o777, 0o600);
+  const descriptors = await runBoundedProcess("sh", ["-c",
+    `ls -l /proc/${result.identity.pid}/fd 2>/dev/null | grep -c socket`], { timeoutMs: 10_000, maxOutputBytes: 4096 });
+  assert.ok(Number(descriptors.stdout.toString("utf8").trim()) > 0, "and it is the recorded process holding the listener");
+
+  // Unasked, a stalled boot stays unix and fails as before. `start` runs in the channel that
+  // creates the app-server, where codex's daemon socket is always visible, so it can never see a
+  // redirect and must never invent one.
+  const unasked = await start();
+  await assert.rejects(unasked.run, (error: unknown) =>
+    error instanceof Error && /runtime did not become healthy/u.test(error.message));
+  assert.equal(await stat(`${unasked.runtimeDir}/app-server.token`).then(() => true).catch(() => false), false);
+  await assert.rejects((await start("sideways")).run);
+});
+
+test("inspect reports a redirected socket, which only a later channel can see", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  // Alive and serving — from its own channel. This is the shape that makes the endpoint
+  // unreachable forever, and the one unservingSupervisor can never reclaim, because the server is
+  // not dead.
+  const token = "f".repeat(32);
+  const alive = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: token } });
+  t.after(() => { try { process.kill(alive.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const raw = readFileSync(`/proc/${alive.pid}/stat`, "utf8");
+  const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify({
+    kind: "ssh", token, pid: alive.pid, linuxStartTime: fields[19], processGroupId: Number(fields[2]),
+  }), { mode: 0o600 });
+
+  const inspect = async () => {
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit" }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "inspect", argument],
+      { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{ status: string; serverAlive?: boolean; socketRedirected?: boolean }>(run.stdout, "inspect");
+  };
+
+  // No socket yet is an ordinary boot, not a redirect.
+  assert.equal((await inspect()).socketRedirected, undefined, "an absent socket is not evidence of anything");
+
+  await symlink(`/tmp/codex-daemon-${uid}/${"b".repeat(64)}`, `${runtimeDir}/app-server.sock`);
+  const redirected = await inspect();
+  assert.equal(redirected.status, "unhealthy");
+  assert.equal(redirected.serverAlive, true, "the server is alive, which is exactly why nothing else can reclaim it");
+  assert.equal(redirected.socketRedirected, true);
+
+  // A link of the same shape whose target resolves is the shared-/tmp host, where everything works.
+  await rm(`${runtimeDir}/app-server.sock`);
+  await mkdir(`/tmp/codex-daemon-${uid}`, { recursive: true, mode: 0o700 });
+  const target = `/tmp/codex-daemon-${uid}/${"c".repeat(64)}`;
+  await writeFile(target, "", { mode: 0o600 });
+  t.after(() => rm(target, { force: true }));
+  await symlink(target, `${runtimeDir}/app-server.sock`);
+  assert.equal((await inspect()).socketRedirected, undefined, "a link that resolves is not a redirect");
 });

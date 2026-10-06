@@ -118,11 +118,19 @@ export class WebSocketWire implements RpcWire {
     return new WebSocketWire(socket);
   }
 
-  static async connectStream(stream: WebSocketByteStream, options: { timeoutMs: number }): Promise<WebSocketWire> {
+  // `token`, when present, is the remote runtime's capability token: codex refuses the upgrade
+  // without `Authorization: Bearer` when it was started with --ws-auth. The handshake happens
+  // HERE, locally, over the piped stream — the remote helper is a byte pipe and can never add a
+  // header — which is why the token has to travel back to us rather than stay on the worker.
+  //
+  // No `origin` is sent, deliberately: codex answers a cross-origin Origin with 403, and the ws
+  // client omits the header unless asked.
+  static async connectStream(stream: WebSocketByteStream, options: { timeoutMs: number; token?: string }): Promise<WebSocketWire> {
     const adapter = createSocketCompatibleDuplex(stream);
     const agent = new OneShotStreamAgent(adapter);
     const socket = new WebSocket("ws://qiyan-app-server.invalid/", {
       agent,
+      ...(options.token === undefined ? {} : { headers: { Authorization: `Bearer ${options.token}` } }),
       handshakeTimeout: options.timeoutMs,
       maxPayload: MAX_FRAME_BYTES,
       followRedirects: false,

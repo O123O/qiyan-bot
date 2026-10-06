@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ConversationBinding } from "../../src/chat-apps/shared/binding.ts";
 import { AppError } from "../../src/core/errors.ts";
 import { AssistantRuntime, classifyAttemptEffects } from "../../src/assistant/runtime.ts";
 import { createAssistantTools } from "../../src/assistant/tools.ts";
