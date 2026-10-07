@@ -8,6 +8,7 @@ import { Buffer } from "node:buffer";
 import { AppError } from "../core/errors.ts";
 import {
   claudePreviewFromRecords,
+  requireGrowthShape,
   type ClaudeCommandRunner,
   type ClaudeThreadMeta,
   type ClaudeTranscriptChunk,
@@ -74,13 +75,24 @@ export class SshClaudeCommandRunner implements ClaudeCommandRunner {
       "process.stdout.write(JSON.stringify({snapshot:snap,offset,data:b.subarray(0,n).toString('base64')}))",
       "}finally{fs.closeSync(fd)}",
     ].join(";");
+    requireGrowthShape(request);
     const expected = request.expected === undefined
       ? ""
       : Buffer.from(JSON.stringify(request.expected), "utf8").toString("base64url");
+    // Exits 3 and 5 are the snapshot checks either side of the read. Reporting them as a bare
+    // exit status hid a RETRYABLE condition behind an opaque one: the web client recognises
+    // "transcript changed during" and re-reads from the tail, but has never matched
+    // "exited with status 3", so a remote worker's mismatch became an error line in the panel
+    // instead of a retry. Raise what the local arm raises.
     const output = await this.runCapture(
       `node -e ${shq(script)} ${shq(path)} ${shq(String(request.offset))} ${shq(String(request.length))} ${shq(expected)} ${shq(request.allowGrowth === true ? "1" : "")}`,
       Math.ceil(request.length * 4 / 3) + 4_096,
-    );
+    ).catch((error: unknown) => {
+      if (error instanceof AppError && /exited with status [35]$/u.test(error.message)) {
+        throw new AppError("OPERATION_UNCERTAIN", "Claude transcript changed during bounded history paging");
+      }
+      throw error;
+    });
     let parsed: unknown;
     try { parsed = JSON.parse(output); }
     catch { throw new AppError("OPERATION_UNCERTAIN", "remote Claude transcript chunk was invalid"); }

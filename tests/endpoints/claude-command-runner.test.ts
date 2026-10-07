@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { AppError } from "../../src/core/errors.ts";
 import { LocalClaudeCommandRunner, claudePreviewFromRecords, CLAUDE_PREVIEW_MAX } from "../../src/endpoints/claude-command-runner.ts";
 
 function line(record: unknown): string { return `${JSON.stringify(record)}\n`; }
@@ -116,4 +117,17 @@ test("a descending window tolerates a transcript that grew, but never one that s
       /changed during bounded history paging/u,
     );
   }
+});
+
+test("a tail read can never opt into growth", async () => {
+  const home = await mkdtemp(join(tmpdir(), "claude-tailgrow-"));
+  await writeTranscript(home, "hash", "live", [{ type: "user", cwd: "/work", promptSource: "sdk", promptId: "p", message: { content: "x" } }]);
+  const runner = new LocalClaudeCommandRunner({ home });
+  // A tail read derives its offset from the current size and judges an unterminated final record
+  // against it, so growth would let a partial line read as a whole one. The opt-in is documented
+  // as descending-and-not-tail; this keeps it true by construction rather than by convention.
+  await assert.rejects(
+    runner.readTranscriptChunk("live", "/work", { offset: "tail", length: 128, allowGrowth: true }),
+    (error: unknown) => error instanceof AppError && error.code === "CONFIGURATION_ERROR",
+  );
 });

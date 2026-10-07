@@ -44,6 +44,13 @@ export interface ClaudeTranscriptChunkRequest {
   // Shrinkage still fails: a compaction rewrite or a cleared transcript really does invalidate
   // every offset. Identity is never relaxed, so a replaced file is still caught.
   //
+  // What this gives up, named rather than discovered later: a truncate-then-regrow PAST the
+  // pinned size is no longer detected. An in-place rewrite keeps the inode, and a final size
+  // above the pinned one now passes both checks, so the walk would read old offsets against a new
+  // layout. A rename-into-place still changes the inode and is still caught, and a layout change
+  // almost certainly trips the leading probe into an invalid-record error rather than yielding
+  // plausible-looking turns — this pin was never a content hash.
+  //
   // Only for descending, non-tail reads. A tail read derives its offset from the current size,
   // and parseRecords decides whether an unterminated final record is complete by comparing
   // against snapshot.size -- let that drift and a partial line reads as a whole one.
@@ -103,6 +110,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       throw error;
     }
     try {
+      requireGrowthShape(request);
       const before = transcriptSnapshot(await handle.stat());
       requireExpectedSnapshot(before, request.expected, request.allowGrowth === true);
       const offset = request.offset === "tail"
@@ -199,6 +207,15 @@ async function readClaudeThreadMeta(id: string, path: string): Promise<ClaudeThr
 
 function transcriptSnapshot(value: { dev: number | bigint; ino: number | bigint; size: number }): ClaudeTranscriptSnapshot {
   return { device: String(value.dev), inode: String(value.ino), size: value.size };
+}
+
+// A tail read derives its offset from the current size and decides whether an unterminated final
+// record is complete by comparing against it, so it can never tolerate growth. The opt-in is
+// documented as descending-and-not-tail; this makes it an invariant rather than a convention.
+export function requireGrowthShape(request: ClaudeTranscriptChunkRequest): void {
+  if (request.allowGrowth === true && request.offset === "tail") {
+    throw new AppError("CONFIGURATION_ERROR", "a tail transcript read cannot tolerate growth");
+  }
 }
 
 function requireExpectedSnapshot(
