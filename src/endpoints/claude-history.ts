@@ -127,11 +127,37 @@ export class ClaudeTranscriptHistory {
     }
     const { chunk } = window;
     if (starts.length === 0) {
-      if ((params.sortDirection === "desc" && chunk.offset > 0)
-        || (params.sortDirection === "asc" && chunk.offset + chunk.bytes.length < chunk.snapshot.size)) {
-        throw new HistoryScanBudgetExhaustedError();
+      // The window landed entirely INSIDE one turn. A single agent turn of a few hundred tool
+      // calls runs to megabytes, so no window cut from it contains the turn-start record that
+      // names it, and the backward extension above gives up at EXACT_TRANSFER_BYTES.
+      //
+      // Refusing the page here made that turn's whole session unreadable for as long as it stayed
+      // the newest one -- a cliff rather than a cost, and one that got worse the longer the turn
+      // ran. Report no turns for this window and hand back a cursor PAST it instead: the caller
+      // keeps paging, every other turn stays readable, and the oversized one simply contributes
+      // nothing until a window reaches its start.
+      // Only the descending walk is handled this way. An ascending boundary would have to be a
+      // record start too, and nothing in this build reads ascending — leaving it as the classified
+      // budget error keeps its callers degrading the way they already do.
+      if (params.sortDirection === "asc") {
+        if (chunk.offset + chunk.bytes.length < chunk.snapshot.size) throw new HistoryScanBudgetExhaustedError();
+        return { data: [], nextCursor: null, backwardsCursor: null };
       }
-      return { data: [], nextCursor: null, backwardsCursor: null };
+      if (chunk.offset === 0) return { data: [], nextCursor: null, backwardsCursor: null };
+      // The boundary has to be a RECORD start, not an arithmetic byte position. `chunk.offset` is
+      // `logicalStart - 1`, so the record straddling it would be dropped from this window as the
+      // leading probe and excluded from the next one — lost from both, silently, and if it
+      // happened to be a turn start that turn would vanish from the listing. The first complete
+      // record's offset is always preceded by a newline, so nothing is cut, and it is strictly
+      // below this request's boundary, so the walk still advances.
+      const beyond = records[0]?.offset ?? chunk.offset;
+      return {
+        data: [],
+        nextCursor: encodeCursor<TurnsCursor>({
+          v: 1, kind: "turns", threadId, direction: "desc", boundary: beyond, snapshot: chunk.snapshot,
+        }),
+        backwardsCursor: null,
+      };
     }
     const reconstructed = reconstructClaudeThread({
       threadId,

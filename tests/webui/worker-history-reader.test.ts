@@ -247,3 +247,35 @@ test("a large turn no longer starves the requested message count", async () => {
   assert.ok(page.messages.length >= 4,
     `expected the walk to accumulate messages, got ${page.messages.length} from ${served} pages`);
 });
+
+test("a window with no turn boundary is paged past, not rejected, so the panel still gets messages", async () => {
+  const lease = { endpointId: "local", endpointGeneration: 3, leaseId: "lease" } as never;
+  const cursors: Array<string | undefined> = [];
+  // The shape the Claude transcript reader returns when a byte window lands entirely inside one
+  // oversized turn: no turns, but a cursor past the window. The layer under test used to reject
+  // that outright ("empty thread history page had a continuation cursor"), which left the session
+  // unreadable for as long as that turn stayed newest.
+  const page = await readReadyWorkerTurns({
+    withReadyWorkLease: async (_endpointId, run) => run(lease),
+    request: async (...args) => {
+      if (args[1] !== "thread/turns/list") throw new Error(`unexpected method ${String(args[1])}`);
+      const cursor = (args[2] as { cursor?: string }).cursor;
+      cursors.push(cursor);
+      if (cursor === undefined) return { data: [], nextCursor: "past-the-huge-turn", backwardsCursor: null };
+      return {
+        data: [{
+          ...turn(), id: "older-turn", itemsView: "summary",
+          items: [
+            { type: "userMessage", id: "u1", content: [{ type: "text", text: "still readable" }] },
+            { type: "agentMessage", id: "a1", text: "and so is the reply", phase: "final_answer" },
+          ],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      };
+    },
+  }, "local", "thread", 20, undefined, new AbortController().signal);
+
+  assert.deepEqual(cursors, [undefined, "past-the-huge-turn"], "the empty window is walked past within one request");
+  assert.deepEqual(page.messages.map((message) => message.body), ["still readable", "and so is the reply"]);
+});

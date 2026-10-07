@@ -53,6 +53,11 @@ export class HistoryScanBudgetExhaustedError extends AppError {
   }
 }
 
+// How many turn-less windows a single-page read will step over before giving up. A window is
+// turn-less only when one turn spans it entirely, so a handful of hops covers any turn a worker
+// realistically produces, and the ceiling keeps a pathological transcript bounded.
+export const EMPTY_WINDOW_WALK = 8;
+
 export class HistoryScanBudget {
   private pages = 0;
   private turns = 0;
@@ -93,13 +98,28 @@ export function isHistoryScanBudgetExhausted(error: unknown): error is HistorySc
 export class ThreadHistoryReader {
   constructor(private readonly request: HistoryRequest) {}
 
+  // Walks past windows that carry no turn. A reader paging a native transcript by byte window can
+  // land entirely inside one oversized turn, and taking a single page would then read "this thread
+  // has no turns" — a confident wrong answer where callers depend on a right one: an active-turn
+  // identity, a recovery baseline, a delivery boundary. A false `undefined` baseline makes every
+  // historical turn a delivery candidate, which is the duplicate-delivery shape.
+  //
+  // Bounded, and on exhaustion it raises the SAME classified error the callers already degrade on,
+  // so the failure stays loud and retryable rather than becoming silently empty.
   async latestTurn(threadId: string): Promise<ThreadHistoryTurn | undefined> {
-    const page = await this.turnsPage(threadId, {
-      limit: 1,
-      sortDirection: "desc",
-      itemsView: "notLoaded",
-    });
-    return page.data[0];
+    let cursor: string | undefined;
+    for (let walked = 0; walked < EMPTY_WINDOW_WALK; walked += 1) {
+      const page = await this.turnsPage(threadId, {
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: 1,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      });
+      if (page.data.length > 0) return page.data[0];
+      if (page.nextCursor === null) return undefined;
+      cursor = page.nextCursor;
+    }
+    throw new HistoryScanBudgetExhaustedError();
   }
 
   async turnsPage(
@@ -317,7 +337,15 @@ function nullableCursor(value: unknown): string | null {
 }
 
 function validatePageProgress(page: ThreadHistoryPage<unknown>, requestCursor: string | undefined): void {
-  if (page.data.length === 0 && page.nextCursor !== null) throw uncertain("empty thread history page had a continuation cursor");
+  // An empty page carrying a cursor IS legitimate progress for a reader that pages by byte window
+  // over a native transcript: a window cut from inside one oversized turn contains no turn
+  // boundary at all, and the honest answer is "nothing here, keep going" rather than refusing the
+  // read and making that session unreadable for as long as the turn stays newest.
+  //
+  // What must never happen is a page that does not MOVE, and that is the check below. Every
+  // walker over these pages is independently bounded — HistoryScanBudget for the scans,
+  // READY_PAGE_WALK_BUDGET for the panel — so a run of empty pages costs a bounded amount and
+  // then ends, where before it ended the session.
   if (requestCursor !== undefined && page.nextCursor === requestCursor) throw uncertain("thread history cursor did not advance");
 }
 

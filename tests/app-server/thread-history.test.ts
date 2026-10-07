@@ -125,7 +125,7 @@ test("inclusive history recovery starts at the first observed managed turn", asy
   assert.deepEqual(suffix.turns.map((turn) => turn.id), ["newest", "first-managed"]);
 });
 
-test("single pages reject duplicate rows, empty continuations, and non-advancing cursors", async () => {
+test("single pages reject duplicate rows and non-advancing cursors, but allow an empty window", async () => {
   const duplicate = new ThreadHistoryReader(async () => ({
     data: [
       { id: "same", status: "completed", itemsView: "notLoaded", items: [] },
@@ -138,8 +138,15 @@ test("single pages reject duplicate rows, empty continuations, and non-advancing
     error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
   ));
 
+  // An empty page WITH a cursor is legitimate progress: a reader paging a native transcript by
+  // byte window can land entirely inside one oversized turn, which contains no turn boundary.
+  // Rejecting it made such a session unreadable rather than slow, and every walker over these
+  // pages is separately bounded, so a run of empty windows ends on its own.
   const empty = new ThreadHistoryReader(async () => ({ data: [], nextCursor: "more", backwardsCursor: null }));
-  await assert.rejects(empty.turnsPage("thread", { limit: 1, sortDirection: "desc", itemsView: "notLoaded" }));
+  assert.deepEqual(
+    (await empty.turnsPage("thread", { limit: 1, sortDirection: "desc", itemsView: "notLoaded" })).nextCursor,
+    "more",
+  );
 
   const stuck = new ThreadHistoryReader(async () => ({
     data: [{ id: "turn", status: "completed", itemsView: "notLoaded", items: [] }],
@@ -162,4 +169,40 @@ test("unsupported provider paging fails closed without falling back to a full th
     cursor: "not+a+base64url+cursor", limit: 1, sortDirection: "desc", itemsView: "notLoaded",
   }), (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY");
   assert.deepEqual(calls, ["thread/turns/list"]);
+});
+
+test("latestTurn steps over turn-less windows rather than reporting an empty thread", async () => {
+  // A reader paging a native transcript by byte window lands entirely inside one oversized turn
+  // and legitimately returns no turns for that window. Taking a single page would read that as
+  // "this thread has no turns" — a confident wrong answer feeding active-turn identity, recovery
+  // baselines and delivery boundaries, where a false empty baseline makes every historical turn a
+  // delivery candidate.
+  const cursors: Array<string | undefined> = [];
+  const walked = new ThreadHistoryReader(async (_method, params) => {
+    const cursor = (params as { cursor?: string }).cursor;
+    cursors.push(cursor);
+    if (cursor === undefined) return { data: [], nextCursor: "window-1", backwardsCursor: null };
+    if (cursor === "window-1") return { data: [], nextCursor: "window-2", backwardsCursor: null };
+    return {
+      data: [{ id: "newest", status: "completed", itemsView: "notLoaded", items: [] }],
+      nextCursor: null,
+      backwardsCursor: null,
+    };
+  });
+  assert.equal((await walked.latestTurn("thread"))?.id, "newest");
+  assert.deepEqual(cursors, [undefined, "window-1", "window-2"]);
+
+  // A thread that really has no turns still answers undefined, not an error.
+  const genuinelyEmpty = new ThreadHistoryReader(async () => ({ data: [], nextCursor: null, backwardsCursor: null }));
+  assert.equal(await genuinelyEmpty.latestTurn("thread"), undefined);
+
+  // And a walk that never finds one fails the way its callers already handle: the classified
+  // budget error they degrade on, never a silent empty answer.
+  let hops = 0;
+  const endless = new ThreadHistoryReader(async () => {
+    hops += 1;
+    return { data: [], nextCursor: `window-${hops}`, backwardsCursor: null };
+  });
+  await assert.rejects(endless.latestTurn("thread"), (error: unknown) => error instanceof HistoryScanBudgetExhaustedError);
+  assert.ok(hops <= 8, `the walk must stay bounded, took ${hops}`);
 });

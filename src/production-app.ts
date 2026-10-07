@@ -25,6 +25,8 @@ import { LocalAppServerRuntime } from "./app-server/local-runtime.ts";
 import { EndpointAuthenticationRequiredError, ManagedAppServerEndpoint } from "./app-server/managed-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import {
+  EMPTY_WINDOW_WALK,
+  HistoryScanBudgetExhaustedError,
   createHistoryScanBudget,
   isHistoryScanBudgetExhausted,
   type ThreadHistoryReader,
@@ -5120,11 +5122,24 @@ export async function buildProductionApp(
     lease?: EndpointWorkLease,
   ) {
     const reader = pool.historyReader(endpointId, lease);
-    const page = await reader.turnsPage(threadId, {
+    // Step over windows that carry no turn, for the same reason latestTurn does: reporting an
+    // empty thread here makes a start that DID dispatch look like one that never ran.
+    let page = await reader.turnsPage(threadId, {
       limit: recoveryTurnWindowLimit,
       sortDirection: "desc",
       itemsView: "notLoaded",
     });
+    // Shares latestTurn's ceiling, and counts the same way: at most EMPTY_WINDOW_WALK requests in
+    // total, so the two readers mean the same thing by the same number.
+    for (let walked = 1; walked < EMPTY_WINDOW_WALK && page.data.length === 0 && page.nextCursor !== null; walked += 1) {
+      page = await reader.turnsPage(threadId, {
+        cursor: page.nextCursor,
+        limit: recoveryTurnWindowLimit,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      });
+    }
+    if (page.data.length === 0 && page.nextCursor !== null) throw new HistoryScanBudgetExhaustedError();
     const turns = [...page.data].reverse();
     return {
       thread: {
