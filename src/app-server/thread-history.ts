@@ -56,7 +56,7 @@ export class HistoryScanBudgetExhaustedError extends AppError {
 // How many turn-less windows a single-page read will step over before giving up. A window is
 // turn-less only when one turn spans it entirely, so a handful of hops covers any turn a worker
 // realistically produces, and the ceiling keeps a pathological transcript bounded.
-const EMPTY_WINDOW_WALK = 8;
+export const EMPTY_WINDOW_WALK = 8;
 
 export class HistoryScanBudget {
   private pages = 0;

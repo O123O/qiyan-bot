@@ -25,6 +25,7 @@ import { LocalAppServerRuntime } from "./app-server/local-runtime.ts";
 import { EndpointAuthenticationRequiredError, ManagedAppServerEndpoint } from "./app-server/managed-endpoint.ts";
 import { AppServerPool } from "./app-server/pool.ts";
 import {
+  EMPTY_WINDOW_WALK,
   HistoryScanBudgetExhaustedError,
   createHistoryScanBudget,
   isHistoryScanBudgetExhausted,
@@ -5128,7 +5129,9 @@ export async function buildProductionApp(
       sortDirection: "desc",
       itemsView: "notLoaded",
     });
-    for (let walked = 0; walked < 8 && page.data.length === 0 && page.nextCursor !== null; walked += 1) {
+    // Shares latestTurn's ceiling, and counts the same way: at most EMPTY_WINDOW_WALK requests in
+    // total, so the two readers mean the same thing by the same number.
+    for (let walked = 1; walked < EMPTY_WINDOW_WALK && page.data.length === 0 && page.nextCursor !== null; walked += 1) {
       page = await reader.turnsPage(threadId, {
         cursor: page.nextCursor,
         limit: recoveryTurnWindowLimit,
