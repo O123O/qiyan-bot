@@ -7,6 +7,10 @@ import { LocalClaudeCommandRunner, claudePreviewFromRecords, CLAUDE_PREVIEW_MAX 
 
 function line(record: unknown): string { return `${JSON.stringify(record)}\n`; }
 
+async function appendTranscript(home: string, dirHash: string, id: string, records: unknown[]): Promise<void> {
+  await writeFile(join(home, ".claude", "projects", dirHash, `${id}.jsonl`), records.map(line).join(""), { flag: "a" });
+}
+
 async function writeTranscript(home: string, dirHash: string, id: string, records: unknown[]): Promise<void> {
   const dir = join(home, ".claude", "projects", dirHash);
   await mkdir(dir, { recursive: true });
@@ -65,4 +69,51 @@ test("transcript reads are positional, byte-bounded, and snapshot-pinned", async
     runner.readTranscriptChunk("large", "/work", { offset: 0, length: 128, expected: tail.snapshot }),
     /changed during bounded history paging/u,
   );
+});
+
+test("a descending window tolerates a transcript that grew, but never one that shrank or moved", async () => {
+  const home = await mkdtemp(join(tmpdir(), "claude-grow-"));
+  const record = (content: string) => ({ type: "user", cwd: "/work", promptSource: "sdk", promptId: "p", message: { content } });
+  await writeTranscript(home, "hash", "live", [record("x".repeat(60_000))]);
+  const runner = new LocalClaudeCommandRunner({ home });
+  const pinned = await runner.readTranscriptChunk("live", "/work", { offset: "tail", length: 128 });
+  assert.ok(pinned);
+
+  // A worker mid-turn appends several times a second, and one page of history is tens of these
+  // reads. Pinning size by equality aborted every one of them — on exactly the sessions worth
+  // reading. The bytes a descending window reads are strictly below the pinned size, so an
+  // append cannot have touched them.
+  await appendTranscript(home, "hash", "live", [record("appended while we were reading")]);
+  const grown = await runner.readTranscriptChunk("live", "/work", {
+    offset: 0, length: 128, expected: pinned.snapshot, allowGrowth: true,
+  });
+  assert.ok(grown);
+  assert.equal(grown.bytes.length, 128);
+  assert.ok(grown.snapshot.size > pinned.snapshot.size, "the chunk reports the fresh size, not the pinned one");
+
+  // Without opting in, growth still fails — the tail read relies on the size it was issued at.
+  await assert.rejects(
+    runner.readTranscriptChunk("live", "/work", { offset: 0, length: 128, expected: pinned.snapshot }),
+    /changed during bounded history paging/u,
+  );
+
+  // Shrinking really does invalidate every offset: a compaction rewrite or a cleared transcript.
+  await writeTranscript(home, "hash", "live", [record("tiny")]);
+  await assert.rejects(
+    runner.readTranscriptChunk("live", "/work", { offset: 0, length: 128, expected: pinned.snapshot, allowGrowth: true }),
+    /changed during bounded history paging/u,
+  );
+
+  // And identity is never relaxed, however much the file grew: a transcript replaced at the same
+  // path must not be read at an offset from the old one. (A rewrite in place keeps the inode and
+  // is legitimately allowed; only a genuinely different file is refused.)
+  await writeTranscript(home, "hash", "live", [record("y".repeat(200_000))]);
+  for (const identity of [{ inode: "999999999" }, { device: "999999999" }]) {
+    await assert.rejects(
+      runner.readTranscriptChunk("live", "/work", {
+        offset: 0, length: 128, expected: { ...pinned.snapshot, ...identity }, allowGrowth: true,
+      }),
+      /changed during bounded history paging/u,
+    );
+  }
 });

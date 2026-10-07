@@ -35,6 +35,19 @@ export interface ClaudeTranscriptChunkRequest {
   offset: number | "tail";
   length: number;
   expected?: ClaudeTranscriptSnapshot;
+  // Accept a transcript that has GROWN since the cursor was issued. Appends never move earlier
+  // bytes, and a descending window reads a range entirely below the size it was issued at, so
+  // growth cannot invalidate it. Equality instead aborted every read of a worker that was still
+  // writing -- which is most reads of an interesting session, since one page is tens of chunk
+  // reads and a worker mid-turn appends several times a second.
+  //
+  // Shrinkage still fails: a compaction rewrite or a cleared transcript really does invalidate
+  // every offset. Identity is never relaxed, so a replaced file is still caught.
+  //
+  // Only for descending, non-tail reads. A tail read derives its offset from the current size,
+  // and parseRecords decides whether an unterminated final record is complete by comparing
+  // against snapshot.size -- let that drift and a partial line reads as a whole one.
+  allowGrowth?: boolean;
 }
 
 export interface ClaudeCommandRunner {
@@ -91,7 +104,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
     }
     try {
       const before = transcriptSnapshot(await handle.stat());
-      requireExpectedSnapshot(before, request.expected);
+      requireExpectedSnapshot(before, request.expected, request.allowGrowth === true);
       const offset = request.offset === "tail"
         ? Math.max(0, before.size - request.length)
         : request.offset;
@@ -101,7 +114,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       const bytes = Buffer.alloc(Math.min(request.length, before.size - offset));
       const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset);
       const after = transcriptSnapshot(await handle.stat());
-      requireExpectedSnapshot(after, before);
+      requireExpectedSnapshot(after, before, request.allowGrowth === true);
       return { snapshot: before, offset, bytes: bytes.subarray(0, bytesRead) };
     } finally {
       await handle.close();
@@ -188,9 +201,14 @@ function transcriptSnapshot(value: { dev: number | bigint; ino: number | bigint;
   return { device: String(value.dev), inode: String(value.ino), size: value.size };
 }
 
-function requireExpectedSnapshot(actual: ClaudeTranscriptSnapshot, expected: ClaudeTranscriptSnapshot | undefined): void {
+function requireExpectedSnapshot(
+  actual: ClaudeTranscriptSnapshot,
+  expected: ClaudeTranscriptSnapshot | undefined,
+  allowGrowth = false,
+): void {
   if (!expected) return;
-  if (actual.device !== expected.device || actual.inode !== expected.inode || actual.size !== expected.size) {
+  const sizeChanged = allowGrowth ? actual.size < expected.size : actual.size !== expected.size;
+  if (actual.device !== expected.device || actual.inode !== expected.inode || sizeChanged) {
     throw new AppError("OPERATION_UNCERTAIN", "Claude transcript changed during bounded history paging");
   }
 }

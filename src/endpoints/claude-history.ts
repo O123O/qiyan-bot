@@ -107,6 +107,9 @@ export class ClaudeTranscriptHistory {
         offset,
         length: window.chunk.offset - offset,
         expected: window.chunk.snapshot,
+        // Extending backwards from a window we already hold: strictly older bytes, which an
+        // append cannot touch. Without this a worker writing during the walk aborted the page.
+        allowGrowth: true,
       });
       if (!prefix || prefix.offset !== offset || prefix.offset + prefix.bytes.length !== window.chunk.offset) {
         throw new AppError("OPERATION_UNCERTAIN", "Claude transcript paging returned a noncontiguous window");
@@ -282,7 +285,7 @@ export class ClaudeTranscriptHistory {
     return this.runner.readTranscriptChunk(threadId, cwd, {
       offset,
       length,
-      ...(cursor === undefined ? {} : { expected: cursor.snapshot }),
+      ...(cursor === undefined ? {} : { expected: cursor.snapshot, allowGrowth: direction === "desc" }),
     }).then((chunk) => chunk === undefined ? undefined : {
       chunk,
       leadingProbe: direction === "desc" && logicalStart > 0,
