@@ -35,6 +35,26 @@ export interface ClaudeTranscriptChunkRequest {
   offset: number | "tail";
   length: number;
   expected?: ClaudeTranscriptSnapshot;
+  // Accept a transcript that has GROWN since the cursor was issued. Appends never move earlier
+  // bytes, and a descending window reads a range entirely below the size it was issued at, so
+  // growth cannot invalidate it. Equality instead aborted every read of a worker that was still
+  // writing -- which is most reads of an interesting session, since one page is tens of chunk
+  // reads and a worker mid-turn appends several times a second.
+  //
+  // Shrinkage still fails: a compaction rewrite or a cleared transcript really does invalidate
+  // every offset. Identity is never relaxed, so a replaced file is still caught.
+  //
+  // What this gives up, named rather than discovered later: a truncate-then-regrow PAST the
+  // pinned size is no longer detected. An in-place rewrite keeps the inode, and a final size
+  // above the pinned one now passes both checks, so the walk would read old offsets against a new
+  // layout. A rename-into-place still changes the inode and is still caught, and a layout change
+  // almost certainly trips the leading probe into an invalid-record error rather than yielding
+  // plausible-looking turns — this pin was never a content hash.
+  //
+  // Only for descending, non-tail reads. A tail read derives its offset from the current size,
+  // and parseRecords decides whether an unterminated final record is complete by comparing
+  // against snapshot.size -- let that drift and a partial line reads as a whole one.
+  allowGrowth?: boolean;
 }
 
 export interface ClaudeCommandRunner {
@@ -90,8 +110,9 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       throw error;
     }
     try {
+      requireGrowthShape(request);
       const before = transcriptSnapshot(await handle.stat());
-      requireExpectedSnapshot(before, request.expected);
+      requireExpectedSnapshot(before, request.expected, request.allowGrowth === true);
       const offset = request.offset === "tail"
         ? Math.max(0, before.size - request.length)
         : request.offset;
@@ -101,7 +122,7 @@ export class LocalClaudeCommandRunner implements ClaudeCommandRunner {
       const bytes = Buffer.alloc(Math.min(request.length, before.size - offset));
       const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset);
       const after = transcriptSnapshot(await handle.stat());
-      requireExpectedSnapshot(after, before);
+      requireExpectedSnapshot(after, before, request.allowGrowth === true);
       return { snapshot: before, offset, bytes: bytes.subarray(0, bytesRead) };
     } finally {
       await handle.close();
@@ -188,9 +209,23 @@ function transcriptSnapshot(value: { dev: number | bigint; ino: number | bigint;
   return { device: String(value.dev), inode: String(value.ino), size: value.size };
 }
 
-function requireExpectedSnapshot(actual: ClaudeTranscriptSnapshot, expected: ClaudeTranscriptSnapshot | undefined): void {
+// A tail read derives its offset from the current size and decides whether an unterminated final
+// record is complete by comparing against it, so it can never tolerate growth. The opt-in is
+// documented as descending-and-not-tail; this makes it an invariant rather than a convention.
+export function requireGrowthShape(request: ClaudeTranscriptChunkRequest): void {
+  if (request.allowGrowth === true && request.offset === "tail") {
+    throw new AppError("CONFIGURATION_ERROR", "a tail transcript read cannot tolerate growth");
+  }
+}
+
+function requireExpectedSnapshot(
+  actual: ClaudeTranscriptSnapshot,
+  expected: ClaudeTranscriptSnapshot | undefined,
+  allowGrowth = false,
+): void {
   if (!expected) return;
-  if (actual.device !== expected.device || actual.inode !== expected.inode || actual.size !== expected.size) {
+  const sizeChanged = allowGrowth ? actual.size < expected.size : actual.size !== expected.size;
+  if (actual.device !== expected.device || actual.inode !== expected.inode || sizeChanged) {
     throw new AppError("OPERATION_UNCERTAIN", "Claude transcript changed during bounded history paging");
   }
 }
