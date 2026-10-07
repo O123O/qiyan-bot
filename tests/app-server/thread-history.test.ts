@@ -125,7 +125,7 @@ test("inclusive history recovery starts at the first observed managed turn", asy
   assert.deepEqual(suffix.turns.map((turn) => turn.id), ["newest", "first-managed"]);
 });
 
-test("single pages reject duplicate rows, empty continuations, and non-advancing cursors", async () => {
+test("single pages reject duplicate rows and non-advancing cursors, but allow an empty window", async () => {
   const duplicate = new ThreadHistoryReader(async () => ({
     data: [
       { id: "same", status: "completed", itemsView: "notLoaded", items: [] },
@@ -138,8 +138,15 @@ test("single pages reject duplicate rows, empty continuations, and non-advancing
     error instanceof AppError && error.code === "OPERATION_UNCERTAIN"
   ));
 
+  // An empty page WITH a cursor is legitimate progress: a reader paging a native transcript by
+  // byte window can land entirely inside one oversized turn, which contains no turn boundary.
+  // Rejecting it made such a session unreadable rather than slow, and every walker over these
+  // pages is separately bounded, so a run of empty windows ends on its own.
   const empty = new ThreadHistoryReader(async () => ({ data: [], nextCursor: "more", backwardsCursor: null }));
-  await assert.rejects(empty.turnsPage("thread", { limit: 1, sortDirection: "desc", itemsView: "notLoaded" }));
+  assert.deepEqual(
+    (await empty.turnsPage("thread", { limit: 1, sortDirection: "desc", itemsView: "notLoaded" })).nextCursor,
+    "more",
+  );
 
   const stuck = new ThreadHistoryReader(async () => ({
     data: [{ id: "turn", status: "completed", itemsView: "notLoaded", items: [] }],

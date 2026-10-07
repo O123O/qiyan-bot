@@ -317,7 +317,15 @@ function nullableCursor(value: unknown): string | null {
 }
 
 function validatePageProgress(page: ThreadHistoryPage<unknown>, requestCursor: string | undefined): void {
-  if (page.data.length === 0 && page.nextCursor !== null) throw uncertain("empty thread history page had a continuation cursor");
+  // An empty page carrying a cursor IS legitimate progress for a reader that pages by byte window
+  // over a native transcript: a window cut from inside one oversized turn contains no turn
+  // boundary at all, and the honest answer is "nothing here, keep going" rather than refusing the
+  // read and making that session unreadable for as long as the turn stays newest.
+  //
+  // What must never happen is a page that does not MOVE, and that is the check below. Every
+  // walker over these pages is independently bounded — HistoryScanBudget for the scans,
+  // READY_PAGE_WALK_BUDGET for the panel — so a run of empty pages costs a bounded amount and
+  // then ends, where before it ended the session.
   if (requestCursor !== undefined && page.nextCursor === requestCursor) throw uncertain("thread history cursor did not advance");
 }
 
