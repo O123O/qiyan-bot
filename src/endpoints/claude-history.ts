@@ -127,11 +127,28 @@ export class ClaudeTranscriptHistory {
     }
     const { chunk } = window;
     if (starts.length === 0) {
-      if ((params.sortDirection === "desc" && chunk.offset > 0)
-        || (params.sortDirection === "asc" && chunk.offset + chunk.bytes.length < chunk.snapshot.size)) {
-        throw new HistoryScanBudgetExhaustedError();
-      }
-      return { data: [], nextCursor: null, backwardsCursor: null };
+      // The window landed entirely INSIDE one turn. A single agent turn of a few hundred tool
+      // calls runs to megabytes, so no window cut from it contains the turn-start record that
+      // names it, and the backward extension above gives up at EXACT_TRANSFER_BYTES.
+      //
+      // Refusing the page here made that turn's whole session unreadable for as long as it stayed
+      // the newest one -- a cliff rather than a cost, and one that got worse the longer the turn
+      // ran. Report no turns for this window and hand back a cursor PAST it instead: the caller
+      // keeps paging, every other turn stays readable, and the oversized one simply contributes
+      // nothing until a window reaches its start.
+      const beyond = params.sortDirection === "desc"
+        ? (chunk.offset > 0 ? chunk.offset : undefined)
+        : (chunk.offset + chunk.bytes.length < chunk.snapshot.size
+          ? chunk.offset + chunk.bytes.length
+          : undefined);
+      return {
+        data: [],
+        nextCursor: beyond === undefined ? null : encodeCursor<TurnsCursor>({
+          v: 1, kind: "turns", threadId, direction: params.sortDirection,
+          boundary: beyond, snapshot: chunk.snapshot,
+        }),
+        backwardsCursor: null,
+      };
     }
     const reconstructed = reconstructClaudeThread({
       threadId,

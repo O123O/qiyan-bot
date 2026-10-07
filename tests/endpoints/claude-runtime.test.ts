@@ -2641,3 +2641,36 @@ test("the summary view keeps every user message, in the order they were written"
     ["userMessage", "agentMessage", "userMessage", "agentMessage"],
     "each message sits where it was written");
 });
+
+test("a turn larger than the exact window pages past itself instead of failing the read", async () => {
+  const claude = new FakeClaude();
+  const threadId = "oversized-turn";
+  const cwd = "/w";
+  // One agent turn of a few hundred tool calls really does run to megabytes. No window cut from
+  // inside it contains the turn-start record that names it, and the backward extension gives up
+  // at EXACT_TRANSFER_BYTES — so this turn's own start is unreachable from the tail.
+  claude.seed(threadId, [
+    { type: "user", cwd, promptSource: "sdk", uuid: "older", message: { role: "user", content: "older" } },
+    { type: "assistant", cwd, uuid: "older-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "older reply" }] } },
+    { type: "user", cwd, promptSource: "sdk", uuid: "huge", message: { role: "user", content: "huge" } },
+    ...Array.from({ length: 6 }, (_, index) => ({ type: "progress", uuid: `progress-${index}`, padding: "x".repeat(1024 * 1024) })),
+    { type: "assistant", cwd, uuid: "huge-agent", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "huge reply" }] } },
+  ]);
+
+  const history = new ClaudeTranscriptHistory(claude);
+  let page = await history.turnsPage(threadId, cwd, { limit: 5, sortDirection: "desc", itemsView: "summary" });
+  // The page is empty rather than an error, and it carries a cursor that moves past the window.
+  assert.deepEqual(page.data.map((turn) => turn.id), []);
+  assert.equal(typeof page.nextCursor, "string");
+
+  // Paging onwards reaches every turn the oversized one does not cover. Before this, the read
+  // threw and the session stayed unreadable for as long as that turn was the newest.
+  const seen: string[] = [];
+  for (let walked = 0; walked < 40 && page.nextCursor; walked += 1) {
+    page = await history.turnsPage(threadId, cwd, {
+      cursor: page.nextCursor, limit: 5, sortDirection: "desc", itemsView: "summary",
+    });
+    seen.push(...page.data.map((turn) => String(turn.id)));
+  }
+  assert.ok(seen.includes("older"), `expected the older turn to remain readable, saw ${JSON.stringify(seen)}`);
+});
