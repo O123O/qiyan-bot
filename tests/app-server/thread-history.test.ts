@@ -170,3 +170,39 @@ test("unsupported provider paging fails closed without falling back to a full th
   }), (error: unknown) => error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY");
   assert.deepEqual(calls, ["thread/turns/list"]);
 });
+
+test("latestTurn steps over turn-less windows rather than reporting an empty thread", async () => {
+  // A reader paging a native transcript by byte window lands entirely inside one oversized turn
+  // and legitimately returns no turns for that window. Taking a single page would read that as
+  // "this thread has no turns" — a confident wrong answer feeding active-turn identity, recovery
+  // baselines and delivery boundaries, where a false empty baseline makes every historical turn a
+  // delivery candidate.
+  const cursors: Array<string | undefined> = [];
+  const walked = new ThreadHistoryReader(async (_method, params) => {
+    const cursor = (params as { cursor?: string }).cursor;
+    cursors.push(cursor);
+    if (cursor === undefined) return { data: [], nextCursor: "window-1", backwardsCursor: null };
+    if (cursor === "window-1") return { data: [], nextCursor: "window-2", backwardsCursor: null };
+    return {
+      data: [{ id: "newest", status: "completed", itemsView: "notLoaded", items: [] }],
+      nextCursor: null,
+      backwardsCursor: null,
+    };
+  });
+  assert.equal((await walked.latestTurn("thread"))?.id, "newest");
+  assert.deepEqual(cursors, [undefined, "window-1", "window-2"]);
+
+  // A thread that really has no turns still answers undefined, not an error.
+  const genuinelyEmpty = new ThreadHistoryReader(async () => ({ data: [], nextCursor: null, backwardsCursor: null }));
+  assert.equal(await genuinelyEmpty.latestTurn("thread"), undefined);
+
+  // And a walk that never finds one fails the way its callers already handle: the classified
+  // budget error they degrade on, never a silent empty answer.
+  let hops = 0;
+  const endless = new ThreadHistoryReader(async () => {
+    hops += 1;
+    return { data: [], nextCursor: `window-${hops}`, backwardsCursor: null };
+  });
+  await assert.rejects(endless.latestTurn("thread"), (error: unknown) => error instanceof HistoryScanBudgetExhaustedError);
+  assert.ok(hops <= 8, `the walk must stay bounded, took ${hops}`);
+});
