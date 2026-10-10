@@ -53,6 +53,9 @@ interface ThreadState {
   // folded into that turn by reconstruction, so it is the only identity live and history
   // agree on for it.
   lastTurnId?: string;
+  // Whether the one-time seed from disk has been attempted, so a thread with no findable turn
+  // does not repeat the walk on every page.
+  lastTurnIdSeeded?: boolean;
   terminalTurns: Set<string>;            // turn ids known interrupted/failed
   // Assistant text this endpoint streamed, per turn, in the exact shape the terminal
   // notification carries. See LIVE_TURN_ITEM_BYTES for why it is kept at all.
@@ -602,6 +605,34 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     return state;
   }
 
+  // The newest turn the transcript knows, found once and remembered. A single window answers for
+  // an ordinary session; one whose newest turn is enormous needs the walk, which is the same walk
+  // the reader would have done on every page anyway. Paying it once per thread turns every later
+  // page into a single window read.
+  //
+  // Bounded, and failure is silent: without an id the reader behaves exactly as it did before.
+  private async seedLastTurnId(threadId: string, state: ThreadState): Promise<string | undefined> {
+    if (state.lastTurnIdSeeded) return undefined;
+    state.lastTurnIdSeeded = true;
+    let cursor: string | undefined;
+    for (let page = 0; page < 4; page += 1) {
+      const probe = await this.history.turnsPage(threadId, state.cwd, {
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: 1,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      }).catch(() => undefined);
+      const found = probe?.data[0]?.id;
+      if (found !== undefined) {
+        state.lastTurnId = found;
+        return found;
+      }
+      if (!probe?.nextCursor) return undefined;
+      cursor = probe.nextCursor;
+    }
+    return undefined;
+  }
+
   private async loadState(threadId: string, recoveryCwd?: string): Promise<ThreadState> {
     const cwd = await this.history.sessionCwd(threadId, "");
     if (cwd === undefined && recoveryCwd === undefined) throw noRollout(threadId);
@@ -675,7 +706,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // Who owns tail records that carry no turn start of their own. This is the same expression
     // the live stream attributes by, so history and live agree on identity by construction —
     // which is what lets the panel merge them instead of rendering both.
-    const tailTurnId = state.running[0] ?? state.lastTurnId;
+    //
+    // After a restart neither half is known: `lastTurnId` is only ever set by watching a turn
+    // start or settle in THIS process, and nothing seeds it from disk. That is exactly when the
+    // panel is opened, so without a seed the attribution never engages and the reader falls back
+    // to showing the owning turn's oldest messages.
+    const tailTurnId = state.running[0] ?? state.lastTurnId
+      ?? (sortDirection === "desc" ? await this.seedLastTurnId(threadId, state) : undefined);
     const page = await this.history.turnsPage(threadId, state.cwd, {
       ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
       limit,
