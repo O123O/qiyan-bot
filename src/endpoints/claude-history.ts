@@ -77,7 +77,15 @@ export class ClaudeTranscriptHistory {
   async turnsPage(
     threadId: string,
     cwd: string,
-    params: { cursor?: string; limit: number; sortDirection: "asc" | "desc"; itemsView: ThreadItemsView },
+    params: {
+      cursor?: string; limit: number; sortDirection: "asc" | "desc"; itemsView: ThreadItemsView;
+      // The turn that owns records at the tail which carry no turn-start of their own. Background
+      // work and subagent output append under a turn that has already finished its reply, so the
+      // newest bytes of a transcript routinely belong to a turn whose start is far behind them.
+      // Supplied by the runtime, which knows the id from its own state, and only meaningful for a
+      // descending read.
+      tailTurnId?: string;
+    },
   ): Promise<ThreadHistoryPage<ThreadHistoryTurn>> {
     requireLimit(params.limit);
     const cursor = params.cursor === undefined
@@ -92,7 +100,10 @@ export class ClaudeTranscriptHistory {
       const id = claudeTurnIdFromRecord(record.value);
       return id === undefined ? [] : [{ id, recordIndex: index, offset: record.offset }];
     });
-    while (params.sortDirection === "desc" && starts.length === 0 && window.chunk.offset > 0
+    // The backward extension exists only to find an id. With `tailTurnId` we already have it, so
+    // a panel read of a session in this state costs one 256 KB window instead of sixteen.
+    const huntForStart = params.sortDirection === "desc" && params.tailTurnId === undefined;
+    while (huntForStart && starts.length === 0 && window.chunk.offset > 0
       && window.chunk.bytes.length < EXACT_TRANSFER_BYTES) {
       const remaining = EXACT_TRANSFER_BYTES - window.chunk.bytes.length;
       const logicalLength = Math.min(
@@ -147,6 +158,32 @@ export class ClaudeTranscriptHistory {
         return { data: [], nextCursor: null, backwardsCursor: null };
       }
       if (chunk.offset === 0) return { data: [], nextCursor: null, backwardsCursor: null };
+      // Attribute the window to the turn the runtime says owns it. Without this the newest bytes
+      // of a transcript are unreadable whenever the owning turn's start is further back than the
+      // extension ceiling — a fixed 4 MB of staleness, not a function of how old the turn is.
+      //
+      // Status is `completed`, never in-progress: the runtime rewrites the status of turns it
+      // knows are running, and claiming otherwise here would let a finished turn read as
+      // permanently working and let `latestTurn` adopt it as the session's active turn.
+      if (params.tailTurnId !== undefined && records.length > 0) {
+        const tail = reconstructClaudeThread({
+          threadId,
+          cwd,
+          records: records.map((record) => record.value),
+          tailTurnId: params.tailTurnId,
+        }).turns.map((turn) => asHistoryTurn(turn));
+        const owned = tail.filter((turn) => turn.id === params.tailTurnId);
+        if (owned.length > 0) {
+          return {
+            data: owned.map((turn) => projectTurn({ ...turn, status: "completed" }, params.itemsView)),
+            nextCursor: encodeCursor<TurnsCursor>({
+              v: 1, kind: "turns", threadId, direction: "desc",
+              boundary: records[0]!.offset, snapshot: chunk.snapshot,
+            }),
+            backwardsCursor: null,
+          };
+        }
+      }
       // The boundary has to be a RECORD start, not an arithmetic byte position. `chunk.offset` is
       // `logicalStart - 1`, so the record straddling it would be dropped from this window as the
       // leading probe and excluded from the next one — lost from both, silently, and if it
