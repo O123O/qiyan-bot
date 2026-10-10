@@ -75,6 +75,14 @@ export interface ReconstructClaudeThreadParams {
   // executing before `claude` flushes its user row, so disk reconstruction alone can
   // read `idle`; overlaying this forces the thread `active`.
   runningTurnId?: string;
+  // Opens a turn under this id for records that arrive BEFORE any turn start. A window cut from
+  // the tail of a transcript is full of them: background work and subagent output append under a
+  // turn whose own start record is far behind the window. Without an owner those records are
+  // dropped, which is what left a panel showing nothing newer than the extension ceiling.
+  //
+  // The id must be the one the live stream uses for the same records, or the Web UI renders them
+  // twice instead of merging; the runtime supplies it from its own state for exactly that reason.
+  tailTurnId?: string;
 }
 
 interface TurnAccumulator {
@@ -84,7 +92,17 @@ interface TurnAccumulator {
 
 export function reconstructClaudeThread(params: ReconstructClaudeThreadParams): ClaudeThreadView {
   const turns: ClaudeThreadTurn[] = [];
-  let current: TurnAccumulator | undefined;
+  let current: TurnAccumulator | undefined = params.tailTurnId === undefined ? undefined : {
+    turn: {
+      id: params.tailTurnId,
+      status: "completed",
+      itemsView: "full",
+      items: [],
+      startedAt: null,
+      completedAt: null,
+    },
+    terminal: false,
+  };
   let assistantRecordSeq = 0;
 
   const finalize = (accumulator: TurnAccumulator | undefined): void => {

@@ -672,11 +672,16 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     const limit = requirePositiveInteger(params.limit, "limit");
     const sortDirection = requireDirection(params.sortDirection);
     const itemsView = requireItemsView(params.itemsView);
+    // Who owns tail records that carry no turn start of their own. This is the same expression
+    // the live stream attributes by, so history and live agree on identity by construction —
+    // which is what lets the panel merge them instead of rendering both.
+    const tailTurnId = state.running[0] ?? state.lastTurnId;
     const page = await this.history.turnsPage(threadId, state.cwd, {
       ...(typeof params.cursor === "string" ? { cursor: params.cursor } : {}),
       limit,
       sortDirection,
       itemsView,
+      ...(sortDirection === "desc" && tailTurnId ? { tailTurnId } : {}),
     });
     if (state.running.length === 0) return page;
     // Every accepted turn is reported non-terminal, because reconstruction derives a trailing
