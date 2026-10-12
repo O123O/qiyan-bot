@@ -184,8 +184,10 @@ re-pinning it to a new fixed list.
 
 And state the cross-version rule, because two instances share this ledger and deploys here are not
 atomic: a row written by a new build and reconciled by an old one hits the old allowlist and strands.
-The rollout is therefore ordered — every instance reading this ledger must carry the tolerant parse
-*before* any instance writes the new fields. Until that is true, the new fields are not written.
+The rollout is therefore ordered, and only two releases can enforce it — a feature flag on shared
+NFS state cannot give you the ordering. Release N ships the tolerant parse and the extended sets and
+writes nothing new. Release N+1 writes `destroyed` and `forced`. Until N is everywhere, the new
+fields are not written.
 
 This is what makes "no uncertain status" true rather than relocated. If the channel dies between
 destroy and start, the last checkpoint today is `runtime_stopped` — indistinguishable from an
