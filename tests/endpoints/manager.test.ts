@@ -1042,15 +1042,17 @@ test("forced recovery destroys over an identity read that throws", async () => {
 test("forced recovery of a row that carries no identity starts a replacement", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
-  const before = remote.starts;
+  const generation = value.manager.endpointGeneration("devbox").generation;
   const checkpoints: unknown[] = [];
 
   await value.manager.recoverRestart("devbox", "runtime_stopped", undefined,
     (checkpoint) => checkpoints.push(checkpoint), true);
 
   assert.equal(value.manager.endpointGeneration("devbox").endpoint.state, "ready");
-  assert.ok((value.manager.endpointGeneration("devbox").endpoint as FakeEndpoint).starts >= before);
-  assert.deepEqual(checkpoints.map((checkpoint) => (checkpoint as { phase: string }).phase), ["runtime_started"]);
+  assert.ok(value.manager.endpointGeneration("devbox").generation > generation, "the recovered endpoint was republished");
+  // The row carried no identity, so the one it writes back carries none either -- and writing it
+  // at all is what settles the row instead of leaving it to fence the next restart.
+  assert.deepEqual(checkpoints, [{ phase: "runtime_started", identity: await remote.runtimeIdentity() }]);
 });
 
 // The local endpoint is neither remote nor daemonless, and nothing covered it. A dropped local

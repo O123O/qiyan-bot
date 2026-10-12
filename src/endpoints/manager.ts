@@ -509,7 +509,12 @@ export class EndpointManager {
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        if (!force && !sameRuntimeIdentity(actual, expectedIdentity)) {
+        // `expectedIdentity &&` is load-bearing, not defensive. This branch asks "did the identity
+        // CHANGE under us", and an absent expected identity means "we never knew one", which is a
+        // different thing: without the guard such a row would take this branch, re-ready the same
+        // runtime, find the replacement identical to it, and report `ready` having restarted
+        // nothing. It belongs on the normal destroy-and-replace path below.
+        if (!force && expectedIdentity && !sameRuntimeIdentity(actual, expectedIdentity)) {
           // A reconnect can create and publish the replacement after the old runtime exits but
           // before the restart operation checkpoints runtime_stopped. A different attested
           // identity is the restart's desired postcondition, not an ownership conflict.
