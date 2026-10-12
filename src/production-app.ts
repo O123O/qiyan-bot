@@ -5428,9 +5428,12 @@ export async function buildProductionApp(
             const phase = recoverablePhase(saved.phase);
             if (phase === "runtime_started") return;
             await endpointManager.recoverDisconnect(endpointId, phase, saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
           }
-          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          // Force lives on the row's own args, so the retry of a forced action is itself forced.
+          // Retrying unforced refuses again on the same unprovable idle and leaves the row
+          // unresolved -- and that row is what fences the next lifecycle action on the endpoint.
+          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           if (args.endpoint === assistantEndpoint.id) {
@@ -5443,8 +5446,8 @@ export async function buildProductionApp(
             const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
             if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
             if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
-            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
+            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
             await resumeManagedEndpoint(endpointId, true);
             await succeedRecovered(operation, { endpoint: endpointId, state: "ready" },
               () => prepareToolSystemNotice(operation.id, operation.attemptId, `endpoint ${endpointId} restarted`));

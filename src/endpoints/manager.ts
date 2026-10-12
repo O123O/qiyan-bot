@@ -315,11 +315,17 @@ export class EndpointManager {
     phase: "draining" | "idle_proven" | "runtime_stopped",
     expectedIdentity: RuntimeIdentity | undefined,
     checkpoint?: (value: unknown) => void,
+    force = false,
   ): Promise<void> {
     const record = this.record(id);
+    // Force is on the row, so the retry of a forced action is itself forced. Retrying unforced
+    // refuses again on the same unprovable idle, leaves the row unresolved, and the row then
+    // fences the next lifecycle action -- the wedge, rebuilt by its own recovery.
+    if (force) record.gate.discardLiveWork();
     return this.enqueueLifecycle(id, record, async () => {
       if (record.gate.desiredState === "disconnected") return;
       this.cancelReconnect(record);
+      if (force) record.gate.discardLiveWork();
       const drain = await record.gate.beginDrain();
       let proofEndpoint: ManagedAppServerEndpoint | undefined;
       let startedForProof = false;
@@ -332,21 +338,31 @@ export class EndpointManager {
         candidateWasNew = record.endpoint !== candidate.endpoint;
         const actual = await candidate.endpoint.runtimeIdentity();
         if (!actual) {
-          await this.requireClosed(candidate.endpoint, id);
+          // Nothing left to signal, so there is nothing to destroy by identity. Under force the
+          // adapter is abandoned rather than politely closed: an endpoint whose channel is dead is
+          // exactly the one that cannot finish a close.
+          if (force) await this.discardEndpoint(candidate.endpoint);
+          else await this.requireClosed(candidate.endpoint, id);
+          if (force) this.reportRuntimeDestroyed(id);
           if (phase !== "runtime_stopped") checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           drain.disconnect();
           return;
         }
-        if (!sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        // The identity on the row is what the attempt meant to destroy. A forced action destroys
+        // whatever occupies this endpoint's runtime directory and tmux session instead, so a
+        // changed identity is not a reason to stop -- it is the same instruction aimed at whatever
+        // is there now.
+        if (!force && !sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
         let endpoint = candidate.endpoint;
-        if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
+        if (!force && (await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(candidate);
           startedForProof = true;
         }
         proofEndpoint = endpoint;
-        await this.requireManagedThreadsIdle(id, endpoint);
-        await endpoint.shutdownRuntime(actual);
+        await this.requireManagedThreadsIdle(id, endpoint, force);
+        await endpoint.shutdownRuntime(actual, force);
         runtimeStopped = true;
+        if (force) this.reportRuntimeDestroyed(id);
         checkpoint?.({ phase: "runtime_stopped", identity: actual });
         drain.disconnect();
       } catch (error) {
@@ -364,11 +380,17 @@ export class EndpointManager {
     phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
     expectedIdentity: RuntimeIdentity | undefined,
     checkpoint?: (value: unknown) => void,
+    force = false,
   ): Promise<void> {
     const record = this.record(id);
+    // Force is on the row, so the retry of a forced restart is itself forced. Retrying unforced
+    // refuses again on the same unprovable idle, leaves the row unresolved, and the row then
+    // fences the next restart -- the wedge, rebuilt by its own recovery.
+    if (force) record.gate.discardLiveWork();
     return this.enqueueLifecycle(id, record, async () => {
       this.cancelReconnect(record);
       if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
+      if (force) record.gate.discardLiveWork();
       const replacement = phase === "runtime_started" || phase === "runtime_stopped"
         ? record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id)
         : await this.prepareCandidate(id);
@@ -390,8 +412,8 @@ export class EndpointManager {
           }
           const identity = phase === "runtime_started"
             ? await this.requireRuntimeIdentity(replacementEndpoint)
-            : await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity!);
-          if (phase === "runtime_started" && !sameRuntimeIdentity(identity, expectedIdentity!)) {
+            : await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity!, force);
+          if (!force && phase === "runtime_started" && !sameRuntimeIdentity(identity, expectedIdentity!)) {
             throw new AppError("OPERATION_UNCERTAIN", `checkpointed replacement runtime identity changed: ${id}`);
           }
           if (phase === "runtime_stopped") checkpoint?.({ phase: "runtime_started", identity });
@@ -400,10 +422,13 @@ export class EndpointManager {
         }
         const target = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
         if (target.endpoint.daemonless) {
-          // No runtime identity to reconcile: close the old adapter, re-ready a fresh one.
-          await this.requireClosed(target.endpoint, id);
+          // No runtime identity to reconcile: close the old adapter, re-ready a fresh one. Under
+          // force the old adapter is abandoned instead -- a dead channel cannot finish a close.
+          if (force) await this.discardEndpoint(target.endpoint);
+          else await this.requireClosed(target.endpoint, id);
           checkpoint?.({ phase: "runtime_stopped", identity: undefined });
           runtimeStopped = true;
+          if (force) this.reportRuntimeDestroyed(id);
           const started = await this.startCandidate(replacement);
           replacementEndpoint = started;
           checkpoint?.({ phase: "runtime_started", identity: undefined });
@@ -412,17 +437,22 @@ export class EndpointManager {
         }
         const actual = await target.endpoint.runtimeIdentity();
         if (!actual) {
-          await this.requireClosed(target.endpoint, id);
+          // Nothing left to signal, so there is nothing to destroy by identity. Under force the
+          // adapter is abandoned rather than politely closed: an endpoint whose channel is dead is
+          // exactly the one that cannot finish a close.
+          if (force) await this.discardEndpoint(target.endpoint);
+          else await this.requireClosed(target.endpoint, id);
           checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           runtimeStopped = true;
+          if (force) this.reportRuntimeDestroyed(id);
           const started = await this.startCandidate(replacement);
           replacementEndpoint = started;
-          const identity = await this.requireReplacementIdentity(started, expectedIdentity!);
+          const identity = await this.requireReplacementIdentity(started, expectedIdentity!, force);
           checkpoint?.({ phase: "runtime_started", identity });
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        if (!sameRuntimeIdentity(actual, expectedIdentity!)) {
+        if (!force && !sameRuntimeIdentity(actual, expectedIdentity!)) {
           // A reconnect can create and publish the replacement after the old runtime exits but
           // before the restart operation checkpoints runtime_stopped. A different attested
           // identity is the restart's desired postcondition, not an ownership conflict.
@@ -439,18 +469,19 @@ export class EndpointManager {
           return;
         }
         let endpoint = target.endpoint;
-        if ((await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
+        if (!force && (await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(target);
           proofStarted = true;
         }
         proofEndpoint = endpoint;
-        await this.requireManagedThreadsIdle(id, endpoint);
-        await endpoint.shutdownRuntime(actual);
+        await this.requireManagedThreadsIdle(id, endpoint, force);
+        await endpoint.shutdownRuntime(actual, force);
         runtimeStopped = true;
+        if (force) this.reportRuntimeDestroyed(id);
         checkpoint?.({ phase: "runtime_stopped", identity: actual });
         const started = await this.startCandidate(replacement);
         replacementEndpoint = started;
-        const identity = await this.requireReplacementIdentity(started, expectedIdentity!);
+        const identity = await this.requireReplacementIdentity(started, expectedIdentity!, force);
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, started);
       } catch (error) {

@@ -1568,6 +1568,42 @@ test("a forced stop reports the destroy before any replacement publishes", async
   assert.deepEqual(events.filter((event) => event.startsWith("destroyed")), ["destroyed:devbox"]);
 });
 
+// A forced restart that crashes mid-flight is retried from its row. Retrying it unforced refuses
+// again on the same unprovable idle, leaves the row unresolved, and that row then fences every
+// later restart -- the wedge, rebuilt by its own recovery.
+test("recovery of a forced restart is itself forced", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    // The status that can never be read: the endpoint that most needs restarting, and the one
+    // every proof refuses to touch.
+    managedThreadState: (_id, _threadId, generation) => ({ availability: "ready", status: "unknown", endpointGeneration: generation }),
+  });
+
+  await manager.ensureReady("devbox");
+  const stopped = await made.at(-1)!.runtimeIdentity();
+
+  await assert.rejects(manager.recoverRestart("devbox", "draining", stopped), (error: unknown) =>
+    error instanceof AppError && /prove managed thread idle/u.test(error.message));
+
+  await manager.recoverRestart("devbox", "draining", stopped, undefined, true);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
+  assert.notDeepEqual(await manager.endpointGeneration("devbox").endpoint.runtimeIdentity(), stopped);
+});
+
 test("a forced restart destroys a runtime whose identity cannot be proven", async () => {
   const local = new FakeEndpoint("local");
   const made: FakeEndpoint[] = [];
