@@ -1345,3 +1345,96 @@ test("inspect reports a redirected socket, which only a later channel can see", 
   await symlink(target, `${runtimeDir}/app-server.sock`);
   assert.equal((await inspect()).socketRedirected, undefined, "a link that resolves is not a redirect");
 });
+
+test("a forced stop destroys by location, reports what it killed, and never refuses", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-${runtimeDir.slice(-24)}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  const stop = async (extra: Record<string, unknown>) => {
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit", ...extra }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", argument],
+      { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{
+      stopped: boolean; destroyedIdentity: unknown; survivors?: unknown; serverSurvived?: boolean;
+    }>(run.stdout, "stop");
+  };
+  const identityOf = (pid: number, token: string) => {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    return { kind: "ssh", token, pid, linuxStartTime: fields[19], processGroupId: Number(fields[2]) };
+  };
+
+  // 1. No identity at all — the case force exists for, and the one an identity-addressed stop can
+  // only answer "I don't know" to.
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  const bare = await stop({ force: true });
+  assert.equal(bare.stopped, true);
+  assert.equal(bare.destroyedIdentity, null);
+  // Never 0: there was nothing to signal from, and a zero would read as "clean" when it means
+  // "did not look".
+  assert.match(String(bare.survivors), /unknown/u);
+  assert.equal(await tmux("has-session", "-t", session).then(() => true).catch(() => false), false, "the session is gone");
+
+  // 2. An identity that does NOT match what the caller expects. Unforced this is
+  // "runtime identity cannot be proven"; forced it is simply destroyed, and reported.
+  const victim = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: "c".repeat(32) } });
+  t.after(() => { try { process.kill(victim.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const identity = identityOf(victim.pid!, "c".repeat(32));
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify(identity), { mode: 0o600 });
+  await writeFile(`${runtimeDir}/app-server.token`, `${"d".repeat(64)}\n`, { mode: 0o600 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+
+  const mismatched = { ...identity, token: "f".repeat(32) };
+  await assert.rejects(stop({ expected: mismatched }), /identity cannot be proven/u);
+  const destroyed = await stop({ force: true, expected: mismatched });
+  assert.equal(destroyed.stopped, true);
+  assert.deepEqual(destroyed.destroyedIdentity, identity, "a force says what it killed");
+  for (const file of ["identity.json", "app-server.token", "app-server.sock"]) {
+    assert.equal(await stat(`${runtimeDir}/${file}`).then(() => true).catch(() => false), false, `${file} removed`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(await runBoundedProcess("sh", ["-c", `kill -0 ${victim.pid} 2>/dev/null && echo alive || echo gone`],
+    { timeoutMs: 5_000, maxOutputBytes: 1024 }).then((r) => r.stdout.toString().trim()), "gone");
+});
+
+test("a forced stop never signals a process group carrying a foreign token", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+
+  // A process that is NOT ours, recorded under a pgid we claim. Force is permission to destroy this
+  // endpoint's runtime, never permission to signal strangers — on a login node with hundreds of
+  // users a recycled pgid is the difference between a reclaim and an outage.
+  const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: "e".repeat(32) } });
+  t.after(() => { try { process.kill(stranger.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const raw = readFileSync(`/proc/${stranger.pid}/stat`, "utf8");
+  const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+  await writeFile(`${runtimeDir}/identity.json`, JSON.stringify({
+    kind: "ssh", token: "a".repeat(32), pid: stranger.pid, linuxStartTime: fields[19], processGroupId: Number(fields[2]),
+  }), { mode: 0o600 });
+
+  const argument = encodeRemoteArgument(JSON.stringify({
+    runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit", force: true,
+  }));
+  await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop", argument],
+    { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(await runBoundedProcess("sh", ["-c", `kill -0 ${stranger.pid} 2>/dev/null && echo alive || echo gone`],
+    { timeoutMs: 5_000, maxOutputBytes: 1024 }).then((r) => r.stdout.toString().trim()), "alive",
+    "a token we do not own is never signalled, even under force");
+});
