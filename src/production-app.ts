@@ -5490,18 +5490,21 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "disconnect_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
+          // Off a row, not off the parsed tool schema, and two builds share this ledger. `=== true`
+          // keeps a string "false" or a stray 0 from forcing silently.
+          const forced = args.force === true;
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
           if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
           if (saved) {
             const phase = recoverablePhase(saved.phase);
             if (phase === "runtime_started") return;
             await endpointManager.recoverDisconnect(endpointId, phase, saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
           }
           // Force lives on the row's own args, so the retry of a forced action is itself forced.
           // Retrying unforced refuses again on the same unprovable idle and leaves the row
           // unresolved -- and that row is what fences the next lifecycle action on the endpoint.
-          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
+          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           if (args.endpoint === assistantEndpoint.id) {
@@ -5511,11 +5514,13 @@ export async function buildProductionApp(
             } else failRecoveredNoEffect(operation.id, "assistant restart target was not durably scheduled exactly");
           } else {
             const endpointId = projectEndpoint(args.endpoint);
+            // See the disconnect branch: this comes off the ledger, not off a parsed schema.
+            const forced = args.force === true;
             const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
             if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
             if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
-            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
+            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
             // Deliberately NOT isolated the way the tool handler isolates it. Here a thrown
             // resume leaves the row recoverable, and the next reconciliation pass retries it --
             // which is how unrecovered sessions eventually come back without a human. Succeeding

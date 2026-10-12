@@ -75,12 +75,21 @@ export class LocalAppServerRuntime implements AppServerRuntimeService {
 
   async classifyLoss(): Promise<EndpointLossKind> { return "runtime-lost"; }
 
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<undefined> {
-    const actual = this.identity ?? this.lastIdentity;
-    if (!actual || !sameLocalIdentity(actual, expected)) {
-      throw new AppError("OPERATION_CONFLICT", "local App Server runtime identity changed before shutdown");
+  async shutdownRuntime(expected: RuntimeIdentity | undefined, force = false): Promise<undefined> {
+    // The identity proof guards against closing a DIFFERENT generation's connection. Under force
+    // there is nothing for it to guard: closing a local connection kills no process -- the child
+    // is this process's own and goes with it -- so there is no foreign thing a mismatch could
+    // protect. Proving it anyway is how a forced restart of the local endpoint refused in exactly
+    // the state it is reached for: a dropped connection clears `identity` and keeps `lastIdentity`,
+    // so there is no identity to pass and none to compare against.
+    if (!force) {
+      const actual = this.identity ?? this.lastIdentity;
+      if (!actual || !expected || !sameLocalIdentity(actual, expected)) {
+        throw new AppError("OPERATION_CONFLICT", "local App Server runtime identity changed before shutdown");
+      }
     }
     await this.active?.close();
+    return undefined;
   }
 
   async confirm(connection: LocalConnection, child: ChildProcessWithoutNullStreams, result: AppServerInitializeResult): Promise<AppServerConnectionIdentity> {

@@ -298,6 +298,7 @@ export class EndpointManager {
     const drain = await record.gate.beginDrain({ discardLive: force });
     let target: ShutdownTarget | undefined;
     let runtimeStopped = false;
+    let spent: EndpointLifecycleOutcome = {};
     try {
       target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
@@ -310,15 +311,19 @@ export class EndpointManager {
       // runtime is gone either way, so whatever is still counted against it is counted against
       // nothing.
       if (force) this.reportRuntimeDestroyed(endpointId);
+      spent = { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
+      // Not the last thing that can throw: `checkpoint` is the ledger write, which raises when its
+      // row has been settled by a peer or terminalized under it. A destroy that happened must still
+      // be accounted for when that is what fails.
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       drain.disconnect();
-      return { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
+      return spent;
     } catch (error) {
       if (!runtimeStopped && target?.preparedHere && target.endpoint !== record.endpoint) {
         await this.discardEndpoint(target.endpoint);
       }
       this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
-      throw error;
+      throw this.withDestroySpend(error, spent);
     }
   }
 
@@ -358,7 +363,13 @@ export class EndpointManager {
         const candidate = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
         candidateEndpoint = candidate.endpoint;
         candidateWasNew = record.endpoint !== candidate.endpoint;
-        const actual = await candidate.endpoint.runtimeIdentity();
+        // Swallowed under force for the same reason shutdownTarget swallows it: an SSH runtime that
+        // is unhealthy with no readable identity THROWS here rather than returning undefined, and
+        // that throw is `OPERATION_UNCERTAIN` -- the one word the forced contract forbids, raised
+        // before the branch below that knows how to destroy without an identity is ever reached.
+        const actual = force
+          ? await candidate.endpoint.runtimeIdentity().catch(() => undefined)
+          : await candidate.endpoint.runtimeIdentity();
         if (!actual) {
           // Nothing left to signal, so there is nothing to destroy by identity -- but under force
           // the destroy still has to be ISSUED, by location, or the tmux session and socket
@@ -459,7 +470,11 @@ export class EndpointManager {
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        const actual = await target.endpoint.runtimeIdentity();
+        // See the sibling read in recoverDisconnect: under force an unreadable identity is a state
+        // to destroy from, not an error to report.
+        const actual = force
+          ? await target.endpoint.runtimeIdentity().catch(() => undefined)
+          : await target.endpoint.runtimeIdentity();
         if (!actual) {
           // Nothing left to signal, so there is nothing to destroy by identity -- but under force
           // the destroy still has to be ISSUED, by location, or the tmux session and socket
@@ -471,7 +486,15 @@ export class EndpointManager {
           if (force) this.reportRuntimeDestroyed(id);
           const started = await this.startCandidate(replacement);
           replacementEndpoint = started;
-          const identity = await this.requireReplacementIdentity(started, expectedIdentity!, force);
+          // There may be no expected identity to be distinct FROM: a forced attempt that could not
+          // read one checkpoints `draining` without it, and this branch is now reachable in that
+          // state. With nothing to compare against there is nothing to prove, so the replacement's
+          // identity is read for the record and NOT required -- requiring it would reintroduce the
+          // `runtime identity is unavailable` refusal on the exact host force was reached for, one
+          // step later. That the replacement started and is ready has already been established.
+          const identity = expectedIdentity
+            ? await this.requireReplacementIdentity(started, expectedIdentity, force)
+            : await started.runtimeIdentity().catch(() => undefined);
           checkpoint?.({ phase: "runtime_started", identity });
           this.publishAfterReopen(record, drain, started);
           return;
@@ -968,7 +991,7 @@ export class EndpointManager {
       // ours to clean up if the action fails, and reopenAfterLifecycleFailure only republishes a
       // started one. Saying so lets the caller discard it instead of leaking an SSH adapter per
       // failed forced restart.
-      return { endpoint, ...(identity ? { identity } : {}), startedForProof: false, preparedHere: !current };
+      return { endpoint, ...(identity ? { identity } : {}), startedForProof: false, preparedHere: !current && !this.builtins.has(endpointId) };
     }
     if (current) {
       // A daemonless endpoint (Claude) has no runtime identity to prove — it is always its
@@ -1009,8 +1032,13 @@ export class EndpointManager {
       parts.push(`interrupted ${outcome.interruptedTurns.map((turn) => turn.threadId).join(", ")}`);
     }
     if (parts.length === 0) return error;
-    const suffix = ` (the forced destroy had already completed: ${parts.join("; ")})`;
-    if (error instanceof AppError) return new AppError(error.code, `${error.message}${suffix}`, error.details);
+    const suffix = ` (the destroy had already completed: ${parts.join("; ")})`;
+    // `cause` on both branches: the rebuilt error's stack points here, so the original throw site
+    // would otherwise be gone from diagnostics. A non-AppError subclass still flattens -- nothing
+    // instanceof-checks one out of a lifecycle action -- but its own fields survive on the cause.
+    if (error instanceof AppError) {
+      return Object.assign(new AppError(error.code, `${error.message}${suffix}`, error.details), { cause: error });
+    }
     return error instanceof Error ? new Error(`${error.message}${suffix}`, { cause: error }) : error;
   }
 

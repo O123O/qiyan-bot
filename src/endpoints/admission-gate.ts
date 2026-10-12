@@ -71,9 +71,15 @@ export class EndpointAdmissionGate {
   // flag here makes the two inseparable rather than relying on every call site keeping them
   // together.
   beginDrain(options?: { discardLive?: boolean }): Promise<EndpointDrainHandle> {
+    // Before the early return, not after it. Joining a drain already in progress is the one way the
+    // discard and the close could still come apart, and the whole point of taking the flag here is
+    // that they cannot.
+    if (options?.discardLive) {
+      this.live.clear();
+      this.resolveDrainIfReady();
+    }
     if (this.drainPromise) return this.drainPromise;
     if (this.state === "disconnected") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is disconnected: ${this.endpointId}`);
-    if (options?.discardLive) this.live.clear();
     this.state = "draining";
     this.drainPromise = new Promise((resolve) => { this.drainResolve = resolve; });
     this.resolveDrainIfReady();

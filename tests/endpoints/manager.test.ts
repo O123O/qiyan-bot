@@ -40,7 +40,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   async closeConnection() { this.connectionCloses += 1; this.state = "stopped"; }
   async shutdownRuntime(expected?: RuntimeIdentity, force = false) {
     this.runtimeStops += 1;
-    const destroyed = await this.runtimeIdentity();
+    const destroyed = await this.runtimeIdentity().catch(() => undefined);
     this.state = "stopped";
     if (this.rotateIdentityOnStop) {
       if (this.id === "local") this.localPid += 1;
@@ -1010,6 +1010,46 @@ test("restart recovery of a daemonless endpoint completes without a runtime iden
   assert.equal(remote.state, "ready");
 });
 
+// An SSH runtime that is unhealthy with no readable identity THROWS here rather than returning
+// undefined, and the throw is OPERATION_UNCERTAIN -- the word the forced contract forbids, raised
+// before the branch that knows how to destroy without an identity is ever reached. shutdownTarget
+// already swallowed it; these two did not, so force was threaded through a path it could not pass.
+test("forced recovery destroys over an identity read that throws", async () => {
+  for (const enter of ["restart", "disconnect"] as const) {
+    const value = fixture();
+    const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+    remote.onRuntimeIdentity = () => {
+      throw new AppError("OPERATION_UNCERTAIN", "SSH runtime identity is unavailable");
+    };
+    const stops = remote.runtimeStops;
+
+    await assert.rejects(enter === "restart"
+      ? value.manager.recoverRestart("devbox", "draining", undefined)
+      : value.manager.recoverDisconnect("devbox", "draining", undefined),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_UNCERTAIN");
+
+    if (enter === "restart") await value.manager.recoverRestart("devbox", "draining", undefined, undefined, true);
+    else await value.manager.recoverDisconnect("devbox", "draining", undefined, undefined, true);
+    // The destroy was issued by location rather than reported as unknown.
+    assert.equal(remote.runtimeStops, stops + 1, `${enter}: the unreadable runtime was destroyed`);
+  }
+});
+
+// The local endpoint is neither remote nor daemonless, and nothing covered it. A dropped local
+// connection clears the identity and keeps only `lastIdentity`, which is exactly the state a forced
+// restart is reached for -- and the identity proof then had nothing to compare against.
+test("a forced restart of the local endpoint needs no identity", async () => {
+  const value = fixture();
+  await value.manager.ensureReady("local");
+  const local = value.manager.endpointGeneration("local").endpoint as FakeEndpoint;
+  local.identityAvailable = false;
+
+  const generation = value.manager.endpointGeneration("local").generation;
+  await value.manager.restart("local", undefined, true);
+  assert.equal(value.manager.endpointGeneration("local").endpoint.state, "ready");
+  assert.ok(value.manager.endpointGeneration("local").generation > generation);
+});
+
 // A daemonless endpoint has no remote runtime to signal: it IS its connection. So the destroy is
 // abandoning the adapter, and the generation bump is the only other observable effect. What force
 // must not do here is wait out a polite close -- a dead channel is exactly what cannot finish one.
@@ -1684,6 +1724,28 @@ test("a forced restart that fails after its destroy still says what it destroyed
     assert.match(error.message, /interrupted thread-1/u);
     return true;
   });
+});
+
+// The checkpoint is the ledger write, and it raises when its row has been settled by a peer or
+// terminalized under it. A destroy that happened must still be accounted for when THAT is what
+// fails -- on a failure the result object never reaches the caller, only the error does.
+test("a forced disconnect still says what it destroyed when the ledger write fails", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const destroyed = (await remote.runtimeIdentity())!;
+
+  await assert.rejects(
+    value.manager.disconnect("devbox", (checkpoint) => {
+      if ((checkpoint as { phase: string }).phase !== "runtime_stopped") return;
+      throw new AppError("OPERATION_UNCERTAIN", "operation failure was fenced or already terminalized");
+    }, true),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.code, "OPERATION_UNCERTAIN", "the fence's own code survives");
+      assert.match(error.message, new RegExp(`destroyed pid ${destroyed.pid}`, "u"));
+      return true;
+    },
+  );
 });
 
 // A destroyed runtime never announces its own death, and the pool releases turn-capacity claims
