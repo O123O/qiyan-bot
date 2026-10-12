@@ -1035,6 +1035,24 @@ test("forced recovery destroys over an identity read that throws", async () => {
   }
 });
 
+// A forced attempt that could not read an identity checkpoints `runtime_stopped` without one, and
+// this is the branch that row recovers into -- so "distinct from the identity the row expected"
+// has nothing to compare against. It dereferenced it anyway. Release N+1 makes this more
+// reachable still, because the `destroyed` phase recovers here too.
+test("forced recovery of a row that carries no identity starts a replacement", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  const before = remote.starts;
+  const checkpoints: unknown[] = [];
+
+  await value.manager.recoverRestart("devbox", "runtime_stopped", undefined,
+    (checkpoint) => checkpoints.push(checkpoint), true);
+
+  assert.equal(value.manager.endpointGeneration("devbox").endpoint.state, "ready");
+  assert.ok((value.manager.endpointGeneration("devbox").endpoint as FakeEndpoint).starts >= before);
+  assert.deepEqual(checkpoints.map((checkpoint) => (checkpoint as { phase: string }).phase), ["runtime_started"]);
+});
+
 // The local endpoint is neither remote nor daemonless, and nothing covered it. A dropped local
 // connection clears the identity and keeps only `lastIdentity`, which is exactly the state a forced
 // restart is reached for -- and the identity proof then had nothing to compare against.

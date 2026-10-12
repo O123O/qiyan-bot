@@ -387,7 +387,7 @@ export class EndpointManager {
         // whatever occupies this endpoint's runtime directory and tmux session instead, so a
         // changed identity is not a reason to stop -- it is the same instruction aimed at whatever
         // is there now.
-        if (!force && !sameRuntimeIdentity(actual, expectedIdentity!)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
+        if (!force && !sameRuntimeIdentity(actual, expectedIdentity)) throw new AppError("OPERATION_UNCERTAIN", `checkpointed runtime identity changed: ${id}`);
         let endpoint = candidate.endpoint;
         if (!force && (await this.options.managedThreadIds(id)).length > 0 && endpoint.state !== "ready") {
           endpoint = await this.startCandidate(candidate);
@@ -444,10 +444,20 @@ export class EndpointManager {
             this.publishAfterReopen(record, drain, replacementEndpoint);
             return;
           }
+          // A lifecycle receipt may legitimately carry NO identity: a forced attempt that could not
+          // read one checkpoints `runtime_stopped` without it, and this is the branch such a row
+          // recovers into. With nothing to be distinct FROM there is nothing to prove, so the
+          // replacement's identity is read for the record and not required -- requiring it would
+          // reintroduce `runtime identity is unavailable` on the exact host force was reached for.
+          // That the replacement became ready is still proven, by requireReadyCandidate at publish.
           const identity = phase === "runtime_started"
             ? await this.requireRuntimeIdentity(replacementEndpoint)
-            : await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity!, force);
-          if (!force && phase === "runtime_started" && !sameRuntimeIdentity(identity, expectedIdentity!)) {
+            : expectedIdentity
+              ? await this.requireReplacementIdentity(replacementEndpoint, expectedIdentity, force)
+              : await replacementEndpoint.runtimeIdentity().catch(() => undefined);
+          // Unforced, `runtime_started` always carries an identity -- only a forced attempt can
+          // checkpoint without one -- so this reads the same as before for every unforced row.
+          if (!force && phase === "runtime_started" && identity && !sameRuntimeIdentity(identity, expectedIdentity)) {
             throw new AppError("OPERATION_UNCERTAIN", `checkpointed replacement runtime identity changed: ${id}`);
           }
           if (phase === "runtime_stopped") checkpoint?.({ phase: "runtime_started", identity });
@@ -499,7 +509,7 @@ export class EndpointManager {
           this.publishAfterReopen(record, drain, started);
           return;
         }
-        if (!force && !sameRuntimeIdentity(actual, expectedIdentity!)) {
+        if (!force && !sameRuntimeIdentity(actual, expectedIdentity)) {
           // A reconnect can create and publish the replacement after the old runtime exits but
           // before the restart operation checkpoints runtime_stopped. A different attested
           // identity is the restart's desired postcondition, not an ownership conflict.
@@ -1087,7 +1097,13 @@ function endpointRecoveryPause(error: unknown): EndpointRecoveryPause | undefine
   return { reason: error.details.recovery, sshHost: error.details.sshHost };
 }
 
-function sameRuntimeIdentity(left: RuntimeIdentity, right: RuntimeIdentity): boolean {
+// Total in both arguments, because a lifecycle receipt may legitimately carry NO identity: a forced
+// attempt that could not read one checkpoints without it. Every caller that can reach that state
+// now guards it explicitly, but the guards are spread across two recovery paths and a tool handler,
+// and getting one wrong raised a TypeError from deep inside a restart rather than a decision. An
+// absent identity is simply not the same as a present one.
+function sameRuntimeIdentity(left: RuntimeIdentity | undefined, right: RuntimeIdentity | undefined): boolean {
+  if (!left || !right) return false;
   return left.kind === right.kind && (left.kind === "local"
     ? right.kind === "local" && left.pid === right.pid && left.startTime === right.startTime
     : right.kind === "ssh" && left.token === right.token && left.pid === right.pid
