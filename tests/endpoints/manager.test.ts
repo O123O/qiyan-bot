@@ -1478,3 +1478,85 @@ test("force restarts an endpoint whose worker status cannot be read or is still 
   await manager.restart("devbox", undefined, true);
   assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
 });
+
+test("a forced restart is not parked by live work, nor queued behind one that already is", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+  });
+  const value = { manager };
+  await value.manager.ensureReady("devbox");
+
+  // Work on a channel that will never answer. Unforced, draining waits for it indefinitely — there
+  // is no timeout — and because lifecycle actions serialize on one chain, every later restart
+  // queues behind that wait. This is the shape that leaves an endpoint unrestartable.
+  let releaseStuck!: () => void;
+  const stuck = value.manager.withWorkLease("devbox", "rpc", () => new Promise<void>((resolve) => { releaseStuck = resolve; }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let parkedSettled = false;
+  const parked = value.manager.restart("devbox").then(() => { parkedSettled = true; }, () => { parkedSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(parkedSettled, false, "the unforced restart really is parked on the live lease");
+
+  // The forced restart must clear the predecessor and complete, not join the queue behind it.
+  // Bounded on purpose: without the pre-enqueue discard this does not fail, it hangs — and a hung
+  // suite reports nothing useful about the thing being fixed.
+  await Promise.race([
+    value.manager.restart("devbox", undefined, true),
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error("forced restart queued behind the parked one")), 5_000)),
+  ]);
+  assert.equal(value.manager.endpointGeneration("devbox").endpoint.state, "ready");
+
+  releaseStuck();
+  await stuck.catch(() => undefined);
+  await parked;
+});
+
+test("a forced restart destroys a runtime whose identity cannot be proven", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    // Status that can never be read is exactly the endpoint that most needs restarting, and
+    // exactly the one every proof refuses to touch.
+    managedThreadState: (_id, _threadId, generation) => ({ availability: "ready", status: "unknown", endpointGeneration: generation }),
+  });
+
+  await manager.ensureReady("devbox");
+  const runtime = made.at(-1)!;
+  // No identity at all: unforced this is "runtime identity is unavailable", an uncertain outcome.
+  runtime.identityAvailable = false;
+
+  await assert.rejects(manager.restart("devbox"), (error: unknown) =>
+    error instanceof AppError && /prove managed thread idle|identity is unavailable/u.test(error.message));
+
+  await manager.restart("devbox", undefined, true);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
+  assert.ok(made.length > 1, "a replacement runtime was started");
+});

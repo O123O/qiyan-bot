@@ -32,7 +32,9 @@ export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   readonly daemonless?: boolean;
   start(): Promise<void>;
   closeConnection(): Promise<void>;
-  shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
+  // `force` destroys the runtime by location instead of proving its identity first. See
+  // docs/development/forced-restart-design.md.
+  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<void>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;

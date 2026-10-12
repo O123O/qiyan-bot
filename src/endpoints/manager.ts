@@ -252,21 +252,27 @@ export class EndpointManager {
   async disconnect(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
+    if (force) record.gate.discardLiveWork();
     return this.enqueueLifecycle(endpointId, record, () => this.disconnectInternal(endpointId, record, checkpoint, force));
   }
 
   private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     if (record.gate.desiredState === "disconnected") return;
     this.cancelReconnect(record);
+    // Again here, not only before enqueueing. Clearing a parked predecessor lets it finish, and
+    // finishing REOPENS the gate — reconnect, recovery and status work immediately take fresh
+    // leases, on the same dead channel, and this call would park on those instead. The first
+    // discard unwedges the queue; this one keeps the window it opens from closing on us.
+    if (force) record.gate.discardLiveWork();
     const drain = await record.gate.beginDrain();
     let target: ShutdownTarget | undefined;
     let runtimeStopped = false;
     try {
-      target = await this.shutdownTarget(endpointId, record);
+      target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
       await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await this.stopEndpointRuntime(target);
+      await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       drain.disconnect();
@@ -279,6 +285,11 @@ export class EndpointManager {
   async restart(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
+    // Before enqueueing, not inside the action: a PREDECESSOR already parked in beginDrain holds
+    // the lifecycle chain, so a forced restart queued behind it would never start. Clearing the
+    // gate's live leases resolves that predecessor's drain, it completes or fails, and the chain
+    // moves. See docs/development/forced-restart-design.md.
+    if (force) record.gate.discardLiveWork();
     return this.enqueueLifecycle(endpointId, record, () => this.restartInternal(endpointId, record, checkpoint, force));
   }
 
@@ -440,6 +451,7 @@ export class EndpointManager {
     if (record.gate.desiredState === "disconnected") {
       record.gate.requestAutomatic();
       const prepared = await this.prepareCandidate(endpointId);
+      if (force) record.gate.discardLiveWork();
       const drain = await record.gate.beginDrain();
       let replacement: ManagedAppServerEndpoint | undefined;
       try {
@@ -461,16 +473,16 @@ export class EndpointManager {
     let runtimeStopped = false;
     let replacement: ManagedAppServerEndpoint | undefined;
     try {
-      target = await this.shutdownTarget(endpointId, record);
+      target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
       await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await this.stopEndpointRuntime(target);
+      await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       replacement = await this.startCandidate(preparedReplacement);
       // A daemonless replacement has no identity to prove distinct from the stopped one.
-      const replacementIdentity = target.identity ? await this.requireReplacementIdentity(replacement, target.identity) : undefined;
+      const replacementIdentity = target.identity ? await this.requireReplacementIdentity(replacement, target.identity, force) : undefined;
       checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       this.publishAfterReopen(record, drain, replacement);
     } catch (error) {
@@ -804,9 +816,21 @@ export class EndpointManager {
     return identity;
   }
 
-  private async requireReplacementIdentity(endpoint: ManagedAppServerEndpoint, previous: RuntimeIdentity): Promise<RuntimeIdentity> {
+  // A forced restart destroyed by location, so the replacement cannot legitimately carry the old
+  // identity — it got a new pid, process group and token. If it does, that is a real anomaly and a
+  // real failure, but a DEFINITE one: the destroy provably happened, so "I don't know" is the wrong
+  // word for it, and the contract is success or a reason.
+  private async requireReplacementIdentity(
+    endpoint: ManagedAppServerEndpoint,
+    previous: RuntimeIdentity,
+    force = false,
+  ): Promise<RuntimeIdentity> {
     const identity = await this.requireRuntimeIdentity(endpoint);
-    if (sameRuntimeIdentity(identity, previous)) throw new AppError("OPERATION_UNCERTAIN", `replacement runtime retained the stopped identity: ${endpoint.id}`);
+    if (sameRuntimeIdentity(identity, previous)) {
+      throw force
+        ? new AppError("ENDPOINT_UNAVAILABLE", `replacement runtime retained the stopped identity after a forced restart: ${endpoint.id}`)
+        : new AppError("OPERATION_UNCERTAIN", `replacement runtime retained the stopped identity: ${endpoint.id}`);
+    }
     return identity;
   }
 
@@ -827,8 +851,17 @@ export class EndpointManager {
     return result;
   }
 
-  private async shutdownTarget(endpointId: string, record: EndpointRecord): Promise<ShutdownTarget> {
+  private async shutdownTarget(endpointId: string, record: EndpointRecord, force = false): Promise<ShutdownTarget> {
     const current = record.endpoint;
+    // A forced shutdown destroys by LOCATION, so it needs no identity and must never start a
+    // runtime merely to obtain one. Whatever identity is readable is passed along — the helper uses
+    // it to signal the recorded process group and to report what it killed — but its absence is not
+    // a reason to refuse, and refusing there is where `runtime identity is unavailable` came from.
+    if (force) {
+      const endpoint = current ?? (await this.prepareCandidate(endpointId)).endpoint;
+      const identity = endpoint.daemonless ? undefined : await endpoint.runtimeIdentity().catch(() => undefined);
+      return { endpoint, ...(identity ? { identity } : {}), startedForProof: false };
+    }
     if (current) {
       // A daemonless endpoint (Claude) has no runtime identity to prove — it is always its
       // own shutdown target, closed directly rather than drained by identity.
@@ -851,9 +884,20 @@ export class EndpointManager {
   }
 
   // Stop an endpoint's runtime: prove-and-shutdown a daemon, or just close a daemonless one.
-  private async stopEndpointRuntime(target: ShutdownTarget): Promise<void> {
-    if (target.identity) await target.endpoint.shutdownRuntime(target.identity);
-    else await this.requireClosed(target.endpoint, target.endpoint.id);
+  private async stopEndpointRuntime(target: ShutdownTarget, force = false): Promise<void> {
+    if (target.identity) {
+      await target.endpoint.shutdownRuntime(target.identity, force);
+      return;
+    }
+    // Daemonless, or forced with no readable identity. A daemonless runtime IS its connection, so
+    // "destroyed" means abandoning it: under force we do not wait out requireClosed's bounded
+    // close, because an endpoint whose channel is dead is exactly the one that cannot finish it,
+    // and `endpoint connection did not close` is one of the outcomes force exists to remove.
+    if (force) {
+      await this.discardEndpoint(target.endpoint);
+      return;
+    }
+    await this.requireClosed(target.endpoint, target.endpoint.id);
   }
 
   private record(id: string): EndpointRecord {

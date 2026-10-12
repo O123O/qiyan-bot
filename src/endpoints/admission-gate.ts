@@ -46,6 +46,23 @@ export class EndpointAdmissionGate {
     this.resolveDrainIfReady();
   }
 
+  // Abandon every live lease. A forced lifecycle action uses this so that work in flight cannot
+  // park it: a lease on a dead channel would otherwise hold `beginDrain` open forever, and because
+  // lifecycle actions serialize, every later one queues behind it.
+  //
+  // What this does and does not do, precisely. A discarded lease can no longer be used for further
+  // work — `validate` fails for it, and `release` becomes a safe no-op when the orphaned work
+  // finally unwinds. It does NOT cancel work already running: that RPC will still return, and its
+  // result is simply not waited for and not relied upon. That is the same position a lost
+  // connection leaves us in, which is the honest comparison; claiming the result is "ignored"
+  // would be claiming a guarantee this does not provide.
+  discardLiveWork(): number {
+    const discarded = this.live.size;
+    this.live.clear();
+    this.resolveDrainIfReady();
+    return discarded;
+  }
+
   beginDrain(): Promise<EndpointDrainHandle> {
     if (this.drainPromise) return this.drainPromise;
     if (this.state === "disconnected") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is disconnected: ${this.endpointId}`);

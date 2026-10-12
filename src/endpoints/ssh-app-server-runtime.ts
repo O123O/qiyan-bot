@@ -73,7 +73,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
     return await this.options.runtime.runtimeIdentity() === undefined ? "runtime-lost" : "connection-lost";
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<void> {
     if (this.transportClosing) throw new AppError("OPERATION_CONFLICT", "SSH transport teardown is already active");
     this.transportClosing = true;
     try {
@@ -82,7 +82,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
       try { await this.active?.close(); } catch (error) { cleanupError = error; }
       try { await this.settlePendingCleanup(); } catch (error) { cleanupError ??= error; }
       let stopError: unknown;
-      try { await this.options.runtime.stop(expected); } catch (error) { stopError = error; }
+      try { await this.options.runtime.stop(expected, force); } catch (error) { stopError = error; }
       if (this.active?.cleanupPending) {
         try { await this.active.close(); } catch (error) { cleanupError ??= error; }
       }
