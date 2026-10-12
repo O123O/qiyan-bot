@@ -94,6 +94,19 @@ export class EndpointManager {
     // true only after the durable owner notice is prepared. A throw/false result is isolated from
     // the endpoint error and retried on the next directly-triggered classified failure.
     onRecoveryPaused?(endpointId: string, recovery: EndpointRecoveryPause): boolean;
+    // Called when a forced stop has destroyed an endpoint's runtime, before any replacement is
+    // published. Turn-capacity claims are not held by the admission gate: the pool releases them
+    // from the endpoint's own `onUnavailable` subscription, and a destroyed runtime is exactly the
+    // one that will never announce its own death. `startTurnAdmitted` deliberately retains a claim
+    // on OPERATION_UNCERTAIN, which a destroy mid-`turn/start` produces, and once the replacement
+    // publishes, the old endpoint's subscriptions are removed and a late event is dropped --
+    // stranding the claim for the life of the process, inflating activeTurnCount and conflicting
+    // with any later caller reusing the claim id. So the destroy reports itself here instead of
+    // waiting for a dead connection to do it.
+    //
+    // For a daemonless endpoint, where a forced stop makes no helper call at all, this and the
+    // generation bump are the only observable effects.
+    onRuntimeDestroyed?(endpointId: string): void;
   }) {
     this.builtins.set("local", options.localEndpoint);
     for (const endpoint of options.builtinEndpoints ?? []) this.builtins.set(endpoint.id, endpoint);
@@ -274,6 +287,10 @@ export class EndpointManager {
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
       await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
+      // Before any replacement publishes, and before a start that may fail: from here the old
+      // runtime is gone either way, so whatever is still counted against it is counted against
+      // nothing.
+      if (force) this.reportRuntimeDestroyed(endpointId);
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       drain.disconnect();
     } catch (error) {
@@ -479,6 +496,10 @@ export class EndpointManager {
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
       await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
+      // Before any replacement publishes, and before a start that may fail: from here the old
+      // runtime is gone either way, so whatever is still counted against it is counted against
+      // nothing.
+      if (force) this.reportRuntimeDestroyed(endpointId);
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       replacement = await this.startCandidate(preparedReplacement);
       // A daemonless replacement has no identity to prove distinct from the stopped one.
@@ -884,6 +905,12 @@ export class EndpointManager {
   }
 
   // Stop an endpoint's runtime: prove-and-shutdown a daemon, or just close a daemonless one.
+  // Isolated: a listener that throws must not turn a completed destroy into a failed one. The
+  // destroy already happened, and reporting it is bookkeeping about work that is over.
+  private reportRuntimeDestroyed(endpointId: string): void {
+    try { this.options.onRuntimeDestroyed?.(endpointId); } catch { /* bookkeeping only */ }
+  }
+
   private async stopEndpointRuntime(target: ShutdownTarget, force = false): Promise<void> {
     if (target.identity) {
       await target.endpoint.shutdownRuntime(target.identity, force);

@@ -3551,6 +3551,11 @@ export async function buildProductionApp(
               return false;
             }
           },
+          // A forced destroy leaves an endpoint that will never announce its own death, and the
+          // pool releases turn-capacity claims from that announcement. Released here instead, so a
+          // claim retained across a destroyed turn/start does not outlive the runtime it was
+          // counted against. The pool exists by the time any lifecycle action can run.
+          onRuntimeDestroyed: (id) => { pool?.markEndpointUnavailable(id, "runtime-lost"); },
         });
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           resolveEndpoint: (id) => endpointManager.ensureReady(id),

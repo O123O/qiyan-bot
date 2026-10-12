@@ -1526,6 +1526,48 @@ test("a forced restart is not parked by live work, nor queued behind one that al
   await parked;
 });
 
+// A destroyed runtime never announces its own death, and the pool releases turn-capacity claims
+// from exactly that announcement. Without this report a claim retained across a destroyed
+// turn/start outlives the runtime it was counted against for the life of the process.
+test("a forced stop reports the destroy before any replacement publishes", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  const events: string[] = [];
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      events.push(`created:${definition.id}`);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    onRuntimeDestroyed: (id) => { events.push(`destroyed:${id}`); },
+  });
+
+  await manager.ensureReady("devbox");
+  manager.onEndpoint((endpoint) => events.push(`published:${endpoint.id}`));
+  events.length = 0;
+
+  // Unforced, nothing is reported: the endpoint is alive and announces its own loss.
+  await manager.restart("devbox");
+  assert.deepEqual(events.filter((event) => event.startsWith("destroyed")), []);
+
+  events.length = 0;
+  await manager.restart("devbox", undefined, true);
+  assert.deepEqual(events.filter((event) => event !== "created:devbox"), ["destroyed:devbox", "published:devbox"]);
+
+  events.length = 0;
+  await manager.disconnect("devbox", undefined, true);
+  assert.deepEqual(events.filter((event) => event.startsWith("destroyed")), ["destroyed:devbox"]);
+});
+
 test("a forced restart destroys a runtime whose identity cannot be proven", async () => {
   const local = new FakeEndpoint("local");
   const made: FakeEndpoint[] = [];
