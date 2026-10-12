@@ -42,7 +42,7 @@ export interface AppServerRuntimeService {
   classifyLoss(): Promise<EndpointLossKind>;
   // `force` destroys the runtime by location instead of proving its identity first. See
   // docs/development/forced-restart-design.md.
-  shutdownRuntime(expected: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
+  shutdownRuntime(expected: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   closeTransport?(): Promise<void>;
 }
 
@@ -129,7 +129,7 @@ export class ManagedAppServerEndpoint {
     if (firstError !== undefined) throw firstError;
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport | undefined> {
+  async shutdownRuntime(expected: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport | undefined> {
     this.generation += 1;
     this.state = "stopped";
     let cleanupError: unknown;

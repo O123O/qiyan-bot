@@ -25,6 +25,7 @@ import {
   operationUnsettled,
   settleRecoveryPassVerdict,
   settleEarlierEndpointOperations,
+  settleSessionRecovery,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
   operationRecoveryAction,
@@ -2071,6 +2072,23 @@ test("an explicit restart fails without creating another uncertain action when r
     && error.message === "endpoint lyris has an earlier unresolved operation");
 });
 
+// The restart is done and the endpoint is running a new runtime. Letting a failed session recovery
+// escape as the restart's own result reported a completed restart as uncertain -- which leaves a row
+// fencing the next restart on an endpoint that is, in fact, already fine.
+test("a failed session recovery is reported beside a successful restart, not as its verdict", async () => {
+  const reasons: string[] = [];
+  assert.deepEqual(await settleSessionRecovery(async () => undefined, (reason) => reasons.push(reason)), { ok: true });
+  assert.deepEqual(reasons, [] as string[], "a successful recovery reports nothing");
+
+  const outcome = await settleSessionRecovery(
+    async () => { throw new AppError("ENDPOINT_UNAVAILABLE", "lyris did not answer"); },
+    (reason) => reasons.push(reason),
+  );
+  assert.deepEqual(outcome, { ok: false, reason: "lyris did not answer" });
+  // The reason reaches the operational log too, not only the tool result.
+  assert.deepEqual(reasons, ["lyris did not answer"]);
+});
+
 // The fence is the first thing a restart reaches, so a refusal here means the manager is never
 // asked -- which is how an endpoint that needs a restart became one that cannot have one.
 test("a forced restart proceeds past earlier rows without reconciling or waiting", async () => {
@@ -2105,6 +2123,39 @@ test("a forced restart proceeds past earlier rows without reconciling or waiting
 
   assert.equal(result, "proceed");
   assert.deepEqual(failed, ["restart-earlier"]);
+});
+
+// Two instances share one ledger on NFS here, so a peer settling the row between the listing and
+// the retire is ordinary. `fail` throws OPERATION_UNCERTAIN when its update matches nothing, and
+// letting that escape would kill the forced restart inside the fence -- nothing destroyed, nothing
+// started, and the one word the contract forbids reported back.
+test("a forced restart survives a peer settling the row it was retiring", async () => {
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+      fail: () => { throw new AppError("OPERATION_UNCERTAIN", "operation failure was fenced or already terminalized"); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
 });
 
 // A peer instance sharing this ledger is still going to settle its own dispatched row. Retiring it

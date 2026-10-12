@@ -63,9 +63,17 @@ export class EndpointAdmissionGate {
     return discarded;
   }
 
-  beginDrain(): Promise<EndpointDrainHandle> {
+  // `discardLive` discards in the SAME synchronous step that closes the gate. Doing the two as
+  // separate statements is only race-free while they are adjacent, and on the forced paths they
+  // were not: an `await` between them (preparing a replacement over SSH takes hundreds of
+  // milliseconds) reopens the gate long enough for reconnect, recovery or status work to take a
+  // fresh lease -- on the same dead channel -- and the drain then parks on that instead. Taking the
+  // flag here makes the two inseparable rather than relying on every call site keeping them
+  // together.
+  beginDrain(options?: { discardLive?: boolean }): Promise<EndpointDrainHandle> {
     if (this.drainPromise) return this.drainPromise;
     if (this.state === "disconnected") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is disconnected: ${this.endpointId}`);
+    if (options?.discardLive) this.live.clear();
     this.state = "draining";
     this.drainPromise = new Promise((resolve) => { this.drainResolve = resolve; });
     this.resolveDrainIfReady();

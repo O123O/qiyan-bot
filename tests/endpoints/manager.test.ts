@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { EndpointManager } from "../../src/endpoints/manager.ts";
+import { AppServerPool } from "../../src/app-server/pool.ts";
 import type { PermissionBlockedEvent } from "../../src/app-server/managed-endpoint.ts";
 import type { EndpointLossKind, ManagedAppServerEndpoint, RuntimeIdentity } from "../../src/endpoints/types.ts";
 import { AppError } from "../../src/core/errors.ts";
@@ -1009,6 +1010,26 @@ test("restart recovery of a daemonless endpoint completes without a runtime iden
   assert.equal(remote.state, "ready");
 });
 
+// A daemonless endpoint has no remote runtime to signal: it IS its connection. So the destroy is
+// abandoning the adapter, and the generation bump is the only other observable effect. What force
+// must not do here is wait out a polite close -- a dead channel is exactly what cannot finish one.
+test("a forced restart of a daemonless endpoint abandons its connection rather than closing it", async () => {
+  const value = fixture();
+  const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
+  remote.daemonless = true;
+  remote.identityAvailable = false;
+  const generation = value.manager.endpointGeneration("devbox").generation;
+  const stops = remote.runtimeStops;
+
+  await value.manager.restart("devbox", undefined, true);
+
+  // No runtime shutdown is issued: there is no remote runtime to destroy.
+  assert.equal(remote.runtimeStops, stops, "a daemonless runtime has nothing to signal");
+  assert.equal(remote.connectionCloses > 0, true, "its connection is what gets abandoned");
+  assert.ok(value.manager.endpointGeneration("devbox").generation > generation, "the generation moved");
+  assert.equal(value.manager.endpointGeneration("devbox").endpoint.state, "ready");
+});
+
 test("disconnect recovery of a daemonless endpoint completes without a runtime identity", async () => {
   const value = fixture();
   const remote = await value.manager.ensureReady("devbox") as FakeEndpoint;
@@ -1530,6 +1551,53 @@ test("a forced restart is not parked by live work, nor queued behind one that al
   await parked;
 });
 
+// Discarding and then closing the gate is only race-free while the two are adjacent, and on this
+// path they were not: preparing a replacement over SSH sits between them. A lease taken in that
+// window -- by reconnect, recovery or status work, on the same dead channel -- parked the drain
+// forever, which is the failure the discard exists to remove, one step further along.
+test("a forced restart is not parked by work that arrives while its replacement is prepared", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  let onPrepare: (() => void) | undefined;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      onPrepare?.();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+  });
+  await manager.ensureReady("devbox");
+
+  // Taken after the forced restart has already discarded, while it waits on prepareCandidate.
+  let releaseLate!: () => void;
+  let late: Promise<unknown> | undefined;
+  onPrepare = () => {
+    onPrepare = undefined;
+    late = manager.withWorkLease("devbox", "rpc", () => new Promise<void>((resolve) => { releaseLate = resolve; }));
+  };
+
+  // Bounded on purpose: without the atomic discard this does not fail, it hangs, and a hung suite
+  // says nothing about the thing being fixed.
+  await Promise.race([
+    manager.restart("devbox", undefined, true),
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error("forced restart parked on a lease taken during prepare")), 5_000)),
+  ]);
+  assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
+
+  releaseLate?.();
+  await late?.catch(() => undefined);
+});
+
 // Force's justification is that the operator spends an in-flight turn deliberately, so a bare
 // success is not an answer: he is owed what was destroyed and what refused to die.
 test("a forced restart reports what it destroyed and the turns it interrupted", async () => {
@@ -1578,6 +1646,46 @@ test("a forced restart reports what it destroyed and the turns it interrupted", 
   assert.equal(unforced.interruptedTurns, undefined);
 });
 
+// On a failure the result object never reaches the caller -- only the error does. A forced restart
+// that destroyed a runtime and then failed to start a replacement still spent what it spent, and
+// dropping that account is dropping it in the one case the operator most needs it.
+test("a forced restart that fails after its destroy still says what it destroyed", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  let failNextStart = false;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      endpoint.failStart = failNextStart;
+      endpoint.startError = new Error("the launcher could not start");
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: (id) => id === "devbox" ? ["thread-1"] : [],
+    managedThreadState: (_id, _threadId, generation) => ({ availability: "ready", status: "active", endpointGeneration: generation }),
+  });
+
+  await manager.ensureReady("devbox");
+  const destroyed = (await made.at(-1)!.runtimeIdentity())!;
+  failNextStart = true;
+
+  await assert.rejects(manager.restart("devbox", undefined, true), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    // The launcher's own reason survives -- it is the same failure, described more completely.
+    assert.match(error.message, /the launcher could not start/u);
+    assert.match(error.message, new RegExp(`destroyed pid ${destroyed.pid}`, "u"));
+    assert.match(error.message, /interrupted thread-1/u);
+    return true;
+  });
+});
+
 // A destroyed runtime never announces its own death, and the pool releases turn-capacity claims
 // from exactly that announcement. Without this report a claim retained across a destroyed
 // turn/start outlives the runtime it was counted against for the life of the process.
@@ -1618,6 +1726,46 @@ test("a forced stop reports the destroy before any replacement publishes", async
   events.length = 0;
   await manager.disconnect("devbox", undefined, true);
   assert.deepEqual(events.filter((event) => event.startsWith("destroyed")), ["destroyed:devbox"]);
+});
+
+// The point of the callback, against the real pool rather than a log line. A claim retained across
+// a destroyed turn/start is released from the endpoint's own onUnavailable announcement -- which a
+// destroyed runtime never makes. Without this the claim outlives the runtime it was counted
+// against: activeTurnCount stays inflated, and any later caller reusing the claim id conflicts.
+test("a forced restart releases a turn-capacity claim the destroyed runtime would never release", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  let pool!: AppServerPool;
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: () => [],
+    onRuntimeDestroyed: (id) => pool.markEndpointUnavailable(id, "runtime-lost"),
+  });
+  const endpoint = await manager.ensureReady("devbox");
+  pool = new AppServerPool([endpoint], { resolveEndpoint: (id) => manager.ensureReady(id) });
+
+  pool.claimTurnCapacity("devbox", "thread-1", "claim-1");
+  assert.equal(pool.activeTurnCount, 1);
+
+  // An unforced restart leaves it: the endpoint is alive and announces its own loss.
+  await manager.restart("devbox");
+  assert.equal(pool.activeTurnCount, 1);
+
+  await manager.restart("devbox", undefined, true);
+  assert.equal(pool.activeTurnCount, 0, "the claim did not outlive the runtime it was counted against");
+  // And the id is reusable rather than conflicting for the life of the process.
+  assert.doesNotThrow(() => pool.claimTurnCapacity("devbox", "thread-2", "claim-1"));
 });
 
 // A forced restart that crashes mid-flight is retried from its row. Retrying it unforced refuses
@@ -1686,7 +1834,13 @@ test("a forced restart destroys a runtime whose identity cannot be proven", asyn
   await assert.rejects(manager.restart("devbox"), (error: unknown) =>
     error instanceof AppError && /prove managed thread idle|identity is unavailable/u.test(error.message));
 
+  const stops = runtime.runtimeStops;
   await manager.restart("devbox", undefined, true);
   assert.equal(manager.endpointGeneration("devbox").endpoint.state, "ready");
-  assert.ok(made.length > 1, "a replacement runtime was started");
+  // The point of the test, and what it did not check: an unreadable identity is not a reason to
+  // SKIP the destroy. Skipping it is worse than refusing -- the tmux session and socket survive,
+  // and the replacement's own start then refuses on `existing SSH runtime is unhealthy`, leaving
+  // the endpoint exactly as wedged as before.
+  assert.equal(runtime.runtimeStops, stops + 1, "the unprovable runtime was destroyed, not abandoned");
+  assert.notEqual(manager.endpointGeneration("devbox").endpoint, runtime);
 });

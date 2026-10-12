@@ -128,7 +128,7 @@ export interface ClaudeReattachment {
 export interface ClaudePersistentRuntime {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
-  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
+  shutdownRuntime(expectedIdentity: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
   // Reconnect-time reattach. The host already knows what is still running, so this only has
@@ -416,7 +416,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     this.forgetLoadedSessions();
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport | undefined> {
+  async shutdownRuntime(expected: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport | undefined> {
     this.lifecycleGeneration += 1;
     this.endpointState = "stopped";
     this.persistentUnavailableSubscription?.();

@@ -1407,6 +1407,65 @@ test("a forced stop destroys by location, reports what it killed, and never refu
     { timeoutMs: 5_000, maxOutputBytes: 1024 }).then((r) => r.stdout.toString().trim()), "gone");
 });
 
+// The remote Claude host is the same shape with different names, and it had none of this: force
+// was accepted by the client, sent over the wire, and then refused by the helper on an identity
+// proof it never checked `force` against -- so a forced restart of a remote Claude endpoint could
+// not work at all.
+test("a forced stop of a Claude host destroys by location and never refuses", async (t) => {
+  const uid = process.getuid?.();
+  assert.ok(uid);
+  const runtimeDir = `/tmp/qiyan-${uid}/${randomBytes(12).toString("hex")}`;
+  const session = `qiyan-claude-${randomBytes(6).toString("hex")}`;
+  t.after(() => rm(runtimeDir, { recursive: true, force: true }));
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await cp(helperPath, `${runtimeDir}/qiyan-ssh-helper.mjs`);
+  const tmux = (...args: string[]) => runBoundedProcess("tmux", ["-S", `${runtimeDir}/tmux.sock`, "-f", "/dev/null", ...args],
+    { timeoutMs: 15_000, maxOutputBytes: 64 * 1024 });
+  t.after(async () => { await tmux("kill-server").catch(() => undefined); });
+
+  const stop = async (extra: Record<string, unknown>) => {
+    const argument = encodeRemoteArgument(JSON.stringify({ runtimeDir, session, tmuxMode: "explicit", ...extra }));
+    const run = await runBoundedProcess(process.execPath, [`${runtimeDir}/qiyan-ssh-helper.mjs`, "stop-claude-host", argument],
+      { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 });
+    return parseRemoteHelperResponse<{
+      stopped: boolean; destroyedIdentity: unknown; survivors?: unknown; serverSurvived?: boolean;
+    }>(run.stdout, "stop-claude-host");
+  };
+
+  // No identity file at all: the case force exists for, and the one the proof can only answer
+  // "cannot be proven" to.
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+  await assert.rejects(stop({ expected: { kind: "ssh", token: "a".repeat(32), pid: 1, linuxStartTime: "1", processGroupId: 1 } }),
+    /Claude host identity cannot be proven/u);
+  const bare = await stop({ force: true });
+  assert.equal(bare.stopped, true);
+  assert.equal(bare.destroyedIdentity, null);
+  assert.match(String(bare.survivors), /unknown/u);
+  assert.equal(await tmux("has-session", "-t", session).then(() => true).catch(() => false), false, "the session is gone");
+
+  // An identity that does not match what the caller expects. Unforced this refuses; forced it is
+  // destroyed, reported, and its files removed.
+  const victim = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, QIYAN_RUNTIME_TOKEN: "c".repeat(32) } });
+  t.after(() => { try { process.kill(victim.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const raw = readFileSync(`/proc/${victim.pid}/stat`, "utf8");
+  const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/u);
+  const identity = { kind: "ssh", token: "c".repeat(32), pid: victim.pid!, linuxStartTime: fields[19], processGroupId: Number(fields[2]) };
+  await writeFile(`${runtimeDir}/claude-host-identity.json`, JSON.stringify(identity), { mode: 0o600 });
+  await tmux("new-session", "-d", "-s", session, "sleep 600");
+
+  const mismatched = { ...identity, token: "f".repeat(32) };
+  await assert.rejects(stop({ expected: mismatched }), /Claude host identity cannot be proven/u);
+  const destroyed = await stop({ force: true, expected: mismatched });
+  assert.equal(destroyed.stopped, true);
+  assert.deepEqual(destroyed.destroyedIdentity, identity, "a force says what it killed");
+  assert.equal(await stat(`${runtimeDir}/claude-host-identity.json`).then(() => true).catch(() => false), false);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(await runBoundedProcess("sh", ["-c", `kill -0 ${victim.pid} 2>/dev/null && echo alive || echo gone`],
+    { timeoutMs: 5_000, maxOutputBytes: 1024 }).then((r) => r.stdout.toString().trim()), "gone");
+});
+
 test("a forced stop never signals a process group carrying a foreign token", async (t) => {
   const uid = process.getuid?.();
   assert.ok(uid);

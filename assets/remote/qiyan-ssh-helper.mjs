@@ -670,8 +670,17 @@ function resolveAgentSdkPath(shell) {
 async function stopClaudeHost(value) {
   const paths = claudeRuntimePaths(value);
   const identity = await readIdentity(paths.claudeHostIdentityPath);
-  const expected = validIdentity(value?.expected);
-  if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  // Same rule as the Codex runtime's stop: a FORCED stop is addressed by location, not by identity.
+  // It destroys whatever occupies this runtime directory and tmux session, because "is this the
+  // exact host I was told about?" has no answer when the identity file is gone, the generation
+  // moved, or the channel died before the close was acknowledged -- and "I don't know" is the
+  // outcome the caller asked to be rid of. The identity is still read, for its token and pgid, and
+  // reported back so a force says what it killed.
+  const forced = value?.force === true;
+  if (!forced) {
+    const expected = validIdentity(value?.expected);
+    if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  }
   // The supervisor dies FIRST, before anything that can fail or return early, so "the restart
   // kills the old things, including the tmux session" holds on every path out of this function.
   // Asserting it below instead made a reclaim impossible in the one case a reclaim is for: a live
@@ -683,25 +692,27 @@ async function stopClaudeHost(value) {
   // Only reachable with no identity under force, where there is nothing to signal from: the
   // session is already dead and the files are about to go.
   if (identity) {
-  let members = ownedGroupMembers(identity);
-  if (members.length > 0) {
-    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-    await waitForEmptyGroup(identity.processGroupId, 2_000);
-    members = ownedGroupMembers(identity);
+    let members = ownedGroupMembers(identity);
     if (members.length > 0) {
-      try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+      try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
+      members = ownedGroupMembers(identity);
+      if (members.length > 0) {
+        try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+        await waitForEmptyGroup(identity.processGroupId, 2_000);
+      }
+      survivors = ownedGroupMembers(identity).length;
+      // Same rule as the Codex runtime's stop, and it matters MORE here: Claude runs Bash tools,
+      // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem --
+      // inheriting the host's process group and token, unreapable by any signal, and otherwise
+      // refusing this reclaim forever. Insist only that the HOST is gone. Under force that is
+      // reported rather than raised: the session is dead, the files are about to go, and the
+      // replacement gets a new pid, process group, token and socket.
+      if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
+        if (!forced) throw new Error("Claude host process group did not stop");
+        serverSurvived = true;
+      }
     }
-    survivors = ownedGroupMembers(identity).length;
-    // Same rule as the Codex runtime's stop, and it matters MORE here: Claude runs Bash tools,
-    // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem —
-    // inheriting the host's process group and token, unreapable by any signal, and otherwise
-    // refusing this reclaim forever. Insist only that the HOST is gone.
-    if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
-      if (!forced) throw new Error("Claude host process group did not stop");
-      serverSurvived = true;
-    }
-  }
   }
   // Files last, for the same reason as the Codex runtime's stop: identity.json is what any survivor
   // would have to be signalled from, and its absence is what lets the next start see `absent`.

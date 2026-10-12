@@ -780,6 +780,33 @@ export function recoverableOperationTarget(
   }
 }
 
+export type SessionRecoveryOutcome = { ok: true } | { ok: false; reason: string };
+
+// Re-attaching a restarted endpoint's managed sessions, separated from the restart's own verdict.
+//
+// A thrown resume used to escape as the restart's result. The runtime was replaced and running, and
+// the call reported uncertainty -- which leaves a row fencing the next restart on an endpoint that
+// is, in fact, already fine. The restart is done; whether its sessions came back is a second fact,
+// and the caller is told both rather than having the first one overwritten by the second.
+//
+// This is for the TOOL path only. The operation-recovery branch deliberately lets a resume throw,
+// because a thrown one leaves the row recoverable and the next pass retries it -- succeeding the
+// row with `sessions_restored: false` would end those retries and leave the sessions down until a
+// human intervened.
+export async function settleSessionRecovery(
+  resume: () => Promise<unknown>,
+  onFailed: (reason: string) => void,
+): Promise<SessionRecoveryOutcome> {
+  try {
+    await resume();
+    return { ok: true };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    onFailed(reason);
+    return { ok: false, reason };
+  }
+}
+
 export function assistantPostTurnActionMatches(
   action: AssistantPostTurnAction | undefined,
   expected:
@@ -973,9 +1000,17 @@ export async function settleEarlierEndpointOperations(options: {
     for (const operation of captured) {
       if (operation.state !== "uncertain") continue;
       if (!subsumedByLifecycle(operation, options.currentKind, options.resolver)) continue;
-      options.operations.fail(operation.id, {
-        message: `superseded by a forced ${options.currentKind} on endpoint ${options.endpointId}`,
-      });
+      // Isolated per row, and deliberately. `fail` throws OPERATION_UNCERTAIN when its UPDATE
+      // matches nothing -- which is exactly what a peer instance settling the row first produces,
+      // and two instances share one ledger here. Letting that escape would kill the forced restart
+      // inside the fence: nothing destroyed, nothing started, and the one word the contract
+      // forbids reported back. Retiring is pure bookkeeping; a row left behind costs nothing,
+      // because the next forced action proceeds past it too.
+      try {
+        options.operations.fail(operation.id, {
+          message: `superseded by a forced ${options.currentKind} on endpoint ${options.endpointId}`,
+        });
+      } catch { /* the row is someone else's to settle now */ }
     }
     // The `satisfied` short-circuit is deliberately NOT taken here. A forced restart that returns
     // without restarting anything is a lie, and this operation is asked for exactly when the
@@ -4674,8 +4709,10 @@ export async function buildProductionApp(
     }
   }
 
-  // What a forced action spent, flattened into the tool result. Absent entirely for an unforced
-  // action, which destroys nothing it has not first proven.
+  // What a lifecycle action spent, flattened into the tool result. `destroyed_identity` appears for
+  // an unforced SSH stop too -- that one also destroys a runtime, having first proven it, and the
+  // helper reports the same fact either way. `interrupted_turns` is forced-only, because an
+  // unforced action never proceeds over a turn in flight.
   function forcedLifecycleReport(outcome: EndpointLifecycleOutcome): Record<string, unknown> {
     return {
       ...(outcome.destroyed ? {
@@ -4687,17 +4724,10 @@ export async function buildProductionApp(
     };
   }
 
-  // Recovery of a restarted endpoint's managed sessions, isolated from the restart's own result.
-  async function resumeManagedEndpointSafely(endpointId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-    try {
-      await resumeManagedEndpoint(endpointId, true);
-      return { ok: true };
-    } catch (error) {
-      reportOperationalSafely(report, {
-        level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId,
-      });
-      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-    }
+  function resumeManagedEndpointSafely(endpointId: string): Promise<SessionRecoveryOutcome> {
+    return settleSessionRecovery(() => resumeManagedEndpoint(endpointId, true), (reason) => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId, reason,
+    }));
   }
 
   function prepareToolSystemNotice(operationId: string, attemptId: string, body: string): void {
@@ -5486,15 +5516,15 @@ export async function buildProductionApp(
             if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
               (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
             else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
-            const restored = await resumeManagedEndpointSafely(endpointId);
-            await succeedRecovered(operation, {
-              endpoint: endpointId,
-              state: "ready",
-              sessions_restored: restored.ok,
-              ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
-            }, () => prepareToolSystemNotice(operation.id, operation.attemptId, restored.ok
-              ? `endpoint ${endpointId} restarted`
-              : `endpoint ${endpointId} restarted; session recovery failed: ${restored.reason}`));
+            // Deliberately NOT isolated the way the tool handler isolates it. Here a thrown
+            // resume leaves the row recoverable, and the next reconciliation pass retries it --
+            // which is how unrecovered sessions eventually come back without a human. Succeeding
+            // the row with `sessions_restored: false` would end the retries and leave the sessions
+            // down until someone ran recover_endpoint. That gates succeedRecovered; removing it
+            // here would break recovery to fix reporting.
+            await resumeManagedEndpoint(endpointId, true);
+            await succeedRecovered(operation, { endpoint: endpointId, state: "ready", sessions_restored: true },
+              () => prepareToolSystemNotice(operation.id, operation.attemptId, `endpoint ${endpointId} restarted`));
           }
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;

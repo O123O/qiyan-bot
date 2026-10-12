@@ -25,7 +25,7 @@ import {
   type RuntimeIdentity,
 } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "9913b2fd369124874705f57cc9450e0020fc6974630f5a29a5909bff88ee6c4e";
+export const REMOTE_HELPER_SHA256 = "c4a484ea1c4b818336a85939f15ea785ba8bb9841e7f6d6ec5a08d86c267578d";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
 export const REMOTE_CLAUDE_HOST_SHA256 = "115b2b25827e69677dc65fe972156f2cb62d2c064d2020f81b7aa282f30034c6";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -186,7 +186,7 @@ export interface SshRuntimeController {
   // ControlMaster, which is never torn down. Anything added here must respect that — releasing a
   // connection is not a reason to end a master.
   closeTransport?(): Promise<void>;
-  stop(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
+  stop(expectedIdentity: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
 }
 
 // The provider-neutral host facts a remote endpoint's consumers need (workspace router,
@@ -376,7 +376,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(expectedIdentity: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport> {
+  async stop(expectedIdentity: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport> {
     const prepared = await this.prepare();
     // Forced: destroyed by location, so an identity that cannot be vouched for is not a reason to
     // refuse. Still sent, for the helper's process-group signal and its report of what it killed.

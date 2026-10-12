@@ -35,7 +35,8 @@ export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   // `force` destroys the runtime by location instead of proving its identity first. See
   // docs/development/forced-restart-design.md. Returns what the destroy left behind, when the
   // runtime is one that can report it.
-  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
+  // The identity may be absent only under force, which destroys by location and needs none.
+  shutdownRuntime(expectedIdentity: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;

@@ -34,6 +34,9 @@ interface ShutdownTarget {
   // Absent for a daemonless endpoint (no runtime identity to prove).
   identity?: RuntimeIdentity;
   startedForProof: boolean;
+  // The target was created for this action rather than taken from the record, so nothing else owns
+  // it and a failed action must discard it.
+  preparedHere?: boolean;
 }
 
 interface ScheduledWork { cancel(): void }
@@ -287,12 +290,12 @@ export class EndpointManager {
   private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<EndpointLifecycleOutcome> {
     if (record.gate.desiredState === "disconnected") return {};
     this.cancelReconnect(record);
-    // Again here, not only before enqueueing. Clearing a parked predecessor lets it finish, and
-    // finishing REOPENS the gate — reconnect, recovery and status work immediately take fresh
-    // leases, on the same dead channel, and this call would park on those instead. The first
-    // discard unwedges the queue; this one keeps the window it opens from closing on us.
-    if (force) record.gate.discardLiveWork();
-    const drain = await record.gate.beginDrain();
+    // Discarded again here, not only before enqueueing, and in the same step that closes the gate.
+    // Clearing a parked predecessor lets it finish, and finishing REOPENS the gate -- reconnect,
+    // recovery and status work immediately take fresh leases, on the same dead channel, and this
+    // call would park on those instead. The first discard unwedges the queue; this one keeps the
+    // window it opens from closing on us.
+    const drain = await record.gate.beginDrain({ discardLive: force });
     let target: ShutdownTarget | undefined;
     let runtimeStopped = false;
     try {
@@ -311,6 +314,9 @@ export class EndpointManager {
       drain.disconnect();
       return { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
     } catch (error) {
+      if (!runtimeStopped && target?.preparedHere && target.endpoint !== record.endpoint) {
+        await this.discardEndpoint(target.endpoint);
+      }
       this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
       throw error;
     }
@@ -342,8 +348,7 @@ export class EndpointManager {
     return this.enqueueLifecycle(id, record, async () => {
       if (record.gate.desiredState === "disconnected") return;
       this.cancelReconnect(record);
-      if (force) record.gate.discardLiveWork();
-      const drain = await record.gate.beginDrain();
+      const drain = await record.gate.beginDrain({ discardLive: force });
       let proofEndpoint: ManagedAppServerEndpoint | undefined;
       let startedForProof = false;
       let runtimeStopped = false;
@@ -355,11 +360,13 @@ export class EndpointManager {
         candidateWasNew = record.endpoint !== candidate.endpoint;
         const actual = await candidate.endpoint.runtimeIdentity();
         if (!actual) {
-          // Nothing left to signal, so there is nothing to destroy by identity. Under force the
-          // adapter is abandoned rather than politely closed: an endpoint whose channel is dead is
-          // exactly the one that cannot finish a close.
-          if (force) await this.discardEndpoint(candidate.endpoint);
-          else await this.requireClosed(candidate.endpoint, id);
+          // Nothing left to signal, so there is nothing to destroy by identity -- but under force
+          // the destroy still has to be ISSUED, by location, or the tmux session and socket
+          // survive the restart that was meant to end them. Abandoning the adapter is the whole
+          // destroy only for a daemonless runtime, which is its connection; stopEndpointRuntime
+          // draws that line. A dead channel cannot finish a polite close, so force does not wait
+          // for one.
+          await this.stopEndpointRuntime({ endpoint: candidate.endpoint, startedForProof: false }, force);
           if (force) this.reportRuntimeDestroyed(id);
           if (phase !== "runtime_stopped") checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           drain.disconnect();
@@ -407,11 +414,10 @@ export class EndpointManager {
     return this.enqueueLifecycle(id, record, async () => {
       this.cancelReconnect(record);
       if (record.gate.desiredState === "disconnected") record.gate.requestAutomatic();
-      if (force) record.gate.discardLiveWork();
       const replacement = phase === "runtime_started" || phase === "runtime_stopped"
         ? record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id)
         : await this.prepareCandidate(id);
-      const drain = await record.gate.beginDrain();
+      const drain = await record.gate.beginDrain({ discardLive: force });
       let proofEndpoint: ManagedAppServerEndpoint | undefined;
       let proofStarted = false;
       let replacementEndpoint: ManagedAppServerEndpoint | undefined;
@@ -440,7 +446,8 @@ export class EndpointManager {
         const target = record.endpoint ? { endpoint: record.endpoint } : await this.prepareCandidate(id);
         if (target.endpoint.daemonless) {
           // No runtime identity to reconcile: close the old adapter, re-ready a fresh one. Under
-          // force the old adapter is abandoned instead -- a dead channel cannot finish a close.
+          // force the old adapter is abandoned instead -- a daemonless runtime IS its connection,
+          // and a dead channel cannot finish a polite close.
           if (force) await this.discardEndpoint(target.endpoint);
           else await this.requireClosed(target.endpoint, id);
           checkpoint?.({ phase: "runtime_stopped", identity: undefined });
@@ -454,11 +461,11 @@ export class EndpointManager {
         }
         const actual = await target.endpoint.runtimeIdentity();
         if (!actual) {
-          // Nothing left to signal, so there is nothing to destroy by identity. Under force the
-          // adapter is abandoned rather than politely closed: an endpoint whose channel is dead is
-          // exactly the one that cannot finish a close.
-          if (force) await this.discardEndpoint(target.endpoint);
-          else await this.requireClosed(target.endpoint, id);
+          // Nothing left to signal, so there is nothing to destroy by identity -- but under force
+          // the destroy still has to be ISSUED, by location, or the tmux session and socket
+          // survive the restart that was meant to end them. See the sibling branch in
+          // recoverDisconnect.
+          await this.stopEndpointRuntime({ endpoint: target.endpoint, startedForProof: false }, force);
           checkpoint?.({ phase: "runtime_stopped", identity: expectedIdentity });
           runtimeStopped = true;
           if (force) this.reportRuntimeDestroyed(id);
@@ -498,7 +505,11 @@ export class EndpointManager {
         checkpoint?.({ phase: "runtime_stopped", identity: actual });
         const started = await this.startCandidate(replacement);
         replacementEndpoint = started;
-        const identity = await this.requireReplacementIdentity(started, expectedIdentity!, force);
+        // Against what was actually destroyed, not what the row expected. Force proceeds past a
+        // changed identity, so the two differ exactly when it matters -- and comparing with the
+        // stale one would let a replacement byte-identical to the runtime just destroyed pass the
+        // check that exists to catch precisely that.
+        const identity = await this.requireReplacementIdentity(started, actual, force);
         checkpoint?.({ phase: "runtime_started", identity });
         this.publishAfterReopen(record, drain, started);
       } catch (error) {
@@ -516,8 +527,7 @@ export class EndpointManager {
     if (record.gate.desiredState === "disconnected") {
       record.gate.requestAutomatic();
       const prepared = await this.prepareCandidate(endpointId);
-      if (force) record.gate.discardLiveWork();
-      const drain = await record.gate.beginDrain();
+      const drain = await record.gate.beginDrain({ discardLive: force });
       let replacement: ManagedAppServerEndpoint | undefined;
       try {
         replacement = await this.startCandidate(prepared);
@@ -534,10 +544,11 @@ export class EndpointManager {
       return {};
     }
     const preparedReplacement = await this.prepareCandidate(endpointId);
-    const drain = await record.gate.beginDrain();
+    const drain = await record.gate.beginDrain({ discardLive: force });
     let target: ShutdownTarget | undefined;
     let runtimeStopped = false;
     let replacement: ManagedAppServerEndpoint | undefined;
+    let spent: EndpointLifecycleOutcome = {};
     try {
       target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
@@ -546,6 +557,7 @@ export class EndpointManager {
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
       const destroyed = await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
+      spent = { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
       // Before any replacement publishes, and before a start that may fail: from here the old
       // runtime is gone either way, so whatever is still counted against it is counted against
       // nothing.
@@ -556,15 +568,18 @@ export class EndpointManager {
       const replacementIdentity = target.identity ? await this.requireReplacementIdentity(replacement, target.identity, force) : undefined;
       checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       this.publishAfterReopen(record, drain, replacement);
-      return { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
+      return spent;
     } catch (error) {
       if (runtimeStopped && replacement && replacement.state !== "stopped") {
         await this.discardEndpoint(replacement);
       } else if (!runtimeStopped && record.endpoint !== preparedReplacement.endpoint) {
         await this.discardEndpoint(preparedReplacement.endpoint);
       }
+      if (target?.preparedHere && target.endpoint !== record.endpoint && target.endpoint !== replacement) {
+        await this.discardEndpoint(target.endpoint);
+      }
       this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
-      throw error;
+      throw this.withDestroySpend(error, spent);
     }
   }
 
@@ -949,7 +964,11 @@ export class EndpointManager {
     if (force) {
       const endpoint = current ?? (await this.prepareCandidate(endpointId)).endpoint;
       const identity = endpoint.daemonless ? undefined : await endpoint.runtimeIdentity().catch(() => undefined);
-      return { endpoint, ...(identity ? { identity } : {}), startedForProof: false };
+      // `startedForProof` is false -- nothing was started -- but a candidate prepared here is still
+      // ours to clean up if the action fails, and reopenAfterLifecycleFailure only republishes a
+      // started one. Saying so lets the caller discard it instead of leaking an SSH adapter per
+      // failed forced restart.
+      return { endpoint, ...(identity ? { identity } : {}), startedForProof: false, preparedHere: !current };
     }
     if (current) {
       // A daemonless endpoint (Claude) has no runtime identity to prove — it is always its
@@ -973,6 +992,28 @@ export class EndpointManager {
   }
 
   // Stop an endpoint's runtime: prove-and-shutdown a daemon, or just close a daemonless one.
+  // A forced action that destroyed a runtime and then failed still spent what it spent, and the
+  // reason-bearing error is the only thing that reaches the caller on a failure -- the result
+  // object does not. So the account goes into the message rather than being dropped with the
+  // result. The original code is preserved, because the caller's handling of it is unchanged: it
+  // is the same failure, described more completely.
+  private withDestroySpend(error: unknown, outcome: EndpointLifecycleOutcome): unknown {
+    const parts: string[] = [];
+    if (outcome.destroyed) {
+      const identity = outcome.destroyed.destroyedIdentity;
+      parts.push(`destroyed ${identity ? `pid ${identity.pid}` : "no recorded identity"}`);
+      if (outcome.destroyed.survivors !== undefined) parts.push(`survivors ${outcome.destroyed.survivors}`);
+      if (outcome.destroyed.serverSurvived) parts.push("the recorded server process survived");
+    }
+    if (outcome.interruptedTurns?.length) {
+      parts.push(`interrupted ${outcome.interruptedTurns.map((turn) => turn.threadId).join(", ")}`);
+    }
+    if (parts.length === 0) return error;
+    const suffix = ` (the forced destroy had already completed: ${parts.join("; ")})`;
+    if (error instanceof AppError) return new AppError(error.code, `${error.message}${suffix}`, error.details);
+    return error instanceof Error ? new Error(`${error.message}${suffix}`, { cause: error }) : error;
+  }
+
   // Isolated: a listener that throws must not turn a completed destroy into a failed one. The
   // destroy already happened, and reporting it is bookkeeping about work that is over.
   private reportRuntimeDestroyed(endpointId: string): void {
@@ -980,13 +1021,18 @@ export class EndpointManager {
   }
 
   private async stopEndpointRuntime(target: ShutdownTarget, force = false): Promise<RuntimeDestroyReport | undefined> {
-    if (target.identity) {
+    // An identity is a precondition only for an UNFORCED stop. A forced one destroys by location,
+    // so an unreadable identity is not a reason to skip the destroy -- and skipping it is worse
+    // than refusing: the tmux session and socket survive, and the replacement's own start then
+    // refuses on `existing SSH runtime is unhealthy`, leaving the endpoint exactly as wedged. The
+    // helper handles an absent identity itself and says so in `survivors`.
+    if (target.identity || (force && !target.endpoint.daemonless)) {
       return target.endpoint.shutdownRuntime(target.identity, force);
     }
-    // Daemonless, or forced with no readable identity. A daemonless runtime IS its connection, so
-    // "destroyed" means abandoning it: under force we do not wait out requireClosed's bounded
-    // close, because an endpoint whose channel is dead is exactly the one that cannot finish it,
-    // and `endpoint connection did not close` is one of the outcomes force exists to remove.
+    // A daemonless runtime IS its connection, so "destroyed" means abandoning it: under force we
+    // do not wait out requireClosed's bounded close, because an endpoint whose channel is dead is
+    // exactly the one that cannot finish it, and `endpoint connection did not close` is one of the
+    // outcomes force exists to remove.
     if (force) {
       await this.discardEndpoint(target.endpoint);
       return undefined;

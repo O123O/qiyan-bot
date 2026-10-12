@@ -88,11 +88,11 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
     await this.host.shutdown();
   }
 
-  async shutdownRuntime(expectedIdentity: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport> {
+  async shutdownRuntime(expectedIdentity: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport> {
     // Under force the identity is not a precondition: the host is destroyed by location, so an
     // identity we cannot vouch for is no reason to refuse. It is still SENT, because the helper
     // uses it to signal the recorded process group and to report what it killed.
-    if (!force && expectedIdentity.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
+    if (!force && expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
     this.closing = true;
     await this.host.shutdown().catch((error: unknown) => { if (!force) throw error; });
     return parseRuntimeDestroyReport(await this.invoke("stop-claude-host", {
