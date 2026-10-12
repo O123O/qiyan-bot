@@ -289,3 +289,26 @@ The contract is observable at `restart_endpoint`, so that is where most of these
 - a row carrying the new receipt fields is parsed, not silently skipped, by the recovery branch
 - turn-capacity claims are released when force destroys a runtime mid-`turn/start`
 - an unforced restart still refuses a busy worker, an unproven idle, and a changed identity
+
+## Build status
+
+Release N is complete: the tolerant parse, the whole forced path, and everything it reports. What
+release N+1 adds is exactly the two things N must not write, plus the one consequence that depends
+on them.
+
+**Built (release N).** The tolerant checkpoint parse and the extended phase set; destroy by location
+in the helper and in both runtimes, with `destroyedIdentity`, `survivors` and `serverSurvived`; the
+lease discard at both points and the unparkable lifecycle action; force through the ledger fence,
+with the `satisfied` short-circuit disabled; `onRuntimeDestroyed` releasing turn-capacity claims
+before any replacement publishes; `force` carried through `recoverRestart` and `recoverDisconnect`;
+the destroy report and `interruptedTurns` in the tool result; and session recovery isolated from the
+restart's own result as `sessions_restored`.
+
+**Not built (release N+1).** Writing the `destroyed` checkpoint phase and the `forced: true` receipt,
+which N must not write until N's tolerant parse is everywhere — and, depending on them,
+`isProvenNoEffect` learning that receipt so a forced row that failed after its destroy ends `failed`
+rather than `uncertain`. Until then a forced restart that fails after its destroy still records
+`uncertain`, as an unforced one does; the next forced action proceeds past that row, so it fences
+nothing, but the row is less precise than it will be.
+
+**Out of scope and still unbuilt: the assistant endpoint**, for the reasons in §7.
