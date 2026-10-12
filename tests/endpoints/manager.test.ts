@@ -17,6 +17,7 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
   failStart = false;
   startError: Error | undefined;
   identityAvailable = true;
+  survivors: number | string | undefined = undefined;
   identityToken = "a".repeat(32);
   localPid = 10;
   threadStatus: "notLoaded" | "idle" | "active" | "systemError" = "idle";
@@ -36,13 +37,16 @@ class FakeEndpoint implements ManagedAppServerEndpoint {
     this.events.emit("ready");
   }
   async closeConnection() { this.connectionCloses += 1; this.state = "stopped"; }
-  async shutdownRuntime() {
+  async shutdownRuntime(expected?: RuntimeIdentity, force = false) {
     this.runtimeStops += 1;
+    const destroyed = await this.runtimeIdentity();
     this.state = "stopped";
     if (this.rotateIdentityOnStop) {
       if (this.id === "local") this.localPid += 1;
       else this.identityToken = "b".repeat(32);
     }
+    void expected;
+    return { destroyedIdentity: destroyed ?? null, ...(force && this.survivors ? { survivors: this.survivors } : {}) };
   }
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {
     this.onRuntimeIdentity?.();
@@ -1524,6 +1528,54 @@ test("a forced restart is not parked by live work, nor queued behind one that al
   releaseStuck();
   await stuck.catch(() => undefined);
   await parked;
+});
+
+// Force's justification is that the operator spends an in-flight turn deliberately, so a bare
+// success is not an answer: he is owed what was destroyed and what refused to die.
+test("a forced restart reports what it destroyed and the turns it interrupted", async () => {
+  const local = new FakeEndpoint("local");
+  const made: FakeEndpoint[] = [];
+  let status: "idle" | "active" | "unknown" = "active";
+  const manager = new EndpointManager({
+    localEndpoint: local,
+    catalog: {
+      reload: async () => undefined,
+      require: (id: string) => ({ id, provider: "codex" as const, transport: "ssh" as const, host: id, projectsRoot: "~/qiyan-projects" }),
+    },
+    createRemote: async (definition) => {
+      const endpoint = new FakeEndpoint(definition.id);
+      endpoint.identityToken = String.fromCharCode(97 + made.length).repeat(32);
+      endpoint.survivors = "unknown: no identity to signal from";
+      made.push(endpoint);
+      return { endpoint };
+    },
+    hasIdentityReferences: () => true,
+    managedThreadIds: (id) => id === "devbox" ? ["thread-1", "thread-2"] : [],
+    managedThreadState: (_id, threadId, generation) => ({
+      availability: "ready",
+      status: threadId === "thread-1" ? status : "idle",
+      endpointGeneration: generation,
+    }),
+  });
+
+  await manager.ensureReady("devbox");
+  const destroyed = await made.at(-1)!.runtimeIdentity();
+
+  const outcome = await manager.restart("devbox", undefined, true);
+  assert.deepEqual(outcome.destroyed?.destroyedIdentity, destroyed);
+  assert.equal(outcome.destroyed?.survivors, "unknown: no identity to signal from");
+  // Only the turn that was actually running. An idle peer is not something force spent.
+  assert.deepEqual(outcome.interruptedTurns, [{ threadId: "thread-1", status: "active" }]);
+
+  // An unreadable status is spent too: the turn may be live and there is nothing left to say so.
+  status = "unknown";
+  assert.deepEqual((await manager.restart("devbox", undefined, true)).interruptedTurns,
+    [{ threadId: "thread-1", status: "unknown" }]);
+
+  // An unforced restart destroys nothing it has not first proven, so it accounts for nothing.
+  status = "idle";
+  const unforced = await manager.restart("devbox");
+  assert.equal(unforced.interruptedTurns, undefined);
 });
 
 // A destroyed runtime never announces its own death, and the pool releases turn-capacity claims

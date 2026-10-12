@@ -28,7 +28,7 @@ import type { ClaudeCommandRunner } from "./claude-command-runner.ts";
 import type { ClaudeHost } from "../claude-host/host.ts";
 import type { HostEvent } from "../claude-host/protocol.ts";
 import { ClaudeTranscriptHistory } from "./claude-history.ts";
-import type { EndpointLossKind, EndpointLossReason, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
+import type { EndpointLossKind, EndpointLossReason, ManagedAppServerEndpoint, RuntimeDestroyReport, RuntimeIdentity } from "./types.ts";
 
 interface ThreadState {
   cwd: string;
@@ -128,7 +128,7 @@ export interface ClaudeReattachment {
 export interface ClaudePersistentRuntime {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
-  shutdownRuntime(expectedIdentity: RuntimeIdentity): Promise<void>;
+  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
   // Reconnect-time reattach. The host already knows what is still running, so this only has
@@ -416,16 +416,20 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     this.forgetLoadedSessions();
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport | undefined> {
     this.lifecycleGeneration += 1;
     this.endpointState = "stopped";
     this.persistentUnavailableSubscription?.();
     delete this.persistentUnavailableSubscription;
-    if (this.options.persistentRuntime) await this.options.persistentRuntime.shutdownRuntime(expected);
+    let destroyed: RuntimeDestroyReport | undefined;
+    // The in-process host has no remote runtime to account for: it is this process's own session
+    // map, and ending it leaves nothing behind that a report could describe.
+    if (this.options.persistentRuntime) destroyed = await this.options.persistentRuntime.shutdownRuntime(expected, force);
     else await this.options.host.shutdown();
     // Both branches end the sessions themselves: the in-process host walks its own session
     // map, and the remote branch stops the host process that owned them.
     this.forgetLoadedSessions();
+    return destroyed;
   }
 
   // Every session the host held is gone. This endpoint object outlives them — the manager

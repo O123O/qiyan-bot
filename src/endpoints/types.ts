@@ -33,14 +33,38 @@ export interface ManagedAppServerEndpoint extends AppServerEndpoint {
   start(): Promise<void>;
   closeConnection(): Promise<void>;
   // `force` destroys the runtime by location instead of proving its identity first. See
-  // docs/development/forced-restart-design.md.
-  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<void>;
+  // docs/development/forced-restart-design.md. Returns what the destroy left behind, when the
+  // runtime is one that can report it.
+  shutdownRuntime(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onReady(listener: () => void): () => void;
   onUnavailable(listener: (kind: EndpointLossKind, reason?: EndpointLossReason) => void): () => void;
   onPermissionBlocked(listener: (event: PermissionBlockedEvent) => void): () => void;
 }
+
+// What a destroy left behind. Force's whole justification is that the operator spends something
+// deliberately, so he is owed an account of what was spent rather than a bare success.
+export interface RuntimeDestroyReport {
+  // The identity read immediately before the destroy, or null when there was none. A force that
+  // killed something must be able to say what.
+  readonly destroyedIdentity: RuntimeIdentity | null;
+  // Token-carrying members that outlived SIGKILL. With no identity there was nothing to signal
+  // FROM, so this is the string reason rather than 0: a zero there reads as "clean" when it means
+  // "did not look", and a detached app-server outside the pane's process group survives
+  // kill-session unaccounted for in exactly that case.
+  readonly survivors?: number | string;
+  // The recorded server process itself is still alive and token-carrying. Unforced this raises;
+  // under force it is reported, because the socket is unlinked and the replacement gets a new pid,
+  // process group, token and port -- but it is loud enough to deserve its own field.
+  readonly serverSurvived?: boolean;
+}
+
+export const runtimeDestroyReportSchema = z.object({
+  destroyedIdentity: z.unknown().optional(),
+  survivors: z.union([z.number(), z.string()]).optional(),
+  serverSurvived: z.boolean().optional(),
+}).passthrough();
 
 const identitySchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("local"), pid: z.number().int().positive(), startTime: z.string().regex(/^\d+$/u) }).strict(),
@@ -51,3 +75,18 @@ const identitySchema = z.discriminatedUnion("kind", [
 ]);
 
 export function parseRuntimeIdentity(value: unknown): RuntimeIdentity { return identitySchema.parse(value); }
+
+// A destroy that happened is not undone by a report we cannot read, so an unparseable identity
+// degrades to null rather than throwing: the kill is already done, and refusing here would turn a
+// completed destroy into a failed operation and leave the row fencing the endpoint.
+export function parseRuntimeDestroyReport(value: unknown): RuntimeDestroyReport {
+  const parsed = runtimeDestroyReportSchema.safeParse(value);
+  if (!parsed.success) return { destroyedIdentity: null };
+  let destroyedIdentity: RuntimeIdentity | null = null;
+  try { destroyedIdentity = identitySchema.parse(parsed.data.destroyedIdentity); } catch { destroyedIdentity = null; }
+  return {
+    destroyedIdentity,
+    ...(parsed.data.survivors === undefined ? {} : { survivors: parsed.data.survivors }),
+    ...(parsed.data.serverSurvived === undefined ? {} : { serverSurvived: parsed.data.serverSurvived }),
+  };
+}

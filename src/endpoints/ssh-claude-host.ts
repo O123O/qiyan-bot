@@ -15,7 +15,7 @@ import { RemoteClaudeHost, type HostChannel } from "../claude-host/transport.ts"
 import type { ClaudePersistentRuntime, ClaudeReattachment } from "./claude-runtime.ts";
 import type { ReadyProcessStream } from "./ssh-process.ts";
 import { unservingSupervisor, type RemoteHost } from "./ssh-runtime.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
+import { parseRuntimeDestroyReport, parseRuntimeIdentity, type EndpointLossKind, type RuntimeDestroyReport, type RuntimeIdentity } from "./types.ts";
 
 // What the channel opener needs from the runtime. Separate from the class so the adapter is
 // testable on its own and the direction of the dependency stays one-way.
@@ -88,16 +88,16 @@ export class SshClaudeHostRuntime implements ClaudePersistentRuntime, ClaudeHost
     await this.host.shutdown();
   }
 
-  async shutdownRuntime(expectedIdentity: RuntimeIdentity, force = false): Promise<void> {
+  async shutdownRuntime(expectedIdentity: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport> {
     // Under force the identity is not a precondition: the host is destroyed by location, so an
     // identity we cannot vouch for is no reason to refuse. It is still SENT, because the helper
     // uses it to signal the recorded process group and to report what it killed.
     if (!force && expectedIdentity.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
     this.closing = true;
     await this.host.shutdown().catch((error: unknown) => { if (!force) throw error; });
-    await this.invoke("stop-claude-host", {
+    return parseRuntimeDestroyReport(await this.invoke("stop-claude-host", {
       ...this.runtimeRequest(), expected: expectedIdentity, ...(force ? { force: true } : {}),
-    });
+    }));
   }
 
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> {

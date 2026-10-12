@@ -70,7 +70,7 @@ class FakeRemoteRuntime implements SshRuntimeController {
   async runtimeIdentity(): Promise<RuntimeIdentity | undefined> { return this.current; }
   async classifyLoss(): Promise<EndpointLossKind> { return this.classification; }
   async closeTransport(): Promise<void> { this.transportCloses += 1; }
-  async stop(expected: RuntimeIdentity): Promise<void> { this.stops.push(expected); }
+  async stop(expected: RuntimeIdentity) { this.stops.push(expected); return { destroyedIdentity: expected }; }
 }
 
 function fixture(remote = new FakeRemoteRuntime(), options: {

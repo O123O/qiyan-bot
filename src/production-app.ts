@@ -120,7 +120,7 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager, type EndpointRecoveryPause } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
@@ -3322,7 +3322,7 @@ export async function buildProductionApp(
             await runAssistantRestart(action, {
               endpointId: assistantEndpoint.id,
               runtimeIdentity: () => assistantEndpoint.runtimeIdentity(),
-              shutdownRuntime: (identity) => assistantEndpoint.shutdownRuntime(identity),
+              shutdownRuntime: async (identity) => { await assistantEndpoint.shutdownRuntime(identity); },
               startAndResume: async () => { await assistantEndpoint.start(); await startOrResumeAssistant(); },
             }, context.checkpoint);
             completeDeferredSystemNotices(action);
@@ -4429,12 +4429,12 @@ export async function buildProductionApp(
         if (await settleEndpointLifecycleOrder(
           context.operationSequence, endpointId, "disconnect_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
-        await endpointManager.disconnect(
+        const outcome = await endpointManager.disconnect(
           endpointId,
           (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
           args.force,
         );
-        return { endpoint: endpointId, state: "disconnected" };
+        return { endpoint: endpointId, state: "disconnected", ...forcedLifecycleReport(outcome) };
       },
       // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
       // is the same path an automatic reconnect takes, and it is deliberately NOT an endpoint
@@ -4495,14 +4495,26 @@ export async function buildProductionApp(
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
-        await endpointManager.restart(
+        const outcome = await endpointManager.restart(
           endpointId,
           (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
           args.force,
         );
-        await resumeManagedEndpoint(endpointId, true);
-        prepareToolSystemNotice(context.operationId, context.attemptId, `endpoint ${endpointId} restarted`);
-        return { endpoint: endpointId, state: "ready" };
+        // The restart is done and the endpoint is running a new runtime. Session recovery is a
+        // separate thing that can fail on its own, and letting its failure poison this result
+        // reported a completed restart as uncertain -- which leaves the row fencing the next
+        // restart on an endpoint that is, in fact, already fine.
+        const restored = await resumeManagedEndpointSafely(endpointId);
+        prepareToolSystemNotice(context.operationId, context.attemptId, restored.ok
+          ? `endpoint ${endpointId} restarted`
+          : `endpoint ${endpointId} restarted; session recovery failed: ${restored.reason}`);
+        return {
+          endpoint: endpointId,
+          state: "ready",
+          sessions_restored: restored.ok,
+          ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
+          ...forcedLifecycleReport(outcome),
+        };
       },
       set_session_model: async (args, context) => {
         if (args.nickname === "assistant") {
@@ -4659,6 +4671,32 @@ export async function buildProductionApp(
     catch (error) {
       if (error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY") return undefined;
       throw error;
+    }
+  }
+
+  // What a forced action spent, flattened into the tool result. Absent entirely for an unforced
+  // action, which destroys nothing it has not first proven.
+  function forcedLifecycleReport(outcome: EndpointLifecycleOutcome): Record<string, unknown> {
+    return {
+      ...(outcome.destroyed ? {
+        destroyed_identity: outcome.destroyed.destroyedIdentity,
+        ...(outcome.destroyed.survivors === undefined ? {} : { survivors: outcome.destroyed.survivors }),
+        ...(outcome.destroyed.serverSurvived ? { server_survived: true } : {}),
+      } : {}),
+      ...(outcome.interruptedTurns ? { interrupted_turns: outcome.interruptedTurns } : {}),
+    };
+  }
+
+  // Recovery of a restarted endpoint's managed sessions, isolated from the restart's own result.
+  async function resumeManagedEndpointSafely(endpointId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      await resumeManagedEndpoint(endpointId, true);
+      return { ok: true };
+    } catch (error) {
+      reportOperationalSafely(report, {
+        level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId,
+      });
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -5448,9 +5486,15 @@ export async function buildProductionApp(
             if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
               (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
             else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), args.force);
-            await resumeManagedEndpoint(endpointId, true);
-            await succeedRecovered(operation, { endpoint: endpointId, state: "ready" },
-              () => prepareToolSystemNotice(operation.id, operation.attemptId, `endpoint ${endpointId} restarted`));
+            const restored = await resumeManagedEndpointSafely(endpointId);
+            await succeedRecovered(operation, {
+              endpoint: endpointId,
+              state: "ready",
+              sessions_restored: restored.ok,
+              ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
+            }, () => prepareToolSystemNotice(operation.id, operation.attemptId, restored.ok
+              ? `endpoint ${endpointId} restarted`
+              : `endpoint ${endpointId} restarted; session recovery failed: ${restored.reason}`));
           }
         } else if (operation.kind === "collect_messages") {
           const checkpoint = operation.receipt as { messageIds?: string[] } | undefined;

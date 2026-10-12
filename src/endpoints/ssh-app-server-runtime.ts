@@ -8,7 +8,7 @@ import type { RpcWire } from "../app-server/rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import type { ReadyProcessStream } from "./ssh-process.ts";
 import type { SshRuntimeController } from "./ssh-runtime.ts";
-import type { EndpointLossKind, RuntimeIdentity } from "./types.ts";
+import type { EndpointLossKind, RuntimeDestroyReport, RuntimeIdentity } from "./types.ts";
 
 export class SshAppServerRuntime implements AppServerRuntimeService {
   private active?: SshProxyConnection;
@@ -73,7 +73,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
     return await this.options.runtime.runtimeIdentity() === undefined ? "runtime-lost" : "connection-lost";
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<void> {
+  async shutdownRuntime(expected: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport | undefined> {
     if (this.transportClosing) throw new AppError("OPERATION_CONFLICT", "SSH transport teardown is already active");
     this.transportClosing = true;
     try {
@@ -82,13 +82,15 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
       try { await this.active?.close(); } catch (error) { cleanupError = error; }
       try { await this.settlePendingCleanup(); } catch (error) { cleanupError ??= error; }
       let stopError: unknown;
-      try { await this.options.runtime.stop(expected, force); } catch (error) { stopError = error; }
+      let destroyed: RuntimeDestroyReport | undefined;
+      try { destroyed = await this.options.runtime.stop(expected, force); } catch (error) { stopError = error; }
       if (this.active?.cleanupPending) {
         try { await this.active.close(); } catch (error) { cleanupError ??= error; }
       }
       try { await this.settlePendingCleanup(); } catch (error) { cleanupError ??= error; }
       if (cleanupError !== undefined) throw cleanupError;
       if (stopError !== undefined) throw stopError;
+      return destroyed;
     } finally {
       this.transportClosing = false;
     }

@@ -75,7 +75,7 @@ export class LocalAppServerRuntime implements AppServerRuntimeService {
 
   async classifyLoss(): Promise<EndpointLossKind> { return "runtime-lost"; }
 
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+  async shutdownRuntime(expected: RuntimeIdentity): Promise<undefined> {
     const actual = this.identity ?? this.lastIdentity;
     if (!actual || !sameLocalIdentity(actual, expected)) {
       throw new AppError("OPERATION_CONFLICT", "local App Server runtime identity changed before shutdown");

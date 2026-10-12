@@ -17,7 +17,13 @@ import {
   type BoundedProcessResult,
   type ReadyProcessStream,
 } from "./ssh-process.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
+import {
+  parseRuntimeDestroyReport,
+  parseRuntimeIdentity,
+  type EndpointLossKind,
+  type RuntimeDestroyReport,
+  type RuntimeIdentity,
+} from "./types.ts";
 
 export const REMOTE_HELPER_SHA256 = "9913b2fd369124874705f57cc9450e0020fc6974630f5a29a5909bff88ee6c4e";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
@@ -180,7 +186,7 @@ export interface SshRuntimeController {
   // ControlMaster, which is never torn down. Anything added here must respect that — releasing a
   // connection is not a reason to end a master.
   closeTransport?(): Promise<void>;
-  stop(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<void>;
+  stop(expectedIdentity: RuntimeIdentity, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
 }
 
 // The provider-neutral host facts a remote endpoint's consumers need (workspace router,
@@ -370,12 +376,12 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(expectedIdentity: RuntimeIdentity, force = false): Promise<void> {
+  async stop(expectedIdentity: RuntimeIdentity, force = false): Promise<RuntimeDestroyReport> {
     const prepared = await this.prepare();
     // Forced: destroyed by location, so an identity that cannot be vouched for is not a reason to
     // refuse. Still sent, for the helper's process-group signal and its report of what it killed.
     if (!force && expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
-    await this.options.remote.invoke("stop", [JSON.stringify({
+    const reported = await this.options.remote.invoke("stop", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
       session: prepared.session,
       tmuxMode: prepared.tmuxMode,
@@ -383,6 +389,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       ...(force ? { force: true } : {}),
     })], prepared.host.remoteHelperPath);
     if (prepared.tmuxMode === "legacy") delete this.prepared;
+    return parseRuntimeDestroyReport(reported);
   }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {

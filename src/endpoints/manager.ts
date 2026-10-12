@@ -2,7 +2,22 @@ import { AppError } from "../core/errors.ts";
 import type { EndpointDefinition } from "./catalog.ts";
 import { EndpointAdmissionGate, type EndpointDesiredState } from "./admission-gate.ts";
 import type { PendingDestinationBinding } from "./ssh-config.ts";
-import type { EndpointLossKind, EndpointWorkLease, ManagedAppServerEndpoint, RuntimeIdentity } from "./types.ts";
+import type {
+  EndpointLossKind,
+  EndpointWorkLease,
+  ManagedAppServerEndpoint,
+  RuntimeDestroyReport,
+  RuntimeIdentity,
+} from "./types.ts";
+
+// What a forced lifecycle action spent. Force's justification is that the operator spends an
+// in-flight turn deliberately, so he is owed the account rather than a bare success.
+export interface EndpointLifecycleOutcome {
+  readonly destroyed?: RuntimeDestroyReport;
+  // Managed threads that were not provably idle when force destroyed the runtime. Read from the
+  // same view the idle proof reads, at the moment force declines to wait for it.
+  readonly interruptedTurns?: readonly { readonly threadId: string; readonly status: string }[];
+}
 
 interface CatalogReader {
   reload(): Promise<void>;
@@ -262,15 +277,15 @@ export class EndpointManager {
     return { unavailable: unavailable.sort() };
   }
 
-  async disconnect(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
+  async disconnect(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<EndpointLifecycleOutcome> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
     if (force) record.gate.discardLiveWork();
     return this.enqueueLifecycle(endpointId, record, () => this.disconnectInternal(endpointId, record, checkpoint, force));
   }
 
-  private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
-    if (record.gate.desiredState === "disconnected") return;
+  private async disconnectInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<EndpointLifecycleOutcome> {
+    if (record.gate.desiredState === "disconnected") return {};
     this.cancelReconnect(record);
     // Again here, not only before enqueueing. Clearing a parked predecessor lets it finish, and
     // finishing REOPENS the gate — reconnect, recovery and status work immediately take fresh
@@ -283,9 +298,10 @@ export class EndpointManager {
     try {
       target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
+      const interruptedTurns = force ? await this.managedTurnsInFlight(endpointId) : [];
       await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await this.stopEndpointRuntime(target, force);
+      const destroyed = await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
       // Before any replacement publishes, and before a start that may fail: from here the old
       // runtime is gone either way, so whatever is still counted against it is counted against
@@ -293,13 +309,14 @@ export class EndpointManager {
       if (force) this.reportRuntimeDestroyed(endpointId);
       checkpoint?.({ phase: "runtime_stopped", identity: target.identity });
       drain.disconnect();
+      return { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
     } catch (error) {
       this.reopenAfterLifecycleFailure(record, drain, !runtimeStopped && target?.startedForProof ? target.endpoint : undefined);
       throw error;
     }
   }
 
-  async restart(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
+  async restart(id?: string, checkpoint?: (value: unknown) => void, force = false): Promise<EndpointLifecycleOutcome> {
     const endpointId = this.normalize(id);
     const record = this.record(endpointId);
     // Before enqueueing, not inside the action: a PREDECESSOR already parked in beginDrain holds
@@ -494,7 +511,7 @@ export class EndpointManager {
     });
   }
 
-  private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<void> {
+  private async restartInternal(endpointId: string, record: EndpointRecord, checkpoint?: (value: unknown) => void, force = false): Promise<EndpointLifecycleOutcome> {
     this.cancelReconnect(record);
     if (record.gate.desiredState === "disconnected") {
       record.gate.requestAutomatic();
@@ -513,7 +530,8 @@ export class EndpointManager {
         this.reopenAfterLifecycleFailure(record, drain);
         throw error;
       }
-      return;
+      // A disconnected endpoint has no runtime to destroy: this branch only starts one.
+      return {};
     }
     const preparedReplacement = await this.prepareCandidate(endpointId);
     const drain = await record.gate.beginDrain();
@@ -523,9 +541,10 @@ export class EndpointManager {
     try {
       target = await this.shutdownTarget(endpointId, record, force);
       checkpoint?.({ phase: "draining", identity: target.identity });
+      const interruptedTurns = force ? await this.managedTurnsInFlight(endpointId) : [];
       await this.requireManagedThreadsIdle(endpointId, target.endpoint, force);
       checkpoint?.({ phase: "idle_proven", identity: target.identity });
-      await this.stopEndpointRuntime(target, force);
+      const destroyed = await this.stopEndpointRuntime(target, force);
       runtimeStopped = true;
       // Before any replacement publishes, and before a start that may fail: from here the old
       // runtime is gone either way, so whatever is still counted against it is counted against
@@ -537,6 +556,7 @@ export class EndpointManager {
       const replacementIdentity = target.identity ? await this.requireReplacementIdentity(replacement, target.identity, force) : undefined;
       checkpoint?.({ phase: "runtime_started", identity: replacementIdentity });
       this.publishAfterReopen(record, drain, replacement);
+      return { ...(destroyed ? { destroyed } : {}), ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}) };
     } catch (error) {
       if (runtimeStopped && replacement && replacement.state !== "stopped") {
         await this.discardEndpoint(replacement);
@@ -711,6 +731,23 @@ export class EndpointManager {
   // read is exactly the one that needs restarting. Without an override the proof that protects
   // live work also makes a wedged endpoint unrepairable, so the owner can spend the in-flight
   // turn deliberately rather than being told no by a status nobody can observe.
+  // Managed threads this endpoint's idle proof would have refused on. Under force the proof is
+  // skipped, so this is the only record of what the destroy is about to interrupt.
+  private async managedTurnsInFlight(endpointId: string): Promise<{ threadId: string; status: string }[]> {
+    const generation = this.record(endpointId).generation;
+    const inFlight: { threadId: string; status: string }[] = [];
+    for (const threadId of await this.options.managedThreadIds(endpointId)) {
+      const state = this.options.managedThreadState?.(endpointId, threadId, generation);
+      // No readable state is itself something force is spending: the turn may be live and there is
+      // nothing left to say otherwise. "unknown" is what the idle proof refuses on, so it is what
+      // the operator is owed here.
+      if (!state || state.availability !== "ready" || state.endpointGeneration !== generation) {
+        inFlight.push({ threadId, status: "unknown" });
+      } else if (state.status !== "idle") inFlight.push({ threadId, status: state.status });
+    }
+    return inFlight;
+  }
+
   private async requireManagedThreadsIdle(endpointId: string, _endpoint: ManagedAppServerEndpoint, force = false): Promise<void> {
     if (force) return;
     const generation = this.record(endpointId).generation;
@@ -942,10 +979,9 @@ export class EndpointManager {
     try { this.options.onRuntimeDestroyed?.(endpointId); } catch { /* bookkeeping only */ }
   }
 
-  private async stopEndpointRuntime(target: ShutdownTarget, force = false): Promise<void> {
+  private async stopEndpointRuntime(target: ShutdownTarget, force = false): Promise<RuntimeDestroyReport | undefined> {
     if (target.identity) {
-      await target.endpoint.shutdownRuntime(target.identity, force);
-      return;
+      return target.endpoint.shutdownRuntime(target.identity, force);
     }
     // Daemonless, or forced with no readable identity. A daemonless runtime IS its connection, so
     // "destroyed" means abandoning it: under force we do not wait out requireClosed's bounded
@@ -953,9 +989,10 @@ export class EndpointManager {
     // and `endpoint connection did not close` is one of the outcomes force exists to remove.
     if (force) {
       await this.discardEndpoint(target.endpoint);
-      return;
+      return undefined;
     }
     await this.requireClosed(target.endpoint, target.endpoint.id);
+    return undefined;
   }
 
   private record(id: string): EndpointRecord {
