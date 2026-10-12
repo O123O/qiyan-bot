@@ -35,6 +35,7 @@ import {
   recoverableOperationHasNoDispatch,
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
+  recoverablePhase,
   prepareAssistantWebCommentary,
   routeLifecycleNotification,
   processWorkerTerminalNotification,
@@ -3280,10 +3281,24 @@ test("assistant notification failure before dispatcher construction still report
   assert.deepEqual(reports, ["assistant notification"]);
 });
 
-test("endpoint lifecycle recovery checkpoints require an exact phase and runtime identity", () => {
+test("endpoint lifecycle recovery checkpoints keep a known phase and identity, and tolerate new fields", () => {
   const checkpoint = { endpoint: "devbox", phase: "runtime_started", identity: { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 } };
   assert.deepEqual(parseEndpointLifecycleCheckpoint(checkpoint), checkpoint);
-  assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, extra: true }), undefined);
+  // A field a later build added must not make the whole receipt unparseable. The recovery branch
+  // silently skips a row it cannot parse, which leaves it unresolved forever and fences every later
+  // lifecycle action on that endpoint — and two instances share this ledger, so a strict allowlist
+  // here is a wedge waiting for the next deploy.
+  assert.deepEqual(parseEndpointLifecycleCheckpoint({ ...checkpoint, forced: true }), checkpoint);
+  // `destroyed` is accepted before anything writes it, and means to an older instance exactly what
+  // it means to a newer one: the runtime is gone, so recovery is a plain start.
+  assert.deepEqual(
+    parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "destroyed" }),
+    { ...checkpoint, phase: "destroyed" },
+  );
+  assert.equal(recoverablePhase("destroyed"), "runtime_stopped");
+  for (const phase of ["draining", "idle_proven", "runtime_stopped", "runtime_started"] as const) {
+    assert.equal(recoverablePhase(phase), phase, "a phase this build understands is unchanged");
+  }
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "unknown" }), undefined);
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, identity: { ...checkpoint.identity, token: "bad" } }), undefined);
   // A daemonless (Claude) endpoint checkpoints with no identity; the parse must accept it

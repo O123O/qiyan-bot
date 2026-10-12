@@ -2478,18 +2478,37 @@ export function reportOperationalSafely(sink: OperationalEventSink, event: Opera
   catch { /* operational logging must not change runtime behavior */ }
 }
 
-export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity?: RuntimeIdentity } | undefined {
+// Phases a lifecycle receipt may carry. `destroyed` is written by a forced restart, which tears the
+// runtime down by location rather than by identity; it is accepted here BEFORE anything writes it,
+// because two instances share this ledger and a row written by a newer build must never be
+// unparseable to an older one. See docs/development/forced-restart-design.md.
+const LIFECYCLE_CHECKPOINT_PHASES = new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started", "destroyed"]);
+export type EndpointLifecyclePhase = "draining" | "idle_proven" | "runtime_stopped" | "runtime_started" | "destroyed";
+
+// What a build that does not itself write `destroyed` should do when it reads one: the phase means
+// the runtime was torn down by location and is provably gone, which is exactly what
+// `runtime_stopped` means to the recovery paths. Mapping it keeps such a row RESOLVABLE by an older
+// instance sharing this ledger, instead of stranding it.
+export function recoverablePhase(phase: EndpointLifecyclePhase): "draining" | "idle_proven" | "runtime_stopped" | "runtime_started" {
+  return phase === "destroyed" ? "runtime_stopped" : phase;
+}
+
+export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: EndpointLifecyclePhase; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
-  if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
+  // Unknown keys are IGNORED, not rejected. The previous allowlist meant any field a later build
+  // added made the whole receipt parse as undefined, and the recovery branch silently skips a row
+  // it cannot parse — leaving it unresolved forever and fencing every later lifecycle action on
+  // that endpoint. That is the exact wedge this area keeps producing, and a strict allowlist on
+  // state shared between versions is how it gets produced again.
+  if (typeof item.endpoint !== "string" || !LIFECYCLE_CHECKPOINT_PHASES.has(String(item.phase))) return undefined;
   try {
     // A daemonless endpoint (local Claude) checkpoints with no runtime identity, so `identity` is
     // absent from the persisted receipt — accept that instead of failing the parse (which
     // would strand the recovery and permanently lock out the endpoint's lifecycle ops).
     return {
       endpoint: item.endpoint,
-      phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
+      phase: item.phase as EndpointLifecyclePhase,
       ...(item.identity === undefined ? {} : { identity: parseRuntimeIdentity(item.identity) }),
     };
   } catch { return undefined; }
@@ -5366,8 +5385,9 @@ export async function buildProductionApp(
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
           if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
           if (saved) {
-            if (saved.phase === "runtime_started") return;
-            await endpointManager.recoverDisconnect(endpointId, saved.phase, saved.identity,
+            const phase = recoverablePhase(saved.phase);
+            if (phase === "runtime_started") return;
+            await endpointManager.recoverDisconnect(endpointId, phase, saved.identity,
               (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
           }
           else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
@@ -5382,7 +5402,7 @@ export async function buildProductionApp(
             const endpointId = projectEndpoint(args.endpoint);
             const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
             if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
-            if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
+            if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
               (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
             else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
             await resumeManagedEndpoint(endpointId, true);
