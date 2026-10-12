@@ -2071,6 +2071,144 @@ test("an explicit restart fails without creating another uncertain action when r
     && error.message === "endpoint lyris has an earlier unresolved operation");
 });
 
+// The fence is the first thing a restart reaches, so a refusal here means the manager is never
+// asked -- which is how an endpoint that needs a restart became one that cannot have one.
+test("a forced restart proceeds past earlier rows without reconciling or waiting", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    // Both of these talk to the endpoint a forced restart is called on precisely because it does
+    // not answer. Reaching either is the hang this path exists to remove.
+    reconcile: async () => assert.fail("a forced action must not reconcile"),
+    isEndpointReady: () => assert.fail("a forced action must not consult endpoint health"),
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => assert.fail("a forced action must not wait"),
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, ["restart-earlier"]);
+});
+
+// A peer instance sharing this ledger is still going to settle its own dispatched row. Retiring it
+// would race that and record a completed operation as superseded; leaving it costs nothing, because
+// the next forced action proceeds past it too.
+test("a forced restart leaves a peer's dispatched row alone and still proceeds", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const dispatched = {
+    id: "restart-peer",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "dispatched" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [dispatched] as any,
+      get: () => dispatched as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, [], "a peer's in-flight row is not retired by a forced restart");
+});
+
+// An uncertain send is not something a restart's postcondition subsumes, so force proceeds past it
+// without claiming it was settled. Retiring it would invite a re-send of a delivered message.
+test("a forced restart does not retire a non-lifecycle row it proceeds past", async () => {
+  const send = {
+    id: "send-wedged",
+    sequence: 1,
+    kind: "send_to_session",
+    args: { nickname: "worker" },
+    state: "uncertain" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [send] as any,
+      get: () => send as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => nickname === "worker" ? { endpoint: "lyris" } as any : undefined,
+    },
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, []);
+});
+
+// Returning "satisfied" reports a restart that this call did not perform. The owner forces exactly
+// when the system's own bookkeeping is what he does not trust.
+test("a forced restart never takes the satisfied short-circuit", async () => {
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "succeeded" as const,
+  };
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => ({ ...earlier, state: "succeeded" }) as any,
+      fail: () => assert.fail("a succeeded row is not retired"),
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+    reconcile: async () => undefined,
+    isEndpointReady: () => true,
+    isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed", "the forced call must restart rather than inherit an earlier success");
+});
+
 test("reconnection incidents compare-delete per endpoint and preserve a newer loss", () => {
   const incidents = new EndpointRecoveryIncidents("test-run");
   assert.equal(incidents.pending("endpoint-a"), undefined, "initial activation has no recovery incident");

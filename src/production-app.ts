@@ -936,6 +936,9 @@ export async function settleEarlierEndpointOperations(options: {
   waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
   waitTimeoutMs?: number;
   signal?: AbortSignal;
+  // The operator's instruction about this endpoint, not a proof about these rows. Under it the
+  // fence never refuses and never waits: see the forced branch below.
+  force?: boolean;
 }): Promise<"proceed" | "satisfied"> {
   const earlier = (): RecoverableOperation[] => options.operations.listRecoverable()
     .filter((operation) => operation.sequence < options.currentSequence)
@@ -949,6 +952,36 @@ export async function settleEarlierEndpointOperations(options: {
   if (captured.length === 0) return "proceed";
   const conflict = (): AppError =>
     new AppError("OPERATION_CONFLICT", `endpoint ${options.endpointId} has an earlier unresolved operation`);
+
+  if (options.force) {
+    // Proceed past every earlier row without waiting, whatever its state and whoever owns it. Not
+    // reconciling first is deliberate: a reconciliation pass talks to the endpoint, and a forced
+    // action is asked for precisely when the endpoint does not answer -- waiting for the fence to
+    // clear itself is the hang this path exists to remove.
+    //
+    // "Proceed past" is not "retire". Only an `uncertain` lifecycle row this action subsumes is
+    // retired, exactly as the unreachable branch does. A peer's `dispatched` row is left alone: the
+    // peer is still going to settle it, retiring it would race that and record a completed
+    // operation as superseded, and leaving it costs nothing because the next forced action
+    // proceeds past it too.
+    //
+    // The justification is the operator's decision, not subsumption. Subsumption holds when a peer
+    // is mid-destroy or stalled; it does not hold when the peer has not reached its destroy yet,
+    // and it will then destroy our fresh runtime seconds after we report success. Proceeding is
+    // still right -- refusing is how the endpoint got wedged -- but it is right because force is an
+    // instruction about this endpoint, not because the earlier rows are provably moot.
+    for (const operation of captured) {
+      if (operation.state !== "uncertain") continue;
+      if (!subsumedByLifecycle(operation, options.currentKind, options.resolver)) continue;
+      options.operations.fail(operation.id, {
+        message: `superseded by a forced ${options.currentKind} on endpoint ${options.endpointId}`,
+      });
+    }
+    // The `satisfied` short-circuit is deliberately NOT taken here. A forced restart that returns
+    // without restarting anything is a lie, and this operation is asked for exactly when the
+    // system's own bookkeeping is the thing the owner does not trust.
+    return "proceed";
+  }
 
   try {
     await options.reconcile();
@@ -4389,7 +4422,7 @@ export async function buildProductionApp(
       disconnect_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         if (await settleEndpointLifecycleOrder(
-          context.operationSequence, endpointId, "disconnect_endpoint", context.signal,
+          context.operationSequence, endpointId, "disconnect_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
         await endpointManager.disconnect(
           endpointId,
@@ -4453,7 +4486,7 @@ export async function buildProductionApp(
         }
         const endpointId = projectEndpoint(args.endpoint);
         if (await settleEndpointLifecycleOrder(
-          context.operationSequence, endpointId, "restart_endpoint", context.signal,
+          context.operationSequence, endpointId, "restart_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
@@ -4825,6 +4858,7 @@ export async function buildProductionApp(
     endpointId: string,
     currentKind: EndpointLifecycleOperationKind,
     signal?: AbortSignal,
+    force?: boolean,
   ): Promise<"proceed" | "satisfied"> {
     return settleEarlierEndpointOperations({
       operations,
@@ -4842,6 +4876,7 @@ export async function buildProductionApp(
         return operationReconciler.waitForTerminal(operationId, operationSignal);
       },
       ...(signal ? { signal } : {}),
+      ...(force ? { force: true } : {}),
     });
   }
 
