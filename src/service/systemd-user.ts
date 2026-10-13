@@ -73,6 +73,18 @@ TimeoutStopSec=30s
 # looks unrelated and dies anyway. Restarting an assistant must not destroy the work it manages,
 # nor an interactively authenticated master the owner cannot re-create without answering MFA.
 KillMode=process
+# A worker's commands run under this service's cgroup, so a worker that fills the machine gets
+# a process of this unit OOM-killed. systemd's default, OOMPolicy=stop, then stops the WHOLE
+# unit — including the assistant, which the kernel had deliberately spared for being three
+# orders of magnitude smaller than the job it supervises. Losing the supervisor is how a
+# worker's bad pool size turns into every session dying, its in-flight work abandoned and its
+# scheduled wake-ups gone. OOMPolicy=continue leaves that judgement to the kernel: the process
+# it chose dies, and the assistant that has to report the loss survives to do it.
+OOMPolicy=continue
+# And make the supervisor an unattractive victim in the first place. The OOM killer scores by
+# size, so a 160 MB assistant is already unlikely to be chosen over a multi-GB job, but this
+# says so explicitly rather than relying on the workload staying that shape.
+OOMScoreAdjust=-500
 UMask=0077
 
 [Install]

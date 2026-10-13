@@ -49,6 +49,10 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   // A stop must signal the bot, not the whole cgroup: the owner's running jobs and any
   // interactively authenticated ControlMaster share it, and neither can be recreated by a restart.
   assert.match(unit, /^KillMode=process$/mu);
+  // A worker's own job being OOM-killed must not take the assistant with it: the kernel picks
+  // the victim, and systemd's default would stop the whole unit around that choice.
+  assert.match(unit, /^OOMPolicy=continue$/mu);
+  assert.match(unit, /^OOMScoreAdjust=-500$/mu);
   assert.match(unit, /UMask=0077/u);
   assert.match(unit, /^ConditionHost=render-host\.example\.net$/mu);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);
