@@ -79,12 +79,15 @@ KillMode=process
 # orders of magnitude smaller than the job it supervises. Losing the supervisor is how a
 # worker's bad pool size turns into every session dying, its in-flight work abandoned and its
 # scheduled wake-ups gone. OOMPolicy=continue leaves that judgement to the kernel: the process
-# it chose dies, and the assistant that has to report the loss survives to do it.
+# it chose dies, and the supervisor survives it.
+#
+# Note what this trades away: a stop was at least VISIBLE — the owner saw the bot restart. With
+# continue, a worker-triggered OOM kill is silent until something here reports it, which nothing
+# does yet. OOMScoreAdjust is deliberately absent rather than forgotten: lowering oom_score_adj
+# needs CAP_SYS_RESOURCE, a systemd --user manager has none, and systemd skips the EPERM
+# without a word, so the line would read as protection while doing nothing (measured here:
+# -500 lands as 0, while +200 applies).
 OOMPolicy=continue
-# And make the supervisor an unattractive victim in the first place. The OOM killer scores by
-# size, so a 160 MB assistant is already unlikely to be chosen over a multi-GB job, but this
-# says so explicitly rather than relying on the workload staying that shape.
-OOMScoreAdjust=-500
 UMask=0077
 
 [Install]

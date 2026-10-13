@@ -52,7 +52,13 @@ test("renders a secret-free foreground user unit with safely quoted paths", () =
   // A worker's own job being OOM-killed must not take the assistant with it: the kernel picks
   // the victim, and systemd's default would stop the whole unit around that choice.
   assert.match(unit, /^OOMPolicy=continue$/mu);
-  assert.match(unit, /^OOMScoreAdjust=-500$/mu);
+  // Deliberately NOT OOMScoreAdjust: lowering oom_score_adj needs CAP_SYS_RESOURCE, which a
+  // `systemd --user` manager does not have, and systemd >= 245 skips the EPERM silently.
+  // Measured on this host: `systemd-run --user -p OOMScoreAdjust=-500` yields 0, not -500.
+  // A directive that provably does nothing is worse than none: it reads as protection.
+  // The unit EXPLAINS the absence in a comment, so this must match a directive line, not a
+  // mention of the word.
+  assert.doesNotMatch(unit, /^OOMScoreAdjust=/mu);
   assert.match(unit, /UMask=0077/u);
   assert.match(unit, /^ConditionHost=render-host\.example\.net$/mu);
   assert.doesNotMatch(unit, /EnvironmentFile|TOKEN=|auth\.json/u);
