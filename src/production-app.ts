@@ -123,7 +123,7 @@ import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner, buildSshStreamArgs, type SshConnectionPlan } from "./endpoints/ssh-config.ts";
 import { runBoundedProcess } from "./endpoints/ssh-process.ts";
-import { WorkerMemoryWatch, type WorkerMemorySample } from "./sessions/worker-memory.ts";
+import { WorkerMemoryWatch, selectWatchTargets, type MemoryScope, type WorkerMemorySample } from "./sessions/worker-memory.ts";
 import { createLocalWorkerMemorySampler, createRemoteWorkerMemorySampler } from "./sessions/worker-memory-probe.ts";
 import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
@@ -3410,22 +3410,41 @@ export async function buildProductionApp(
         const monitorCheckRunners = new Map<string, (command: string) => Promise<boolean>>();
         // How a worker's memory is read, per endpoint. An endpoint with no sampler is simply
         // not watched — there is no fallback reading, because a wrong attribution is worse
-        // than none.
-        const workerMemorySamplers = new Map<string, (threadId: string) => Promise<WorkerMemorySample | undefined>>();
+        // than none. `scope` records what one reading covers: a Codex app-server hosts every
+        // thread on its endpoint, so that reading is the endpoint's, not any one session's.
+        const workerMemorySamplers = new Map<string, {
+          scope: MemoryScope;
+          sample(threadId: string): Promise<WorkerMemorySample | undefined>;
+        }>();
         const probeStdout = async (command: string, args: readonly string[]): Promise<string | undefined> => {
           try { return (await runBoundedProcess(command, args, { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 })).stdout.toString("utf8"); }
           catch { return undefined; }
         };
         // A remote worker is measured on its own machine, over the ControlMaster the endpoint
-        // already holds. The identity is what carries the runtime pid.
+        // already holds. The identity is what carries the runtime pid and its start time.
         const sshMemorySampler = (plan: SshConnectionPlan, runtime: { runtimeIdentity(): Promise<RuntimeIdentity | undefined> }) =>
           createRemoteWorkerMemorySampler({
             rootPid: async () => {
               // An unhealthy runtime throws rather than returning nothing; either way there is
               // no pid to measure and the watch simply stays quiet about this endpoint.
-              try { return (await runtime.runtimeIdentity())?.pid; } catch { return undefined; }
+              try {
+                const identity = await runtime.runtimeIdentity();
+                if (!identity) return undefined;
+                return identity.kind === "ssh"
+                  ? { pid: identity.pid, startTime: identity.linuxStartTime }
+                  : { pid: identity.pid };
+              } catch { return undefined; }
             },
-            runRemote: (remoteCommand) => probeStdout("ssh", buildSshStreamArgs(plan, remoteCommand)),
+            runRemote: async (remoteCommand) => {
+              // Re-attest a user-owned ControlMaster before using it, exactly as every other
+              // ssh operation here does: the socket could have been swapped between reads, and
+              // this one hands a shell program to whatever is behind it.
+              if (!plan.ownsControlMaster) {
+                try { await attestUserControlMaster(plan); }
+                catch { return undefined; }
+              }
+              return probeStdout("ssh", buildSshStreamArgs(plan, remoteCommand));
+            },
           });
         scheduling = new SchedulingService({
           db,
@@ -3466,24 +3485,36 @@ export async function buildProductionApp(
         // anything in that cgroup is OOM-killed — so without this the first casualty is the
         // assistant that would otherwise have noticed, and the worker is never told at all.
         workerMemoryWatch = new WorkerMemoryWatch({
-          targets: () => Object.entries(registry.managedSnapshot().sessions)
-            .filter(([, session]) => workerMemorySamplers.has(session.endpoint))
-            .map(([nickname, session]) => ({ nickname, endpointId: session.endpoint, threadId: session.thread_id })),
-          sample: (target) => workerMemorySamplers.get(target.endpointId)?.(target.threadId) ?? Promise.resolve(undefined),
+          targets: () => selectWatchTargets(
+            Object.entries(registry.managedSnapshot().sessions)
+              .map(([nickname, session]) => ({ nickname, endpointId: session.endpoint, threadId: session.thread_id })),
+            (endpointId) => workerMemorySamplers.get(endpointId)?.scope,
+          ),
+          sample: (target) => workerMemorySamplers.get(target.endpointId)?.sample(target.threadId) ?? Promise.resolve(undefined),
           // `auto`: steered into the running turn when the worker is busy, which is exactly
           // when its memory is climbing, and started as a turn when it is idle but still
           // holding the memory. The send is live and never durable — a memory reading is only
           // true at the instant it was taken, so a redelivery after a restart would warn about
           // a cliff that no longer exists.
-          warn: (target, message) => sessions.send(target.nickname, message, {
+          warn: (target, message, reason) => sessions.send(target.nickname, message, {
             mode: "auto",
-            clientUserMessageId: `worker-memory:${target.endpointId}:${target.threadId}:${Date.now()}`,
+            clientUserMessageId: `worker-memory:${reason}:${target.endpointId}:${target.threadId}:${Date.now()}`,
           }).then(() => undefined),
           now: () => Date.now(),
           onError: (error, target) => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "worker_memory_watch",
             endpoint: target.endpointId, reason: error instanceof Error ? error.message : "unknown",
           }),
+          // Being unable to measure is this feature's whole failure mode, and it is silent by
+          // construction. Say it out loud once it has persisted, so a watch that has quietly
+          // stopped protecting anything is visible rather than indistinguishable from calm.
+          onUnmeasured: (target, consecutive) => {
+            if (consecutive !== 10 && consecutive % 60 !== 0) return;
+            reportOperationalSafely(report, {
+              level: "warn", code: "worker_memory_unmeasured", component: "worker_memory_watch",
+              endpoint: target.endpointId, reason: `no memory reading for ${consecutive} consecutive checks`,
+            });
+          },
         });
         // Archive tombstones are the only QiYan-side state a Claude runtime still needs.
         // Steering is no longer one: the SDK queues input arriving mid-turn and runs it in
@@ -3514,7 +3545,7 @@ export async function buildProductionApp(
             botPid: process.pid,
             runLocal: (argv) => probeStdout("sh", argv),
           });
-          workerMemorySamplers.set(localClaudeDef.id, (threadId) => sampleLocal(threadId));
+          workerMemorySamplers.set(localClaudeDef.id, { scope: "session", sample: (threadId) => sampleLocal(threadId) });
         }
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         webSshRuntimeRoot = sshRuntimeRoot;
@@ -3567,7 +3598,7 @@ export async function buildProductionApp(
                 ...claudeRuntimeOptions(definition.id),
               });
               const sampleRemoteClaude = sshMemorySampler(generation.plan, claudeRemoteEndpoint);
-              workerMemorySamplers.set(definition.id, () => sampleRemoteClaude());
+              workerMemorySamplers.set(definition.id, { scope: "endpoint", sample: () => sampleRemoteClaude() });
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
@@ -3599,7 +3630,7 @@ export async function buildProductionApp(
             // One app-server hosts every thread on a Codex endpoint, so this one reading is the
             // memory of all of that endpoint's work; each of its sessions is told the same figure.
             const sampleRemoteCodex = sshMemorySampler(generation.plan, remoteEndpoint);
-            workerMemorySamplers.set(definition.id, () => sampleRemoteCodex());
+            workerMemorySamplers.set(definition.id, { scope: "endpoint", sample: () => sampleRemoteCodex() });
             remoteCandidateContexts.set(remoteEndpoint, { host: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
           },

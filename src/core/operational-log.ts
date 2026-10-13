@@ -38,6 +38,7 @@ export type OperationalEventCode =
   | "endpoint_reconnect_gave_up"
   | "endpoint_connection_lost"
   | "endpoint_runtime_reclaimed"
+  | "worker_memory_unmeasured"
   // A ledger write on the path that produces a wedged lifecycle row's ONLY terminal verdict failed
   // -- the durable attempt count, or the give-up itself. Neither aborts the pass, because that
   // would discard every other row's attempt, so without this the row would sit uncertain with
