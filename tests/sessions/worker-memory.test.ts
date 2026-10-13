@@ -128,7 +128,8 @@ test("a hung send cannot stall the pass for the other workers", async () => {
   assert.match(String((errors[0] as Error).message), /timed out/u);
 });
 
-test("a hung sample is bounded too, and reported rather than swallowed", async () => {
+test("a hung sample is bounded rather than left to stall the pass", async () => {
+  const unmeasured: string[] = [];
   const errors: unknown[] = [];
   const watch = new WorkerMemoryWatch({
     targets: () => [target],
@@ -136,17 +137,21 @@ test("a hung sample is bounded too, and reported rather than swallowed", async (
     warn: async () => undefined,
     now: () => 0,
     onError: (error) => errors.push(error),
+    onUnmeasured: (_t, _consecutive, reason) => unmeasured.push(reason),
     opTimeoutMs: 50,
   });
   await watch.tick();
-  assert.equal(errors.length, 1);
-  assert.match(String((errors[0] as Error).message), /sample timed out/u);
+  // It is a failure to MEASURE, so it takes the unmeasured ladder rather than reporting an
+  // unthrottled error on every tick for as long as the host stays wedged.
+  assert.equal(unmeasured.length, 1);
+  assert.match(unmeasured[0]!, /sample timed out/u);
+  assert.deepEqual(errors, []);
 });
 
 test("a sample or a send that throws is isolated, and the other workers still get their pass", async () => {
   const other: WorkerMemoryTarget = { nickname: "qarl", endpointId: "ptyche", threadId: "t2" };
   const sent: string[] = [];
-  const errors: unknown[] = [];
+  const unmeasured: string[] = [];
   const watch = new WorkerMemoryWatch({
     targets: () => [target, other],
     sample: async (t) => {
@@ -155,11 +160,25 @@ test("a sample or a send that throws is isolated, and the other workers still ge
     },
     warn: async (t) => { sent.push(t.nickname); },
     now: () => 0,
+    onUnmeasured: (_t, _consecutive, reason) => unmeasured.push(reason),
+  });
+  await watch.tick();
+  assert.deepEqual(unmeasured, ["probe exploded"]);
+  assert.deepEqual(sent, ["qarl"]);
+});
+
+test("a send that fails still reaches onError", async () => {
+  const errors: unknown[] = [];
+  const watch = new WorkerMemoryWatch({
+    targets: () => [target],
+    sample: async () => sample(200, 252),
+    warn: async () => { throw new Error("session is busy"); },
+    now: () => 0,
     onError: (error) => errors.push(error),
   });
   await watch.tick();
   assert.equal(errors.length, 1);
-  assert.deepEqual(sent, ["qarl"]);
+  assert.match(String((errors[0] as Error).message), /session is busy/u);
 });
 
 test("a worker that stops being watched does not keep its latch forever", async () => {
@@ -299,4 +318,143 @@ test("the message rounds the share and keeps one decimal on the sizes", () => {
     hostPressureWarningMessage({ usedBytes: GB, limitBytes: 4 * GB, scope: "session", hostTotalBytes: 4 * GB, hostAvailableBytes: GB / 2 }, 12.5),
     /13% memory free \(0\.5 GB of 4\.0 GB\), and your own work is using 1\.0 GB/u,
   );
+});
+
+// N1: the generation counter stopped the rescheduling, but clearing `ticking` in stop() removed
+// the only thing keeping two passes apart — and a concurrent prune() could delete a latch the
+// other pass was about to write, producing two identical warnings at the same instant.
+test("a stop and restart during a tick cannot produce two warnings at one instant", async () => {
+  const sent: number[] = [];
+  let live: WorkerMemoryTarget[] = [target];
+  let releaseSample!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseSample = resolve; });
+  let first = true;
+  const watch = new WorkerMemoryWatch({
+    targets: () => live,
+    sample: async () => {
+      if (first) { first = false; await blocked; }
+      return sample(200, 252);
+    },
+    warn: async () => { sent.push(0); },
+    now: () => 0,
+    pollIntervalMs: 1,
+    setTimer: (fn) => { const handle = setTimeout(fn, 0); return { cancel: () => clearTimeout(handle) }; },
+  });
+  const inFlight = watch.tick();
+  watch.stop();
+  watch.start();
+  // The session list goes momentarily empty, which is what used to prune the latch mid-pass.
+  live = [];
+  await watch.tick();
+  live = [target];
+  await watch.tick();
+  releaseSample();
+  await inFlight;
+  watch.stop();
+  assert.equal(sent.length, 1, "one crossing, one warning, however the passes interleave");
+});
+
+test("a second tick cannot start while one is still running", async () => {
+  let inFlightSamples = 0;
+  let peak = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const watch = new WorkerMemoryWatch({
+    targets: () => [target],
+    sample: async () => {
+      inFlightSamples += 1;
+      peak = Math.max(peak, inFlightSamples);
+      await blocked;
+      inFlightSamples -= 1;
+      return undefined;
+    },
+    warn: async () => undefined,
+    now: () => 0,
+  });
+  const first = watch.tick();
+  watch.stop();
+  watch.start();
+  await watch.tick();
+  release();
+  await first;
+  watch.stop();
+  assert.equal(peak, 1, "stop() must not let a second pass overlap the one in flight");
+});
+
+// N2: a timed-out sample used to reach onError and never increment the unmeasured ladder — so
+// the escalation added for a silent watch never fired for a wedged host, and that host emitted
+// an unthrottled operational warning on every single tick instead.
+test("a hung sample counts as unmeasured, not as a bare error", async () => {
+  const unmeasured: { consecutive: number; reason: string }[] = [];
+  const errors: unknown[] = [];
+  const watch = new WorkerMemoryWatch({
+    targets: () => [target],
+    sample: () => new Promise(() => { /* never settles */ }),
+    warn: async () => undefined,
+    now: () => 0,
+    onError: (error) => errors.push(error),
+    onUnmeasured: (_t, consecutive, reason) => unmeasured.push({ consecutive, reason }),
+    opTimeoutMs: 20,
+  });
+  await watch.tick();
+  await watch.tick();
+  await watch.tick();
+  assert.deepEqual(unmeasured.map((entry) => entry.consecutive), [1, 2, 3], "the ladder sees the wedged host");
+  assert.match(unmeasured[0]!.reason, /timed out/u);
+  assert.deepEqual(errors, [], "and it is not also reported as an unthrottled error every tick");
+});
+
+// N6: every session on a nearly-full host crossed the host line in the same pass, and the
+// concurrent fan-out meant N turns started at once as the response to a full machine.
+test("a nearly-full host produces one warning per endpoint, not one per session", async () => {
+  const sessions: WorkerMemoryTarget[] = [
+    { nickname: "a", endpointId: "claude-local", threadId: "t1" },
+    { nickname: "b", endpointId: "claude-local", threadId: "t2" },
+    { nickname: "c", endpointId: "claude-local", threadId: "t3" },
+  ];
+  const sent: string[] = [];
+  const watch = new WorkerMemoryWatch({
+    targets: () => sessions,
+    sample: async () => sample(5, 252, { totalGb: 252, availableGb: 10 }),
+    warn: async (t, message) => { if (/nearly full/u.test(message)) sent.push(t.nickname); },
+    now: () => 0,
+  });
+  await watch.tick();
+  assert.equal(sent.length, 1, "the host is one thing however many sessions sit on it");
+});
+
+// N3: the endpoint's single warning used to go to whichever nickname sorted first, which can be
+// an idle session that owns none of the memory — starting a turn to tell it about someone
+// else's work, while the session doing the work hears nothing.
+test("an endpoint's warning goes to a session that is actually running", () => {
+  const sessions: WorkerMemoryTarget[] = [
+    { nickname: "zed", endpointId: "ptyche", threadId: "busy" },
+    { nickname: "aria", endpointId: "ptyche", threadId: "idle" },
+  ];
+  const endpointScope = () => "endpoint" as const;
+  assert.deepEqual(
+    selectWatchTargets(sessions, endpointScope, (session) => session.threadId === "busy").map((entry) => entry.nickname),
+    ["zed"],
+  );
+  // With nobody busy the choice stays the stable one, so the carrier does not wander.
+  assert.deepEqual(selectWatchTargets(sessions, endpointScope).map((entry) => entry.nickname), ["aria"]);
+});
+
+test("an endpoint-wide latch survives the carrier changing", async () => {
+  let carrier: WorkerMemoryTarget = { nickname: "aria", endpointId: "ptyche", threadId: "t1" };
+  const sent: string[] = [];
+  let clock = 0;
+  const watch = new WorkerMemoryWatch({
+    targets: () => [carrier],
+    sample: async () => ({ usedBytes: 200 * GB, limitBytes: 252 * GB, scope: "endpoint" }),
+    warn: async (t) => { sent.push(t.nickname); },
+    now: () => clock,
+  });
+  await watch.tick();
+  assert.deepEqual(sent, ["aria"]);
+  // A busier session takes over as carrier a minute later; the endpoint's throttle must hold.
+  carrier = { nickname: "zed", endpointId: "ptyche", threadId: "t2" };
+  clock += 60_000;
+  await watch.tick();
+  assert.deepEqual(sent, ["aria"], "changing which session carries it does not reset the interval");
 });

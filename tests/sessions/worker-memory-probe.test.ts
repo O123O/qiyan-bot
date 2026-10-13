@@ -225,3 +225,65 @@ test("the remote sampler stays quiet when the runtime has no identity at all", a
   assert.equal(await sample(), undefined);
   assert.equal(ran, false);
 });
+
+// A probe that keeps refusing used to cost a full remote inspect every tick forever: the
+// identity read fine, so the backoff never armed, and the refusal dropped the cache again.
+test("an endpoint whose probe keeps refusing is also backed off", async () => {
+  let identityReads = 0;
+  let probes = 0;
+  let clock = 0;
+  const sample = createRemoteWorkerMemorySampler({
+    rootPid: async () => { identityReads += 1; return { pid: 10, startTime: "1" }; },
+    runRemote: async () => { probes += 1; return ""; },
+    now: () => clock,
+    identityBackoffMs: 60_000,
+    failuresBeforeBackoff: 3,
+  });
+  for (let attempt = 0; attempt < 6; attempt += 1) { await sample(); clock += 1000; }
+  assert.equal(identityReads, 3, "the refusals stopped costing a remote inspect per tick");
+  assert.equal(probes, 3);
+  clock += 60_000;
+  await sample();
+  assert.equal(identityReads, 4, "and it is retried once the backoff expires");
+});
+
+test("a working probe clears the refusal count", async () => {
+  let identityReads = 0;
+  let output = "";
+  let clock = 0;
+  const sample = createRemoteWorkerMemorySampler({
+    rootPid: async () => { identityReads += 1; return { pid: 10, startTime: "1" }; },
+    runRemote: async () => output,
+    now: () => clock,
+    identityBackoffMs: 60_000,
+    failuresBeforeBackoff: 3,
+  });
+  await sample();
+  await sample();
+  output = "100 200 200 150\n";
+  assert.ok(await sample());
+  output = "";
+  for (let attempt = 0; attempt < 2; attempt += 1) { await sample(); clock += 1000; }
+  // 3 reads to reach the success, then the cached identity serves the first refusal and only
+  // the second costs a re-read: two refusals after a success never reach the backoff.
+  assert.equal(identityReads, 4);
+});
+
+test("parent reads are batched so a low file-descriptor limit cannot hide the owning process", async () => {
+  const pids = Array.from({ length: 300 }, (_unused, index) => index + 1);
+  let inFlight = 0;
+  let peak = 0;
+  const found = await findWorkerRootPid(1, "t-abc", {
+    listPids: async () => pids,
+    readParentPid: async (pid) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      return pid === 1 ? undefined : 1;
+    },
+    readCommandLine: async (pid) => pid === 42 ? "claude --resume=t-abc" : "other",
+  });
+  assert.equal(found, 42);
+  assert.ok(peak <= 64, `parent reads stayed bounded (peak ${peak})`);
+});

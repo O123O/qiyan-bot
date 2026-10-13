@@ -53,7 +53,7 @@ memtotal=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 memavailable=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 [ -n "\${memavailable:-}" ] || memavailable=-1
 limit=$memtotal
-g=$(awk -F: '/^0::/{print $3; exit}' /proc/self/cgroup 2>/dev/null || true)
+g=$(awk '/^0::/{sub(/^0::/, ""); print; exit}' /proc/self/cgroup 2>/dev/null || true)
 while [ -n "\${g:-}" ] && [ "$g" != "/" ]; do
   for base in /sys/fs/cgroup /sys/fs/cgroup/unified; do
     v=$(cat "$base$g/memory.max" 2>/dev/null || true)
@@ -64,7 +64,7 @@ while [ -n "\${g:-}" ] && [ "$g" != "/" ]; do
   done
   g=\${g%/*}
 done
-m=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)
+m=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {sub(/^[0-9]*:[^:]*:/, ""); print; exit}' /proc/self/cgroup 2>/dev/null || true)
 while [ -n "\${m:-}" ] && [ "$m" != "/" ]; do
   v=$(cat "/sys/fs/cgroup/memory$m/memory.limit_in_bytes" 2>/dev/null || true)
   case "\${v:-}" in
@@ -126,6 +126,9 @@ export interface ProcessTreeReader {
 // thread id — from being mistaken for that other session's runtime.
 export const MAX_OWNER_DEPTH = 3;
 
+// How many /proc reads are in flight at once while mapping the process tree.
+const PARENT_READ_BATCH = 64;
+
 // Finds the process that IS a local worker, for hosts where no runtime identity carries a pid.
 // A remote runtime reports its own pid, so this is only needed locally, where a Claude session
 // is spawned inside the Agent SDK and its pid never surfaces to us.
@@ -143,10 +146,15 @@ export async function findWorkerRootPid(
   if (!Number.isSafeInteger(rootPid) || rootPid <= 0 || needle.length === 0) return undefined;
   const pids = await reader.listPids();
   const parents = new Map<number, number>();
-  await Promise.all(pids.map(async (pid) => {
-    const parent = await reader.readParentPid(pid);
-    if (parent !== undefined) parents.set(pid, parent);
-  }));
+  // In batches rather than all at once: a busy host has thousands of pids, and a default
+  // `ulimit -n` of 1024 would turn the fan-out into EMFILE — which this reader swallows as
+  // "no parent", quietly dropping the owning process out of the candidate set.
+  for (let index = 0; index < pids.length; index += PARENT_READ_BATCH) {
+    await Promise.all(pids.slice(index, index + PARENT_READ_BATCH).map(async (pid) => {
+      const parent = await reader.readParentPid(pid);
+      if (parent !== undefined) parents.set(pid, parent);
+    }));
+  }
   const depthOf = (pid: number): number | undefined => {
     let depth = 0;
     let current = pid;
@@ -235,21 +243,37 @@ export function createRemoteWorkerMemorySampler(deps: {
   runRemote(command: string): Promise<string | undefined>;
   now?(): number;
   identityBackoffMs?: number;
+  failuresBeforeBackoff?: number;
 }): () => Promise<WorkerMemorySample | undefined> {
   const now = deps.now ?? (() => Date.now());
   const backoffMs = deps.identityBackoffMs ?? 5 * 60 * 1000;
+  const failuresBeforeBackoff = deps.failuresBeforeBackoff ?? 3;
   let cached: RemoteRuntimeRoot | undefined;
   let blockedUntil = 0;
+  let consecutiveFailures = 0;
   return async () => {
     if (cached === undefined) {
       if (now() < blockedUntil) return undefined;
       cached = await deps.rootPid();
       if (cached === undefined) { blockedUntil = now() + backoffMs; return undefined; }
-      blockedUntil = 0;
     }
     const stdout = await deps.runRemote(remoteMemoryProbeCommand(cached.pid, cached.startTime));
     const sample = stdout === undefined ? undefined : parseMemoryProbeOutput(stdout, "endpoint");
-    if (!sample) cached = undefined;
-    return sample;
+    if (sample) {
+      consecutiveFailures = 0;
+      blockedUntil = 0;
+      return sample;
+    }
+    // A probe that keeps refusing — a start time that never matches, a host with no `ps`, a
+    // cgroup layout the script cannot read — would otherwise cost a full remote inspect every
+    // tick forever, since dropping the cache sends us back through rootPid() each time. The
+    // identity being readable is not evidence that measuring it will ever work.
+    cached = undefined;
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= failuresBeforeBackoff) {
+      blockedUntil = now() + backoffMs;
+      consecutiveFailures = 0;
+    }
+    return undefined;
   };
 }

@@ -3430,9 +3430,11 @@ export async function buildProductionApp(
               try {
                 const identity = await runtime.runtimeIdentity();
                 if (!identity) return undefined;
+                // Both identity kinds carry a start time; it is what makes the pid an identity
+                // rather than a number the kernel may hand to something else.
                 return identity.kind === "ssh"
                   ? { pid: identity.pid, startTime: identity.linuxStartTime }
-                  : { pid: identity.pid };
+                  : { pid: identity.pid, startTime: identity.startTime };
               } catch { return undefined; }
             },
             runRemote: async (remoteCommand) => {
@@ -3485,11 +3487,27 @@ export async function buildProductionApp(
         // anything in that cgroup is OOM-killed — so without this the first casualty is the
         // assistant that would otherwise have noticed, and the worker is never told at all.
         workerMemoryWatch = new WorkerMemoryWatch({
-          targets: () => selectWatchTargets(
-            Object.entries(registry.managedSnapshot().sessions)
-              .map(([nickname, session]) => ({ nickname, endpointId: session.endpoint, threadId: session.thread_id })),
-            (endpointId) => workerMemorySamplers.get(endpointId)?.scope,
-          ),
+          targets: () => {
+            const sessions = Object.entries(registry.managedSnapshot().sessions)
+              .map(([nickname, session]) => ({
+                nickname,
+                endpointId: session.endpoint,
+                threadId: session.thread_id,
+                mappingId: session.mapping_id,
+              }));
+            const busy = new Set(sessions
+              .filter((session) => nativeSessions.view({
+                endpointId: session.endpointId, threadId: session.threadId, mappingId: session.mappingId,
+              })?.status === "active")
+              .map((session) => `${session.endpointId}\0${session.threadId}`));
+            return selectWatchTargets(
+              sessions,
+              (endpointId) => workerMemorySamplers.get(endpointId)?.scope,
+              // An endpoint's single warning goes to a session that is actually running: that is
+              // where the memory is being spent, and a steer lands there without starting a turn.
+              (session) => busy.has(`${session.endpointId}\0${session.threadId}`),
+            );
+          },
           sample: (target) => workerMemorySamplers.get(target.endpointId)?.sample(target.threadId) ?? Promise.resolve(undefined),
           // `auto`: steered into the running turn when the worker is busy, which is exactly
           // when its memory is climbing, and started as a turn when it is idle but still
@@ -3508,11 +3526,11 @@ export async function buildProductionApp(
           // Being unable to measure is this feature's whole failure mode, and it is silent by
           // construction. Say it out loud once it has persisted, so a watch that has quietly
           // stopped protecting anything is visible rather than indistinguishable from calm.
-          onUnmeasured: (target, consecutive) => {
+          onUnmeasured: (target, consecutive, why) => {
             if (consecutive !== 10 && consecutive % 60 !== 0) return;
             reportOperationalSafely(report, {
               level: "warn", code: "worker_memory_unmeasured", component: "worker_memory_watch",
-              endpoint: target.endpointId, reason: `no memory reading for ${consecutive} consecutive checks`,
+              endpoint: target.endpointId, reason: `${why} for ${consecutive} consecutive checks`,
             });
           },
         });

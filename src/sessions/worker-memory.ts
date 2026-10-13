@@ -106,10 +106,17 @@ export function hostPressureWarningMessage(sample: WorkerMemorySample, freePerce
 // separately, so each one is watched. An endpoint-scoped endpoint has ONE reading covering all
 // of its threads, so exactly one session carries it — otherwise every session sharing a Codex
 // app-server is warned about the same memory, separately, each in a turn started for the
-// purpose. The choice is the lowest nickname so it is the same session tick after tick.
+// purpose.
+//
+// Which one matters. A busy session is preferred because that is where the memory is being
+// spent, where a steer lands without starting a turn, and where someone can actually act;
+// handing the endpoint's only warning to an idle session means starting a turn to tell it about
+// work it does not own while the session doing the work hears nothing. Among equals the lowest
+// nickname wins, so the choice is stable tick after tick rather than inherited from Map order.
 export function selectWatchTargets(
   sessions: readonly WorkerMemoryTarget[],
   scopeOf: (endpointId: string) => MemoryScope | undefined,
+  isBusy: (session: WorkerMemoryTarget) => boolean = () => false,
 ): WorkerMemoryTarget[] {
   const chosen = new Map<string, WorkerMemoryTarget>();
   for (const session of sessions) {
@@ -117,9 +124,19 @@ export function selectWatchTargets(
     if (scope === undefined) continue;
     if (scope === "session") { chosen.set(`${session.endpointId}\0${session.threadId}`, session); continue; }
     const held = chosen.get(session.endpointId);
-    if (!held || session.nickname < held.nickname) chosen.set(session.endpointId, session);
+    if (held === undefined || preferredCarrier(session, held, isBusy)) chosen.set(session.endpointId, session);
   }
   return [...chosen.values()];
+}
+
+function preferredCarrier(
+  candidate: WorkerMemoryTarget,
+  held: WorkerMemoryTarget,
+  isBusy: (session: WorkerMemoryTarget) => boolean,
+): boolean {
+  const candidateBusy = isBusy(candidate);
+  if (candidateBusy !== isBusy(held)) return candidateBusy;
+  return candidate.nickname < held.nickname;
 }
 
 interface WatchState { warnedAt: number }
@@ -138,7 +155,7 @@ export interface WorkerMemoryWatchDeps {
   onError?(error: unknown, target: WorkerMemoryTarget): void;
   // Called when a worker could not be measured at all. Silence is the failure mode this
   // feature degrades into, so somebody has to be able to see it happening.
-  onUnmeasured?(target: WorkerMemoryTarget, consecutive: number): void;
+  onUnmeasured?(target: WorkerMemoryTarget, consecutive: number, reason: string): void;
   warnPercent?: number;
   rearmPercent?: number;
   hostFreeWarnPercent?: number;
@@ -172,10 +189,13 @@ export class WorkerMemoryWatch {
     this.scheduleTick(this.generation);
   }
 
+  // `ticking` is deliberately NOT cleared here. It is the only thing keeping two passes apart,
+  // and clearing it let a stop/start during a tick run a second pass alongside the first —
+  // whose prune() could delete a latch the first pass was about to write, producing two
+  // identical warnings at the same instant. The in-flight tick clears it in its own `finally`.
   stop(): void {
     this.stopped = true;
     this.generation += 1;
-    this.ticking = false;
     this.timer?.cancel();
     this.timer = undefined;
   }
@@ -196,12 +216,16 @@ export class WorkerMemoryWatch {
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
+    // A tick that outlives a stop must not keep mutating state or sending: it finishes quietly.
+    const generation = this.generation;
     try {
       const targets = this.deps.targets();
+      if (generation !== this.generation) return;
       this.prune(targets);
       // Concurrently: a wedged endpoint must not delay the pass for the healthy ones, and the
       // timeout below only bounds each worker's own wait, not its position in a queue.
       await Promise.all(targets.map(async (target) => {
+        if (generation !== this.generation) return;
         try { await this.visit(target); }
         catch (error) { this.deps.onError?.(error, target); }
       }));
@@ -213,51 +237,90 @@ export class WorkerMemoryWatch {
   private async visit(target: WorkerMemoryTarget): Promise<void> {
     const timeout = this.deps.opTimeoutMs ?? DEFAULT_OP_TIMEOUT_MS;
     const key = stateKey(target);
-    const sample = await bounded(this.deps.sample(target), timeout, "worker memory sample timed out");
-    if (!sample) {
-      const consecutive = (this.unmeasured.get(key) ?? 0) + 1;
-      this.unmeasured.set(key, consecutive);
-      this.deps.onUnmeasured?.(target, consecutive);
+    let sample: WorkerMemorySample | undefined;
+    try {
+      sample = await bounded(this.deps.sample(target), timeout, "worker memory sample timed out");
+    } catch (error) {
+      // A sample that hung or threw IS an unmeasured sample. Letting it reach onError instead
+      // meant the escalation ladder never fired for the one failure it exists for — a wedged
+      // host — while that host emitted an unthrottled operational warning every single tick.
+      this.recordUnmeasured(target, key, error instanceof Error ? error.message : "sample failed");
       return;
     }
+    if (!sample) { this.recordUnmeasured(target, key, "no reading"); return; }
     this.unmeasured.delete(key);
-    const free = hostFreePercent(sample);
+    const reading = sample;
+    const free = hostFreePercent(reading);
+    // Both lines are judged in the same pass, independently: a send that fails for one must not
+    // skip the other's check for a whole interval.
+    const checks: Promise<void>[] = [];
     if (free !== undefined) {
-      await this.consider(target, "host", free <= (this.deps.hostFreeWarnPercent ?? HOST_FREE_WARN_PERCENT),
+      checks.push(this.consider(target, "host", this.hostLatchKey(target),
+        free <= (this.deps.hostFreeWarnPercent ?? HOST_FREE_WARN_PERCENT),
         free >= (this.deps.hostFreeRearmPercent ?? HOST_FREE_REARM_PERCENT),
-        () => hostPressureWarningMessage(sample, free), timeout);
+        () => hostPressureWarningMessage(reading, free), timeout));
     }
-    const percent = memorySharePercent(sample);
-    if (percent === undefined) return;
-    await this.consider(target, "share", percent > (this.deps.warnPercent ?? WARN_PERCENT),
-      percent < (this.deps.rearmPercent ?? REARM_PERCENT),
-      () => memoryWarningMessage(sample, percent), timeout);
+    const percent = memorySharePercent(reading);
+    if (percent !== undefined) {
+      checks.push(this.consider(target, "share", this.shareLatchKey(target, reading.scope),
+        percent > (this.deps.warnPercent ?? WARN_PERCENT),
+        percent < (this.deps.rearmPercent ?? REARM_PERCENT),
+        () => memoryWarningMessage(reading, percent), timeout));
+    }
+    const settled = await Promise.allSettled(checks);
+    const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+    if (failure) throw failure.reason;
+  }
+
+  // The host is one thing however many sessions sit on it, so its latch belongs to the endpoint
+  // rather than to each session. Otherwise "the machine has 15% free" starts a turn on every
+  // local session at once — N simultaneous LLM turns as the response to a full machine.
+  private hostLatchKey(target: WorkerMemoryTarget): string { return target.endpointId; }
+
+  // An endpoint-wide reading is throttled per endpoint too, so changing which session carries
+  // the warning (a busier one appears, the carrier is archived) does not reset the interval.
+  private shareLatchKey(target: WorkerMemoryTarget, scope: MemoryScope): string {
+    return scope === "endpoint" ? target.endpointId : stateKey(target);
+  }
+
+  private recordUnmeasured(target: WorkerMemoryTarget, key: string, reason: string): void {
+    const consecutive = (this.unmeasured.get(key) ?? 0) + 1;
+    this.unmeasured.set(key, consecutive);
+    this.deps.onUnmeasured?.(target, consecutive, reason);
   }
 
   private async consider(
     target: WorkerMemoryTarget,
     reason: WarningReason,
+    latch: string,
     over: boolean,
     recovered: boolean,
     message: () => string,
     timeoutMs: number,
   ): Promise<void> {
-    const key = `${stateKey(target)}\0${reason}`;
+    const key = `${latch}\0${reason}`;
     if (recovered) { this.state.delete(key); return; }
     if (!over) return;
     const now = this.deps.now();
     const previous = this.state.get(key);
     if (previous && now - previous.warnedAt < (this.deps.repeatWarningMs ?? REPEAT_WARNING_MS)) return;
-    // Recorded BEFORE the send: a send that hangs or fails must not leave the worker eligible
-    // for another warning on the very next tick.
+    // Recorded BEFORE the send, with no await in between: a send that hangs or fails must not
+    // leave the worker eligible for another warning on the very next tick, and two concurrent
+    // visits sharing one latch must not both decide they are the one to send.
     this.state.set(key, { warnedAt: now });
     await bounded(this.deps.warn(target, message(), reason), timeoutMs, "worker memory warning send timed out");
   }
 
   private prune(targets: readonly WorkerMemoryTarget[]): void {
-    const live = new Set(targets.map(stateKey));
-    for (const key of [...this.state.keys()]) if (!live.has(key.slice(0, key.lastIndexOf("\0")))) this.state.delete(key);
-    for (const key of [...this.unmeasured.keys()]) if (!live.has(key)) this.unmeasured.delete(key);
+    // A latch key is `<endpointId|endpointId\0threadId>\0<reason>`: endpoint-wide readings and
+    // host pressure are held per endpoint, a session's own share per session.
+    const liveSessions = new Set(targets.map(stateKey));
+    const liveEndpoints = new Set(targets.map((target) => target.endpointId));
+    for (const key of [...this.state.keys()]) {
+      const owner = key.slice(0, key.lastIndexOf("\0"));
+      if (!liveSessions.has(owner) && !liveEndpoints.has(owner)) this.state.delete(key);
+    }
+    for (const key of [...this.unmeasured.keys()]) if (!liveSessions.has(key)) this.unmeasured.delete(key);
   }
 }
 
