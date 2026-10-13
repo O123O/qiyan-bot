@@ -121,7 +121,10 @@ import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
 import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
-import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
+import { SshGenerationPlanner, buildSshStreamArgs, type SshConnectionPlan } from "./endpoints/ssh-config.ts";
+import { runBoundedProcess } from "./endpoints/ssh-process.ts";
+import { WorkerMemoryWatch, type WorkerMemorySample } from "./sessions/worker-memory.ts";
+import { createLocalWorkerMemorySampler, createRemoteWorkerMemorySampler } from "./sessions/worker-memory-probe.ts";
 import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
 import { SshAppServerRuntime } from "./endpoints/ssh-app-server-runtime.ts";
@@ -2710,6 +2713,7 @@ export async function buildProductionApp(
   let assistantEndpoint!: ManagedAppServerEndpoint;
   let claudeEndpoint: ClaudeCodeRuntime | undefined;
   let scheduling: SchedulingService | undefined;
+  let workerMemoryWatch: WorkerMemoryWatch | undefined;
   let claudeArchives: ClaudeArchiveStore | undefined;
   let endpointCatalog!: EndpointCatalog;
   let endpointBindings!: EndpointBindingStore;
@@ -3404,6 +3408,25 @@ export async function buildProductionApp(
         // below so the check runs over ssh on the worker's host. `monitor` is offered only to
         // sessions whose host has a registered runner (see supportsMonitor).
         const monitorCheckRunners = new Map<string, (command: string) => Promise<boolean>>();
+        // How a worker's memory is read, per endpoint. An endpoint with no sampler is simply
+        // not watched — there is no fallback reading, because a wrong attribution is worse
+        // than none.
+        const workerMemorySamplers = new Map<string, (threadId: string) => Promise<WorkerMemorySample | undefined>>();
+        const probeStdout = async (command: string, args: readonly string[]): Promise<string | undefined> => {
+          try { return (await runBoundedProcess(command, args, { timeoutMs: 20_000, maxOutputBytes: 64 * 1024 })).stdout.toString("utf8"); }
+          catch { return undefined; }
+        };
+        // A remote worker is measured on its own machine, over the ControlMaster the endpoint
+        // already holds. The identity is what carries the runtime pid.
+        const sshMemorySampler = (plan: SshConnectionPlan, runtime: { runtimeIdentity(): Promise<RuntimeIdentity | undefined> }) =>
+          createRemoteWorkerMemorySampler({
+            rootPid: async () => {
+              // An unhealthy runtime throws rather than returning nothing; either way there is
+              // no pid to measure and the watch simply stays quiet about this endpoint.
+              try { return (await runtime.runtimeIdentity())?.pid; } catch { return undefined; }
+            },
+            runRemote: (remoteCommand) => probeStdout("ssh", buildSshStreamArgs(plan, remoteCommand)),
+          });
         scheduling = new SchedulingService({
           db,
           now: () => Date.now(),
@@ -3438,6 +3461,30 @@ export async function buildProductionApp(
             return current.nickname;
           },
         });
+        // Warns a worker before the machine goes down under the work it started. The
+        // supervisor shares a cgroup with the work, and systemd stops the whole unit when
+        // anything in that cgroup is OOM-killed — so without this the first casualty is the
+        // assistant that would otherwise have noticed, and the worker is never told at all.
+        workerMemoryWatch = new WorkerMemoryWatch({
+          targets: () => Object.entries(registry.managedSnapshot().sessions)
+            .filter(([, session]) => workerMemorySamplers.has(session.endpoint))
+            .map(([nickname, session]) => ({ nickname, endpointId: session.endpoint, threadId: session.thread_id })),
+          sample: (target) => workerMemorySamplers.get(target.endpointId)?.(target.threadId) ?? Promise.resolve(undefined),
+          // `auto`: steered into the running turn when the worker is busy, which is exactly
+          // when its memory is climbing, and started as a turn when it is idle but still
+          // holding the memory. The send is live and never durable — a memory reading is only
+          // true at the instant it was taken, so a redelivery after a restart would warn about
+          // a cliff that no longer exists.
+          warn: (target, message) => sessions.send(target.nickname, message, {
+            mode: "auto",
+            clientUserMessageId: `worker-memory:${target.endpointId}:${target.threadId}:${Date.now()}`,
+          }).then(() => undefined),
+          now: () => Date.now(),
+          onError: (error, target) => reportOperationalSafely(report, {
+            level: "warn", code: "background_task_failed", component: "worker_memory_watch",
+            endpoint: target.endpointId, reason: error instanceof Error ? error.message : "unknown",
+          }),
+        });
         // Archive tombstones are the only QiYan-side state a Claude runtime still needs.
         // Steering is no longer one: the SDK queues input arriving mid-turn and runs it in
         // order, so a steer is an ordinary send rather than a durable row redelivered later.
@@ -3460,6 +3507,15 @@ export async function buildProductionApp(
         });
         // The local worker's `monitor` check runs on this host.
         if (localClaudeDef) monitorCheckRunners.set(localClaudeDef.id, (command) => runMonitorCheck(command));
+        if (localClaudeDef) {
+          // A local session runs inside the Agent SDK, which never surfaces its pid, so the
+          // process is found by the thread id QiYan resumed it with.
+          const sampleLocal = createLocalWorkerMemorySampler({
+            botPid: process.pid,
+            runLocal: (argv) => probeStdout("sh", argv),
+          });
+          workerMemorySamplers.set(localClaudeDef.id, (threadId) => sampleLocal(threadId));
+        }
         const sshRuntimeRoot = await prepareLocalSshRuntimeRoot(dataDir);
         webSshRuntimeRoot = sshRuntimeRoot;
         const helperSource = await readFile(join(remoteAssetRoot, "qiyan-ssh-helper.mjs"));
@@ -3510,6 +3566,8 @@ export async function buildProductionApp(
                 },
                 ...claudeRuntimeOptions(definition.id),
               });
+              const sampleRemoteClaude = sshMemorySampler(generation.plan, claudeRemoteEndpoint);
+              workerMemorySamplers.set(definition.id, () => sampleRemoteClaude());
               remoteCandidateContexts.set(claudeRemoteEndpoint, { host, remote, projectsRoot: definition.projectsRoot });
               return { endpoint: claudeRemoteEndpoint, pendingBinding: generation.pendingBinding };
             }
@@ -3538,6 +3596,10 @@ export async function buildProductionApp(
               }),
               minimumVersion: MINIMUM_SUPPORTED_CODEX_VERSION,
             });
+            // One app-server hosts every thread on a Codex endpoint, so this one reading is the
+            // memory of all of that endpoint's work; each of its sessions is told the same figure.
+            const sampleRemoteCodex = sshMemorySampler(generation.plan, remoteEndpoint);
+            workerMemorySamplers.set(definition.id, () => sampleRemoteCodex());
             remoteCandidateContexts.set(remoteEndpoint, { host: remoteRuntime, remote, projectsRoot: definition.projectsRoot });
             return { endpoint: remoteEndpoint, pendingBinding: generation.pendingBinding };
           },
@@ -4007,6 +4069,7 @@ export async function buildProductionApp(
         // proactive assistant, NOT worker goal-drive / self-scheduling). Recovery re-arms
         // durable schedules on start; fires drive send_to_session.
         if (scheduling) await scheduling.start();
+        workerMemoryWatch?.start();
         if (options.testing?.holdAssistantScheduler) return;
         schedulerAccepting = true;
         await enqueuePendingEvents();
@@ -4017,6 +4080,7 @@ export async function buildProductionApp(
         // Before the awaited scheduler stop, not after: a timer firing during that await would
         // enqueue into a scheduler that is already shutting down.
         transientTurnRetry?.stop();
+        workerMemoryWatch?.stop();
         if (scheduling) await scheduling.stop();
         assistantToolReadiness.stop();
         schedulerAccepting = false;
