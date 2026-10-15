@@ -25,6 +25,7 @@ import {
   operationUnsettled,
   settleRecoveryPassVerdict,
   settleEarlierEndpointOperations,
+  settleSessionRecovery,
   managedSessionNeedsRecovery,
   markEndpointOwnersUnavailable,
   operationRecoveryAction,
@@ -35,6 +36,7 @@ import {
   recoverableOperationHasNoDispatch,
   projectReadyRecoveryDisposition,
   parseEndpointLifecycleCheckpoint,
+  recoverablePhase,
   prepareAssistantWebCommentary,
   routeLifecycleNotification,
   processWorkerTerminalNotification,
@@ -2070,6 +2072,194 @@ test("an explicit restart fails without creating another uncertain action when r
     && error.message === "endpoint lyris has an earlier unresolved operation");
 });
 
+// The restart is done and the endpoint is running a new runtime. Letting a failed session recovery
+// escape as the restart's own result reported a completed restart as uncertain -- which leaves a row
+// fencing the next restart on an endpoint that is, in fact, already fine.
+test("a failed session recovery is reported beside a successful restart, not as its verdict", async () => {
+  const reasons: string[] = [];
+  assert.deepEqual(await settleSessionRecovery(async () => undefined, (reason) => reasons.push(reason)), { ok: true });
+  assert.deepEqual(reasons, [] as string[], "a successful recovery reports nothing");
+
+  const outcome = await settleSessionRecovery(
+    async () => { throw new AppError("ENDPOINT_UNAVAILABLE", "lyris did not answer"); },
+    (reason) => reasons.push(reason),
+  );
+  assert.deepEqual(outcome, { ok: false, reason: "lyris did not answer" });
+  // The reason reaches the operational log too, not only the tool result.
+  assert.deepEqual(reasons, ["lyris did not answer"]);
+});
+
+// The fence is the first thing a restart reaches, so a refusal here means the manager is never
+// asked -- which is how an endpoint that needs a restart became one that cannot have one.
+test("a forced restart proceeds past earlier rows without reconciling or waiting", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    // Both of these talk to the endpoint a forced restart is called on precisely because it does
+    // not answer. Reaching either is the hang this path exists to remove.
+    reconcile: async () => assert.fail("a forced action must not reconcile"),
+    isEndpointReady: () => assert.fail("a forced action must not consult endpoint health"),
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => assert.fail("a forced action must not wait"),
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, ["restart-earlier"]);
+});
+
+// Two instances share one ledger on NFS here, so a peer settling the row between the listing and
+// the retire is ordinary. `fail` throws OPERATION_UNCERTAIN when its update matches nothing, and
+// letting that escape would kill the forced restart inside the fence -- nothing destroyed, nothing
+// started, and the one word the contract forbids reported back.
+test("a forced restart survives a peer settling the row it was retiring", async () => {
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "uncertain" as const,
+  };
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => earlier as any,
+      fail: () => { throw new AppError("OPERATION_UNCERTAIN", "operation failure was fenced or already terminalized"); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+});
+
+// A peer instance sharing this ledger is still going to settle its own dispatched row. Retiring it
+// would race that and record a completed operation as superseded; leaving it costs nothing, because
+// the next forced action proceeds past it too.
+test("a forced restart leaves a peer's dispatched row alone and still proceeds", async () => {
+  const resolver = { defaultProjectEndpointId: "local", session: () => undefined };
+  const dispatched = {
+    id: "restart-peer",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "dispatched" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [dispatched] as any,
+      get: () => dispatched as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver,
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, [], "a peer's in-flight row is not retired by a forced restart");
+});
+
+// An uncertain send is not something a restart's postcondition subsumes, so force proceeds past it
+// without claiming it was settled. Retiring it would invite a re-send of a delivered message.
+test("a forced restart does not retire a non-lifecycle row it proceeds past", async () => {
+  const send = {
+    id: "send-wedged",
+    sequence: 1,
+    kind: "send_to_session",
+    args: { nickname: "worker" },
+    state: "uncertain" as const,
+  };
+  const failed: string[] = [];
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [send] as any,
+      get: () => send as any,
+      fail: (id) => { failed.push(id); },
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: {
+      defaultProjectEndpointId: "local",
+      session: (nickname) => nickname === "worker" ? { endpoint: "lyris" } as any : undefined,
+    },
+    reconcile: async () => undefined,
+    isEndpointReady: () => false,
+    isAwaitingAuthentication: () => true,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed");
+  assert.deepEqual(failed, []);
+});
+
+// Returning "satisfied" reports a restart that this call did not perform. The owner forces exactly
+// when the system's own bookkeeping is what he does not trust.
+test("a forced restart never takes the satisfied short-circuit", async () => {
+  const earlier = {
+    id: "restart-earlier",
+    sequence: 1,
+    kind: "restart_endpoint",
+    args: { endpoint: "lyris" },
+    state: "succeeded" as const,
+  };
+
+  const result = await settleEarlierEndpointOperations({
+    operations: {
+      listRecoverable: () => [earlier] as any,
+      get: () => ({ ...earlier, state: "succeeded" }) as any,
+      fail: () => assert.fail("a succeeded row is not retired"),
+    },
+    currentSequence: 2,
+    endpointId: "lyris",
+    currentKind: "restart_endpoint",
+    resolver: { defaultProjectEndpointId: "local", session: () => undefined },
+    reconcile: async () => undefined,
+    isEndpointReady: () => true,
+    isAwaitingAuthentication: () => false,
+    waitForTerminal: async () => undefined,
+    force: true,
+  });
+
+  assert.equal(result, "proceed", "the forced call must restart rather than inherit an earlier success");
+});
+
 test("reconnection incidents compare-delete per endpoint and preserve a newer loss", () => {
   const incidents = new EndpointRecoveryIncidents("test-run");
   assert.equal(incidents.pending("endpoint-a"), undefined, "initial activation has no recovery incident");
@@ -3280,10 +3470,24 @@ test("assistant notification failure before dispatcher construction still report
   assert.deepEqual(reports, ["assistant notification"]);
 });
 
-test("endpoint lifecycle recovery checkpoints require an exact phase and runtime identity", () => {
+test("endpoint lifecycle recovery checkpoints keep a known phase and identity, and tolerate new fields", () => {
   const checkpoint = { endpoint: "devbox", phase: "runtime_started", identity: { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 } };
   assert.deepEqual(parseEndpointLifecycleCheckpoint(checkpoint), checkpoint);
-  assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, extra: true }), undefined);
+  // A field a later build added must not make the whole receipt unparseable. The recovery branch
+  // silently skips a row it cannot parse, which leaves it unresolved forever and fences every later
+  // lifecycle action on that endpoint — and two instances share this ledger, so a strict allowlist
+  // here is a wedge waiting for the next deploy.
+  assert.deepEqual(parseEndpointLifecycleCheckpoint({ ...checkpoint, forced: true }), checkpoint);
+  // `destroyed` is accepted before anything writes it, and means to an older instance exactly what
+  // it means to a newer one: the runtime is gone, so recovery is a plain start.
+  assert.deepEqual(
+    parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "destroyed" }),
+    { ...checkpoint, phase: "destroyed" },
+  );
+  assert.equal(recoverablePhase("destroyed"), "runtime_stopped");
+  for (const phase of ["draining", "idle_proven", "runtime_stopped", "runtime_started"] as const) {
+    assert.equal(recoverablePhase(phase), phase, "a phase this build understands is unchanged");
+  }
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, phase: "unknown" }), undefined);
   assert.equal(parseEndpointLifecycleCheckpoint({ ...checkpoint, identity: { ...checkpoint.identity, token: "bad" } }), undefined);
   // A daemonless (Claude) endpoint checkpoints with no identity; the parse must accept it

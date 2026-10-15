@@ -238,7 +238,7 @@ test("lazily resolves and starts one endpoint generation", async () => {
     starts = 0;
     async start() { this.starts += 1; this.state = "ready"; }
     async closeConnection() { this.state = "stopped"; }
-    async shutdownRuntime() { this.state = "stopped"; }
+    async shutdownRuntime() { this.state = "stopped"; return undefined; }
     async runtimeIdentity() { return { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 }; }
     onNotification() { return () => undefined; }
     onReady() { return () => undefined; }
@@ -261,7 +261,7 @@ test("a replacement generation ignores stale endpoint callbacks", () => {
     private readonly unavailable = new Set<(kind: "connection-lost" | "runtime-lost") => void>();
     async start() { this.state = "ready"; }
     async closeConnection() { this.state = "stopped"; }
-    async shutdownRuntime() { this.state = "stopped"; }
+    async shutdownRuntime() { this.state = "stopped"; return undefined; }
     async runtimeIdentity() { return { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 }; }
     onNotification() { return () => undefined; }
     onReady() { return () => undefined; }

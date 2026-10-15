@@ -136,6 +136,28 @@ test("local runtime requires the exact confirmed identity for shutdown", async (
   await runtime.shutdownRuntime(confirmed.runtime);
 });
 
+// The identity proof guards against closing a DIFFERENT generation's connection. Under force there
+// is nothing for it to guard -- closing a local connection kills no process -- and proving it anyway
+// refused in exactly the state force is reached for: a dropped connection clears the identity, so
+// there is none to pass and none to compare against.
+test("a forced local shutdown needs no identity", async () => {
+  const child = new FakeChild(321);
+  const runtime = new LocalAppServerRuntime({
+    codexBinary: "codex", spawn: () => child as never,
+    resolveMcpClientIdentity: async () => ({ pid: 1_321, startTime: "1321" }),
+  });
+  const connection = await runtime.open();
+  await connection.confirmInitialized({});
+  await connection.close();
+  assert.equal(await runtime.runtimeIdentity(), undefined, "a dropped connection leaves no identity to pass");
+
+  await assert.rejects(runtime.shutdownRuntime(undefined), /identity/iu);
+  // Not a rejection, and not a TypeError from dereferencing the absent identity.
+  assert.equal(await runtime.shutdownRuntime(undefined, true), undefined);
+  // A mismatched identity is likewise not a reason to refuse a forced stop.
+  assert.equal(await runtime.shutdownRuntime({ kind: "local", pid: 1_399, startTime: "1399" }, true), undefined);
+});
+
 test("an old local process exit cannot affect a newer runtime generation", async () => {
   const children = [new FakeChild(401), new FakeChild(402)];
   let index = 0;

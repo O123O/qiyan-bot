@@ -120,7 +120,7 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager, type EndpointRecoveryPause } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner } from "./endpoints/ssh-config.ts";
 import { prepareSshControlMasterUnusableNotice, prepareSshFreshChannelUnavailableNotice } from "./endpoints/ssh-recovery.ts";
 import { attestUserControlMaster, prepareRemoteHost, type RemoteHost, SshRemoteClient, SshRuntime } from "./endpoints/ssh-runtime.ts";
@@ -780,6 +780,33 @@ export function recoverableOperationTarget(
   }
 }
 
+export type SessionRecoveryOutcome = { ok: true } | { ok: false; reason: string };
+
+// Re-attaching a restarted endpoint's managed sessions, separated from the restart's own verdict.
+//
+// A thrown resume used to escape as the restart's result. The runtime was replaced and running, and
+// the call reported uncertainty -- which leaves a row fencing the next restart on an endpoint that
+// is, in fact, already fine. The restart is done; whether its sessions came back is a second fact,
+// and the caller is told both rather than having the first one overwritten by the second.
+//
+// This is for the TOOL path only. The operation-recovery branch deliberately lets a resume throw,
+// because a thrown one leaves the row recoverable and the next pass retries it -- succeeding the
+// row with `sessions_restored: false` would end those retries and leave the sessions down until a
+// human intervened.
+export async function settleSessionRecovery(
+  resume: () => Promise<unknown>,
+  onFailed: (reason: string) => void,
+): Promise<SessionRecoveryOutcome> {
+  try {
+    await resume();
+    return { ok: true };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    onFailed(reason);
+    return { ok: false, reason };
+  }
+}
+
 export function assistantPostTurnActionMatches(
   action: AssistantPostTurnAction | undefined,
   expected:
@@ -936,6 +963,9 @@ export async function settleEarlierEndpointOperations(options: {
   waitForTerminal(operationId: string, signal?: AbortSignal): Promise<void>;
   waitTimeoutMs?: number;
   signal?: AbortSignal;
+  // The operator's instruction about this endpoint, not a proof about these rows. Under it the
+  // fence never refuses and never waits: see the forced branch below.
+  force?: boolean;
 }): Promise<"proceed" | "satisfied"> {
   const earlier = (): RecoverableOperation[] => options.operations.listRecoverable()
     .filter((operation) => operation.sequence < options.currentSequence)
@@ -949,6 +979,44 @@ export async function settleEarlierEndpointOperations(options: {
   if (captured.length === 0) return "proceed";
   const conflict = (): AppError =>
     new AppError("OPERATION_CONFLICT", `endpoint ${options.endpointId} has an earlier unresolved operation`);
+
+  if (options.force) {
+    // Proceed past every earlier row without waiting, whatever its state and whoever owns it. Not
+    // reconciling first is deliberate: a reconciliation pass talks to the endpoint, and a forced
+    // action is asked for precisely when the endpoint does not answer -- waiting for the fence to
+    // clear itself is the hang this path exists to remove.
+    //
+    // "Proceed past" is not "retire". Only an `uncertain` lifecycle row this action subsumes is
+    // retired, exactly as the unreachable branch does. A peer's `dispatched` row is left alone: the
+    // peer is still going to settle it, retiring it would race that and record a completed
+    // operation as superseded, and leaving it costs nothing because the next forced action
+    // proceeds past it too.
+    //
+    // The justification is the operator's decision, not subsumption. Subsumption holds when a peer
+    // is mid-destroy or stalled; it does not hold when the peer has not reached its destroy yet,
+    // and it will then destroy our fresh runtime seconds after we report success. Proceeding is
+    // still right -- refusing is how the endpoint got wedged -- but it is right because force is an
+    // instruction about this endpoint, not because the earlier rows are provably moot.
+    for (const operation of captured) {
+      if (operation.state !== "uncertain") continue;
+      if (!subsumedByLifecycle(operation, options.currentKind, options.resolver)) continue;
+      // Isolated per row, and deliberately. `fail` throws OPERATION_UNCERTAIN when its UPDATE
+      // matches nothing -- which is exactly what a peer instance settling the row first produces,
+      // and two instances share one ledger here. Letting that escape would kill the forced restart
+      // inside the fence: nothing destroyed, nothing started, and the one word the contract
+      // forbids reported back. Retiring is pure bookkeeping; a row left behind costs nothing,
+      // because the next forced action proceeds past it too.
+      try {
+        options.operations.fail(operation.id, {
+          message: `superseded by a forced ${options.currentKind} on endpoint ${options.endpointId}`,
+        });
+      } catch { /* the row is someone else's to settle now */ }
+    }
+    // The `satisfied` short-circuit is deliberately NOT taken here. A forced restart that returns
+    // without restarting anything is a lie, and this operation is asked for exactly when the
+    // system's own bookkeeping is the thing the owner does not trust.
+    return "proceed";
+  }
 
   try {
     await options.reconcile();
@@ -2478,18 +2546,37 @@ export function reportOperationalSafely(sink: OperationalEventSink, event: Opera
   catch { /* operational logging must not change runtime behavior */ }
 }
 
-export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: "draining" | "idle_proven" | "runtime_stopped" | "runtime_started"; identity?: RuntimeIdentity } | undefined {
+// Phases a lifecycle receipt may carry. `destroyed` is written by a forced restart, which tears the
+// runtime down by location rather than by identity; it is accepted here BEFORE anything writes it,
+// because two instances share this ledger and a row written by a newer build must never be
+// unparseable to an older one. See docs/development/forced-restart-design.md.
+const LIFECYCLE_CHECKPOINT_PHASES = new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started", "destroyed"]);
+export type EndpointLifecyclePhase = "draining" | "idle_proven" | "runtime_stopped" | "runtime_started" | "destroyed";
+
+// What a build that does not itself write `destroyed` should do when it reads one: the phase means
+// the runtime was torn down by location and is provably gone, which is exactly what
+// `runtime_stopped` means to the recovery paths. Mapping it keeps such a row RESOLVABLE by an older
+// instance sharing this ledger, instead of stranding it.
+export function recoverablePhase(phase: EndpointLifecyclePhase): "draining" | "idle_proven" | "runtime_stopped" | "runtime_started" {
+  return phase === "destroyed" ? "runtime_stopped" : phase;
+}
+
+export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: EndpointLifecyclePhase; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).some((key) => !new Set(["endpoint", "phase", "identity"]).has(key))) return undefined;
-  if (typeof item.endpoint !== "string" || !new Set(["draining", "idle_proven", "runtime_stopped", "runtime_started"]).has(String(item.phase))) return undefined;
+  // Unknown keys are IGNORED, not rejected. The previous allowlist meant any field a later build
+  // added made the whole receipt parse as undefined, and the recovery branch silently skips a row
+  // it cannot parse — leaving it unresolved forever and fencing every later lifecycle action on
+  // that endpoint. That is the exact wedge this area keeps producing, and a strict allowlist on
+  // state shared between versions is how it gets produced again.
+  if (typeof item.endpoint !== "string" || !LIFECYCLE_CHECKPOINT_PHASES.has(String(item.phase))) return undefined;
   try {
     // A daemonless endpoint (local Claude) checkpoints with no runtime identity, so `identity` is
     // absent from the persisted receipt — accept that instead of failing the parse (which
     // would strand the recovery and permanently lock out the endpoint's lifecycle ops).
     return {
       endpoint: item.endpoint,
-      phase: item.phase as "draining" | "idle_proven" | "runtime_stopped" | "runtime_started",
+      phase: item.phase as EndpointLifecyclePhase,
       ...(item.identity === undefined ? {} : { identity: parseRuntimeIdentity(item.identity) }),
     };
   } catch { return undefined; }
@@ -3270,7 +3357,7 @@ export async function buildProductionApp(
             await runAssistantRestart(action, {
               endpointId: assistantEndpoint.id,
               runtimeIdentity: () => assistantEndpoint.runtimeIdentity(),
-              shutdownRuntime: (identity) => assistantEndpoint.shutdownRuntime(identity),
+              shutdownRuntime: async (identity) => { await assistantEndpoint.shutdownRuntime(identity); },
               startAndResume: async () => { await assistantEndpoint.start(); await startOrResumeAssistant(); },
             }, context.checkpoint);
             completeDeferredSystemNotices(action);
@@ -3499,6 +3586,11 @@ export async function buildProductionApp(
               return false;
             }
           },
+          // A forced destroy leaves an endpoint that will never announce its own death, and the
+          // pool releases turn-capacity claims from that announcement. Released here instead, so a
+          // claim retained across a destroyed turn/start does not outlive the runtime it was
+          // counted against. The pool exists by the time any lifecycle action can run.
+          onRuntimeDestroyed: (id) => { pool?.markEndpointUnavailable(id, "runtime-lost"); },
         });
         pool = new AppServerPool([endpoint, assistantEndpoint, ...(claudeEndpoint ? [claudeEndpoint] : [])], {
           resolveEndpoint: (id) => endpointManager.ensureReady(id),
@@ -4370,14 +4462,14 @@ export async function buildProductionApp(
       disconnect_endpoint: async (args, context) => {
         const endpointId = projectEndpoint(args.endpoint);
         if (await settleEndpointLifecycleOrder(
-          context.operationSequence, endpointId, "disconnect_endpoint", context.signal,
+          context.operationSequence, endpointId, "disconnect_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
-        await endpointManager.disconnect(
+        const outcome = await endpointManager.disconnect(
           endpointId,
           (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
           args.force,
         );
-        return { endpoint: endpointId, state: "disconnected" };
+        return { endpoint: endpointId, state: "disconnected", ...forcedLifecycleReport(outcome) };
       },
       // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
       // is the same path an automatic reconnect takes, and it is deliberately NOT an endpoint
@@ -4434,18 +4526,30 @@ export async function buildProductionApp(
         }
         const endpointId = projectEndpoint(args.endpoint);
         if (await settleEndpointLifecycleOrder(
-          context.operationSequence, endpointId, "restart_endpoint", context.signal,
+          context.operationSequence, endpointId, "restart_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
-        await endpointManager.restart(
+        const outcome = await endpointManager.restart(
           endpointId,
           (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
           args.force,
         );
-        await resumeManagedEndpoint(endpointId, true);
-        prepareToolSystemNotice(context.operationId, context.attemptId, `endpoint ${endpointId} restarted`);
-        return { endpoint: endpointId, state: "ready" };
+        // The restart is done and the endpoint is running a new runtime. Session recovery is a
+        // separate thing that can fail on its own, and letting its failure poison this result
+        // reported a completed restart as uncertain -- which leaves the row fencing the next
+        // restart on an endpoint that is, in fact, already fine.
+        const restored = await resumeManagedEndpointSafely(endpointId);
+        prepareToolSystemNotice(context.operationId, context.attemptId, restored.ok
+          ? `endpoint ${endpointId} restarted`
+          : `endpoint ${endpointId} restarted; session recovery failed: ${restored.reason}`);
+        return {
+          endpoint: endpointId,
+          state: "ready",
+          sessions_restored: restored.ok,
+          ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
+          ...forcedLifecycleReport(outcome),
+        };
       },
       set_session_model: async (args, context) => {
         if (args.nickname === "assistant") {
@@ -4603,6 +4707,27 @@ export async function buildProductionApp(
       if (error instanceof AppError && error.code === "UNSUPPORTED_CAPABILITY") return undefined;
       throw error;
     }
+  }
+
+  // What a lifecycle action spent, flattened into the tool result. `destroyed_identity` appears for
+  // an unforced SSH stop too -- that one also destroys a runtime, having first proven it, and the
+  // helper reports the same fact either way. `interrupted_turns` is forced-only, because an
+  // unforced action never proceeds over a turn in flight.
+  function forcedLifecycleReport(outcome: EndpointLifecycleOutcome): Record<string, unknown> {
+    return {
+      ...(outcome.destroyed ? {
+        destroyed_identity: outcome.destroyed.destroyedIdentity,
+        ...(outcome.destroyed.survivors === undefined ? {} : { survivors: outcome.destroyed.survivors }),
+        ...(outcome.destroyed.serverSurvived ? { server_survived: true } : {}),
+      } : {}),
+      ...(outcome.interruptedTurns ? { interrupted_turns: outcome.interruptedTurns } : {}),
+    };
+  }
+
+  function resumeManagedEndpointSafely(endpointId: string): Promise<SessionRecoveryOutcome> {
+    return settleSessionRecovery(() => resumeManagedEndpoint(endpointId, true), (reason) => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId, reason,
+    }));
   }
 
   function prepareToolSystemNotice(operationId: string, attemptId: string, body: string): void {
@@ -4806,6 +4931,7 @@ export async function buildProductionApp(
     endpointId: string,
     currentKind: EndpointLifecycleOperationKind,
     signal?: AbortSignal,
+    force?: boolean,
   ): Promise<"proceed" | "satisfied"> {
     return settleEarlierEndpointOperations({
       operations,
@@ -4823,6 +4949,7 @@ export async function buildProductionApp(
         return operationReconciler.waitForTerminal(operationId, operationSignal);
       },
       ...(signal ? { signal } : {}),
+      ...(force ? { force: true } : {}),
     });
   }
 
@@ -5363,14 +5490,21 @@ export async function buildProductionApp(
           operations.succeed(operation.id, { file_handle: prepared.id, display_name: prepared.displayName, media_type: prepared.mediaType, size: prepared.size, sha256: prepared.sha256 });
         } else if (operation.kind === "disconnect_endpoint") {
           const endpointId = projectEndpoint(args.endpoint);
+          // Off a row, not off the parsed tool schema, and two builds share this ledger. `=== true`
+          // keeps a string "false" or a stray 0 from forcing silently.
+          const forced = args.force === true;
           const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
           if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
           if (saved) {
-            if (saved.phase === "runtime_started") return;
-            await endpointManager.recoverDisconnect(endpointId, saved.phase, saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+            const phase = recoverablePhase(saved.phase);
+            if (phase === "runtime_started") return;
+            await endpointManager.recoverDisconnect(endpointId, phase, saved.identity,
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
           }
-          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+          // Force lives on the row's own args, so the retry of a forced action is itself forced.
+          // Retrying unforced refuses again on the same unprovable idle and leaves the row
+          // unresolved -- and that row is what fences the next lifecycle action on the endpoint.
+          else await endpointManager.disconnect(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
           operations.succeed(operation.id, { endpoint: endpointId, state: "disconnected" });
         } else if (operation.kind === "restart_endpoint") {
           if (args.endpoint === assistantEndpoint.id) {
@@ -5380,13 +5514,21 @@ export async function buildProductionApp(
             } else failRecoveredNoEffect(operation.id, "assistant restart target was not durably scheduled exactly");
           } else {
             const endpointId = projectEndpoint(args.endpoint);
+            // See the disconnect branch: this comes off the ledger, not off a parsed schema.
+            const forced = args.force === true;
             const saved = parseEndpointLifecycleCheckpoint(operation.receipt);
             if (operation.receipt !== undefined && (!saved || saved.endpoint !== endpointId)) return;
-            if (saved) await endpointManager.recoverRestart(endpointId, saved.phase, saved.identity,
-              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
-            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }));
+            if (saved) await endpointManager.recoverRestart(endpointId, recoverablePhase(saved.phase), saved.identity,
+              (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
+            else await endpointManager.restart(endpointId, (checkpoint) => operations.checkpoint(operation.id, { endpoint: endpointId, ...(checkpoint as object) }), forced);
+            // Deliberately NOT isolated the way the tool handler isolates it. Here a thrown
+            // resume leaves the row recoverable, and the next reconciliation pass retries it --
+            // which is how unrecovered sessions eventually come back without a human. Succeeding
+            // the row with `sessions_restored: false` would end the retries and leave the sessions
+            // down until someone ran recover_endpoint. That gates succeedRecovered; removing it
+            // here would break recovery to fix reporting.
             await resumeManagedEndpoint(endpointId, true);
-            await succeedRecovered(operation, { endpoint: endpointId, state: "ready" },
+            await succeedRecovered(operation, { endpoint: endpointId, state: "ready", sessions_restored: true },
               () => prepareToolSystemNotice(operation.id, operation.attemptId, `endpoint ${endpointId} restarted`));
           }
         } else if (operation.kind === "collect_messages") {

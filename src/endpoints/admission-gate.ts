@@ -46,7 +46,38 @@ export class EndpointAdmissionGate {
     this.resolveDrainIfReady();
   }
 
-  beginDrain(): Promise<EndpointDrainHandle> {
+  // Abandon every live lease. A forced lifecycle action uses this so that work in flight cannot
+  // park it: a lease on a dead channel would otherwise hold `beginDrain` open forever, and because
+  // lifecycle actions serialize, every later one queues behind it.
+  //
+  // What this does and does not do, precisely. A discarded lease can no longer be used for further
+  // work — `validate` fails for it, and `release` becomes a safe no-op when the orphaned work
+  // finally unwinds. It does NOT cancel work already running: that RPC will still return, and its
+  // result is simply not waited for and not relied upon. That is the same position a lost
+  // connection leaves us in, which is the honest comparison; claiming the result is "ignored"
+  // would be claiming a guarantee this does not provide.
+  discardLiveWork(): number {
+    const discarded = this.live.size;
+    this.live.clear();
+    this.resolveDrainIfReady();
+    return discarded;
+  }
+
+  // `discardLive` discards in the SAME synchronous step that closes the gate. Doing the two as
+  // separate statements is only race-free while they are adjacent, and on the forced paths they
+  // were not: an `await` between them (preparing a replacement over SSH takes hundreds of
+  // milliseconds) reopens the gate long enough for reconnect, recovery or status work to take a
+  // fresh lease -- on the same dead channel -- and the drain then parks on that instead. Taking the
+  // flag here makes the two inseparable rather than relying on every call site keeping them
+  // together.
+  beginDrain(options?: { discardLive?: boolean }): Promise<EndpointDrainHandle> {
+    // Before the early return, not after it. Joining a drain already in progress is the one way the
+    // discard and the close could still come apart, and the whole point of taking the flag here is
+    // that they cannot.
+    if (options?.discardLive) {
+      this.live.clear();
+      this.resolveDrainIfReady();
+    }
     if (this.drainPromise) return this.drainPromise;
     if (this.state === "disconnected") throw new AppError("ENDPOINT_UNAVAILABLE", `endpoint is disconnected: ${this.endpointId}`);
     this.state = "draining";

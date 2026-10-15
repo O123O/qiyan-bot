@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { LinuxProcessIdentity } from "../core/process-identity.ts";
 import { AppError } from "../core/errors.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type EndpointLossReason, type RuntimeIdentity } from "../endpoints/types.ts";
+import { parseRuntimeIdentity, type EndpointLossKind, type EndpointLossReason, type RuntimeDestroyReport, type RuntimeIdentity } from "../endpoints/types.ts";
 import { APP_VERSION } from "../version.ts";
 import type { DynamicToolCallResponse } from "./generated/v2/DynamicToolCallResponse.ts";
 import type { RpcRequest } from "./protocol.ts";
@@ -40,7 +40,9 @@ export interface AppServerRuntimeService {
   open(): Promise<AppServerConnection>;
   runtimeIdentity(): Promise<RuntimeIdentity | undefined>;
   classifyLoss(): Promise<EndpointLossKind>;
-  shutdownRuntime(expected: RuntimeIdentity): Promise<void>;
+  // `force` destroys the runtime by location instead of proving its identity first. See
+  // docs/development/forced-restart-design.md.
+  shutdownRuntime(expected: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
   closeTransport?(): Promise<void>;
 }
 
@@ -127,13 +129,14 @@ export class ManagedAppServerEndpoint {
     if (firstError !== undefined) throw firstError;
   }
 
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> {
+  async shutdownRuntime(expected: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport | undefined> {
     this.generation += 1;
     this.state = "stopped";
     let cleanupError: unknown;
     try { await this.disposeConnection(); } catch (error) { cleanupError = error; }
-    await this.options.runtime.shutdownRuntime(expected);
+    const destroyed = await this.options.runtime.shutdownRuntime(expected, force);
     if (cleanupError !== undefined) throw cleanupError;
+    return destroyed;
   }
 
   runtimeIdentity(): Promise<RuntimeIdentity | undefined> { return this.options.runtime.runtimeIdentity(); }

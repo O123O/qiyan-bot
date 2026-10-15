@@ -17,9 +17,15 @@ import {
   type BoundedProcessResult,
   type ReadyProcessStream,
 } from "./ssh-process.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type RuntimeIdentity } from "./types.ts";
+import {
+  parseRuntimeDestroyReport,
+  parseRuntimeIdentity,
+  type EndpointLossKind,
+  type RuntimeDestroyReport,
+  type RuntimeIdentity,
+} from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "051d76bf7b8e2a945364da4c99d8d867e98a1a48f2ba9605c89dcaba17942ef9";
+export const REMOTE_HELPER_SHA256 = "c4a484ea1c4b818336a85939f15ea785ba8bb9841e7f6d6ec5a08d86c267578d";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
 export const REMOTE_CLAUDE_HOST_SHA256 = "115b2b25827e69677dc65fe972156f2cb62d2c064d2020f81b7aa282f30034c6";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -180,7 +186,7 @@ export interface SshRuntimeController {
   // ControlMaster, which is never torn down. Anything added here must respect that — releasing a
   // connection is not a reason to end a master.
   closeTransport?(): Promise<void>;
-  stop(expectedIdentity: RuntimeIdentity): Promise<void>;
+  stop(expectedIdentity: RuntimeIdentity | undefined, force?: boolean): Promise<RuntimeDestroyReport | undefined>;
 }
 
 // The provider-neutral host facts a remote endpoint's consumers need (workspace router,
@@ -370,16 +376,20 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     return (await this.inspectPrepared(prepared)).status === "absent" ? "runtime-lost" : "connection-lost";
   }
 
-  async stop(expectedIdentity: RuntimeIdentity): Promise<void> {
+  async stop(expectedIdentity: RuntimeIdentity | undefined, force = false): Promise<RuntimeDestroyReport> {
     const prepared = await this.prepare();
-    if (expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
-    await this.options.remote.invoke("stop", [JSON.stringify({
+    // Forced: destroyed by location, so an identity that cannot be vouched for is not a reason to
+    // refuse. Still sent, for the helper's process-group signal and its report of what it killed.
+    if (!force && expectedIdentity?.kind !== "ssh") throw new AppError("OPERATION_CONFLICT", "exact SSH runtime identity is required for shutdown");
+    const reported = await this.options.remote.invoke("stop", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
       session: prepared.session,
       tmuxMode: prepared.tmuxMode,
       expected: expectedIdentity,
+      ...(force ? { force: true } : {}),
     })], prepared.host.remoteHelperPath);
     if (prepared.tmuxMode === "legacy") delete this.prepared;
+    return parseRuntimeDestroyReport(reported);
   }
 
   private async prepare(): Promise<NonNullable<SshRuntime["prepared"]>> {

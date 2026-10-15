@@ -469,8 +469,17 @@ async function launcherFailureDetail(paths) {
 async function stop(value) {
   const paths = runtimePaths(value);
   const identity = await readIdentity(paths.identityPath);
-  const expected = validIdentity(value?.expected);
-  if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
+  // A FORCED stop is addressed by location, not by identity: it destroys whatever occupies this
+  // runtime directory and tmux session. Asking "is this the exact runtime I was told about?" has no
+  // answer when the identity file is gone, the generation moved, or the channel died before the
+  // close was acknowledged -- and "I don't know" is the outcome the caller explicitly asked to be
+  // rid of. The identity is still READ, for its token and pgid, and reported back so a force says
+  // what it killed. See docs/development/forced-restart-design.md.
+  const forced = value?.force === true;
+  if (!forced) {
+    const expected = validIdentity(value?.expected);
+    if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("runtime identity cannot be proven");
+  }
   // The supervisor dies FIRST, before anything that can fail or return early. "The restart kills
   // the old things, including the tmux session" then holds on every path out of this function
   // rather than only on the ones that reach the bottom -- and it is what the reclaim of a live
@@ -490,6 +499,7 @@ async function stop(value) {
   // before this teardown was hoisted, and a strictly stronger one.
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
+  let serverSurvived = false;
   if (identity) {
     // This gate is the protection against a RECYCLED pgid, not a redundant liveness check:
     // the signal below goes to the whole process group, and only a surviving member still
@@ -520,17 +530,35 @@ async function stop(value) {
       // The supervisor half of that is already established rather than asserted -- the session was
       // killed above -- so this is left as one fact about the server itself. Asserting the
       // supervisor instead made a reclaim impossible in the one case a reclaim is now for.
+      // Under force this is reported, never raised. The session is dead and the files are about to
+      // go either way, and the replacement gets a new pid, process group, token and socket, so a
+      // survivor cannot become a second live app-server. It is loud enough to deserve its own field
+      // rather than being folded into a count.
       if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
-        throw new Error("runtime process group did not stop");
+        if (!forced) throw new Error("runtime process group did not stop");
+        serverSurvived = true;
       }
     }
   }
+  // Files go LAST, and the order is load-bearing: `inspect` derives group membership from
+  // identity.json, so removing it first would make any survivor unsignallable -- and their absence
+  // is what makes the next `start` see `absent` rather than `unhealthy`, which is the only reason
+  // a forced restart can go straight on to start a fresh runtime.
   await rm(paths.socketPath, { force: true });
   await rm(paths.identityPath, { force: true });
   await rm(paths.tokenPath, { force: true });
   // Report what was left behind. A caller that reclaimed over unreapable debris should be able
   // to say so rather than presenting the endpoint as cleanly stopped.
-  return { stopped: true, ...survivors > 0 ? { survivors } : {} };
+  //
+  // With no identity there was nothing to signal FROM, so `survivors: 0` would be a lie of the
+  // worst kind: it reads as "clean" when it means "did not look". A detached app-server outside the
+  // pane's process group survives kill-session unaccounted for in exactly that case.
+  return {
+    stopped: true,
+    ...(identity ? { destroyedIdentity: identity } : { destroyedIdentity: null }),
+    ...(identity ? (survivors > 0 ? { survivors } : {}) : { survivors: "unknown: no identity to signal from" }),
+    ...(serverSurvived ? { serverSurvived } : {}),
+  };
 }
 
 // The Claude host runtime is the Codex app-server runtime with a different server: one
@@ -642,8 +670,17 @@ function resolveAgentSdkPath(shell) {
 async function stopClaudeHost(value) {
   const paths = claudeRuntimePaths(value);
   const identity = await readIdentity(paths.claudeHostIdentityPath);
-  const expected = validIdentity(value?.expected);
-  if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  // Same rule as the Codex runtime's stop: a FORCED stop is addressed by location, not by identity.
+  // It destroys whatever occupies this runtime directory and tmux session, because "is this the
+  // exact host I was told about?" has no answer when the identity file is gone, the generation
+  // moved, or the channel died before the close was acknowledged -- and "I don't know" is the
+  // outcome the caller asked to be rid of. The identity is still read, for its token and pgid, and
+  // reported back so a force says what it killed.
+  const forced = value?.force === true;
+  if (!forced) {
+    const expected = validIdentity(value?.expected);
+    if (!identity || !expected || !sameIdentity(identity, expected)) throw new Error("Claude host identity cannot be proven");
+  }
   // The supervisor dies FIRST, before anything that can fail or return early, so "the restart
   // kills the old things, including the tmux session" holds on every path out of this function.
   // Asserting it below instead made a reclaim impossible in the one case a reclaim is for: a live
@@ -651,30 +688,45 @@ async function stopClaudeHost(value) {
   // torn down.
   await run("tmux", [...tmuxArgs(paths), "kill-session", "-t", paths.session], true);
   let survivors = 0;
-  let members = ownedGroupMembers(identity);
-  if (members.length > 0) {
-    try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-    await waitForEmptyGroup(identity.processGroupId, 2_000);
-    members = ownedGroupMembers(identity);
+  let serverSurvived = false;
+  // Only reachable with no identity under force, where there is nothing to signal from: the
+  // session is already dead and the files are about to go.
+  if (identity) {
+    let members = ownedGroupMembers(identity);
     if (members.length > 0) {
-      try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+      try { process.kill(-identity.processGroupId, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
       await waitForEmptyGroup(identity.processGroupId, 2_000);
-    }
-    survivors = ownedGroupMembers(identity).length;
-    // Same rule as the Codex runtime's stop, and it matters MORE here: Claude runs Bash tools,
-    // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem —
-    // inheriting the host's process group and token, unreapable by any signal, and otherwise
-    // refusing this reclaim forever. Insist only that the HOST is gone.
-    if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
-      throw new Error("Claude host process group did not stop");
+      members = ownedGroupMembers(identity);
+      if (members.length > 0) {
+        try { process.kill(-identity.processGroupId, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+        await waitForEmptyGroup(identity.processGroupId, 2_000);
+      }
+      survivors = ownedGroupMembers(identity).length;
+      // Same rule as the Codex runtime's stop, and it matters MORE here: Claude runs Bash tools,
+      // so a command it started can be blocked in uninterruptible I/O on a stalled filesystem --
+      // inheriting the host's process group and token, unreapable by any signal, and otherwise
+      // refusing this reclaim forever. Insist only that the HOST is gone. Under force that is
+      // reported rather than raised: the session is dead, the files are about to go, and the
+      // replacement gets a new pid, process group, token and socket.
+      if (survivors > 0 && identityMatches(identity) && processHasToken(identity.pid, identity.token)) {
+        if (!forced) throw new Error("Claude host process group did not stop");
+        serverSurvived = true;
+      }
     }
   }
+  // Files last, for the same reason as the Codex runtime's stop: identity.json is what any survivor
+  // would have to be signalled from, and its absence is what lets the next start see `absent`.
   await rm(paths.claudeHostSocketPath, { force: true });
   await rm(paths.claudeHostIdentityPath, { force: true });
   // The tmux socket is deliberately left alone: one tmux server in this runtime directory
   // may also be supervising the endpoint's Codex app-server session, and unlinking it would
   // strand that generation. Codex's own stop() does not remove it either.
-  return { stopped: true, ...survivors > 0 ? { survivors } : {} };
+  return {
+    stopped: true,
+    ...(identity ? { destroyedIdentity: identity } : { destroyedIdentity: null }),
+    ...(identity ? (survivors > 0 ? { survivors } : {}) : { survivors: "unknown: no identity to signal from" }),
+    ...(serverSurvived ? { serverSurvived } : {}),
+  };
 }
 
 async function proxyAppServer(value) {

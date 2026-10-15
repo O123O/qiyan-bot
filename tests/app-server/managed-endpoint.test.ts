@@ -65,7 +65,7 @@ class FakeRuntime implements AppServerRuntimeService {
     if (this.classify instanceof Error) throw this.classify;
     return this.classify;
   }
-  async shutdownRuntime(expected: RuntimeIdentity): Promise<void> { this.shutdowns.push(expected); }
+  async shutdownRuntime(expected: RuntimeIdentity): Promise<undefined> { this.shutdowns.push(expected); return undefined; }
   async closeTransport(): Promise<void> { this.transportCloses += 1; }
 }
 
