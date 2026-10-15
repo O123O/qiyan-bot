@@ -18,6 +18,24 @@ import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remot
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
+// A previewed HTML/SVG document opened in its own tab. A bare `sandbox` is the FULLY restrictive
+// sandbox: no scripts, and no top-level navigation either, so a report's own links go dead and its
+// scripts never run. That is not a preview, it is a screenshot — and the file reads as broken
+// everywhere except after a manual download, which is the one place it is least useful.
+//
+// What stays revoked is the one that matters: `allow-same-origin` is deliberately absent, so the
+// document lands in an OPAQUE origin. The auth cookie is HttpOnly and belongs to the real origin,
+// so the document can neither read it nor have it attached; a call to /api/* from here is
+// cross-origin and uncredentialed, and CORS blocks reading the reply. These files are written by
+// workers, sometimes out of data the worker did not author, so the preview is treated as hostile.
+//
+// `allow-top-navigation-by-user-activation` rather than the unqualified form: a click still
+// follows a link, while a script cannot silently redirect the tab somewhere else.
+const PREVIEW_SANDBOX = [
+  "sandbox", "allow-scripts", "allow-forms", "allow-modals",
+  "allow-popups", "allow-popups-to-escape-sandbox", "allow-downloads",
+  "allow-top-navigation-by-user-activation",
+].join(" ");
 const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_WS_INPUT_BYTES = 4 * 1024;
@@ -31,6 +49,19 @@ const RAW_CONTENT_TYPES: Record<string, string> = {
   ".md": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
   ".json": "application/json; charset=utf-8", ".csv": "text/csv; charset=utf-8",
 };
+
+// Whether this content type is rendered as a document the browser will execute, rather than as
+// bytes. Only these two need the sandbox, and only these two can read their own URL.
+function isPreviewDocument(contentType: string): boolean {
+  return contentType.startsWith("text/html") || contentType === "image/svg+xml";
+}
+
+// The same question asked of a path, before the file is opened — used to decide whether ?token=
+// has to be stripped from the URL the document will be able to read.
+function isPreviewDocumentPath(path: string): boolean {
+  const contentType = RAW_CONTENT_TYPES[extname(path).toLowerCase()];
+  return contentType !== undefined && isPreviewDocument(contentType);
+}
 
 // Stream a resolved file with a best-effort Content-Type so the browser can render/read it inline
 // (or download it, when `download` is set).
@@ -46,8 +77,13 @@ async function serveRaw(response: ServerResponse, target: string | undefined, do
     "content-type": contentType, "content-length": String(info.size),
     "content-disposition": disposition, "x-content-type-options": "nosniff",
   };
-  // Neuter scripts/callbacks in previewed HTML/SVG opened as a document (unique, isolated origin).
-  if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
+  // Previewed HTML/SVG runs as a document in an isolated origin — see PREVIEW_SANDBOX. The referrer
+  // is suppressed because the page that opened this one carries ?token= in its own URL, and a
+  // document that can now run scripts must not be handed that token through document.referrer.
+  if (isPreviewDocument(contentType)) {
+    headers["content-security-policy"] = PREVIEW_SANDBOX;
+    headers["referrer-policy"] = "no-referrer";
+  }
   response.writeHead(200, headers);
   createReadStream(target).pipe(response);
 }
@@ -75,7 +111,10 @@ async function serveRemoteRaw(response: ServerResponse, remote: RemoteDeps, host
       // Sanitize the download filename — strip CR/LF (header injection) and quotes/backslash.
       const name = (path.split("/").pop() || "download").replace(/[\r\n"\\]/g, "_");
       const headers: Record<string, string> = { "content-type": contentType, "content-disposition": download ? `attachment; filename="${name}"` : "inline", "x-content-type-options": "nosniff" };
-      if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
+      if (isPreviewDocument(contentType)) {
+        headers["content-security-policy"] = PREVIEW_SANDBOX;
+        headers["referrer-policy"] = "no-referrer";
+      }
       if (!safeHead(200, headers)) { killChild(); finish(); return; }
     }
     size += chunk.length;
@@ -419,6 +458,18 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const session = url.searchParams.get("session") || undefined;
       const path = url.searchParams.get("path") ?? "";
       const download = url.searchParams.get("download") === "1";
+      // A preview document can run scripts, and a script can read its own URL. The token must not
+      // be in it. The cookie was just set from this very request, so bounce to the same URL without
+      // ?token= and let the cookie carry the retry — the document that finally executes sees a
+      // clean `location`. Stripping the parameter makes the next pass fall through here, so this
+      // cannot loop. A download is bytes, never a document, so it is left alone.
+      if (!download && url.searchParams.has("token") && isPreviewDocumentPath(path)) {
+        const clean = new URL(url);
+        clean.searchParams.delete("token");
+        response.writeHead(302, { location: `${clean.pathname}${clean.search}`, "referrer-policy": "no-referrer" });
+        response.end();
+        return;
+      }
       const target = session ? options.files.fileTarget(session) : undefined;
       if (target?.transport === "remote" && target.host && remote) {
         await serveRemoteRaw(response, remote, target.host, target.projectDir, path, download);
