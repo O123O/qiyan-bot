@@ -783,3 +783,54 @@ test("only executable previews are bounced and sandboxed; bytes are served as by
     assert.match(saved.headers.get("content-disposition") ?? "", /^attachment/u);
   });
 });
+
+// The token reaches a preview through THREE channels, and the server can only close one of them.
+// `Referrer-Policy` on the preview governs what the preview sends onward; the referrer it RECEIVES
+// is chosen by whoever opened it. So the opener has to suppress it, and the token should not be in
+// the opener's URL in the first place. A regression in any one of these re-opens the leak.
+test("the token cannot reach a preview through the referrer or the address bar", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  // `noopener` alone does NOT suppress the referrer -- this is the exact mistake being guarded.
+  assert.match(source, /window\.open\(url, "_blank", "noopener,noreferrer"\)/u, "a preview tab is opened without a referrer");
+
+  await withServer(async (base) => {
+    // The app page is the opener; its own policy is what decides the referrer it sends.
+    const app = await fetch(`${base}/?token=${TOKEN}`);
+    assert.equal(app.status, 200);
+    assert.equal(app.headers.get("referrer-policy"), "no-referrer");
+
+    // And on the 304, because a browser refreshes a STORED response's headers from it. A cached
+    // bundle that revalidates must not end up stored without the policy it was first served with.
+    const revalidated = await fetch(`${base}/?token=${TOKEN}`, { headers: { "if-none-match": app.headers.get("etag") ?? "" } });
+    assert.equal(revalidated.status, 304);
+    assert.equal(revalidated.headers.get("referrer-policy"), "no-referrer");
+  });
+});
+
+test("every executable preview is sandboxed, whatever shape it arrives in", async () => {
+  await withServer(async (base, _calls, _bus, uploadsDir) => {
+    const cookie = { cookie: `qiyan_web_token=${TOKEN}` };
+    // SVG is the other executable type, and the one the client also routes into an <img>.
+    await writeFile(join(uploadsDir, "chart.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>");
+    const svg = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "chart.svg"))}`, { headers: cookie });
+    assert.equal(svg.status, 200);
+    assert.match(svg.headers.get("content-security-policy") ?? "", /^sandbox .*allow-scripts/u);
+    assert.doesNotMatch(svg.headers.get("content-security-policy") ?? "", /allow-same-origin/u);
+    assert.equal(svg.headers.get("referrer-policy"), "no-referrer");
+
+    // An empty document still gets the guards: a header set only on the non-empty path is one
+    // someone will later assume is always present.
+    await writeFile(join(uploadsDir, "blank.html"), "");
+    const blank = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "blank.html"))}`, { headers: cookie });
+    assert.equal(blank.status, 200);
+    assert.match(blank.headers.get("content-security-policy") ?? "", /allow-scripts/u);
+
+    // A download is bytes on their way to disk, but it is still HTML, and the header costs nothing
+    // to keep. Note what it does NOT buy: response headers are not saved with the file, so opening
+    // it later from the download list gives a file:// document with no CSP at all. What makes that
+    // safe is that nothing on disk holds the token -- not this header.
+    const saved = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "blank.html"))}&download=1`, { headers: cookie });
+    assert.match(saved.headers.get("content-security-policy") ?? "", /allow-scripts/u);
+    assert.match(saved.headers.get("content-disposition") ?? "", /^attachment/u);
+  });
+});
