@@ -167,7 +167,8 @@ class SshProxyConnection implements AppServerConnection {
     // `ws` handles a socket error by detaching its own listener, installing a NOOP and destroying
     // the socket (node_modules/ws/lib/websocket.js, socketOnError) -- it never re-emits it -- so
     // every underlying failure reaches `wire.onClose` as a plain close with no error at all. The
-    // stream is where the SSH child's exit status still exists, and it notifies first.
+    // stream is where the SSH child's exit status still exists; `openReadyProcessStream` holds
+    // its output open until that status is known, so this arrives before the wire's bare close.
     this.removeStreamClose = stream.onClose((error) => { if (error) this.fail(error); });
     // No error means the remote end hung up cleanly -- the SSH child exits 0 when the app-server
     // it was piping for is gone, most often because the host killed it. Say "closed", not
@@ -217,6 +218,7 @@ class SshProxyConnection implements AppServerConnection {
   private fail(error: Error): void {
     if (this.intentional || this.lost) return;
     this.lost = true;
+    this.removeStreamClose();
     this.lossError = error;
     for (const listener of this.closes) listener(error);
   }

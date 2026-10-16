@@ -9,7 +9,7 @@ import {
   type AppServerInitializeResult,
   type AppServerRuntimeService,
 } from "../../src/app-server/managed-endpoint.ts";
-import { endpointLossError } from "../../src/endpoints/types.ts";
+import { endpointLossError, tagEndpointLoss } from "../../src/endpoints/types.ts";
 import type { EndpointLossKind, EndpointLossReason, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 const firstIdentity: RuntimeIdentity = { kind: "local", pid: 10, startTime: "20" };
@@ -251,9 +251,12 @@ test("loss classification failure still emits one conservative reconnect event",
 test("connection loss exposes only a bounded transport reason", async (t) => {
   for (const [error, expected] of [
     [Object.assign(new RangeError("Max payload size exceeded"), { code: "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH" }), "frame_too_large"],
-    [new Error("SSH process exceeded its diagnostic output limit"), "ssh_diagnostic_limit"],
-    [new Error("SSH process input closed"), "ssh_input_closed"],
-    [new Error("SSH process stream failed"), "ssh_process_failed"],
+    [tagEndpointLoss(new Error("SSH process exceeded its diagnostic output limit"), "ssh_diagnostic_limit"), "ssh_diagnostic_limit"],
+    [tagEndpointLoss(new Error("SSH process input closed"), "ssh_input_closed"), "ssh_input_closed"],
+    [tagEndpointLoss(new Error("SSH process stream failed"), "ssh_process_failed"), "ssh_process_failed"],
+    // An untagged error with a once-recognized message is no longer special-cased: the reason has
+    // to be on the error, or it is genuinely unknown.
+    [new Error("SSH process stream failed"), "transport_error"],
     [Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }), "transport_reset"],
     [Object.assign(new Error("Invalid WebSocket frame"), { code: "WS_ERR_INVALID_OPCODE" }), "invalid_frame"],
     // Tagged at the layer that synthesized them, so rewording the message cannot silently

@@ -131,6 +131,8 @@ class LocalConnection implements AppServerConnection {
   constructor(private readonly runtime: LocalAppServerRuntime, private readonly child: ChildProcessWithoutNullStreams) {
     this.wire = new JsonlWire(child.stdout, child.stdin);
     this.removeWireClose = this.wire.onClose((error) => {
+      // `JsonlWire` only closes without an error when WE closed it, and `close()` removes this
+      // listener first -- so the fallback is for an interface that permits undefined, not a case.
       const failure = error ?? endpointLossError("transport_closed", "local App Server wire closed");
       // Let the wire deliver its exact failure to the RPC client before endpoint cleanup closes it.
       queueMicrotask(() => this.lost(failure));

@@ -25,8 +25,12 @@ const LOSS_REASON = Symbol.for("qiyan.endpointLossReason");
 // matched those messages by text, so a reworded message silently downgraded a known cause to
 // `transport_error` -- which is what happened to the byte-stream branch, left matching a string no
 // code produced. The reason now travels ON the error.
+export function tagEndpointLoss<E extends Error>(error: E, reason: EndpointLossReason): E {
+  return Object.assign(error, { [LOSS_REASON]: reason });
+}
+
 export function endpointLossError(reason: EndpointLossReason, message: string): Error {
-  return Object.assign(new Error(message), { [LOSS_REASON]: reason });
+  return tagEndpointLoss(new Error(message), reason);
 }
 
 export function taggedLossReason(error: Error): EndpointLossReason | undefined {

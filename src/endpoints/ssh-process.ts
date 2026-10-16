@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 import { AppError } from "../core/errors.ts";
+import { tagEndpointLoss } from "./types.ts";
 
 // Short enough that a chatty login shell never accumulates the whole budget inside one window;
 // long enough that the sustained rate this permits (64 KiB/min, about 1 KiB/s) is low enough that
@@ -9,6 +10,10 @@ import { AppError } from "../core/errors.ts";
 // r hits the budget in budget/r seconds whatever the window is. It sets the rate threshold above
 // which something counts as runaway at all.
 const DEFAULT_DIAGNOSTIC_WINDOW_MS = 60_000;
+
+// How long the stream waits for an exit status after the child's stdout closes. Generous for an
+// exit already in flight, short enough that a process which merely closed stdout is not held.
+const STDOUT_EXIT_GRACE_MS = 250;
 
 export interface DiagnosticBudget { windowStart: number; bytes: number }
 
@@ -180,7 +185,7 @@ export function openReadyProcessStream(
         diagnosticWindowStart = charged.state.windowStart;
         stderrBytes = charged.state.bytes;
         if (charged.exceeded) {
-          failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its diagnostic output limit"));
+          failStartup(tagEndpointLoss(new AppError("ENDPOINT_UNAVAILABLE", "SSH process exceeded its diagnostic output limit"), "ssh_diagnostic_limit"));
         }
         return;
       }
@@ -190,24 +195,35 @@ export function openReadyProcessStream(
       }
     });
     child.stdin.on("error", () => {
-      if (!intentional && ready) notifyClose(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input closed"));
+      if (!intentional && ready) notifyClose(tagEndpointLoss(new AppError("ENDPOINT_UNAVAILABLE", "SSH process input closed"), "ssh_input_closed"));
     });
-    child.once("error", () => failStartup(new AppError("ENDPOINT_UNAVAILABLE", ready
-      ? "SSH process stream failed"
-      : "SSH process stream failed before readiness")));
+    child.once("error", () => failStartup(ready
+      ? tagEndpointLoss(new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream failed"), "ssh_process_failed")
+      : new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream failed before readiness")));
     child.once("exit", (code, signal) => {
       processExited = true;
       if (escalation) clearTimeout(escalation);
       exitResolve();
-      const error = code === 0 && !signal ? undefined : new AppError(
+      const error = code === 0 && !signal ? undefined : tagEndpointLoss(new AppError(
         "ENDPOINT_UNAVAILABLE",
         ready ? "SSH process stream failed" : "SSH process stream failed before readiness",
         code === null ? undefined : { exitCode: code },
-      );
+      ), "ssh_process_failed");
       if (!startupSettled) failStartup(error ?? new AppError("ENDPOINT_UNAVAILABLE", "SSH process stream closed before readiness"));
       else if (!intentional) notifyClose(error);
     });
-    child.stdout.once("close", () => { if (ready) output.end(); });
+    // Ending the output here is what starts the WebSocket teardown, and that teardown reaches the
+    // endpoint as a close with NO error -- while the exit status, the only thing that says why the
+    // remote went away, is one tick behind in `child.on("exit")`. Ending immediately let the
+    // errorless close win roughly seven times in ten, so a helper that died non-zero was reported
+    // as a clean hangup. Wait for the exit that is already on its way, bounded so that a stdout
+    // that closes under a process which keeps running cannot wedge the stream.
+    child.stdout.once("close", () => {
+      if (!ready || processExited) { if (ready) output.end(); return; }
+      const bound = setTimeout(() => output.end(), STDOUT_EXIT_GRACE_MS);
+      bound.unref?.();
+      void exited.then(() => { clearTimeout(bound); output.end(); });
+    });
     const timeout = setTimeout(() => failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process readiness timed out")), options.timeoutMs);
     timeout.unref?.();
   });
