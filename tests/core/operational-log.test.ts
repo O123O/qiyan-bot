@@ -10,6 +10,11 @@ test("operational logs contain only bounded structured metadata", () => {
   report({ level: "warn", code: "endpoint_recovery_paused", endpoint: "prenyx-codex", reason: "ssh_fresh_channel_unavailable" });
   report({ level: "warn", code: "endpoint_connection_lost", endpoint: "polyphe", reason: "frame_too_large" });
   report({ level: "warn", code: "managed_session_parked", endpoint: "prenyx", reason: "thread_writer_locked", sessions: 2 });
+  report({ level: "warn", code: "endpoint_connection_lost", endpoint: "polyphe", reason: "transport_closed", loss: "runtime-lost" });
+  report({
+    level: "warn", code: "endpoint_runtime_reclaimed", component: "ssh_runtime", endpoint: "polyphe",
+    reason: "dead_supervisor", survivors: 3,
+  });
   assert.deepEqual(lines, [
     "qiyan-bot: WARN event=chat_ingress_failed adapter=telegram consecutive_failures=2\n",
     "qiyan-bot: INFO event=chat_input_accepted adapter=unknown\n",
@@ -17,6 +22,9 @@ test("operational logs contain only bounded structured metadata", () => {
     "qiyan-bot: WARN event=endpoint_connection_lost endpoint=polyphe reason=frame_too_large\n",
     // How many sessions parked is the difference between one worker and the whole endpoint.
     "qiyan-bot: WARN event=managed_session_parked endpoint=prenyx reason=thread_writer_locked sessions=2\n",
+    // A lost connection and a dead remote runtime are different incidents; the line says which.
+    "qiyan-bot: WARN event=endpoint_connection_lost endpoint=polyphe reason=transport_closed loss=runtime-lost\n",
+    "qiyan-bot: WARN event=endpoint_runtime_reclaimed endpoint=polyphe reason=dead_supervisor component=ssh_runtime survivors=3\n",
   ]);
   assert.equal(lines.join("").includes("secret-token"), false);
 });

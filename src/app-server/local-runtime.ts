@@ -2,6 +2,7 @@ import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOpti
 import { readFile, realpath } from "node:fs/promises";
 import { AppError } from "../core/errors.ts";
 import { readLinuxProcessIdentity, type LinuxProcessIdentity } from "../core/process-identity.ts";
+import { endpointLossError } from "../endpoints/types.ts";
 import type { EndpointLossKind, RuntimeIdentity } from "../endpoints/types.ts";
 import { JsonlWire } from "./jsonl-wire.ts";
 import type {
@@ -130,12 +131,12 @@ class LocalConnection implements AppServerConnection {
   constructor(private readonly runtime: LocalAppServerRuntime, private readonly child: ChildProcessWithoutNullStreams) {
     this.wire = new JsonlWire(child.stdout, child.stdin);
     this.removeWireClose = this.wire.onClose((error) => {
-      const failure = error ?? new Error("local App Server wire closed");
+      const failure = error ?? endpointLossError("transport_closed", "local App Server wire closed");
       // Let the wire deliver its exact failure to the RPC client before endpoint cleanup closes it.
       queueMicrotask(() => this.lost(failure));
     });
     child.once("error", (error) => this.lost(error));
-    child.once("exit", () => this.lost(new Error("app-server process exited")));
+    child.once("exit", () => this.lost(endpointLossError("runtime_exited", "app-server process exited")));
   }
 
   onClose(listener: (error?: Error) => void): () => void {

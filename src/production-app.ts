@@ -3632,9 +3632,11 @@ export async function buildProductionApp(
                 code: "endpoint_runtime_reclaimed",
                 component: "ssh_runtime",
                 endpoint: endpointId,
-                reason: survivors > 0
-                  ? `cleared a dead runtime whose supervisor was gone; killed ${survivors} surviving process(es) it had started`
-                  : "cleared a dead runtime whose supervisor was gone",
+                // Tokens, not prose: `safeToken` rejects a sentence and prints `reason=unknown`,
+                // which is how the survivor count -- the only part worth paging someone over --
+                // was being dropped on the floor.
+                reason: "dead_supervisor",
+                survivors,
               }),
             });
             const remoteEndpoint = new ManagedAppServerEndpoint({
@@ -6385,7 +6387,7 @@ export async function buildProductionApp(
   ): Promise<void> {
     if (stopping || !endpointsCommitted) return;
     reportOperationalSafely(report, {
-      level: "warn", code: "endpoint_connection_lost", endpoint: target.id, reason: reason ?? kind,
+      level: "warn", code: "endpoint_connection_lost", endpoint: target.id, reason: reason ?? kind, loss: kind,
     });
     const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({

@@ -16,7 +16,23 @@ export type EndpointLossReason =
   | "transport_reset"
   | "byte_stream_error"
   | "transport_error"
+  | "runtime_exited"
   | "transport_closed";
+
+const LOSS_REASON = Symbol.for("qiyan.endpointLossReason");
+
+// A transport that closes with no error of its own still has to hand the endpoint SOMETHING, and
+// every layer that synthesizes that something used to do it with a bare message. The classifier
+// matched those messages by text, so a reworded message silently downgraded a known cause to
+// `transport_error` -- which is what happened to the byte-stream branch, left matching a string no
+// code produced. The reason now travels ON the error.
+export function endpointLossError(reason: EndpointLossReason, message: string): Error {
+  return Object.assign(new Error(message), { [LOSS_REASON]: reason });
+}
+
+export function taggedLossReason(error: Error): EndpointLossReason | undefined {
+  return (error as Error & { [LOSS_REASON]?: EndpointLossReason })[LOSS_REASON];
+}
 
 export interface EndpointWorkLease {
   readonly endpointId: string;

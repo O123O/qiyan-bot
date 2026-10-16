@@ -9,6 +9,7 @@ import {
   type AppServerInitializeResult,
   type AppServerRuntimeService,
 } from "../../src/app-server/managed-endpoint.ts";
+import { endpointLossError } from "../../src/endpoints/types.ts";
 import type { EndpointLossKind, EndpointLossReason, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 const firstIdentity: RuntimeIdentity = { kind: "local", pid: 10, startTime: "20" };
@@ -255,7 +256,11 @@ test("connection loss exposes only a bounded transport reason", async (t) => {
     [new Error("SSH process stream failed"), "ssh_process_failed"],
     [Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }), "transport_reset"],
     [Object.assign(new Error("Invalid WebSocket frame"), { code: "WS_ERR_INVALID_OPCODE" }), "invalid_frame"],
-    [new Error("App Server byte stream failed"), "byte_stream_error"],
+    // Tagged at the layer that synthesized them, so rewording the message cannot silently
+    // downgrade the reason the way it did before.
+    [endpointLossError("transport_closed", "SSH App Server wire closed"), "transport_closed"],
+    [endpointLossError("runtime_exited", "app-server process exited"), "runtime_exited"],
+    [endpointLossError("byte_stream_error", "App Server byte stream cleanup failed"), "byte_stream_error"],
     [new Error("private transport detail"), "transport_error"],
     [undefined, "transport_closed"],
   ] as const) await t.test(expected, async () => {

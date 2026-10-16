@@ -57,6 +57,12 @@ export interface OperationalEvent {
   endpoint?: string;
   reason?: string;
   component?: string;
+  // How the endpoint was lost, alongside `reason` (how the transport failed). The two answer
+  // different questions -- whether the remote runtime is gone, and what the wire reported -- and
+  // collapsing them left "the worker died" and "the socket hiccuped" looking identical.
+  loss?: string;
+  // Processes a reclaim killed that the runtime had started but did not own.
+  survivors?: number;
   consecutiveFailures?: number;
   sessions?: number;
   phase?: string;
@@ -74,6 +80,8 @@ export function createOperationalLogSink(
     if (event.endpoint !== undefined) fields.push(`endpoint=${safeToken(event.endpoint)}`);
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
     if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
+    if (event.loss !== undefined) fields.push(`loss=${safeToken(event.loss)}`);
+    if (event.survivors !== undefined) fields.push(`survivors=${safeCount(event.survivors)}`);
     if (event.consecutiveFailures !== undefined) fields.push(`consecutive_failures=${safeCount(event.consecutiveFailures)}`);
     if (event.sessions !== undefined) fields.push(`sessions=${safeCount(event.sessions)}`);
     if (event.phase !== undefined) fields.push(`phase=${safeToken(event.phase)}`);

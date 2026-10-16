@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { LinuxProcessIdentity } from "../core/process-identity.ts";
 import { AppError } from "../core/errors.ts";
-import { parseRuntimeIdentity, type EndpointLossKind, type EndpointLossReason, type RuntimeDestroyReport, type RuntimeIdentity } from "../endpoints/types.ts";
+import { parseRuntimeIdentity, taggedLossReason, type EndpointLossKind, type EndpointLossReason, type RuntimeDestroyReport, type RuntimeIdentity } from "../endpoints/types.ts";
 import { APP_VERSION } from "../version.ts";
 import type { DynamicToolCallResponse } from "./generated/v2/DynamicToolCallResponse.ts";
 import type { RpcRequest } from "./protocol.ts";
@@ -241,6 +241,8 @@ export class ManagedAppServerEndpoint {
 
 function classifyTransportLoss(error?: Error): EndpointLossReason {
   if (!error) return "transport_closed";
+  const tagged = taggedLossReason(error);
+  if (tagged !== undefined) return tagged;
   const code = (error as Error & { code?: unknown }).code;
   if (code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH") return "frame_too_large";
   if (typeof code === "string" && code.startsWith("WS_ERR_")) return "invalid_frame";
@@ -249,7 +251,6 @@ function classifyTransportLoss(error?: Error): EndpointLossReason {
   if (error.message === "SSH process exceeded its diagnostic output limit") return "ssh_diagnostic_limit";
   if (error.message === "SSH process input closed") return "ssh_input_closed";
   if (error.message === "SSH process stream failed") return "ssh_process_failed";
-  if (error.message === "App Server byte stream failed") return "byte_stream_error";
   return "transport_error";
 }
 

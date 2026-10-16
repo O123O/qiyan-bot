@@ -8,6 +8,7 @@ import type { RpcWire } from "../app-server/rpc-client.ts";
 import { AppError } from "../core/errors.ts";
 import type { ReadyProcessStream } from "./ssh-process.ts";
 import type { SshRuntimeController } from "./ssh-runtime.ts";
+import { endpointLossError } from "./types.ts";
 import type { EndpointLossKind, RuntimeDestroyReport, RuntimeIdentity } from "./types.ts";
 
 export class SshAppServerRuntime implements AppServerRuntimeService {
@@ -161,7 +162,12 @@ class SshProxyConnection implements AppServerConnection {
     private readonly stream: ReadyProcessStream,
     private readonly expected: RuntimeIdentity,
   ) {
-    this.removeWireClose = wire.onClose((error) => this.fail(error ?? new Error("SSH App Server wire closed")));
+    // No error means the remote end hung up cleanly -- the SSH child exits 0 when the app-server
+    // it was piping for is gone, most often because the host killed it. Say "closed", not
+    // "error": the difference is whether to look at the worker or at the network.
+    this.removeWireClose = wire.onClose((error) => this.fail(
+      error ?? endpointLossError("transport_closed", "SSH App Server wire closed"),
+    ));
   }
 
   onClose(listener: (error?: Error) => void): () => void {
