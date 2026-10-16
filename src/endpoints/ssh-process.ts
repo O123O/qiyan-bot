@@ -219,10 +219,12 @@ export function openReadyProcessStream(
     // as a clean hangup. Wait for the exit that is already on its way, bounded so that a stdout
     // that closes under a process which keeps running cannot wedge the stream.
     child.stdout.once("close", () => {
-      if (!ready || processExited) { if (ready) output.end(); return; }
-      const bound = setTimeout(() => output.end(), STDOUT_EXIT_GRACE_MS);
+      if (!ready || intentional) return;
+      const end = (): void => { if (!output.writableEnded) output.end(); };
+      if (processExited) { end(); return; }
+      const bound = setTimeout(end, STDOUT_EXIT_GRACE_MS);
       bound.unref?.();
-      void exited.then(() => { clearTimeout(bound); output.end(); });
+      void exited.then(() => { clearTimeout(bound); end(); });
     });
     const timeout = setTimeout(() => failStartup(new AppError("ENDPOINT_UNAVAILABLE", "SSH process readiness timed out")), options.timeoutMs);
     timeout.unref?.();
