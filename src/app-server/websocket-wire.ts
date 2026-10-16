@@ -3,7 +3,6 @@ import { lstat, realpath } from "node:fs/promises";
 import { Agent, type ClientRequest, type ClientRequestArgs } from "node:http";
 import { Duplex, type Readable, type Writable } from "node:stream";
 import WebSocket from "ws";
-import { endpointLossError } from "../endpoints/types.ts";
 import type { RpcWire } from "./rpc-client.ts";
 
 // App Server RPC is message-framed JSON. A tool-heavy full turn can exceed 16 MiB after JSON
@@ -36,9 +35,10 @@ class SocketCompatibleDuplex extends Duplex {
       stream.output.off("end", end);
       stream.output.off("error", failed);
     });
-    this.removeStreamClose = stream.onClose((error) => this.destroy(
-      error ?? endpointLossError("transport_closed", "App Server byte stream closed"),
-    ));
+    // Deliberately untagged: `ws` swallows socket errors rather than re-emitting them, so nothing
+    // here ever reaches the endpoint's loss classifier. The SSH connection subscribes to the same
+    // stream directly for that reason. This error only tears the duplex down.
+    this.removeStreamClose = stream.onClose((error) => this.destroy(error ?? new Error("App Server byte stream closed")));
   }
 
   override _read(): void { this.stream.output.resume(); }
@@ -53,10 +53,7 @@ class SocketCompatibleDuplex extends Duplex {
     this.removeStreamClose();
     const closing = this.closePromise ?? this.stream.close();
     this.closePromise = closing;
-    void closing.then(
-      () => callback(error),
-      () => callback(error ?? endpointLossError("byte_stream_error", "App Server byte stream cleanup failed")),
-    );
+    void closing.then(() => callback(error), () => callback(error ?? new Error("App Server byte stream cleanup failed")));
   }
 
   setTimeout(_milliseconds: number, _callback?: () => void): this { return this; }

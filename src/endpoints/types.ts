@@ -14,7 +14,6 @@ export type EndpointLossReason =
   | "ssh_input_closed"
   | "ssh_process_failed"
   | "transport_reset"
-  | "byte_stream_error"
   | "transport_error"
   | "runtime_exited"
   | "transport_closed";

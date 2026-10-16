@@ -6387,7 +6387,8 @@ export async function buildProductionApp(
   ): Promise<void> {
     if (stopping || !endpointsCommitted) return;
     reportOperationalSafely(report, {
-      level: "warn", code: "endpoint_connection_lost", endpoint: target.id, reason: reason ?? kind, loss: kind,
+      level: "warn", code: "endpoint_connection_lost", endpoint: target.id, loss: kind,
+      ...(reason === undefined ? {} : { reason }),
     });
     const endpointIncident = endpointRecoveryIncidents.record(target.id);
     markEndpointOwnersUnavailable({

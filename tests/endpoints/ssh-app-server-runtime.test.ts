@@ -189,6 +189,39 @@ test("a wire that closes with no error of its own reports a closed transport, no
   await connection.close();
 });
 
+test("the SSH stream's own failure survives the wire's errorless close", async () => {
+  // `ws` never re-emits a socket error: it detaches its listener, installs a NOOP and destroys
+  // the socket, so the wire reports a bare close and the exit status is gone. Everything the
+  // endpoint can say about WHY a remote worker went away lives on the stream, not the wire.
+  const value = fixture();
+  const connection = await value.runtime.open();
+  await connection.confirmInitialized({});
+  const losses: Array<Error | undefined> = [];
+  connection.onClose((error) => losses.push(error));
+
+  value.remote.streams[0]!.fail(new Error("SSH process stream failed"));
+  value.wires[0]!.close();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(losses.length, 1);
+  assert.equal(losses[0]?.message, "SSH process stream failed");
+  await connection.close();
+});
+
+test("an intentional close is not reported as a stream failure", async () => {
+  const value = fixture();
+  const connection = await value.runtime.open();
+  await connection.confirmInitialized({});
+  const losses: Array<Error | undefined> = [];
+  connection.onClose((error) => losses.push(error));
+
+  await connection.close();
+  value.remote.streams[0]!.fail(new Error("SSH process stream failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(losses, []);
+});
+
 test("a new generation waits until previous proxy cleanup finishes", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });

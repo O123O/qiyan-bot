@@ -79,8 +79,8 @@ export function createOperationalLogSink(
     if (event.adapter !== undefined) fields.push(`adapter=${safeToken(event.adapter)}`);
     if (event.endpoint !== undefined) fields.push(`endpoint=${safeToken(event.endpoint)}`);
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
-    if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
     if (event.loss !== undefined) fields.push(`loss=${safeToken(event.loss)}`);
+    if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
     if (event.survivors !== undefined) fields.push(`survivors=${safeCount(event.survivors)}`);
     if (event.consecutiveFailures !== undefined) fields.push(`consecutive_failures=${safeCount(event.consecutiveFailures)}`);
     if (event.sessions !== undefined) fields.push(`sessions=${safeCount(event.sessions)}`);

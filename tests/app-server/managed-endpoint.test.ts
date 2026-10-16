@@ -260,7 +260,6 @@ test("connection loss exposes only a bounded transport reason", async (t) => {
     // downgrade the reason the way it did before.
     [endpointLossError("transport_closed", "SSH App Server wire closed"), "transport_closed"],
     [endpointLossError("runtime_exited", "app-server process exited"), "runtime_exited"],
-    [endpointLossError("byte_stream_error", "App Server byte stream cleanup failed"), "byte_stream_error"],
     [new Error("private transport detail"), "transport_error"],
     [undefined, "transport_closed"],
   ] as const) await t.test(expected, async () => {

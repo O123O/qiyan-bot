@@ -147,6 +147,7 @@ export class SshAppServerRuntime implements AppServerRuntimeService {
 class SshProxyConnection implements AppServerConnection {
   private readonly closes = new Set<(error?: Error) => void>();
   private readonly removeWireClose: () => void;
+  private readonly removeStreamClose: () => void;
   private intentional = false;
   private wireDisposed = false;
   private closed = false;
@@ -162,6 +163,12 @@ class SshProxyConnection implements AppServerConnection {
     private readonly stream: ReadyProcessStream,
     private readonly expected: RuntimeIdentity,
   ) {
+    // Listen to the SSH stream as well as the wire, because the wire cannot tell us why it died.
+    // `ws` handles a socket error by detaching its own listener, installing a NOOP and destroying
+    // the socket (node_modules/ws/lib/websocket.js, socketOnError) -- it never re-emits it -- so
+    // every underlying failure reaches `wire.onClose` as a plain close with no error at all. The
+    // stream is where the SSH child's exit status still exists, and it notifies first.
+    this.removeStreamClose = stream.onClose((error) => { if (error) this.fail(error); });
     // No error means the remote end hung up cleanly -- the SSH child exits 0 when the app-server
     // it was piping for is gone, most often because the host killed it. Say "closed", not
     // "error": the difference is whether to look at the worker or at the network.
@@ -188,6 +195,7 @@ class SshProxyConnection implements AppServerConnection {
     if (this.closed) return;
     if (this.closing) return this.closing;
     this.intentional = true;
+    this.removeStreamClose();
     if (!this.wireDisposed) {
       this.wireDisposed = true;
       this.removeWireClose();
