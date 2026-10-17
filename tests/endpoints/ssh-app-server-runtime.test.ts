@@ -5,6 +5,7 @@ import type { RpcWire } from "../../src/app-server/rpc-client.ts";
 import { SshAppServerRuntime } from "../../src/endpoints/ssh-app-server-runtime.ts";
 import type { ReadyProcessStream } from "../../src/endpoints/ssh-process.ts";
 import type { SshRuntimeController } from "../../src/endpoints/ssh-runtime.ts";
+import { taggedLossReason } from "../../src/endpoints/types.ts";
 import type { EndpointLossKind, RuntimeIdentity } from "../../src/endpoints/types.ts";
 
 const identity: RuntimeIdentity = { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
@@ -166,6 +167,59 @@ test("App Server wire closure remains the connection-loss signal", async () => {
   assert.deepEqual(losses, ["closed"]);
   assert.equal(await value.runtime.classifyLoss(), "connection-lost");
   await connection.close();
+});
+
+test("a wire that closes with no error of its own reports a closed transport, not an unknown one", async () => {
+  // This is the common remote death: the app-server is killed, the SSH child exits 0, and the
+  // wire closes carrying nothing. The connection has to synthesize an error, and for months that
+  // synthetic error was untyped -- so the endpoint logged `transport_error` and a dead worker was
+  // indistinguishable from a transport fault nobody had classified.
+  const value = fixture();
+  const connection = await value.runtime.open();
+  await connection.confirmInitialized({});
+  const losses: Array<Error | undefined> = [];
+  connection.onClose((error) => losses.push(error));
+
+  value.wires[0]!.close();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(losses.length, 1);
+  assert.ok(losses[0]);
+  assert.equal(taggedLossReason(losses[0]), "transport_closed");
+  await connection.close();
+});
+
+test("the SSH stream's own failure survives the wire's errorless close", async () => {
+  // `ws` never re-emits a socket error: it detaches its listener, installs a NOOP and destroys
+  // the socket, so the wire reports a bare close and the exit status is gone. Everything the
+  // endpoint can say about WHY a remote worker went away lives on the stream, not the wire.
+  const value = fixture();
+  const connection = await value.runtime.open();
+  await connection.confirmInitialized({});
+  const losses: Array<Error | undefined> = [];
+  connection.onClose((error) => losses.push(error));
+
+  value.remote.streams[0]!.fail(new Error("SSH process stream failed"));
+  value.wires[0]!.close();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(losses.length, 1);
+  assert.equal(losses[0]?.message, "SSH process stream failed");
+  await connection.close();
+});
+
+test("an intentional close is not reported as a stream failure", async () => {
+  const value = fixture();
+  const connection = await value.runtime.open();
+  await connection.confirmInitialized({});
+  const losses: Array<Error | undefined> = [];
+  connection.onClose((error) => losses.push(error));
+
+  await connection.close();
+  value.remote.streams[0]!.fail(new Error("SSH process stream failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(losses, []);
 });
 
 test("a new generation waits until previous proxy cleanup finishes", async () => {

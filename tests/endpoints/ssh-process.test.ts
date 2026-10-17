@@ -187,6 +187,32 @@ test("a ready process stream backpressures and resumes its producer", async (t) 
   await stream.close();
 });
 
+test("a ready process stream reports the exit status before it ends its output", async () => {
+  // Ending the output is what starts the consumer's teardown, and that teardown carries no error.
+  // If it goes first the exit status is lost and a process that died non-zero reads as a clean
+  // hangup -- which is how a killed remote worker came back as `transport_closed`.
+  const program = [
+    `process.stdout.write(${JSON.stringify(readyMarker.toString())});`,
+    "setTimeout(() => process.exit(7), 10);",
+  ].join("\n");
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const stream = await openReadyProcessStream(process.execPath, ["-e", program], {
+      readyMarker, timeoutMs: 1_000, maxPreludeBytes: 1024,
+    });
+    const order: string[] = [];
+    const closed = new Promise<Error | undefined>((resolve) => {
+      stream.onClose((error) => { order.push("close"); resolve(error); });
+    });
+    stream.output.on("end", () => order.push("end"));
+    stream.output.resume();
+
+    const error = await closed;
+    assert.match(String(error), /SSH process stream failed/u, `attempt ${attempt}`);
+    assert.equal(order[0], "close", `attempt ${attempt}: output ended before the exit was known`);
+    await stream.close();
+  }
+});
+
 test("a ready process stream ignores final stdout during intentional shutdown", async () => {
   const program = [
     "process.on('SIGTERM', () => process.stdout.write('late', () => process.exit(0)));",

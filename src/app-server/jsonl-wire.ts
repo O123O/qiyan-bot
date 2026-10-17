@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import { endpointLossError } from "../endpoints/types.ts";
 import type { RpcWire } from "./rpc-client.ts";
 
 export class JsonlWire implements RpcWire {
@@ -12,8 +13,11 @@ export class JsonlWire implements RpcWire {
     lines.on("line", (line) => { for (const listener of this.messages) listener(line); });
     lines.on("error", (error) => this.emitClose(error));
     input.on("error", (error) => this.emitClose(error));
-    input.on("end", () => this.emitClose(new Error("app-server stream ended")));
-    input.on("close", () => this.emitClose(new Error("app-server stream closed")));
+    // A healthy app-server has no reason to close the stream it serves us on, and this fires
+    // BEFORE the child's own `exit` event -- which is why tagging that exit handler instead left
+    // every local app-server death classified as an unknown transport fault.
+    input.on("end", () => this.emitClose(endpointLossError("runtime_exited", "app-server stream ended")));
+    input.on("close", () => this.emitClose(endpointLossError("runtime_exited", "app-server stream closed")));
   }
 
   send(message: string): void { this.output.write(`${message}\n`); }

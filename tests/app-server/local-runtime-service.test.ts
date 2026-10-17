@@ -245,8 +245,8 @@ test("local stdout loss preserves the wire error while making the managed endpoi
   });
   const endpoint = new ManagedAppServerEndpoint({ id: "local", runtime });
   await endpoint.start();
-  const losses: string[] = [];
-  endpoint.onUnavailable((kind) => losses.push(kind));
+  const losses: Array<{ kind: string; reason?: string }> = [];
+  endpoint.onUnavailable((kind, reason) => losses.push({ kind, ...(reason === undefined ? {} : { reason }) }));
 
   const pending = endpoint.request("thread/read", { threadId: "thread-1" });
   await requestWritten;
@@ -255,6 +255,8 @@ test("local stdout loss preserves the wire error while making the managed endpoi
   await assert.rejects(pending, /app-server stream ended/u);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(endpoint.state, "unavailable");
-  assert.deepEqual(losses, ["runtime-lost"]);
+  // The stream ending IS the app-server dying, and it beats the child's own `exit` event, so this
+  // is the only place the reason can be told the truth -- it used to arrive as `transport_error`.
+  assert.deepEqual(losses, [{ kind: "runtime-lost", reason: "runtime_exited" }]);
   assert.equal(child.killed, true);
 });

@@ -3,6 +3,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { Agent, type ClientRequest, type ClientRequestArgs } from "node:http";
 import { Duplex, type Readable, type Writable } from "node:stream";
 import WebSocket from "ws";
+import { endpointLossError } from "../endpoints/types.ts";
 import type { RpcWire } from "./rpc-client.ts";
 
 // App Server RPC is message-framed JSON. A tool-heavy full turn can exceed 16 MiB after JSON
@@ -35,6 +36,9 @@ class SocketCompatibleDuplex extends Duplex {
       stream.output.off("end", end);
       stream.output.off("error", failed);
     });
+    // Deliberately untagged: `ws` swallows socket errors rather than re-emitting them, so nothing
+    // here ever reaches the endpoint's loss classifier. The SSH connection subscribes to the same
+    // stream directly for that reason. This error only tears the duplex down.
     this.removeStreamClose = stream.onClose((error) => this.destroy(error ?? new Error("App Server byte stream closed")));
   }
 
@@ -94,7 +98,7 @@ export class WebSocketWire implements RpcWire {
     socket.on("message", (data, isBinary) => {
       const size = Array.isArray(data) ? data.reduce((total, item) => total + item.byteLength, 0) : data.byteLength;
       if (isBinary || size > MAX_FRAME_BYTES) {
-        this.fail(new Error("invalid App Server WebSocket frame"));
+        this.fail(endpointLossError("invalid_frame", "invalid App Server WebSocket frame"));
         socket.terminate();
         return;
       }
