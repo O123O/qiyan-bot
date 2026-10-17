@@ -333,10 +333,16 @@ test("streams any readable raw file with a browser Content-Type; 404s a nonexist
   await withServer(async (base, _calls, _bus, uploadsDir) => {
     await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");
     const abs = encodeURIComponent(join(uploadsDir, "page.html")); // any readable absolute path (owner-only preview)
-    const r = await fetch(`${base}/api/raw?path=${abs}&token=${TOKEN}`);
+    // An executable preview bounces once to shed ?token= from the URL its scripts can read. A
+    // browser carries the just-set cookie through the hop; node's fetch has no cookie jar, so the
+    // cookie is supplied by hand here. The bounce itself is asserted in its own test below.
+    const r = await fetch(`${base}/api/raw?path=${abs}`, { headers: { cookie: `qiyan_web_token=${TOKEN}` } });
     assert.equal(r.status, 200);
     assert.match(r.headers.get("content-type") ?? "", /text\/html/);
-    assert.equal(r.headers.get("content-security-policy"), "sandbox"); // scripts neutered
+    const csp = r.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /^sandbox /u);               // still sandboxed...
+    assert.match(csp, /allow-scripts/u);           // ...but a document, not a screenshot
+    assert.doesNotMatch(csp, /allow-same-origin/u); // never: that would hand it the real origin
     assert.equal(await r.text(), "<h1>hi</h1>");
     // existence + regular-file are still enforced: a nonexistent path → 404
     assert.equal((await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "nope.txt"))}&token=${TOKEN}`)).status, 404);
@@ -730,4 +736,101 @@ test("the stop button is scoped to a busy worker and cannot double-fire", async 
   assert.match(source, /disabled=\{stopping\}/u, "disabled while the interrupt is in flight");
   assert.match(source, /if \(!selected \|\| stopping\) return;/u, "and guarded in the handler too");
   assert.match(source, /const workerBusy = selectedSession\?\.nativeStatus === "active";/u);
+});
+
+test("a previewed document never carries the token in the URL it can read", async () => {
+  await withServer(async (base, _calls, _bus, uploadsDir) => {
+    await writeFile(join(uploadsDir, "deck.html"), "<h1>deck</h1>");
+    const abs = encodeURIComponent(join(uploadsDir, "deck.html"));
+
+    // The document can run scripts now, and a script can read `location`. So the request that
+    // carries ?token= must not be the one that renders: it sets the cookie and bounces.
+    const hop = await fetch(`${base}/api/raw?path=${abs}&token=${TOKEN}`, { redirect: "manual" });
+    assert.equal(hop.status, 302);
+    assert.match(hop.headers.get("set-cookie") ?? "", /qiyan_web_token=/u);
+    const location = hop.headers.get("location") ?? "";
+    assert.doesNotMatch(location, /token/u);
+    assert.match(location, /path=/u); // everything else survives the strip
+
+    // The cookie alone serves it, so the bounce terminates rather than looping.
+    const page = await fetch(`${base}${location}`, { headers: { cookie: `qiyan_web_token=${TOKEN}` } });
+    assert.equal(page.status, 200);
+    assert.equal(await page.text(), "<h1>deck</h1>");
+    const csp = page.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /allow-scripts/u);
+    assert.doesNotMatch(csp, /allow-same-origin/u);
+    // The opener's own URL holds the token; the referrer must not hand it over.
+    assert.equal(page.headers.get("referrer-policy"), "no-referrer");
+  });
+});
+
+test("only executable previews are bounced and sandboxed; bytes are served as bytes", async () => {
+  await withServer(async (base, _calls, _bus, uploadsDir) => {
+    await writeFile(join(uploadsDir, "notes.txt"), "plain");
+    await writeFile(join(uploadsDir, "page.html"), "<h1>hi</h1>");
+    const txt = encodeURIComponent(join(uploadsDir, "notes.txt"));
+    const html = encodeURIComponent(join(uploadsDir, "page.html"));
+
+    // A text file cannot execute and cannot read its own URL, so it is served directly.
+    const plain = await fetch(`${base}/api/raw?path=${txt}&token=${TOKEN}`, { redirect: "manual" });
+    assert.equal(plain.status, 200);
+    assert.equal(plain.headers.get("content-security-policy"), null);
+
+    // A download is bytes on their way to disk, not a document: no bounce, and it stays an
+    // attachment. Bouncing it would be a redirect in the middle of a file save.
+    const saved = await fetch(`${base}/api/raw?path=${html}&download=1&token=${TOKEN}`, { redirect: "manual" });
+    assert.equal(saved.status, 200);
+    assert.match(saved.headers.get("content-disposition") ?? "", /^attachment/u);
+  });
+});
+
+// The token reaches a preview through THREE channels, and the server can only close one of them.
+// `Referrer-Policy` on the preview governs what the preview sends onward; the referrer it RECEIVES
+// is chosen by whoever opened it. So the opener has to suppress it, and the token should not be in
+// the opener's URL in the first place. A regression in any one of these re-opens the leak.
+test("the token cannot reach a preview through the referrer or the address bar", async () => {
+  const source = await readFile(new URL("../../webui-client/src/App.tsx", import.meta.url), "utf8");
+  // `noopener` alone does NOT suppress the referrer -- this is the exact mistake being guarded.
+  assert.match(source, /window\.open\(url, "_blank", "noopener,noreferrer"\)/u, "a preview tab is opened without a referrer");
+
+  await withServer(async (base) => {
+    // The app page is the opener; its own policy is what decides the referrer it sends.
+    const app = await fetch(`${base}/?token=${TOKEN}`);
+    assert.equal(app.status, 200);
+    assert.equal(app.headers.get("referrer-policy"), "no-referrer");
+
+    // And on the 304, because a browser refreshes a STORED response's headers from it. A cached
+    // bundle that revalidates must not end up stored without the policy it was first served with.
+    const revalidated = await fetch(`${base}/?token=${TOKEN}`, { headers: { "if-none-match": app.headers.get("etag") ?? "" } });
+    assert.equal(revalidated.status, 304);
+    assert.equal(revalidated.headers.get("referrer-policy"), "no-referrer");
+  });
+});
+
+test("every executable preview is sandboxed, whatever shape it arrives in", async () => {
+  await withServer(async (base, _calls, _bus, uploadsDir) => {
+    const cookie = { cookie: `qiyan_web_token=${TOKEN}` };
+    // SVG is the other executable type, and the one the client also routes into an <img>.
+    await writeFile(join(uploadsDir, "chart.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>");
+    const svg = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "chart.svg"))}`, { headers: cookie });
+    assert.equal(svg.status, 200);
+    assert.match(svg.headers.get("content-security-policy") ?? "", /^sandbox .*allow-scripts/u);
+    assert.doesNotMatch(svg.headers.get("content-security-policy") ?? "", /allow-same-origin/u);
+    assert.equal(svg.headers.get("referrer-policy"), "no-referrer");
+
+    // An empty document still gets the guards: a header set only on the non-empty path is one
+    // someone will later assume is always present.
+    await writeFile(join(uploadsDir, "blank.html"), "");
+    const blank = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "blank.html"))}`, { headers: cookie });
+    assert.equal(blank.status, 200);
+    assert.match(blank.headers.get("content-security-policy") ?? "", /allow-scripts/u);
+
+    // A download is bytes on their way to disk, but it is still HTML, and the header costs nothing
+    // to keep. Note what it does NOT buy: response headers are not saved with the file, so opening
+    // it later from the download list gives a file:// document with no CSP at all. What makes that
+    // safe is that nothing on disk holds the token -- not this header.
+    const saved = await fetch(`${base}/api/raw?path=${encodeURIComponent(join(uploadsDir, "blank.html"))}&download=1`, { headers: cookie });
+    assert.match(saved.headers.get("content-security-policy") ?? "", /allow-scripts/u);
+    assert.match(saved.headers.get("content-disposition") ?? "", /^attachment/u);
+  });
 });

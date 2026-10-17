@@ -18,6 +18,33 @@ import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remot
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
+// A previewed HTML/SVG document opened in its own tab. A bare `sandbox` is the FULLY restrictive
+// sandbox: no scripts, and no top-level navigation either, so a report's own links go dead and its
+// scripts never run. That is not a preview, it is a screenshot — and the file reads as broken
+// everywhere except after a manual download, which is the one place it is least useful.
+//
+// What stays revoked is the one that matters: `allow-same-origin` is deliberately absent, so the
+// document lands in an OPAQUE origin. The auth cookie is HttpOnly and belongs to the real origin,
+// so the document can neither read it nor have it attached; a call to /api/* from here is
+// cross-origin and uncredentialed, and CORS blocks reading the reply. These files are written by
+// workers, sometimes out of data the worker did not author, so the preview is treated as hostile.
+//
+// `allow-top-navigation-by-user-activation` rather than the unqualified form: a click still
+// follows a link, while a script cannot silently redirect the tab somewhere else. Treat that as
+// a courtesy, not a control -- the page supplies its own links, and an invisible full-page
+// overlay turns any click into activation.
+//
+// `allow-popups-to-escape-sandbox` is the one flag with a precondition OUTSIDE this constant: a
+// window it opens runs unsandboxed at the real origin, which is harmless only while no route
+// serves attacker-authored HTML without these guards. Every path that can (/api/raw local,
+// remote and empty-file) applies them, and unknown types are octet-stream + nosniff. A future
+// "just serve this file as HTML" shortcut would turn that flag into a full compromise, so it is
+// named here as a dependency rather than left to be rediscovered.
+const PREVIEW_SANDBOX = [
+  "sandbox", "allow-scripts", "allow-forms", "allow-modals",
+  "allow-popups", "allow-popups-to-escape-sandbox", "allow-downloads",
+  "allow-top-navigation-by-user-activation",
+].join(" ");
 const NICKNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_WS_INPUT_BYTES = 4 * 1024;
@@ -31,6 +58,29 @@ const RAW_CONTENT_TYPES: Record<string, string> = {
   ".md": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
   ".json": "application/json; charset=utf-8", ".csv": "text/csv; charset=utf-8",
 };
+
+// Whether this content type is rendered as a document the browser will execute, rather than as
+// bytes. Only these two need the sandbox, and only these two can read their own URL.
+function isPreviewDocument(contentType: string): boolean {
+  return contentType.startsWith("text/html") || contentType === "image/svg+xml";
+}
+
+// The same question asked of a path, before the file is opened — used to decide whether ?token=
+// has to be stripped from the URL the document will be able to read.
+function isPreviewDocumentPath(path: string): boolean {
+  const contentType = RAW_CONTENT_TYPES[extname(path).toLowerCase()];
+  return contentType !== undefined && isPreviewDocument(contentType);
+}
+
+// The headers that make an executable preview safe, in one place so the local, remote and
+// empty-file paths cannot drift apart. Empty for anything that is not a document.
+function previewGuards(contentType: string): Record<string, string> {
+  if (!isPreviewDocument(contentType)) return {};
+  // `referrer-policy` here governs what this document sends onward. It does NOT control the
+  // referrer it RECEIVES -- that is decided by whoever opened it, which is why the client opens
+  // previews with `noreferrer` and the app page is served `no-referrer` too. All three are needed.
+  return { "content-security-policy": PREVIEW_SANDBOX, "referrer-policy": "no-referrer" };
+}
 
 // Stream a resolved file with a best-effort Content-Type so the browser can render/read it inline
 // (or download it, when `download` is set).
@@ -46,9 +96,7 @@ async function serveRaw(response: ServerResponse, target: string | undefined, do
     "content-type": contentType, "content-length": String(info.size),
     "content-disposition": disposition, "x-content-type-options": "nosniff",
   };
-  // Neuter scripts/callbacks in previewed HTML/SVG opened as a document (unique, isolated origin).
-  if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
-  response.writeHead(200, headers);
+  response.writeHead(200, { ...headers, ...previewGuards(contentType) });
   createReadStream(target).pipe(response);
 }
 
@@ -74,8 +122,7 @@ async function serveRemoteRaw(response: ServerResponse, remote: RemoteDeps, host
       started = true;
       // Sanitize the download filename — strip CR/LF (header injection) and quotes/backslash.
       const name = (path.split("/").pop() || "download").replace(/[\r\n"\\]/g, "_");
-      const headers: Record<string, string> = { "content-type": contentType, "content-disposition": download ? `attachment; filename="${name}"` : "inline", "x-content-type-options": "nosniff" };
-      if (contentType.startsWith("text/html") || contentType === "image/svg+xml") headers["content-security-policy"] = "sandbox";
+      const headers: Record<string, string> = { "content-type": contentType, "content-disposition": download ? `attachment; filename="${name}"` : "inline", "x-content-type-options": "nosniff", ...previewGuards(contentType) };
       if (!safeHead(200, headers)) { killChild(); finish(); return; }
     }
     size += chunk.length;
@@ -84,7 +131,10 @@ async function serveRemoteRaw(response: ServerResponse, remote: RemoteDeps, host
   });
   child.on("close", (code) => {
     if (finished || started) { finish(); return; }
-    if (code === 0) { safeHead(200, { "content-type": contentType }); finish(); }        // empty file
+    // Empty file. The body is zero bytes so nothing can execute, but it is served with the same
+    // guards as any other preview rather than a bare content-type: a header set only on the
+    // non-empty path is a header someone will later assume is always there.
+    if (code === 0) { safeHead(200, { "content-type": contentType, "x-content-type-options": "nosniff", ...previewGuards(contentType) }); finish(); }
     else { finish(safeHead(404, { "content-type": "text/plain" }) ? "not found" : undefined); } // guard fail / ssh down
   });
   child.on("error", () => { if (finished) return; if (!started) safeHead(502, { "content-type": "text/plain" }); finish(); });
@@ -272,8 +322,12 @@ export function createWebServer(options: WebServerOptions): WebServer {
         const asset = await loadStatic(full);
         if (!asset) continue;
         // A reload then costs one conditional request instead of the whole bundle again.
+        // The referrer policy is repeated here because a browser updates a STORED response's
+        // headers from the 304. Omit it and a client whose cached bundle still matches by etag
+        // (which is size-mtime, so a server-only change can leave it untouched) would keep a
+        // stored copy with no policy, and start leaking ?token= in referrers again.
         if (request?.headers["if-none-match"] === asset.etag) {
-          response.writeHead(304, { etag: asset.etag, "cache-control": "no-cache" });
+          response.writeHead(304, { etag: asset.etag, "cache-control": "no-cache", "referrer-policy": "no-referrer" });
           response.end();
           return;
         }
@@ -286,6 +340,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
           // Revalidate every time rather than caching by age: the asset is replaced by a
           // deploy, and a stale UI against a new backend is its own class of bug report.
           "cache-control": "no-cache",
+          // This document's URL can carry ?token=, and it is the one that opens previews, which
+          // now run scripts. Without this the browser would send that full URL as the `Referer`
+          // of every navigation it starts, which is where `document.referrer` comes from.
+          "referrer-policy": "no-referrer",
           ...(send === asset.gzipped ? { "content-encoding": "gzip", vary: "accept-encoding" } : { vary: "accept-encoding" }),
         });
         response.end(send);
@@ -419,6 +477,18 @@ export function createWebServer(options: WebServerOptions): WebServer {
       const session = url.searchParams.get("session") || undefined;
       const path = url.searchParams.get("path") ?? "";
       const download = url.searchParams.get("download") === "1";
+      // A preview document can run scripts, and a script can read its own URL. The token must not
+      // be in it. The cookie was just set from this very request, so bounce to the same URL without
+      // ?token= and let the cookie carry the retry — the document that finally executes sees a
+      // clean `location`. Stripping the parameter makes the next pass fall through here, so this
+      // cannot loop. A download is bytes, never a document, so it is left alone.
+      if (!download && url.searchParams.has("token") && isPreviewDocumentPath(path)) {
+        const clean = new URL(url);
+        clean.searchParams.delete("token");
+        response.writeHead(302, { location: `${clean.pathname}${clean.search}`, "referrer-policy": "no-referrer" });
+        response.end();
+        return;
+      }
       const target = session ? options.files.fileTarget(session) : undefined;
       if (target?.transport === "remote" && target.host && remote) {
         await serveRemoteRaw(response, remote, target.host, target.projectDir, path, download);

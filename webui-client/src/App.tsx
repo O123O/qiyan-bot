@@ -59,6 +59,12 @@ import {
 const QIYAN_LOGO = new URL("./favicon.png", import.meta.url).href;
 const TOKEN = new URLSearchParams(location.search).get("token") ?? "";
 const TOKEN_Q = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
+// The token stays in this tab's URL on purpose. Scrubbing it with `replaceState` would be better
+// hygiene -- it leaks through bookmarks, history and screenshots -- but the auth cookie is a
+// SESSION cookie, so a scrubbed URL stops working the moment the browser restarts, and a bookmark
+// of the UI becomes a 401. That is a change to how the owner signs in, not part of making previews
+// safe. The referrer channel, which is the one a previewed document can actually read, is closed
+// without it: `noreferrer` below, plus `Referrer-Policy: no-referrer` on this page from the server.
 const IMG_EXT = /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i; // shown inline in the preview panel
 const TAB_EXT = /\.(pdf|html?)$/i;                     // opened in a new tab as a streaming file
 const MENTION = "#qyfile:"; // a fragment scheme: react-markdown never strips it and it never navigates
@@ -494,7 +500,11 @@ export function App() {
     setSrcMode(false);
     const url = rawUrl(path, session);
     if (IMG_EXT.test(path)) { setPreview({ kind: "image", title: path, path, session, url }); return; }
-    if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener"); return; }
+    // `noreferrer`, not just `noopener`. A previewed document runs scripts, and this tab's own URL
+    // can carry ?token=; without this the browser puts that URL in the preview's `document.referrer`,
+    // handing the access token to the very document the server stripped it from. `noopener` does
+    // not suppress the referrer -- only `noreferrer` does (and it implies `noopener`).
+    if (TAB_EXT.test(path)) { window.open(url, "_blank", "noopener,noreferrer"); return; }
     setPreview({ kind: "loading", title: path, path, session });
     void readTextStream(url).then(({ text, truncated }) => setPreview({ kind: "text", title: path, path, session, text, truncated }))
       .catch((e) => setPreview({ kind: "error", title: path, path, session, error: (e as { error?: string }).error ?? "unavailable" }));
