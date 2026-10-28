@@ -38,16 +38,21 @@ const timestamp = (message: AssistantConversationMessage): number => message.com
 // The page's own oldest row decides which case this is: already loaded means the two runs touch
 // and merging keeps the run contiguous; absent means there is a hole, and replacing is still the
 // only honest answer.
+// `replaced` is not a detail of how the merge went: it says whether the oldest row we hold moved.
+// Only then can the server's "is there anything older than this page" answer still describe the
+// run, which is what the scroll-up cursor and the "load older" affordance are asked about.
 export function mergeAssistantHistoryPage<T extends AssistantConversationMessage>(
   loaded: readonly T[],
   latestPage: readonly T[],
-): T[] {
-  const page = deduplicate(latestPage).sort((left, right) => timestamp(left) - timestamp(right));
-  if (loaded.length === 0) return page;
+): { messages: T[]; replaced: boolean } {
+  const byTime = (left: T, right: T) => timestamp(left) - timestamp(right);
+  const page = deduplicate(latestPage).sort(byTime);
   const oldest = page[0];
   const loadedIds = new Set(loaded.flatMap((message) => message.id ? [message.id] : []));
-  if (!oldest?.id || !loadedIds.has(oldest.id)) return page;
-  return deduplicate([...loaded, ...page]).sort((left, right) => timestamp(left) - timestamp(right));
+  // An id-less oldest row cannot be matched against the run, so it is treated as a gap. The
+  // owner transcript always carries ids, so this is a guard, not a path.
+  if (loaded.length === 0 || !oldest?.id || !loadedIds.has(oldest.id)) return { messages: page, replaced: true };
+  return { messages: deduplicate([...loaded, ...page]).sort(byTime), replaced: false };
 }
 
 export function mergeAssistantConversation<T extends AssistantConversationMessage>(
