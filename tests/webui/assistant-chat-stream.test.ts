@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { mergeAssistantConversation, replaceAssistantHistoryPage } from "../../webui-client/src/assistant-chat-stream.ts";
+import { mergeAssistantConversation, mergeAssistantHistoryPage } from "../../webui-client/src/assistant-chat-stream.ts";
 
 const message = (id: string, body: string, at: number, extra = {}) => ({ id, body, at, ...extra });
 
@@ -33,15 +33,41 @@ test("the same durable WebSocket and history message is rendered once", () => {
   assert.deepEqual(mergeAssistantConversation([history, socket], []), [socket]);
 });
 
-test("a reconnect replaces old durable pages so pagination cannot retain a gap", () => {
-  const older = message("you:old", "old", 1);
+test("the first history page is adopted whole", () => {
+  const first = message("assistant:turn-1", "first", 2);
+  const second = message("worker:turn-2", "second", 4);
+
+  assert.deepEqual(mergeAssistantHistoryPage([], [second, first]), [first, second]);
+});
+
+// The reconnect refetch used to replace `history`, so a socket blip discarded every page
+// scroll-up had read back. Your own messages went with it and did not come back: the live
+// stream drops role "you", so only the durable history can restore them.
+test("a reconnect keeps the pages you scrolled back through", () => {
+  const yours = message("you:old", "what is the status?", 1);
   const current = message("assistant:turn-1", "first", 2);
   const refreshed = message("assistant:turn-1", "first, durable", 3);
   const missed = message("worker:turn-2", "missed while offline", 4);
 
-  assert.deepEqual(replaceAssistantHistoryPage([refreshed, missed]), [refreshed, missed]);
-  assert.ok(!replaceAssistantHistoryPage([refreshed, missed]).includes(older));
-  assert.ok(!replaceAssistantHistoryPage([refreshed, missed]).includes(current));
+  const merged = mergeAssistantHistoryPage([yours, current], [refreshed, missed]);
+
+  assert.deepEqual(merged, [yours, refreshed, missed], "the page folds in without dropping older rows");
+  assert.ok(merged.includes(yours), "your own messages survive a reconnect");
+  assert.ok(!merged.includes(current), "the refetched row replaces the stale copy rather than doubling it");
+});
+
+// Merging is only safe while the two runs touch. `history` is one contiguous run paged backwards
+// from its oldest row, so a page starting past what we hold would strand the rows between behind
+// a cursor that can never ask for them.
+test("a page that starts past the loaded run replaces it rather than leaving an unreachable hole", () => {
+  const yours = message("you:old", "old", 1);
+  const current = message("assistant:turn-1", "first", 2);
+  const laterPage = [message("assistant:turn-40", "much later", 90), message("worker:turn-41", "later still", 91)];
+
+  const merged = mergeAssistantHistoryPage([yours, current], laterPage);
+
+  assert.deepEqual(merged, laterPage);
+  assert.ok(!merged.includes(yours) && !merged.includes(current), "no run may span a gap pagination cannot fill");
 });
 
 test("a targeted optimistic echo and its durable history row share one identity", async () => {

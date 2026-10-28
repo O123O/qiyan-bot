@@ -14,7 +14,7 @@ import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkd
 import { explorerRequestSignature, explorerRootToLoad } from "./explorer-loading";
 import { splitHighlightedLines } from "./highlight-lines";
 import { selectedSourceText } from "./code-selection";
-import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
+import { mergeAssistantConversation, mergeAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
@@ -409,7 +409,7 @@ export function App() {
     try {
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`, { signal: abort.signal });
       if (assistantHistoryAbortRef.current !== abort) return;
-      setHistory(replaceAssistantHistoryPage(p.messages));
+      setHistory((current) => mergeAssistantHistoryPage(current, p.messages));
       setHasOlder((current) => ({ ...current, [ASSIST]: p.hasOlder }));
     }
     catch { /* transient */ }
