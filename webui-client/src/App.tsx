@@ -754,7 +754,7 @@ export function App() {
   const loadOlder = useCallback(async () => {
     if (loadingOlder || (selected === null && assistantHistoryAbortRef.current)) return;
     const el = logRef.current;
-    const assistantCursor = selected === null ? history[0]?.at : undefined;
+    const assistantCursor = selected === null ? historyRef.current[0]?.at : undefined;
     const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
     // A retry that also went stale leaves no cursor, and nothing reinstalls one -- so scrolling
     // up would silently do nothing until the panel resubscribed. Re-read the newest page here
@@ -784,11 +784,17 @@ export function App() {
       assistantHistoryAbortRef.current = abort;
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path, { signal: abort.signal });
       if (assistantHistoryAbortRef.current !== abort) return;
+      // Read the run from the ref, never the closure. `loadHistory` writes the ref synchronously
+      // and the state at default priority, so between those two a discrete event can re-enter
+      // this callback from the render before it -- whose closure still holds the pre-merge run.
+      // Prepending onto that would drop exactly the rows the merge just recovered, which are the
+      // ones no live path can supply again.
+      const loaded = historyRef.current;
       // The `before` cursor is INCLUSIVE, so dedup the boundary rows we already have (by id).
-      const existing = new Set(history.map((m) => m.id).filter(Boolean));
+      const existing = new Set(loaded.map((m) => m.id).filter(Boolean));
       const fresh = p.messages.filter((m) => !m.id || !existing.has(m.id));
       if (fresh.length) {
-        applyHistory([...fresh, ...history]);
+        applyHistory([...fresh, ...loaded]);
         setVisible((v) => v + fresh.length);
       } else preserveRef.current = null;
       // Stop paging if the server has no more OR this fetch made no progress (avoids re-fetching the
@@ -799,7 +805,7 @@ export function App() {
       preserveRef.current = settleWorkerScrollPreservation(preserveRef.current);
       setLoadingOlder(false);
     }
-  }, [loadingOlder, selected, history, workerChat, key, loadWorkerPage, applyHistory]);
+  }, [loadingOlder, selected, workerChat, key, loadWorkerPage, applyHistory]);
 
   // Tool-heavy turns can yield a native page with few or no visible messages. Fill the foreground
   // viewport and cross its latest terminal-turn boundary; both searches stay capped and older
