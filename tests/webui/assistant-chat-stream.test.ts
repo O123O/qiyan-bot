@@ -140,8 +140,13 @@ test("source guard: the run has one writer, one reader, and pagination state tha
   // a discrete event landing between them re-enters `loadOlder` from the render before it. Its
   // closure still holds the pre-merge run, and prepending onto that drops exactly the rows the
   // merge recovered -- rows no live path can supply again, your own messages among them.
-  const loadOlder = source.slice(source.indexOf("const loadOlder ="), source.indexOf("loadWorkerPage, applyHistory]);"));
-  assert.ok(loadOlder.length > 0, "loadOlder must be locatable for this guard to mean anything");
+  // Bounds checked against -1 rather than by length: `slice(start, -1)` on a missing end marker
+  // still returns thousands of characters, so a length check passes while the slice silently
+  // runs to EOF -- failing the guard below with a message about the wrong thing.
+  const start = source.indexOf("const loadOlder =");
+  const end = source.indexOf("loadWorkerPage, applyHistory]);");
+  assert.ok(start !== -1 && end > start, "loadOlder must be locatable for this guard to mean anything");
+  const loadOlder = source.slice(start, end);
   assert.match(loadOlder, /const loaded = historyRef\.current;/u);
   // Lookarounds, not a negated class: the spelling that caused the bug was the spread
   // `[...fresh, ...history]`, and a class excluding `.` to spare `historyRef` let it through.
