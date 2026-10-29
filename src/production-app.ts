@@ -4432,12 +4432,21 @@ export async function buildProductionApp(
         const session = registry.get(args.nickname);
         if (!session) throw new AppError("UNKNOWN_SESSION", `unknown session: ${args.nickname}`);
         context.checkpoint({ nickname: args.nickname, ...session, step: "prepared" });
-        const released = await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint));
+        const released = await lifecycle.unadopt(args.nickname, (checkpoint) => context.checkpoint(checkpoint), undefined, args.force === true);
         await reconcileDashboard();
         // Reported, not buried: released against an unreachable host means idleness was never
         // proven, the remote subscription is still there, and any turn still running will have its
-        // answer discarded. The assistant can only say so if it is told.
-        return { nickname: args.nickname, mapping_id: session.mapping_id, ...(released.endpointUnreachable ? { endpoint_unreachable: true } : {}) };
+        // answer discarded. The assistant can only say so if it is told. `forced` says the same
+        // thing about a REACHABLE host whose session state could not be read -- the caller chose
+        // to stop asking, so the answer must not read like a clean release.
+        // `idleness_proven` rides BOTH, because both prove it exactly as little. Emitting it only
+        // on the forced branch let its absence on an unreachable release read as "proven".
+        return {
+          nickname: args.nickname, mapping_id: session.mapping_id,
+          ...(released.endpointUnreachable ? { endpoint_unreachable: true } : {}),
+          ...(released.forced ? { forced: true } : {}),
+          ...(released.endpointUnreachable || released.forced ? { idleness_proven: false } : {}),
+        };
       },
       archive_session: async (args, context) => {
         const session = registry.get(args.nickname);
