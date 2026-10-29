@@ -307,12 +307,18 @@ export class WorkerMemoryWatch {
     const key = `${latch}\0${reason}`;
     if (recovered) { this.state.delete(key); return; }
     if (!over) return;
-    // Only a worker that is running can act on this. The send is `mode: "auto"`, so telling an
-    // idle one STARTS a turn whose entire content is a memory reading about work that already
-    // stopped -- the warning paying for an LLM turn to say nothing actionable. Deliberately not
-    // latched: the first tick where the worker is both over the line and working is the one
-    // that warns, rather than the suppression outliving the idleness that caused it.
-    if (!(this.deps.isBusy?.(target) ?? true)) return;
+    // The share line only. The send is `mode: "auto"`, so telling an idle worker about its OWN
+    // share STARTS a turn whose entire content is a reading about work that already stopped --
+    // an LLM turn to say nothing it can act on. Deliberately not latched: the first tick where
+    // the worker is both over the line and working is the one that warns, rather than the
+    // suppression outliving the idleness that caused it.
+    //
+    // The host line is deliberately NOT gated. It reports memory the target does not own, so
+    // "the work already stopped" is not a reason to withhold it, and it is the only channel
+    // that reports a filling machine at all. Gating it meant a host at 5% free with every
+    // session idle told nobody, forever, with nothing counting the warnings withheld -- and an
+    // idle worker holding the memory in a detached subtree is exactly who can still kill it.
+    if (reason === "share" && !(this.deps.isBusy?.(target) ?? true)) return;
     const now = this.deps.now();
     const previous = this.state.get(key);
     if (previous && now - previous.warnedAt < (this.deps.repeatWarningMs ?? REPEAT_WARNING_MS)) return;

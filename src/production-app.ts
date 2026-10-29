@@ -3514,7 +3514,11 @@ export async function buildProductionApp(
           // which time "was it running when the pass began" is the wrong question.
           isBusy: (target) => {
             const session = registry.managedSnapshot().sessions[target.nickname];
-            return session !== undefined && nativeSessions.view({
+            // Identity, not just the name. A nickname can be archived and reused between the
+            // pass that sampled this target and this lookup, and answering for a different
+            // thread's status would gate the wrong worker's warning.
+            if (session?.endpoint !== target.endpointId || session.thread_id !== target.threadId) return false;
+            return nativeSessions.view({
               endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
             })?.status === "active";
           },

@@ -463,36 +463,56 @@ test("an endpoint-wide latch survives the carrier changing", async () => {
 // The send is `mode: "auto"`, so a warning to an idle worker STARTS a turn -- an LLM turn whose
 // entire content is a reading about work that has already stopped, and which the worker cannot
 // act on because there is nothing running to back off.
-test("an idle worker is not warned, however far over the line it is", async () => {
-  const { watch, sent } = harness([sample(250, 252, { totalGb: 252, availableGb: 2 })], () => false);
+test("an idle worker is not warned about its own share, however far over the line it is", async () => {
+  const { watch, sent } = harness([sample(250, 252)], () => false);
   await watch.tick();
-  assert.deepEqual(sent, [], "neither the personal share nor host pressure reaches an idle worker");
+  assert.deepEqual(sent, [], "99% of its own limit, and still nothing worth a turn to say");
 });
 
-test("suppressing an idle worker is not latched: the first working tick still warns", async () => {
-  let busy = false;
+// The share line is about the target's own work; the host line is about memory it does not own.
+// Gating both meant a filling machine told nobody once every session went idle -- and an idle
+// worker still holding memory in a detached subtree is exactly who can go and kill it.
+test("a filling machine still reaches an idle worker, because that warning is not about its turn", async () => {
+  const { watch, sent } = harness([sample(10, 252, { totalGb: 252, availableGb: 8 })], () => false);
+  await watch.tick();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!.message, /the machine is nearly full/u);
+});
+
+test("an idle skip leaves a latch already taken, so returning to work is not a fresh crossing", async () => {
+  let busy = true;
   const { watch, sent, advance } = harness([sample(220, 252)], () => busy);
   await watch.tick();
-  assert.equal(sent.length, 0);
-  busy = true;
-  // Well inside the repeat interval, so only an absent latch can let this through.
+  assert.equal(sent.length, 1);
+  busy = false;
   advance(1000);
   await watch.tick();
-  assert.equal(sent.length, 1, "the skip must not consume the warning the worker still needs");
+  assert.equal(sent.length, 1, "idle, so nothing is sent");
+  busy = true;
+  advance(1000);
+  await watch.tick();
+  assert.equal(sent.length, 1, "the skip must not have cleared the latch the first warning took");
 });
 
-test("the warning line is four fifths of the share, not half", async () => {
-  const under = harness([sample(201, 252)]); // 79.8%
-  await under.watch.tick();
-  assert.deepEqual(under.sent, [], "just under the line is silent");
+// Two sessions on one endpoint: the share line is judged per session and gated, the host line
+// is one per endpoint and ungated. The gate must not turn the second of those into the first.
+test("gating the share line does not suppress the endpoint's one host warning", async () => {
+  const idle: WorkerMemoryTarget = { nickname: "aaa", endpointId: "ptyche", threadId: "t1" };
+  const busy: WorkerMemoryTarget = { nickname: "zzz", endpointId: "ptyche", threadId: "t2" };
+  const sent: { nickname: string; message: string }[] = [];
+  const watch = new WorkerMemoryWatch({
+    targets: () => [idle, busy],
+    sample: async () => sample(220, 252, { totalGb: 252, availableGb: 5 }),
+    warn: async (t, message) => { sent.push({ nickname: t.nickname, message }); },
+    now: () => 0,
+    isBusy: (t) => t.nickname === "zzz",
+  });
+  await watch.tick();
 
-  const over = harness([sample(203, 252)]); // 80.6%
-  await over.watch.tick();
-  assert.equal(over.sent.length, 1, "just over the line warns");
+  const share = sent.filter((entry) => /you used/u.test(entry.message));
+  assert.deepEqual(share.map((entry) => entry.nickname), ["zzz"],
+    "only the working session is told about a share, and it is told about its own");
 
-  // The share that motivated this change: an ordinary job at half the machine is healthy work,
-  // and warning on it is what made the warning routine enough to ignore.
-  const half = harness([sample(126, 252)]);
-  await half.watch.tick();
-  assert.deepEqual(half.sent, [], "half the machine is no longer a warning");
+  const host = sent.filter((entry) => /the machine is nearly full/u.test(entry.message));
+  assert.equal(host.length, 1, "a full machine is still reported, exactly once for the endpoint");
 });
