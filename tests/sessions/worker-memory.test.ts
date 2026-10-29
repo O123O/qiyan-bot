@@ -20,7 +20,7 @@ const sample = (usedGb: number, limitGb: number, host?: { totalGb: number; avail
   ...(host ? { hostTotalBytes: host.totalGb * GB, hostAvailableBytes: host.availableGb * GB } : {}),
 });
 
-function harness(samples: (WorkerMemorySample | undefined)[]) {
+function harness(samples: (WorkerMemorySample | undefined)[], isBusy?: () => boolean) {
   const sent: { nickname: string; message: string }[] = [];
   const errors: unknown[] = [];
   const unmeasured: number[] = [];
@@ -33,18 +33,19 @@ function harness(samples: (WorkerMemorySample | undefined)[]) {
     now: () => clock,
     onError: (error) => errors.push(error),
     onUnmeasured: (_t, consecutive) => unmeasured.push(consecutive),
+    ...(isBusy ? { isBusy } : {}),
   });
   return { watch, sent, errors, unmeasured, advance: (ms: number) => { clock += ms; } };
 }
 
-test("warns once when a worker crosses half the machine, and names the real figures", async () => {
-  const { watch, sent } = harness([sample(186, 252)]);
+test("warns once when a worker crosses four fifths of the machine, and names the real figures", async () => {
+  const { watch, sent } = harness([sample(212, 252)]);
   await watch.tick();
   assert.equal(sent.length, 1);
   assert.equal(sent[0]!.nickname, "plug-serve");
   assert.equal(
     sent[0]!.message,
-    "[system] Warning, you used 74% memory of the system (186.0 GB of 252.0 GB), be careful about the oom, reduce unnecessary memory cost.",
+    "[system] Warning, you used 84% memory of the system (212.0 GB of 252.0 GB), be careful about the oom, reduce unnecessary memory cost.",
   );
 });
 
@@ -52,13 +53,13 @@ test("stays silent below the threshold and inside the hysteresis band", async ()
   const quiet = harness([sample(10, 252)]);
   await quiet.watch.tick();
   assert.deepEqual(quiet.sent, []);
-  const band = harness([sample(45, 100)]);
+  const band = harness([sample(75, 100)]);
   await band.watch.tick();
   assert.deepEqual(band.sent, []);
 });
 
 test("does not repeat the warning until the repeat interval has passed", async () => {
-  const { watch, sent, advance } = harness([sample(200, 252)]);
+  const { watch, sent, advance } = harness([sample(220, 252)]);
   await watch.tick();
   assert.equal(sent.length, 1);
   advance(14 * 60 * 1000);
@@ -70,7 +71,7 @@ test("does not repeat the warning until the repeat interval has passed", async (
 });
 
 test("dropping below the re-arm point lets the next crossing warn immediately", async () => {
-  const { watch, sent, advance } = harness([sample(200, 252), sample(20, 252), sample(200, 252)]);
+  const { watch, sent, advance } = harness([sample(220, 252), sample(20, 252), sample(220, 252)]);
   await watch.tick();
   assert.equal(sent.length, 1);
   advance(1000);
@@ -82,7 +83,7 @@ test("dropping below the re-arm point lets the next crossing warn immediately", 
 });
 
 test("an unreadable sample is not treated as recovery, and is counted out loud", async () => {
-  const { watch, sent, unmeasured, advance } = harness([sample(200, 252), undefined, undefined, sample(200, 252)]);
+  const { watch, sent, unmeasured, advance } = harness([sample(220, 252), undefined, undefined, sample(220, 252)]);
   await watch.tick();
   assert.equal(sent.length, 1);
   advance(1000);
@@ -112,7 +113,7 @@ test("a hung send cannot stall the pass for the other workers", async () => {
   const errors: unknown[] = [];
   const watch = new WorkerMemoryWatch({
     targets: () => [target, other],
-    sample: async () => sample(3, 4),
+    sample: async () => sample(7, 8),
     warn: (t) => {
       if (t.nickname === "plug-serve") return new Promise<void>(() => { /* never settles */ });
       sent.push(t.nickname);
@@ -156,7 +157,7 @@ test("a sample or a send that throws is isolated, and the other workers still ge
     targets: () => [target, other],
     sample: async (t) => {
       if (t.nickname === "plug-serve") throw new Error("probe exploded");
-      return sample(3, 4);
+      return sample(7, 8);
     },
     warn: async (t) => { sent.push(t.nickname); },
     now: () => 0,
@@ -171,7 +172,7 @@ test("a send that fails still reaches onError", async () => {
   const errors: unknown[] = [];
   const watch = new WorkerMemoryWatch({
     targets: () => [target],
-    sample: async () => sample(200, 252),
+    sample: async () => sample(220, 252),
     warn: async () => { throw new Error("session is busy"); },
     now: () => 0,
     onError: (error) => errors.push(error),
@@ -187,7 +188,7 @@ test("a worker that stops being watched does not keep its latch forever", async 
   let clock = 0;
   const watch = new WorkerMemoryWatch({
     targets: () => live,
-    sample: async () => sample(200, 252),
+    sample: async () => sample(220, 252),
     warn: async (t) => { sent.push(t.nickname); },
     now: () => clock,
   });
@@ -217,11 +218,11 @@ test("warns about the host itself when it is nearly full, even though no single 
 });
 
 test("host pressure and a personal share are separate warnings with separate latches", async () => {
-  const { watch, sent, advance } = harness([sample(200, 252, { totalGb: 252, availableGb: 10 })]);
+  const { watch, sent, advance } = harness([sample(220, 252, { totalGb: 252, availableGb: 10 })]);
   await watch.tick();
   assert.equal(sent.length, 2);
   assert.match(sent[0]!.message, /the machine is nearly full/u);
-  assert.match(sent[1]!.message, /you used 79% memory/u);
+  assert.match(sent[1]!.message, /you used 87% memory/u);
   advance(1000);
   await watch.tick();
   assert.equal(sent.length, 2);
@@ -333,7 +334,7 @@ test("a stop and restart during a tick cannot produce two warnings at one instan
     targets: () => live,
     sample: async () => {
       if (first) { first = false; await blocked; }
-      return sample(200, 252);
+      return sample(220, 252);
     },
     warn: async () => { sent.push(0); },
     now: () => 0,
@@ -446,7 +447,7 @@ test("an endpoint-wide latch survives the carrier changing", async () => {
   let clock = 0;
   const watch = new WorkerMemoryWatch({
     targets: () => [carrier],
-    sample: async () => ({ usedBytes: 200 * GB, limitBytes: 252 * GB, scope: "endpoint" }),
+    sample: async () => ({ usedBytes: 220 * GB, limitBytes: 252 * GB, scope: "endpoint" }),
     warn: async (t) => { sent.push(t.nickname); },
     now: () => clock,
   });
@@ -457,4 +458,41 @@ test("an endpoint-wide latch survives the carrier changing", async () => {
   clock += 60_000;
   await watch.tick();
   assert.deepEqual(sent, ["aria"], "changing which session carries it does not reset the interval");
+});
+
+// The send is `mode: "auto"`, so a warning to an idle worker STARTS a turn -- an LLM turn whose
+// entire content is a reading about work that has already stopped, and which the worker cannot
+// act on because there is nothing running to back off.
+test("an idle worker is not warned, however far over the line it is", async () => {
+  const { watch, sent } = harness([sample(250, 252, { totalGb: 252, availableGb: 2 })], () => false);
+  await watch.tick();
+  assert.deepEqual(sent, [], "neither the personal share nor host pressure reaches an idle worker");
+});
+
+test("suppressing an idle worker is not latched: the first working tick still warns", async () => {
+  let busy = false;
+  const { watch, sent, advance } = harness([sample(220, 252)], () => busy);
+  await watch.tick();
+  assert.equal(sent.length, 0);
+  busy = true;
+  // Well inside the repeat interval, so only an absent latch can let this through.
+  advance(1000);
+  await watch.tick();
+  assert.equal(sent.length, 1, "the skip must not consume the warning the worker still needs");
+});
+
+test("the warning line is four fifths of the share, not half", async () => {
+  const under = harness([sample(201, 252)]); // 79.8%
+  await under.watch.tick();
+  assert.deepEqual(under.sent, [], "just under the line is silent");
+
+  const over = harness([sample(203, 252)]); // 80.6%
+  await over.watch.tick();
+  assert.equal(over.sent.length, 1, "just over the line warns");
+
+  // The share that motivated this change: an ordinary job at half the machine is healthy work,
+  // and warning on it is what made the warning routine enough to ignore.
+  const half = harness([sample(126, 252)]);
+  await half.watch.tick();
+  assert.deepEqual(half.sent, [], "half the machine is no longer a warning");
 });

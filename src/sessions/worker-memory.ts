@@ -15,12 +15,15 @@
 // between tool calls. A single command that goes from nothing to 186 GB inside one tool call
 // will OOM before anything here is read. It catches the climb, not the leap.
 
-// The share at which a worker is told about its own subtree. Half the machine is not fatal on
-// its own, which is the point: the warning has to arrive while there is still room to act.
-export const WARN_PERCENT = 50;
+// The share at which a worker is told about its own subtree. It has to arrive while there is
+// still room to act, but not so early that it is routine: at half the machine a worker running
+// an ordinary job is warned repeatedly about memory it is using correctly, and a warning that
+// arrives on healthy work is one the worker learns to ignore. Four fifths is the point where a
+// climb is worth interrupting and a quarter of the machine is still free to land in.
+export const WARN_PERCENT = 80;
 // Re-arm below this, so a worker hovering at the threshold is not warned on every tick. The
 // gap is deliberate hysteresis, not a second threshold.
-export const REARM_PERCENT = 40;
+export const REARM_PERCENT = 70;
 // Separately: how little free memory makes the HOST itself the emergency. A per-worker share
 // cannot see the aggregate that actually fills a machine — three workers at 35% each is 105%
 // of RAM and not one of them is over the line — so the host is watched in its own right, and
@@ -156,6 +159,9 @@ export interface WorkerMemoryWatchDeps {
   // Called when a worker could not be measured at all. Silence is the failure mode this
   // feature degrades into, so somebody has to be able to see it happening.
   onUnmeasured?(target: WorkerMemoryTarget, consecutive: number, reason: string): void;
+  // Whether this worker is running a turn right now. A warning is only sent to one that is,
+  // so absent the dep every target is treated as working and nothing is suppressed.
+  isBusy?(target: WorkerMemoryTarget): boolean;
   warnPercent?: number;
   rearmPercent?: number;
   hostFreeWarnPercent?: number;
@@ -301,6 +307,12 @@ export class WorkerMemoryWatch {
     const key = `${latch}\0${reason}`;
     if (recovered) { this.state.delete(key); return; }
     if (!over) return;
+    // Only a worker that is running can act on this. The send is `mode: "auto"`, so telling an
+    // idle one STARTS a turn whose entire content is a memory reading about work that already
+    // stopped -- the warning paying for an LLM turn to say nothing actionable. Deliberately not
+    // latched: the first tick where the worker is both over the line and working is the one
+    // that warns, rather than the suppression outliving the idleness that caused it.
+    if (!(this.deps.isBusy?.(target) ?? true)) return;
     const now = this.deps.now();
     const previous = this.state.get(key);
     if (previous && now - previous.warnedAt < (this.deps.repeatWarningMs ?? REPEAT_WARNING_MS)) return;

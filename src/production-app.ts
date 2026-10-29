@@ -3509,11 +3509,21 @@ export async function buildProductionApp(
             );
           },
           sample: (target) => workerMemorySamplers.get(target.endpointId)?.sample(target.threadId) ?? Promise.resolve(undefined),
-          // `auto`: steered into the running turn when the worker is busy, which is exactly
-          // when its memory is climbing, and started as a turn when it is idle but still
-          // holding the memory. The send is live and never durable — a memory reading is only
-          // true at the instant it was taken, so a redelivery after a restart would warn about
-          // a cliff that no longer exists.
+          // Re-read per target rather than reusing the set built in `targets()`: a tick samples
+          // every worker concurrently and a slow host can hold one for the full op timeout, by
+          // which time "was it running when the pass began" is the wrong question.
+          isBusy: (target) => {
+            const session = registry.managedSnapshot().sessions[target.nickname];
+            return session !== undefined && nativeSessions.view({
+              endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
+            })?.status === "active";
+          },
+          // `auto`: steered into the running turn, which is where every warning now lands --
+          // `isBusy` above means an idle worker is never sent one, so the mode's start-a-turn
+          // branch is unreachable from here and a warning never costs a turn of its own. The
+          // send is live and never durable — a memory reading is only true at the instant it
+          // was taken, so a redelivery after a restart would warn about a cliff that no longer
+          // exists.
           warn: (target, message, reason) => sessions.send(target.nickname, message, {
             mode: "auto",
             clientUserMessageId: `worker-memory:${reason}:${target.endpointId}:${target.threadId}:${Date.now()}`,
