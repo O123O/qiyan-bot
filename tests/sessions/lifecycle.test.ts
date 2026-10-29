@@ -1747,8 +1747,11 @@ test("force removes a row stranded in unadopting, at the cost of the native unsu
   endpoint.calls.length = 0;
 
   // Without force the endpoint is reachable, so it is refused and left for reconciliation.
+  // Pinned to OPERATION_CONFLICT specifically: a bare `instanceof AppError` also passes on the
+  // ENDPOINT_UNAVAILABLE this fixture's `unknown` status would raise one step later, so it would
+  // have proved the refusal came from the reachable-host branch when it had not.
   await assert.rejects(lifecycle.unadopt("payments"),
-    (error: unknown) => error instanceof AppError);
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");
   assert.equal(required(registry).lifecycle_state, "unadopting");
 
   const released = await lifecycle.unadopt("payments", undefined, undefined, true);
