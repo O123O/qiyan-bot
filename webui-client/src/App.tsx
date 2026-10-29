@@ -14,7 +14,7 @@ import { joinFilesystemPath, markdownBaseDir, parentFilesystemPath, resolveMarkd
 import { explorerRequestSignature, explorerRootToLoad } from "./explorer-loading";
 import { splitHighlightedLines } from "./highlight-lines";
 import { selectedSourceText } from "./code-selection";
-import { mergeAssistantConversation, replaceAssistantHistoryPage } from "./assistant-chat-stream";
+import { mergeAssistantConversation, mergeAssistantHistoryPage } from "./assistant-chat-stream";
 import { ASSISTANT_COMMAND_SUGGESTIONS, filterCommandSuggestions, type CommandSuggestion } from "./command-suggestions";
 import { STYLES } from "./styles";
 import { parseWorkerCommand, WORKER_COMMAND_SUGGESTIONS, WORKER_GOAL_HELP, type WorkerCommand } from "./worker-commands";
@@ -262,6 +262,7 @@ export function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("qiyan-theme") as "dark" | "light") || "dark");
   const [log, setLog] = useState<Record<string, Msg[]>>({}); // your sent echoes + live replies, keyed by tab
   const [history, setHistory] = useState<Msg[]>([]); // QiYan's loaded conversation page(s), oldest→newest
+  const historyRef = useRef<Msg[]>([]);            // the same run, readable by callbacks that hold no deps
   const [workerChat, setWorkerChat] = useState<WorkerStreamState | null>(null); // foreground worker only
   const [hasOlder, setHasOlder] = useState<Record<string, boolean>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -329,6 +330,9 @@ export function App() {
     return { ...prev, [k]: next.length > MAX_LIVE_LOG ? next.slice(next.length - MAX_LIVE_LOG) : next };
   });
   const replaceWorker = useCallback((next: WorkerStreamState | null) => { workerRef.current = next; setWorkerChat(next); }, []);
+  // Mirrors replaceWorker: the ref is what callbacks with no deps read, the state is what
+  // renders. Keeping them in one writer is what stops the two disagreeing about the run.
+  const applyHistory = useCallback((next: Msg[]) => { historyRef.current = next; setHistory(next); }, []);
   const clearRecoveryRetries = useCallback(() => {
     for (const retry of recoveryRetriesRef.current.values()) window.clearTimeout(retry.timer);
     recoveryRetriesRef.current.clear();
@@ -409,14 +413,24 @@ export function App() {
     try {
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(`/api/assistant/messages?limit=${PAGE}`, { signal: abort.signal });
       if (assistantHistoryAbortRef.current !== abort) return;
-      setHistory(replaceAssistantHistoryPage(p.messages));
-      setHasOlder((current) => ({ ...current, [ASSIST]: p.hasOlder }));
+      const loaded = historyRef.current;
+      const refreshed = mergeAssistantHistoryPage(loaded, p.messages);
+      applyHistory(refreshed.messages);
+      // `p.hasOlder` answers "is anything older than this page", which describes the run only
+      // when the page became the run. Re-arming it after a merge put the "load older" affordance
+      // back on a conversation already paged to its first message.
+      if (refreshed.replaced) setHasOlder((current) => ({ ...current, [ASSIST]: p.hasOlder }));
+      // A merge appends to the tail without widening the render window, so each row it adds below
+      // pushes one off the top and the text under a scrolled-back reader slides. Same remedy as a
+      // live arrival: widen by what arrived, and only while they are not pinned to the bottom.
+      const appended = refreshed.messages.length - loaded.length;
+      if (!stickRef.current && appended > 0) setVisible((value) => value + appended);
     }
     catch { /* transient */ }
     finally {
       if (assistantHistoryAbortRef.current === abort) assistantHistoryAbortRef.current = null;
     }
-  }, []);
+  }, [applyHistory]);
   const loadWorkerPage = useCallback(async (nickname: string, subscriptionId: string, snapshotPending: boolean, before?: string, recoveredTurnId?: string, reconcileLatest = false, staleRetry = false): Promise<boolean> => {
     const current = workerRef.current;
     if (!current || current.nickname !== nickname || current.subscriptionId !== subscriptionId) return false;
@@ -740,7 +754,7 @@ export function App() {
   const loadOlder = useCallback(async () => {
     if (loadingOlder || (selected === null && assistantHistoryAbortRef.current)) return;
     const el = logRef.current;
-    const assistantCursor = selected === null ? history[0]?.at : undefined;
+    const assistantCursor = selected === null ? historyRef.current[0]?.at : undefined;
     const workerCursor = selected !== null && workerChat?.nickname === selected ? workerChat.olderCursor : undefined;
     // A retry that also went stale leaves no cursor, and nothing reinstalls one -- so scrolling
     // up would silently do nothing until the panel resubscribed. Re-read the newest page here
@@ -770,11 +784,17 @@ export function App() {
       assistantHistoryAbortRef.current = abort;
       const p = await api<{ messages: Msg[]; hasOlder: boolean }>(path, { signal: abort.signal });
       if (assistantHistoryAbortRef.current !== abort) return;
+      // Read the run from the ref, never the closure. `loadHistory` writes the ref synchronously
+      // and the state at default priority, so between those two a discrete event can re-enter
+      // this callback from the render before it -- whose closure still holds the pre-merge run.
+      // Prepending onto that would drop exactly the rows the merge just recovered, which are the
+      // ones no live path can supply again.
+      const loaded = historyRef.current;
       // The `before` cursor is INCLUSIVE, so dedup the boundary rows we already have (by id).
-      const existing = new Set(history.map((m) => m.id).filter(Boolean));
+      const existing = new Set(loaded.map((m) => m.id).filter(Boolean));
       const fresh = p.messages.filter((m) => !m.id || !existing.has(m.id));
       if (fresh.length) {
-        setHistory((cur) => [...fresh, ...cur]);
+        applyHistory([...fresh, ...loaded]);
         setVisible((v) => v + fresh.length);
       } else preserveRef.current = null;
       // Stop paging if the server has no more OR this fetch made no progress (avoids re-fetching the
@@ -785,7 +805,7 @@ export function App() {
       preserveRef.current = settleWorkerScrollPreservation(preserveRef.current);
       setLoadingOlder(false);
     }
-  }, [loadingOlder, selected, history, workerChat, key, loadWorkerPage]);
+  }, [loadingOlder, selected, workerChat, key, loadWorkerPage, applyHistory]);
 
   // Tool-heavy turns can yield a native page with few or no visible messages. Fill the foreground
   // viewport and cross its latest terminal-turn boundary; both searches stay capped and older
