@@ -1664,3 +1664,96 @@ test("a Claude worker is created without attempting to name its thread", async (
     "no round trip to a method this provider refuses");
   assert.equal(warned, 0, "and no warning, because nothing needed materializing");
 });
+
+// The deadlock this exists for, from 2026-10-29: a codex "thread-store conflict: already has an
+// active writer" made a thread impossible to open, so its native status stayed `unknown`, so
+// unadopt could never prove idleness, so the nickname could never be freed and re-pointed at a
+// working fork of that thread. Proving idleness requires opening the thread; the thread being
+// unopenable IS the problem. Without a way to stop asking, the session is unreleasable forever.
+test("a session whose native state cannot be read is unreleasable without force", async () => {
+  const { registry, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  setNative(required(registry), "unknown");
+
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE");
+  assert.equal(required(registry).lifecycle_state, "managed", "and it stays stuck, by design, until forced");
+});
+
+test("force releases an unreadable session and reports that nothing was proven", async () => {
+  const { registry, endpoint, epochs, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+  setNative(session, "unknown");
+  endpoint.calls.length = 0;
+
+  const checkpoints: string[] = [];
+  const released = await lifecycle.unadopt("payments", (checkpoint) => { checkpoints.push(checkpoint.step); }, undefined, true);
+
+  assert.equal(registry.get("payments"), undefined, "the nickname is free for re-adoption");
+  assert.equal(released.forced, true, "the caller is told it forced rather than proved");
+  assert.equal(released.endpointUnreachable, false, "the endpoint was reachable; it was the session that could not be read");
+  assert.ok(epochs.latest("local", "thread-1", session.mapping_id)?.endedAt, "the epoch is closed so nothing delivers to it");
+  // One durable write and no intermediate `unadopting` row -- the same local release an
+  // unreachable endpoint takes, so a crash mid-way leaves a session recovery retires as no-effect.
+  assert.deepEqual(checkpoints, ["transition_intent", "removed"]);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false,
+    "it asks the endpoint nothing: the native subscription is deliberately left behind");
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/archive" || call.method === "thread/delete"), false,
+    "force releases, it never archives or deletes the thread");
+});
+
+// Force is an escape hatch from an unprovable state, not a licence to ignore a known one. It
+// releases a running session too -- that is what "stop asking" means, and the unreachable-endpoint
+// path has always done it -- so the honesty of the report is what keeps it usable.
+test("force releases even an active session, and still never archives", async () => {
+  const { registry, endpoint, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  setNative(required(registry), "active", "running-turn");
+  endpoint.calls.length = 0;
+
+  const released = await lifecycle.unadopt("payments", undefined, undefined, true);
+  assert.equal(registry.get("payments"), undefined);
+  assert.equal(released.forced, true);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/archive"), false);
+});
+
+// Force bypasses the idle proof, not the mapping checks. A session already moving to `archiving`
+// belongs to that operation; removing it here would retire a thread that was never archived.
+test("force still refuses a session that belongs to another removal", async () => {
+  const { registry, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+  setNative(session, "unknown");
+  await registry.transition("payments", session, "archiving");
+
+  await assert.rejects(lifecycle.unadopt("payments", undefined, undefined, true),
+    (error: unknown) => error instanceof AppError && error.code === "OPERATION_CONFLICT");
+  assert.equal(required(registry).lifecycle_state, "archiving", "the archive still owns it");
+});
+
+// The one genuinely new behaviour on a REACHABLE endpoint. The ordinary path refuses a row left
+// `unadopting` by a crashed attempt, so reconciliation can finish it with the native unsubscribe
+// the local path cannot send. Force removes it anyway — deliberately, because otherwise a crash
+// mid-unadopt against an unopenable thread is a second way to strand the nickname forever. The
+// cost is the same leaked subscription force already accepts, and it is pinned here so the
+// widening stays a decision rather than a side effect.
+test("force removes a row stranded in unadopting, at the cost of the native unsubscribe", async () => {
+  const { registry, endpoint, lifecycle, setNative } = await fixture();
+  await lifecycle.adopt("payments", "local", "thread-1");
+  const session = required(registry);
+  setNative(session, "unknown");
+  await registry.transition("payments", session, "unadopting");
+  endpoint.calls.length = 0;
+
+  // Without force the endpoint is reachable, so it is refused and left for reconciliation.
+  await assert.rejects(lifecycle.unadopt("payments"),
+    (error: unknown) => error instanceof AppError);
+  assert.equal(required(registry).lifecycle_state, "unadopting");
+
+  const released = await lifecycle.unadopt("payments", undefined, undefined, true);
+  assert.equal(registry.get("payments"), undefined, "the nickname is free even from a stranded row");
+  assert.equal(released.forced, true);
+  assert.equal(endpoint.calls.some((call) => call.method === "thread/unsubscribe"), false,
+    "the unsubscribe reconciliation would have sent is not sent; that subscription leaks");
+});

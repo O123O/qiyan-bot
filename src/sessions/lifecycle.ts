@@ -204,8 +204,27 @@ export class SessionLifecycle {
     nickname: string,
     checkpoint?: (value: LifecycleCheckpoint) => void,
     existingLease?: EndpointWorkLease,
-  ): Promise<{ endpointUnreachable: boolean }> {
+    // Release without asking the endpoint anything. The ordinary path needs one fact -- that no
+    // turn is running -- and gets it from the native view; when that view cannot be built the
+    // session is unreleasable, because proving it idle means opening the thread and the thread
+    // being unopenable is the whole problem. That deadlock stranded a worker on 2026-10-29: a
+    // codex "thread-store conflict: already has an active writer" made the thread impossible to
+    // open, so the status stayed `unknown`, so unadopt could never prove idleness, so the
+    // nickname could never be freed and re-pointed at a working fork.
+    //
+    // This takes the same local release an unreachable endpoint already takes, for the same
+    // reason and with the same honesty: idleness is NOT proven, the native subscription is left
+    // behind, and any turn still running keeps running and has its answer discarded. It stops no
+    // remote work, because a worker's thread lives inside the endpoint's SHARED app-server and
+    // there is no per-session process to stop -- destroying that runtime is `disconnect_endpoint`
+    // with force, which is a different blast radius and stays a separate decision.
+    force = false,
+  ): Promise<{ endpointUnreachable: boolean; forced?: boolean }> {
     const expected = this.requireRemovable(nickname);
+    if (force) {
+      await this.releaseWithoutEndpoint(nickname, expected, checkpoint);
+      return { endpointUnreachable: false, forced: true };
+    }
     {
       // `entered` is the discriminator, and it has to be: the fallback below is only correct when
       // the ENDPOINT could not be reached. Work inside the lease can also raise
