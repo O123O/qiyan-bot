@@ -164,8 +164,9 @@ export interface WorkerMemoryWatchDeps {
   // Called when a worker could not be measured at all. Silence is the failure mode this
   // feature degrades into, so somebody has to be able to see it happening.
   onUnmeasured?(target: WorkerMemoryTarget, consecutive: number, reason: string): void;
-  // Whether this worker is running a turn right now. A warning is only sent to one that is,
-  // so absent the dep every target is treated as working and nothing is suppressed.
+  // Whether this worker is running a turn right now. Gates the SHARE warning only -- host
+  // pressure is about memory the target does not own and is sent either way. Absent the dep
+  // every target is treated as working and nothing is suppressed.
   isBusy?(target: WorkerMemoryTarget): boolean;
   warnPercent?: number;
   rearmPercent?: number;
