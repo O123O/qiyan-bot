@@ -3509,11 +3509,28 @@ export async function buildProductionApp(
             );
           },
           sample: (target) => workerMemorySamplers.get(target.endpointId)?.sample(target.threadId) ?? Promise.resolve(undefined),
-          // `auto`: steered into the running turn when the worker is busy, which is exactly
-          // when its memory is climbing, and started as a turn when it is idle but still
-          // holding the memory. The send is live and never durable — a memory reading is only
-          // true at the instant it was taken, so a redelivery after a restart would warn about
-          // a cliff that no longer exists.
+          // Re-read per target rather than reusing the set built in `targets()`: a tick samples
+          // every worker concurrently and a slow host can hold one for the full op timeout, by
+          // which time "was it running when the pass began" is the wrong question.
+          isBusy: (target) => {
+            const session = registry.managedSnapshot().sessions[target.nickname];
+            // Identity, not just the name. A nickname can be archived and reused between the
+            // pass that sampled this target and this lookup, and answering for a different
+            // thread's status would gate the wrong worker's warning.
+            if (session?.endpoint !== target.endpointId || session.thread_id !== target.threadId) return false;
+            return nativeSessions.view({
+              endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
+            })?.status === "active";
+          },
+          // `auto`: steered into a running turn, or started as one when the worker is idle.
+          // What that costs differs by line. A share warning normally steers, because `isBusy`
+          // gates it to a working worker -- though not strictly: the status is read, then the
+          // send is awaited, and a turn can end inside that window. A HOST warning is ungated
+          // and so does start a turn on an idle worker, deliberately: a machine with no room
+          // left is worth one turn to say so, and the idle worker holding the memory in a
+          // detached subtree is the one who can free it. The send is live and never durable --
+          // a memory reading is only true at the instant it was taken, so a redelivery after a
+          // restart would warn about a cliff that no longer exists.
           warn: (target, message, reason) => sessions.send(target.nickname, message, {
             mode: "auto",
             clientUserMessageId: `worker-memory:${reason}:${target.endpointId}:${target.threadId}:${Date.now()}`,

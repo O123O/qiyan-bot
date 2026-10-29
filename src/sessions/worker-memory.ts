@@ -15,16 +15,24 @@
 // between tool calls. A single command that goes from nothing to 186 GB inside one tool call
 // will OOM before anything here is read. It catches the climb, not the leap.
 
-// The share at which a worker is told about its own subtree. Half the machine is not fatal on
-// its own, which is the point: the warning has to arrive while there is still room to act.
-export const WARN_PERCENT = 50;
+// The share at which a worker is told about its own subtree. It has to arrive while there is
+// still room to act, but not so early that it is routine: at half the machine a worker running
+// an ordinary job is warned repeatedly about memory it is using correctly, and a warning that
+// arrives on healthy work is one the worker learns to ignore. Four fifths is the point where a
+// climb is worth interrupting and a quarter of the machine is still free to land in.
+export const WARN_PERCENT = 80;
 // Re-arm below this, so a worker hovering at the threshold is not warned on every tick. The
 // gap is deliberate hysteresis, not a second threshold.
-export const REARM_PERCENT = 40;
+export const REARM_PERCENT = 70;
 // Separately: how little free memory makes the HOST itself the emergency. A per-worker share
 // cannot see the aggregate that actually fills a machine — three workers at 35% each is 105%
 // of RAM and not one of them is over the line — so the host is watched in its own right, and
 // everyone measured on it is told.
+// Note where the two lines nearly meet: on an UNCAPPED host, `limitBytes` is MemTotal, so for a
+// single dominant worker "80% of my limit" and "15% of the machine free" are within a few GB of
+// each other -- staged in order, but barely. They stay genuinely independent where it matters:
+// on a cgroup-capped remote node `limitBytes` is the cap rather than MemTotal, and on a host
+// with several workers the aggregate is something no per-worker share can see at all.
 export const HOST_FREE_WARN_PERCENT = 15;
 export const HOST_FREE_REARM_PERCENT = 25;
 // A worker that stays over a line is reminded this often: long enough not to nag, short enough
@@ -156,6 +164,10 @@ export interface WorkerMemoryWatchDeps {
   // Called when a worker could not be measured at all. Silence is the failure mode this
   // feature degrades into, so somebody has to be able to see it happening.
   onUnmeasured?(target: WorkerMemoryTarget, consecutive: number, reason: string): void;
+  // Whether this worker is running a turn right now. Gates the SHARE warning only -- host
+  // pressure is about memory the target does not own and is sent either way. Absent the dep
+  // every target is treated as working and nothing is suppressed.
+  isBusy?(target: WorkerMemoryTarget): boolean;
   warnPercent?: number;
   rearmPercent?: number;
   hostFreeWarnPercent?: number;
@@ -275,6 +287,11 @@ export class WorkerMemoryWatch {
   // The host is one thing however many sessions sit on it, so its latch belongs to the endpoint
   // rather than to each session. Otherwise "the machine has 15% free" starts a turn on every
   // local session at once — N simultaneous LLM turns as the response to a full machine.
+  //
+  // WHICH session carries it is unspecified by design, and may well be an idle one. Targets are
+  // sampled concurrently, so the winner is whichever probe returns first — probe latency, not
+  // list order. Exactly one per endpoint is the property worth having; naming the recipient
+  // would be asserting microtask scheduling.
   private hostLatchKey(target: WorkerMemoryTarget): string { return target.endpointId; }
 
   // An endpoint-wide reading is throttled per endpoint too, so changing which session carries
@@ -301,6 +318,18 @@ export class WorkerMemoryWatch {
     const key = `${latch}\0${reason}`;
     if (recovered) { this.state.delete(key); return; }
     if (!over) return;
+    // The share line only. The send is `mode: "auto"`, so telling an idle worker about its OWN
+    // share STARTS a turn whose entire content is a reading about work that already stopped --
+    // an LLM turn to say nothing it can act on. Deliberately not latched: the first tick where
+    // the worker is both over the line and working is the one that warns, rather than the
+    // suppression outliving the idleness that caused it.
+    //
+    // The host line is deliberately NOT gated. It reports memory the target does not own, so
+    // "the work already stopped" is not a reason to withhold it, and it is the only channel
+    // that reports a filling machine at all. Gating it meant a host at 5% free with every
+    // session idle told nobody, forever, with nothing counting the warnings withheld -- and an
+    // idle worker holding the memory in a detached subtree is exactly who can still kill it.
+    if (reason === "share" && !(this.deps.isBusy?.(target) ?? true)) return;
     const now = this.deps.now();
     const previous = this.state.get(key);
     if (previous && now - previous.warnedAt < (this.deps.repeatWarningMs ?? REPEAT_WARNING_MS)) return;
