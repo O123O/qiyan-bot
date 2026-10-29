@@ -516,3 +516,35 @@ test("gating the share line does not suppress the endpoint's one host warning", 
   const host = sent.filter((entry) => /the machine is nearly full/u.test(entry.message));
   assert.equal(host.length, 1, "a full machine is still reported, exactly once for the endpoint");
 });
+
+// The converse of the latch-survives test above, and a distinct property: a skip must not CREATE
+// a latch. Without this, reordering the gate below `state.set` would let an idle-and-over tick
+// take the latch silently, suppressing the worker for the full repeat interval once it goes
+// busy -- through the exact climb the warning exists to interrupt.
+test("suppressing an idle worker is not latched: the first working tick still warns", async () => {
+  let busy = false;
+  const { watch, sent, advance } = harness([sample(220, 252)], () => busy);
+  await watch.tick();
+  assert.equal(sent.length, 0);
+  busy = true;
+  // Well inside the repeat interval, so only an absent latch can let this through.
+  advance(1000);
+  await watch.tick();
+  assert.equal(sent.length, 1, "the skip must not consume the warning the worker still needs");
+});
+
+test("the warning line is four fifths of the share, not half", async () => {
+  const under = harness([sample(201, 252)]); // 79.8%
+  await under.watch.tick();
+  assert.deepEqual(under.sent, [], "just under the line is silent");
+
+  const over = harness([sample(203, 252)]); // 80.6%
+  await over.watch.tick();
+  assert.equal(over.sent.length, 1, "just over the line warns");
+
+  // The share that motivated this change: an ordinary job at half the machine is healthy work,
+  // and warning on it is what made the warning routine enough to ignore.
+  const half = harness([sample(126, 252)]);
+  await half.watch.tick();
+  assert.deepEqual(half.sent, [], "half the machine is no longer a warning");
+});

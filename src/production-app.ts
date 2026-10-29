@@ -3522,12 +3522,15 @@ export async function buildProductionApp(
               endpointId: session.endpoint, threadId: session.thread_id, mappingId: session.mapping_id,
             })?.status === "active";
           },
-          // `auto`: steered into the running turn, which is where every warning now lands --
-          // `isBusy` above means an idle worker is never sent one, so the mode's start-a-turn
-          // branch is unreachable from here and a warning never costs a turn of its own. The
-          // send is live and never durable — a memory reading is only true at the instant it
-          // was taken, so a redelivery after a restart would warn about a cliff that no longer
-          // exists.
+          // `auto`: steered into a running turn, or started as one when the worker is idle.
+          // What that costs differs by line. A share warning normally steers, because `isBusy`
+          // gates it to a working worker -- though not strictly: the status is read, then the
+          // send is awaited, and a turn can end inside that window. A HOST warning is ungated
+          // and so does start a turn on an idle worker, deliberately: a machine with no room
+          // left is worth one turn to say so, and the idle worker holding the memory in a
+          // detached subtree is the one who can free it. The send is live and never durable --
+          // a memory reading is only true at the instant it was taken, so a redelivery after a
+          // restart would warn about a cliff that no longer exists.
           warn: (target, message, reason) => sessions.send(target.nickname, message, {
             mode: "auto",
             clientUserMessageId: `worker-memory:${reason}:${target.endpointId}:${target.threadId}:${Date.now()}`,

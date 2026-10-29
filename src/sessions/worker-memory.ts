@@ -28,6 +28,11 @@ export const REARM_PERCENT = 70;
 // cannot see the aggregate that actually fills a machine — three workers at 35% each is 105%
 // of RAM and not one of them is over the line — so the host is watched in its own right, and
 // everyone measured on it is told.
+// Note where the two lines nearly meet: on an UNCAPPED host, `limitBytes` is MemTotal, so for a
+// single dominant worker "80% of my limit" and "15% of the machine free" are within a few GB of
+// each other -- staged in order, but barely. They stay genuinely independent where it matters:
+// on a cgroup-capped remote node `limitBytes` is the cap rather than MemTotal, and on a host
+// with several workers the aggregate is something no per-worker share can see at all.
 export const HOST_FREE_WARN_PERCENT = 15;
 export const HOST_FREE_REARM_PERCENT = 25;
 // A worker that stays over a line is reminded this often: long enough not to nag, short enough
@@ -281,6 +286,11 @@ export class WorkerMemoryWatch {
   // The host is one thing however many sessions sit on it, so its latch belongs to the endpoint
   // rather than to each session. Otherwise "the machine has 15% free" starts a turn on every
   // local session at once — N simultaneous LLM turns as the response to a full machine.
+  //
+  // WHICH session carries it is unspecified by design, and may well be an idle one. Targets are
+  // sampled concurrently, so the winner is whichever probe returns first — probe latency, not
+  // list order. Exactly one per endpoint is the property worth having; naming the recipient
+  // would be asserting microtask scheduling.
   private hostLatchKey(target: WorkerMemoryTarget): string { return target.endpointId; }
 
   // An endpoint-wide reading is throttled per endpoint too, so changing which session carries
