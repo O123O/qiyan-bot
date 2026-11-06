@@ -1947,11 +1947,6 @@ test("a lifecycle outcome is observed from the endpoint, never inferred or start
   const replacement = await remote.runtimeIdentity();
   assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "replaced", identity: replacement });
 
-  // Each way of not knowing says which one it is, instead of all of them collapsing to "maybe".
-  const noIdentity = await manager.observeLifecycleOutcome("devbox", undefined);
-  assert.equal(noIdentity.outcome, "unobservable");
-  assert.match(noIdentity.outcome === "unobservable" ? noIdentity.reason : "", /no runtime identity to compare/u);
-
   // The host was reached and said there is no runtime: an ANSWER, not a failure to get one. An
   // unreachable host throws instead, and lands in the catch below. Reporting this as merely
   // unobservable would settle a restart that is one start short of done, and recovery -- the only
@@ -1991,4 +1986,31 @@ test("a daemonless endpoint is unobservable rather than reported stopped", async
   const observed = await manager.observeLifecycleOutcome("devbox", stopping);
   assert.equal(observed.outcome, "unobservable");
   assert.match(observed.outcome === "unobservable" ? observed.reason : "", /daemonless/u);
+});
+
+// A forced action destroys by location and does not insist on reading an identity first, so on an
+// unreachable host -- the case the whole observation path exists for -- it has no stop target to
+// offer. The two answers that matter there must still be told apart.
+test("an action with no stop target still separates an absent runtime from an unreachable host", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+
+  remote.identityAvailable = false;
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox"), { outcome: "stopped" },
+    "a host that answers 'absent' is a verdict even with nothing to compare");
+
+  remote.identityAvailable = true;
+  remote.onRuntimeIdentity = () => { throw new Error("ssh channel is gone"); };
+  const unreachable = await manager.observeLifecycleOutcome("devbox");
+  assert.equal(unreachable.outcome, "unobservable");
+  assert.match(unreachable.outcome === "unobservable" ? unreachable.reason : "", /ssh channel is gone/u);
+
+  // A live runtime with no target cannot be attributed: it may be the one the action failed to
+  // stop, or the replacement it did start. Never a verdict.
+  remote.onRuntimeIdentity = undefined;
+  const live = await manager.observeLifecycleOutcome("devbox");
+  assert.equal(live.outcome, "unobservable");
+  assert.match(live.outcome === "unobservable" ? live.reason : "", /no identity to compare it with/u);
 });

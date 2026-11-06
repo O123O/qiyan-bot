@@ -2579,11 +2579,14 @@ export function lifecycleIdentityWatch(): {
   observe(checkpoint: unknown): void;
   identity(): RuntimeIdentity | undefined;
   stopped(): boolean;
+  checkpointed(): boolean;
 } {
   let identity: RuntimeIdentity | undefined;
   let stopped = false;
+  let checkpointed = false;
   return {
     observe(checkpoint) {
+      checkpointed = true;
       const phase = String((checkpoint as { phase?: unknown } | undefined)?.phase);
       if (!LIFECYCLE_STOP_TARGET_PHASES.has(phase)) return;
       // `destroyed` is a forced teardown by location, which recoverablePhase already treats as
@@ -2599,6 +2602,7 @@ export function lifecycleIdentityWatch(): {
     },
     identity: () => identity,
     stopped: () => stopped,
+    checkpointed: () => checkpointed,
   };
 }
 
@@ -2606,17 +2610,21 @@ export function lifecycleIdentityWatch(): {
 // when the outcome was observed, "completed" when the verb's effect is on the host, and
 // `undefined` to rethrow the original -- which leaves the row to the ledger's own proofs and to
 // the reconciliation pass.
-async function decideLifecycleFailure(
-  endpointManager: EndpointManager,
+export async function decideLifecycleFailure(
+  endpointManager: Pick<EndpointManager, "observeLifecycleOutcome">,
   kind: "restart" | "disconnect",
   endpointId: string,
   stopping: ReturnType<typeof lifecycleIdentityWatch>,
   error: unknown,
 ): Promise<AppError | "completed" | undefined> {
-  // Nothing to compare against: either the action died before checkpointing a stop target, or the
-  // endpoint is daemonless. Observing would only produce "could not be observed", which is weaker
-  // than what `isProvenNoEffect` already proves from an absent receipt -- so do not overrule it.
-  if (stopping.identity() === undefined) return undefined;
+  // The one thing observation must never overrule: an action that wrote NO checkpoint proves, by
+  // that absence alone, that it stopped nothing (see isProvenNoEffect). That proof is stronger
+  // than anything a look at the host could add, so leave it to it.
+  //
+  // Deliberately not keyed on a missing identity. A forced action destroys by location and may
+  // hold no identity at all, which is the normal state on an unreachable host -- the exact case
+  // this change exists for. Gating there sent it back to the fence.
+  if (!stopping.checkpointed()) return undefined;
   const decided = lifecycleFailureDisposition(
     kind, await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity()), stopping.stopped());
   if (decided.disposition === "completed") return "completed";

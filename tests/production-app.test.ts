@@ -24,6 +24,7 @@ import {
   lifecycleRecoveryExhausted,
   lifecycleIdentityWatch,
   lifecycleFailureDisposition,
+  decideLifecycleFailure,
   settledLifecycleFailure,
   operationUnsettled,
   settleRecoveryPassVerdict,
@@ -89,7 +90,7 @@ import {
 import { AppError, observedOutcome } from "../src/core/errors.ts";
 import type { ManagementState } from "../src/core/types.ts";
 import { ChatAdapterRegistry } from "../src/chat-apps/shared/adapter-registry.ts";
-import type { EndpointWorkLease } from "../src/endpoints/types.ts";
+import type { EndpointWorkLease, RuntimeIdentity } from "../src/endpoints/types.ts";
 import { composeApp } from "../src/app.ts";
 import { JsonRpcResponseError, RpcRequestTimeoutError } from "../src/app-server/rpc-client.ts";
 import { HistoryScanBudgetExhaustedError } from "../src/app-server/thread-history.ts";
@@ -3936,9 +3937,14 @@ test("a lifecycle identity watch keeps the runtime the action set out to stop", 
   // identity it was handed would adopt the replacement and then report that the replacement had
   // not been stopped.
   const onlyStarted = lifecycleIdentityWatch();
+  assert.equal(onlyStarted.checkpointed(), false);
   onlyStarted.observe({ phase: "runtime_started", identity: replacement });
   assert.equal(onlyStarted.identity(), undefined, "a replacement is never the stop target");
   assert.equal(onlyStarted.stopped(), false);
+  // Counted all the same. A checkpoint that named no stop target is still a checkpoint, and it is
+  // the ABSENCE of one that proves nothing was stopped -- a forced action on an unreachable host
+  // writes `draining` with no identity, and must not be mistaken for having written nothing.
+  assert.equal(onlyStarted.checkpointed(), true);
 
   // A forced teardown destroys by location; `destroyed` means the old runtime is gone too.
   const forced = lifecycleIdentityWatch();
@@ -4001,4 +4007,34 @@ test("a lifecycle failure settles only when nothing is still owed on the host", 
     assert.deepEqual(lifecycleFailureDisposition(kind, { outcome: "unobservable", reason: "gone" }, true),
       { disposition: "settled", observation: { outcome: "unobservable", reason: "gone" } });
   }
+});
+
+// The gate in front of the observation. It exists to protect ONE proof -- an action that wrote no
+// checkpoint stopped nothing -- and must not be widened into "no identity", because a forced
+// action on an unreachable host legitimately holds no identity and is the case the whole
+// observation path was built for.
+test("only an action that checkpointed nothing is left to the ledger's own proof", async () => {
+  const looks: Array<RuntimeIdentity | undefined> = [];
+  const manager = {
+    observeLifecycleOutcome: async (_id: string, stopping?: RuntimeIdentity) => {
+      looks.push(stopping);
+      return { outcome: "unobservable" as const, reason: "the ssh channel is gone" };
+    },
+  };
+  const cause = new AppError("ENDPOINT_UNAVAILABLE", "ssh exited 255");
+
+  const nothing = lifecycleIdentityWatch();
+  assert.equal(await decideLifecycleFailure(manager, "restart", "polyphe", nothing, cause), undefined);
+  assert.deepEqual(looks, [], "a no-receipt proof is stronger than a look, so do not spend one");
+
+  // A forced restart against an unreachable host: shutdownTarget reads no identity, so `draining`
+  // is checkpointed without one. That used to fall through the gate and back into the fence.
+  const forced = lifecycleIdentityWatch();
+  forced.observe({ phase: "draining" });
+  const settled = await decideLifecycleFailure(manager, "restart", "polyphe", forced, cause);
+  assert.equal(looks.length, 1, "an action that checkpointed must be looked at");
+  assert.equal(looks[0], undefined, "with no stop target to offer");
+  assert.ok(settled instanceof AppError);
+  assert.equal(observedOutcome(settled as AppError), "unknown_on_host");
+  assert.match((settled as AppError).message, /the ssh channel is gone/u);
 });

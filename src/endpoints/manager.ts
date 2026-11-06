@@ -675,8 +675,11 @@ export class EndpointManager {
   // read-only on the host, and it is bounded only by the remote helper's own per-invoke timeout --
   // acceptable because this runs after the lifecycle queue is released, so a hanging host delays
   // this one tool call instead of wedging the endpoint.
-  async observeLifecycleOutcome(id: string, stopping: RuntimeIdentity | undefined): Promise<EndpointLifecycleObservation> {
-    if (!stopping) return { outcome: "unobservable", reason: "the action recorded no runtime identity to compare against" };
+  // `stopping` is optional on purpose. A FORCED action destroys by location and deliberately does
+  // not insist on reading an identity first (see shutdownTarget), so on the very host this exists
+  // for -- an unreachable one -- it has no stop target to offer. It can still be told the two
+  // apart that matter there: a host that answers "absent" from one that cannot be reached at all.
+  async observeLifecycleOutcome(id: string, stopping?: RuntimeIdentity): Promise<EndpointLifecycleObservation> {
     const endpoint = this.records.get(this.normalize(id))?.endpoint;
     if (!endpoint) return { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" };
     // A daemonless endpoint (local Claude) has no runtime identity at all, so `undefined` from it
@@ -695,6 +698,10 @@ export class EndpointManager {
     // what the reconciliation pass exists to complete. Reporting it as merely unobservable would
     // settle the row and take that pass away.
     if (!identity) return { outcome: "stopped" };
+    // A live runtime with nothing to compare it against. It cannot be attributed -- it may be the
+    // one this action failed to stop, or the replacement it did start -- so it is honestly
+    // unobservable, and only the "absent" answer above gets to be a verdict without a target.
+    if (!stopping) return { outcome: "unobservable", reason: "a live runtime answered, but the action recorded no identity to compare it with" };
     return sameRuntimeIdentity(identity, stopping) ? { outcome: "intact", identity } : { outcome: "replaced", identity };
   }
 
