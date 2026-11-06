@@ -1952,10 +1952,12 @@ test("a lifecycle outcome is observed from the endpoint, never inferred or start
   assert.equal(noIdentity.outcome, "unobservable");
   assert.match(noIdentity.outcome === "unobservable" ? noIdentity.reason : "", /no runtime identity to compare/u);
 
+  // The host was reached and said there is no runtime: an ANSWER, not a failure to get one. An
+  // unreachable host throws instead, and lands in the catch below. Reporting this as merely
+  // unobservable would settle a restart that is one start short of done, and recovery -- the only
+  // thing that finishes it -- never looks at settled rows again.
   remote.identityAvailable = false;
-  const silent = await manager.observeLifecycleOutcome("devbox", stopping);
-  assert.equal(silent.outcome, "unobservable");
-  assert.match(silent.outcome === "unobservable" ? silent.reason : "", /reported no runtime identity/u);
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "stopped" });
 
   remote.identityAvailable = true;
   remote.onRuntimeIdentity = () => { throw new Error("ssh channel is gone"); };
@@ -1973,4 +1975,20 @@ test("an endpoint with no live runtime is unobservable rather than intact", asyn
   assert.equal(observed.outcome, "unobservable");
   assert.match(observed.outcome === "unobservable" ? observed.reason : "", /holds no runtime to ask/u);
   assert.equal(remotes.size, 0, "an absent endpoint is not connected to in order to be looked at");
+});
+
+// A daemonless endpoint never has a runtime identity, so its `undefined` means "there was never
+// anything to compare" rather than "the runtime is gone" -- and must not borrow the strength of
+// the `stopped` verdict.
+test("a daemonless endpoint is unobservable rather than reported stopped", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+  const stopping = await remote.runtimeIdentity();
+  assert.ok(stopping);
+  remote.daemonless = true;
+  const observed = await manager.observeLifecycleOutcome("devbox", stopping);
+  assert.equal(observed.outcome, "unobservable");
+  assert.match(observed.outcome === "unobservable" ? observed.reason : "", /daemonless/u);
 });

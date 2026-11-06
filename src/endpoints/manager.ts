@@ -18,6 +18,7 @@ import type {
 export type EndpointLifecycleObservation =
   | { outcome: "replaced"; identity: RuntimeIdentity }
   | { outcome: "intact"; identity: RuntimeIdentity }
+  | { outcome: "stopped" }
   | { outcome: "unobservable"; reason: string };
 
 export interface EndpointLifecycleOutcome {
@@ -665,22 +666,35 @@ export class EndpointManager {
   // lifecycle verbs already checkpoint that identity as the first thing they do, so the expensive
   // half of the comparison is on the row before anything is touched; this supplies the other half.
   //
-  // Strictly read-only, and deliberately so. It asks the endpoint the manager already holds and
-  // never prepares or starts one: an observation that started a runtime in order to look at it
-  // would be reporting on its own side effect, and would turn every failed restart of a dead host
-  // into a connection attempt. No live endpoint is therefore `unobservable`, not `intact`.
+  // It never starts, publishes or reconnects an endpoint: it asks the one the manager already
+  // holds, and an endpoint the manager holds none for is `unobservable` rather than assumed
+  // stopped. An observation that connected in order to look would be reporting on its own side
+  // effect, and would turn every failed restart of a dead host into a connection attempt. It is
+  // not, however, free of remote work: reading a legacy tmux runtime's identity re-runs
+  // `prepareRemoteHost`, because `SshRuntime.stop` drops its prepared state. That work is
+  // read-only on the host, and it is bounded only by the remote helper's own per-invoke timeout --
+  // acceptable because this runs after the lifecycle queue is released, so a hanging host delays
+  // this one tool call instead of wedging the endpoint.
   async observeLifecycleOutcome(id: string, stopping: RuntimeIdentity | undefined): Promise<EndpointLifecycleObservation> {
     if (!stopping) return { outcome: "unobservable", reason: "the action recorded no runtime identity to compare against" };
     const endpoint = this.records.get(this.normalize(id))?.endpoint;
     if (!endpoint) return { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" };
-    // A daemonless endpoint (local Claude) has no runtime identity at all, so it answers
-    // `undefined` here exactly as an unreachable one does. Both are honestly unobservable.
+    // A daemonless endpoint (local Claude) has no runtime identity at all, so `undefined` from it
+    // means "there was never anything to compare" rather than "the runtime is gone". Separated
+    // here so the `stopped` verdict below can rest on the stronger reading.
+    if (endpoint.daemonless) return { outcome: "unobservable", reason: "a daemonless endpoint carries no runtime identity" };
     let identity: RuntimeIdentity | undefined;
     try { identity = await endpoint.runtimeIdentity(); }
     catch (error) {
       return { outcome: "unobservable", reason: `the runtime identity could not be read: ${error instanceof Error ? error.message : String(error)}` };
     }
-    if (!identity) return { outcome: "unobservable", reason: "the endpoint reported no runtime identity" };
+    // `undefined` here is an ANSWER, not a failure to get one. A runtime that cannot be reached
+    // throws, and an unhealthy one without an identity throws; only a host that was reached and
+    // reported `absent` returns nothing. So this is positive evidence that the stop landed and
+    // nothing replaced it -- a half-done restart, one start short of finished, which is precisely
+    // what the reconciliation pass exists to complete. Reporting it as merely unobservable would
+    // settle the row and take that pass away.
+    if (!identity) return { outcome: "stopped" };
     return sameRuntimeIdentity(identity, stopping) ? { outcome: "intact", identity } : { outcome: "replaced", identity };
   }
 

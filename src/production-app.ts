@@ -2564,32 +2564,99 @@ export function recoverablePhase(phase: EndpointLifecyclePhase): "draining" | "i
   return phase === "destroyed" ? "runtime_stopped" : phase;
 }
 
-// Holds on to the runtime identity a lifecycle action set out to STOP, so that a failure has
-// something to compare the endpoint against.
-//
-// The first one wins, and that is the whole point of it rather than reading the last checkpoint
-// off the row. Both verbs checkpoint `{phase, identity}` with the shutdown target before they
-// touch anything, but a restart's final `runtime_started` checkpoint carries the REPLACEMENT's
-// identity instead. Comparing against that one would match the live runtime whenever a restart
-// failed after its replacement started, and report "the runtime was not stopped" about a runtime
-// that had just been replaced -- the exact inversion of the truth.
+// The phases whose checkpointed identity names the runtime being STOPPED. `runtime_started` is
+// deliberately absent: it carries the REPLACEMENT's identity, and a restart that reaches the
+// `desiredState === "disconnected"` branch writes that one and nothing else -- so a watch that
+// took any identity it was handed would compare the live replacement against itself and report
+// "the runtime was not stopped" about a runtime it had just started. Selecting by phase rather
+// than by arrival order is what keeps that true no matter which branch ran.
+const LIFECYCLE_STOP_TARGET_PHASES = new Set(["draining", "idle_proven", "runtime_stopped", "destroyed"]);
+
+// Holds on to the runtime identity a lifecycle action set out to stop, and whether the stop
+// actually landed, so that a failure has something to compare the endpoint against and some
+// basis for attributing what it finds.
 export function lifecycleIdentityWatch(): {
   observe(checkpoint: unknown): void;
   identity(): RuntimeIdentity | undefined;
+  stopped(): boolean;
 } {
   let identity: RuntimeIdentity | undefined;
+  let stopped = false;
   return {
     observe(checkpoint) {
+      const phase = String((checkpoint as { phase?: unknown } | undefined)?.phase);
+      if (!LIFECYCLE_STOP_TARGET_PHASES.has(phase)) return;
+      // `destroyed` is a forced teardown by location, which recoverablePhase already treats as
+      // runtime_stopped; both mean the old runtime is gone.
+      if (phase === "runtime_stopped" || phase === "destroyed") stopped = true;
       if (identity) return;
       const value = (checkpoint as { identity?: unknown } | undefined)?.identity;
       if (value === undefined) return;
       // A daemonless endpoint checkpoints without one and an unparseable value is not a
-      // comparison anyone can make; both leave this empty, and an empty watch observes as
-      // `unobservable` rather than guessing.
+      // comparison anyone can make; both leave this empty, and an empty watch is never observed
+      // against at all -- the caller rethrows instead, leaving the older proofs to decide.
       try { identity = parseRuntimeIdentity(value); } catch { /* not a comparison we can make */ }
     },
     identity: () => identity,
+    stopped: () => stopped,
   };
+}
+
+// Applies `lifecycleFailureDisposition` against the live endpoint. Returns the error to raise
+// when the outcome was observed, "completed" when the verb's effect is on the host, and
+// `undefined` to rethrow the original -- which leaves the row to the ledger's own proofs and to
+// the reconciliation pass.
+async function decideLifecycleFailure(
+  endpointManager: EndpointManager,
+  kind: "restart" | "disconnect",
+  endpointId: string,
+  stopping: ReturnType<typeof lifecycleIdentityWatch>,
+  error: unknown,
+): Promise<AppError | "completed" | undefined> {
+  // Nothing to compare against: either the action died before checkpointing a stop target, or the
+  // endpoint is daemonless. Observing would only produce "could not be observed", which is weaker
+  // than what `isProvenNoEffect` already proves from an absent receipt -- so do not overrule it.
+  if (stopping.identity() === undefined) return undefined;
+  const decided = lifecycleFailureDisposition(
+    kind, await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity()), stopping.stopped());
+  if (decided.disposition === "completed") return "completed";
+  if (decided.disposition === "recoverable") return undefined;
+  return settledLifecycleFailure(kind, endpointId, decided.observation, error);
+}
+
+export type LifecycleFailureDisposition =
+  // The effect the verb exists to produce is on the host; report success.
+  | { disposition: "completed" }
+  // Leave it to the ledger and the reconciliation pass: the action is half-done and there is a
+  // path that finishes it, or what happened cannot be attributed to this call.
+  | { disposition: "recoverable" }
+  // Nothing is owed and nothing will come: settle it with what was seen.
+  | { disposition: "settled"; observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" | "stopped" }> };
+
+// What to do with a lifecycle action that threw, given what the endpoint turned out to be
+// carrying. The whole point of the change this belongs to is that "uncertain" must not be the
+// answer where something could be observed -- but it remains the right answer where observing
+// shows work still owed, because an unsettled row is exactly what keeps the reconciliation pass
+// coming back to finish it.
+export function lifecycleFailureDisposition(
+  kind: "restart" | "disconnect",
+  observation: EndpointLifecycleObservation,
+  stoppedRuntime: boolean,
+): LifecycleFailureDisposition {
+  // The host was reached and reported no runtime. For a restart that is a stop that landed with
+  // its start still owed; for a disconnect it is a stop that landed with the gate still open.
+  // Both are completed by recovery, and both would lose that if settled here.
+  if (observation.outcome === "stopped") return { disposition: "recoverable" };
+  if (observation.outcome === "replaced") {
+    // A different live runtime is only THIS call's doing if this call got as far as stopping the
+    // old one. Several bot instances share these endpoints and this ledger, so without that
+    // check a restart refused at its own idle proof -- provably zero effect -- would report
+    // success on the strength of a peer's restart finishing alongside it.
+    if (kind === "restart" && stoppedRuntime) return { disposition: "completed" };
+    // For a disconnect a live runtime is the opposite of the postcondition, whoever started it.
+    return { disposition: "recoverable" };
+  }
+  return { disposition: "settled", observation };
 }
 
 // The answer a failed lifecycle action owes its caller, once the endpoint has been looked at.
@@ -2600,12 +2667,13 @@ export function lifecycleIdentityWatch(): {
 // terminal, and both name what is known -- the first that the runtime is provably still up, the
 // second that it could not be reached and why.
 //
-// `replaced` is not handled here because it is not a failure: a different live runtime means the
-// stop and the start both happened, and the caller reports success instead of calling this.
+// `replaced` and `stopped` are not handled here because neither is a settled failure: see
+// `lifecycleFailureDisposition`, which routes the first to success or to recovery by attribution,
+// and the second to recovery because the host still owes the rest of the action.
 export function settledLifecycleFailure(
   kind: "restart" | "disconnect",
   endpointId: string,
-  observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" }>,
+  observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" | "stopped" }>,
   error: unknown,
 ): AppError {
   const reason = error instanceof Error ? error.message : String(error);
@@ -4675,12 +4743,11 @@ export async function buildProductionApp(
             args.force,
           );
         } catch (error) {
-          // Unlike a restart there is no replacement to find, so every observation that is not
-          // `intact` is honestly unknown -- including a different live runtime, which for a
-          // disconnect means it is still serving rather than that the work is done.
-          const observed = await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity());
-          throw settledLifecycleFailure("disconnect", endpointId,
-            observed.outcome === "replaced" ? { outcome: "unobservable", reason: "a different runtime answered" } : observed, error);
+          // A disconnect has no "completed" answer to find -- there is no replacement that would
+          // mean the work is done -- so either the endpoint was looked at and settles the row, or
+          // the row stays recoverable and the original error travels as it always did.
+          const decided = await decideLifecycleFailure(endpointManager, "disconnect", endpointId, stopping, error);
+          throw decided === undefined ? error : decided;
         }
         return { endpoint: endpointId, state: "disconnected", ...forcedLifecycleReport(outcome) };
       },
@@ -4753,15 +4820,13 @@ export async function buildProductionApp(
             args.force,
           );
         } catch (error) {
-          // The question a thrown restart leaves is answerable, so ask it instead of reporting
-          // "maybe": the endpoint either still carries the runtime this call set out to stop, or
-          // it carries a different live one, or it cannot be asked at all.
-          const observed = await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity());
-          if (observed.outcome !== "replaced") throw settledLifecycleFailure("restart", endpointId, observed, error);
-          // A different live runtime is the thing a restart exists to produce, so the stop and the
-          // start both happened and this is a success -- the throw came after them, typically from
-          // the ledger write that follows. Reported rather than swallowed: the caller is owed the
-          // fact that the call did not return cleanly, even though its effect landed.
+          const decided = await decideLifecycleFailure(endpointManager, "restart", endpointId, stopping, error);
+          if (decided !== "completed") throw decided === undefined ? error : decided;
+          // The stop and the start both landed, so the restart did the thing it exists to do and
+          // the throw came after them -- typically from the ledger write that follows. The forced
+          // account (what was destroyed, which turns were interrupted) cannot be recovered here
+          // because it travelled with the error rather than with a result; it survives as the
+          // prose `withDestroySpend` appended to the message, not as structured fields.
           outcome = {};
           completedAfterError = error instanceof Error ? error.message : String(error);
         }
