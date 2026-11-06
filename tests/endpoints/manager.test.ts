@@ -1926,3 +1926,51 @@ test("a forced restart destroys a runtime whose identity cannot be proven", asyn
   assert.equal(runtime.runtimeStops, stops + 1, "the unprovable runtime was destroyed, not abandoned");
   assert.notEqual(manager.endpointGeneration("devbox").endpoint, runtime);
 });
+
+// Observing a failed lifecycle action, which is what turns "it may have taken effect" into an
+// answer. Every case asserts the verdict AND that looking never started anything: an observation
+// that connected in order to look would be reporting on its own side effect.
+test("a lifecycle outcome is observed from the endpoint, never inferred or started", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+  const stopping = await remote.runtimeIdentity();
+  assert.ok(stopping);
+  const startsBefore = remote.starts;
+
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "intact", identity: stopping });
+
+  // The runtime the action set out to stop is gone and a different one answers: a restart that
+  // threw after this point still did the thing it exists to do.
+  remote.identityToken = "c".repeat(32);
+  const replacement = await remote.runtimeIdentity();
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "replaced", identity: replacement });
+
+  // Each way of not knowing says which one it is, instead of all of them collapsing to "maybe".
+  const noIdentity = await manager.observeLifecycleOutcome("devbox", undefined);
+  assert.equal(noIdentity.outcome, "unobservable");
+  assert.match(noIdentity.outcome === "unobservable" ? noIdentity.reason : "", /no runtime identity to compare/u);
+
+  remote.identityAvailable = false;
+  const silent = await manager.observeLifecycleOutcome("devbox", stopping);
+  assert.equal(silent.outcome, "unobservable");
+  assert.match(silent.outcome === "unobservable" ? silent.reason : "", /reported no runtime identity/u);
+
+  remote.identityAvailable = true;
+  remote.onRuntimeIdentity = () => { throw new Error("ssh channel is gone"); };
+  const unreachable = await manager.observeLifecycleOutcome("devbox", stopping);
+  assert.equal(unreachable.outcome, "unobservable");
+  assert.match(unreachable.outcome === "unobservable" ? unreachable.reason : "", /ssh channel is gone/u);
+
+  assert.equal(remote.starts, startsBefore, "observing must not start or restart anything");
+});
+
+test("an endpoint with no live runtime is unobservable rather than intact", async () => {
+  const { manager, remotes } = fixture();
+  const stopping: RuntimeIdentity = { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+  const observed = await manager.observeLifecycleOutcome("never-activated", stopping);
+  assert.equal(observed.outcome, "unobservable");
+  assert.match(observed.outcome === "unobservable" ? observed.reason : "", /holds no runtime to ask/u);
+  assert.equal(remotes.size, 0, "an absent endpoint is not connected to in order to be looked at");
+});

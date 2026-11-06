@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { AppError } from "../core/errors.ts";
+import { AppError, observedOutcome } from "../core/errors.ts";
 import { parseDirective } from "../directives/parser.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 import type { AttemptScope } from "./attempt-scope.ts";
@@ -217,7 +217,12 @@ export function createAssistantTools(
             ? error
             : new AppError("OPERATION_UNCERTAIN", `${name} terminalized before its result could be committed`);
         }
-        const uncertain = sideEffecting && !isProvenNoEffect(error, operations.get(operation.id));
+        // An observed outcome outranks every inference below it. `isProvenNoEffect` reasons from
+        // what the ledger happens to hold; a handler that went and LOOKED at the target after its
+        // call failed knows better, and says so on the error. Both of its verdicts are terminal --
+        // see ObservedOutcome for why "unknown on the host" is still an answer and not a fence.
+        const uncertain = sideEffecting && observedOutcome(error) === undefined
+          && !isProvenNoEffect(error, operations.get(operation.id));
         const failure = { message: error instanceof Error ? error.message : String(error) };
         if (uncertain) {
           operations.fail(operation.id, failure, true, context.toolFence);

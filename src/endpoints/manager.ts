@@ -12,6 +12,14 @@ import type {
 
 // What a forced lifecycle action spent. Force's justification is that the operator spends an
 // in-flight turn deliberately, so he is owed the account rather than a bare success.
+// The three answers a post-mortem look at an endpoint can give about the runtime a failed
+// lifecycle action was stopping. `replaced` and `intact` are verdicts; `unobservable` carries the
+// reason it is not one, so a caller reporting it can say why rather than say "maybe".
+export type EndpointLifecycleObservation =
+  | { outcome: "replaced"; identity: RuntimeIdentity }
+  | { outcome: "intact"; identity: RuntimeIdentity }
+  | { outcome: "unobservable"; reason: string };
+
 export interface EndpointLifecycleOutcome {
   readonly destroyed?: RuntimeDestroyReport;
   // Managed threads that were not provably idle when force destroyed the runtime. Read from the
@@ -648,6 +656,33 @@ export class EndpointManager {
   // manufactures more unresolved operations, while refusing a restart for a merely absent
   // runtime deadlocks the only repair available.
   awaitingAuthentication(id: string): boolean { return this.record(id).recoveryPause !== undefined; }
+
+  // What a failed lifecycle action actually did to the runtime it set out to stop -- read off the
+  // host, not inferred from the ledger.
+  //
+  // A restart's effect is observable in one comparison: the endpoint either still carries the
+  // identity the action was stopping, or it carries a different one, or it cannot be asked. The
+  // lifecycle verbs already checkpoint that identity as the first thing they do, so the expensive
+  // half of the comparison is on the row before anything is touched; this supplies the other half.
+  //
+  // Strictly read-only, and deliberately so. It asks the endpoint the manager already holds and
+  // never prepares or starts one: an observation that started a runtime in order to look at it
+  // would be reporting on its own side effect, and would turn every failed restart of a dead host
+  // into a connection attempt. No live endpoint is therefore `unobservable`, not `intact`.
+  async observeLifecycleOutcome(id: string, stopping: RuntimeIdentity | undefined): Promise<EndpointLifecycleObservation> {
+    if (!stopping) return { outcome: "unobservable", reason: "the action recorded no runtime identity to compare against" };
+    const endpoint = this.records.get(this.normalize(id))?.endpoint;
+    if (!endpoint) return { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" };
+    // A daemonless endpoint (local Claude) has no runtime identity at all, so it answers
+    // `undefined` here exactly as an unreachable one does. Both are honestly unobservable.
+    let identity: RuntimeIdentity | undefined;
+    try { identity = await endpoint.runtimeIdentity(); }
+    catch (error) {
+      return { outcome: "unobservable", reason: `the runtime identity could not be read: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!identity) return { outcome: "unobservable", reason: "the endpoint reported no runtime identity" };
+    return sameRuntimeIdentity(identity, stopping) ? { outcome: "intact", identity } : { outcome: "replaced", identity };
+  }
 
   onEndpoint(listener: (endpoint: ManagedAppServerEndpoint, generation: number) => void): () => void {
     this.endpointListeners.add(listener);

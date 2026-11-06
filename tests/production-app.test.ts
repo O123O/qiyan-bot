@@ -22,6 +22,8 @@ import {
   routeWorkerNativeRefresh,
   settleDeferredWorkerNativeRefreshes,
   lifecycleRecoveryExhausted,
+  lifecycleIdentityWatch,
+  settledLifecycleFailure,
   operationUnsettled,
   settleRecoveryPassVerdict,
   settleEarlierEndpointOperations,
@@ -83,7 +85,7 @@ import {
   type OperationReconciliationPass,
   type OperationRecoveryTarget,
 } from "../src/production-app.ts";
-import { AppError } from "../src/core/errors.ts";
+import { AppError, observedOutcome } from "../src/core/errors.ts";
 import type { ManagementState } from "../src/core/types.ts";
 import { ChatAdapterRegistry } from "../src/chat-apps/shared/adapter-registry.ts";
 import type { EndpointWorkLease } from "../src/endpoints/types.ts";
@@ -3911,4 +3913,44 @@ test("a batch parking sessions for different reasons does not attribute one reas
   await owner.stop();
 
   assert.deepEqual(reasons, ["mixed"], "two different reasons cannot be reported as either one");
+});
+
+// The identity a failed lifecycle action is compared against must be the one it set out to STOP.
+// A restart's last checkpoint carries the replacement instead, and comparing against that one
+// would report "the runtime was not stopped" about a runtime that had just been replaced.
+test("a lifecycle identity watch keeps the runtime the action set out to stop", () => {
+  const stopping = { kind: "ssh" as const, token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+  const replacement = { ...stopping, token: "b".repeat(32) };
+  const watch = lifecycleIdentityWatch();
+  assert.equal(watch.identity(), undefined);
+  watch.observe({ phase: "draining", identity: stopping });
+  watch.observe({ phase: "runtime_started", identity: replacement });
+  assert.deepEqual(watch.identity(), stopping);
+
+  // Nothing to compare against is left empty rather than guessed: a daemonless endpoint
+  // checkpoints without an identity, and a value that will not parse is not a comparison.
+  const empty = lifecycleIdentityWatch();
+  empty.observe({ phase: "draining" });
+  empty.observe({ phase: "draining", identity: { kind: "ssh", pid: "ten" } });
+  empty.observe(undefined);
+  assert.equal(empty.identity(), undefined);
+});
+
+test("a failed lifecycle action settles on what was observed, never on uncertainty", () => {
+  const identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 4103736, linuxStartTime: "20", processGroupId: 10 };
+  const cause = new AppError("ENDPOINT_UNAVAILABLE", "ssh exited 255");
+
+  const intact = settledLifecycleFailure("restart", "polyphe", { outcome: "intact", identity }, cause);
+  assert.equal(intact.code, "ENDPOINT_UNAVAILABLE");
+  assert.match(intact.message, /was not stopped \(pid 4103736 is still serving\): ssh exited 255/u);
+  assert.equal(observedOutcome(intact), "no_effect");
+  assert.equal(intact.cause, cause, "the original throw site must survive the rebuild");
+
+  const blind = settledLifecycleFailure("disconnect", "polyphe",
+    { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" }, cause);
+  assert.match(blind.message, /could not be observed \(the endpoint holds no runtime to ask\), so retry it or check the host/u);
+  assert.equal(observedOutcome(blind), "unknown_on_host",
+    "an unreachable endpoint is told what is unknown, and is still given a terminal answer");
+  // Neither verdict is OPERATION_UNCERTAIN: that code is what the ledger says when nothing looked.
+  assert.notEqual(blind.code, "OPERATION_UNCERTAIN");
 });

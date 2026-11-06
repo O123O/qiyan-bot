@@ -42,7 +42,7 @@ import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-cont
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { ensureWebUiToken } from "./webui/web-token.ts";
-import { AppError } from "./core/errors.ts";
+import { AppError, tagObservedOutcome } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
   createBackgroundFailureReporter,
@@ -120,7 +120,7 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointLifecycleObservation, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner, buildSshStreamArgs, type SshConnectionPlan } from "./endpoints/ssh-config.ts";
 import { runBoundedProcess } from "./endpoints/ssh-process.ts";
 import { WorkerMemoryWatch, selectWatchTargets, type MemoryScope, type WorkerMemorySample } from "./sessions/worker-memory.ts";
@@ -2564,6 +2564,67 @@ export function recoverablePhase(phase: EndpointLifecyclePhase): "draining" | "i
   return phase === "destroyed" ? "runtime_stopped" : phase;
 }
 
+// Holds on to the runtime identity a lifecycle action set out to STOP, so that a failure has
+// something to compare the endpoint against.
+//
+// The first one wins, and that is the whole point of it rather than reading the last checkpoint
+// off the row. Both verbs checkpoint `{phase, identity}` with the shutdown target before they
+// touch anything, but a restart's final `runtime_started` checkpoint carries the REPLACEMENT's
+// identity instead. Comparing against that one would match the live runtime whenever a restart
+// failed after its replacement started, and report "the runtime was not stopped" about a runtime
+// that had just been replaced -- the exact inversion of the truth.
+export function lifecycleIdentityWatch(): {
+  observe(checkpoint: unknown): void;
+  identity(): RuntimeIdentity | undefined;
+} {
+  let identity: RuntimeIdentity | undefined;
+  return {
+    observe(checkpoint) {
+      if (identity) return;
+      const value = (checkpoint as { identity?: unknown } | undefined)?.identity;
+      if (value === undefined) return;
+      // A daemonless endpoint checkpoints without one and an unparseable value is not a
+      // comparison anyone can make; both leave this empty, and an empty watch observes as
+      // `unobservable` rather than guessing.
+      try { identity = parseRuntimeIdentity(value); } catch { /* not a comparison we can make */ }
+    },
+    identity: () => identity,
+  };
+}
+
+// The answer a failed lifecycle action owes its caller, once the endpoint has been looked at.
+//
+// Never OPERATION_UNCERTAIN. "It may have taken effect" is what the ledger says when nothing went
+// and asked, and for these two verbs something can: `observeLifecycleOutcome` compares the runtime
+// the action checkpointed against the one the endpoint reports now. Both answers below are
+// terminal, and both name what is known -- the first that the runtime is provably still up, the
+// second that it could not be reached and why.
+//
+// `replaced` is not handled here because it is not a failure: a different live runtime means the
+// stop and the start both happened, and the caller reports success instead of calling this.
+export function settledLifecycleFailure(
+  kind: "restart" | "disconnect",
+  endpointId: string,
+  observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" }>,
+  error: unknown,
+): AppError {
+  const reason = error instanceof Error ? error.message : String(error);
+  const settled = observation.outcome === "intact"
+    ? tagObservedOutcome(new AppError("ENDPOINT_UNAVAILABLE",
+      `${kind} of endpoint ${endpointId} failed and its runtime was not stopped `
+      + `(pid ${observation.identity.pid} is still serving): ${reason}`, { endpoint: endpointId }), "no_effect")
+    // Terminal despite naming what it does not know. An unresolved row fences every later
+    // lifecycle action on its endpoint, and on an endpoint nobody can reach a later lifecycle
+    // action is the only move left -- so holding the row back protects nothing and removes the
+    // only repair. What stops a second runtime is the host, not this row: the runtime attests its
+    // identity there and a start refuses over a live supervised one whatever the ledger believes.
+    : tagObservedOutcome(new AppError("ENDPOINT_UNAVAILABLE",
+      `${kind} of endpoint ${endpointId} failed: ${reason}; its effect on the runtime could not be `
+      + `observed (${observation.reason}), so retry it or check the host`, { endpoint: endpointId }), "unknown_on_host");
+  // The original throw site is otherwise lost: this error's stack points here.
+  return Object.assign(settled, { cause: error });
+}
+
 export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: EndpointLifecyclePhase; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
@@ -4605,11 +4666,22 @@ export async function buildProductionApp(
         if (await settleEndpointLifecycleOrder(
           context.operationSequence, endpointId, "disconnect_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
-        const outcome = await endpointManager.disconnect(
-          endpointId,
-          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
-          args.force,
-        );
+        const stopping = lifecycleIdentityWatch();
+        let outcome: EndpointLifecycleOutcome;
+        try {
+          outcome = await endpointManager.disconnect(
+            endpointId,
+            (checkpoint) => { stopping.observe(checkpoint); context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }); },
+            args.force,
+          );
+        } catch (error) {
+          // Unlike a restart there is no replacement to find, so every observation that is not
+          // `intact` is honestly unknown -- including a different live runtime, which for a
+          // disconnect means it is still serving rather than that the work is done.
+          const observed = await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity());
+          throw settledLifecycleFailure("disconnect", endpointId,
+            observed.outcome === "replaced" ? { outcome: "unobservable", reason: "a different runtime answered" } : observed, error);
+        }
         return { endpoint: endpointId, state: "disconnected", ...forcedLifecycleReport(outcome) };
       },
       // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
@@ -4671,11 +4743,28 @@ export async function buildProductionApp(
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
-        const outcome = await endpointManager.restart(
-          endpointId,
-          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
-          args.force,
-        );
+        const stopping = lifecycleIdentityWatch();
+        let outcome: EndpointLifecycleOutcome;
+        let completedAfterError: string | undefined;
+        try {
+          outcome = await endpointManager.restart(
+            endpointId,
+            (checkpoint) => { stopping.observe(checkpoint); context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }); },
+            args.force,
+          );
+        } catch (error) {
+          // The question a thrown restart leaves is answerable, so ask it instead of reporting
+          // "maybe": the endpoint either still carries the runtime this call set out to stop, or
+          // it carries a different live one, or it cannot be asked at all.
+          const observed = await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity());
+          if (observed.outcome !== "replaced") throw settledLifecycleFailure("restart", endpointId, observed, error);
+          // A different live runtime is the thing a restart exists to produce, so the stop and the
+          // start both happened and this is a success -- the throw came after them, typically from
+          // the ledger write that follows. Reported rather than swallowed: the caller is owed the
+          // fact that the call did not return cleanly, even though its effect landed.
+          outcome = {};
+          completedAfterError = error instanceof Error ? error.message : String(error);
+        }
         // The restart is done and the endpoint is running a new runtime. Session recovery is a
         // separate thing that can fail on its own, and letting its failure poison this result
         // reported a completed restart as uncertain -- which leaves the row fencing the next
@@ -4689,6 +4778,7 @@ export async function buildProductionApp(
           state: "ready",
           sessions_restored: restored.ok,
           ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
+          ...(completedAfterError === undefined ? {} : { completed_after_error: completedAfterError }),
           ...forcedLifecycleReport(outcome),
         };
       },

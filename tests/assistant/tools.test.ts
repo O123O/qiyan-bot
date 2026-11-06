@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AppError } from "../../src/core/errors.ts";
+import { AppError, tagObservedOutcome } from "../../src/core/errors.ts";
 import { ASSISTANT_TOOL_SCHEMAS, EPHEMERAL_READ_TOOLS, TOOL_NAMES, createAssistantTools } from "../../src/assistant/tools.ts";
 import { AttemptScope } from "../../src/assistant/attempt-scope.ts";
 import { ConversationStore } from "../../src/storage/conversation-store.ts";
@@ -463,3 +463,36 @@ test("attempt-scoped safeguards feed the ordinary action path with the admitted 
   assert.equal(operations.findForCall(lease.attemptId, "call", "send_to_session")?.contextId, "guard");
   assert.equal((result as any).actualText, "exact");
 });
+
+// The third case, and the one the fence was costing: a lifecycle failure that went and LOOKED at
+// the endpoint afterwards. An observed outcome is terminal whichever way it came out, because the
+// row is no longer standing in for a question nobody asked.
+for (const outcome of ["no_effect", "unknown_on_host"] as const) {
+  test(`an observed lifecycle outcome (${outcome}) settles instead of fencing`, async () => {
+    const db = createTestDatabase();
+    const operations = new OperationStore(db);
+    operations.createSourceContext({ id: "ctx", kind: "telegram", sourceId: `observed-${outcome}`, rawText: "restart", attachmentIds: [] });
+    let calls = 0;
+    const tools = createAssistantTools(operations, {
+      restart_endpoint: async (_args, context) => {
+        calls += 1;
+        // Past the first checkpoint, so the ledger alone would call this uncertain forever.
+        context.checkpoint({ endpoint: "polyphe", phase: "idle_proven" });
+        throw tagObservedOutcome(
+          new AppError("ENDPOINT_UNAVAILABLE", "restart of endpoint polyphe failed: host unreachable"), outcome);
+      },
+    }, { maxCollectCount: 20 });
+
+    const context = { sourceContextId: "ctx", attemptId: "a", turnId: "t", callId: "first" };
+    await assert.rejects(tools.restart_endpoint(context, { endpoint: "polyphe" }), (error: unknown) =>
+      error instanceof AppError && error.code === "ENDPOINT_UNAVAILABLE" && /host unreachable/u.test(error.message));
+
+    const row = db.prepare("SELECT state FROM operations WHERE call_id = 'first'").get() as { state: string };
+    assert.equal(row.state, "failed", "an outcome that was observed is not a maybe");
+
+    // The point of settling it: the next lifecycle action is admitted rather than refused by the
+    // wreckage of the one that could not finish.
+    await assert.rejects(tools.restart_endpoint({ ...context, callId: "second" }, { endpoint: "polyphe" }), /host unreachable/u);
+    assert.equal(calls, 2, "a settled failure does not block the retry that could repair it");
+  });
+}
