@@ -1972,10 +1972,10 @@ test("an endpoint with no live runtime is unobservable rather than intact", asyn
   assert.equal(remotes.size, 0, "an absent endpoint is not connected to in order to be looked at");
 });
 
-// A daemonless endpoint never has a runtime identity, so its `undefined` means "there was never
-// anything to compare" rather than "the runtime is gone" -- and must not borrow the strength of
-// the `stopped` verdict.
-test("a daemonless endpoint is unobservable rather than reported stopped", async () => {
+// A daemonless endpoint has no runtime identity, but it is not therefore unobservable: its
+// runtime IS its connection, so its own state answers the same question. Reporting it unknown
+// would settle the row, and settling takes away the recovery that re-readies the adapter.
+test("a daemonless endpoint is observed by the connection that is its runtime", async () => {
   const { manager, remotes } = fixture();
   await manager.ensureReady("devbox");
   const remote = remotes.get("devbox");
@@ -1983,9 +1983,13 @@ test("a daemonless endpoint is unobservable rather than reported stopped", async
   const stopping = await remote.runtimeIdentity();
   assert.ok(stopping);
   remote.daemonless = true;
-  const observed = await manager.observeLifecycleOutcome("devbox", stopping);
-  assert.equal(observed.outcome, "unobservable");
-  assert.match(observed.outcome === "unobservable" ? observed.reason : "", /daemonless/u);
+
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "intact" },
+    "a connection still up is a stop that did not land, identity or no identity");
+
+  remote.state = "stopped";
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "stopped" },
+    "an abandoned connection leaves a restart one start short, which recovery completes");
 });
 
 // A forced action destroys by location and does not insist on reading an identity first, so on an

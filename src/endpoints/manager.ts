@@ -17,7 +17,9 @@ import type {
 // reason it is not one, so a caller reporting it can say why rather than say "maybe".
 export type EndpointLifecycleObservation =
   | { outcome: "replaced"; identity: RuntimeIdentity }
-  | { outcome: "intact"; identity: RuntimeIdentity }
+  // `identity` is absent for a daemonless endpoint, whose runtime IS its connection and so has
+  // none to name. The verdict is the same one: the thing the action set out to stop is still up.
+  | { outcome: "intact"; identity?: RuntimeIdentity }
   | { outcome: "stopped" }
   | { outcome: "unobservable"; reason: string };
 
@@ -682,10 +684,13 @@ export class EndpointManager {
   async observeLifecycleOutcome(id: string, stopping?: RuntimeIdentity): Promise<EndpointLifecycleObservation> {
     const endpoint = this.records.get(this.normalize(id))?.endpoint;
     if (!endpoint) return { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" };
-    // A daemonless endpoint (local Claude) has no runtime identity at all, so `undefined` from it
-    // means "there was never anything to compare" rather than "the runtime is gone". Separated
-    // here so the `stopped` verdict below can rest on the stronger reading.
-    if (endpoint.daemonless) return { outcome: "unobservable", reason: "a daemonless endpoint carries no runtime identity" };
+    // A daemonless endpoint (local Claude) has no runtime identity at all, so the comparison below
+    // cannot apply to it -- but it is not therefore unobservable. Its runtime IS its connection,
+    // and `stopEndpointRuntime` abandoning that connection is what sets `state` away from "ready".
+    // So the endpoint's own state answers the same question the identity answers for a daemon,
+    // and answering it keeps a failed Claude restart recoverable: `recoverRestart`'s daemonless
+    // branch re-readies the adapter and republishes, which settling the row would take away.
+    if (endpoint.daemonless) return endpoint.state === "ready" ? { outcome: "intact" } : { outcome: "stopped" };
     let identity: RuntimeIdentity | undefined;
     try { identity = await endpoint.runtimeIdentity(); }
     catch (error) {

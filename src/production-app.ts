@@ -2688,7 +2688,9 @@ export function settledLifecycleFailure(
   const settled = observation.outcome === "intact"
     ? tagObservedOutcome(new AppError("ENDPOINT_UNAVAILABLE",
       `${kind} of endpoint ${endpointId} failed and its runtime was not stopped `
-      + `(pid ${observation.identity.pid} is still serving): ${reason}`, { endpoint: endpointId }), "no_effect")
+      // A daemonless endpoint has no pid to name; it is still up, which is the part that matters.
+      + `(${observation.identity ? `pid ${observation.identity.pid} is` : "it is"} still serving): ${reason}`,
+      { endpoint: endpointId }), "no_effect")
     // Terminal despite naming what it does not know. An unresolved row fences every later
     // lifecycle action on its endpoint, and on an endpoint nobody can reach a later lifecycle
     // action is the only move left -- so holding the row back protects nothing and removes the

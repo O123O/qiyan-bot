@@ -4038,3 +4038,12 @@ test("only an action that checkpointed nothing is left to the ledger's own proof
   assert.equal(observedOutcome(settled as AppError), "unknown_on_host");
   assert.match((settled as AppError).message, /the ssh channel is gone/u);
 });
+
+// A daemonless endpoint reports `intact` with no identity to name. The verdict is the same one,
+// and the message has to survive the absence rather than print "pid undefined".
+test("an intact verdict without a pid still says the runtime is up", () => {
+  const settled = settledLifecycleFailure("restart", "claude-local", { outcome: "intact" },
+    new AppError("ENDPOINT_UNAVAILABLE", "adapter refused"));
+  assert.match(settled.message, /was not stopped \(it is still serving\): adapter refused/u);
+  assert.equal(observedOutcome(settled), "no_effect");
+});
