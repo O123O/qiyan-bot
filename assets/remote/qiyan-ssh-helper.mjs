@@ -467,7 +467,9 @@ async function launcherFailureDetail(paths) {
 }
 
 async function stop(value) {
-  const paths = runtimePaths(value);
+  // logind may have removed the node-local directory. A forced stop can still
+  // address its tmux namespace; startup, not teardown, recreates runtime assets.
+  const paths = runtimePaths(value, value?.force === true);
   const identity = await readIdentity(paths.identityPath);
   // A FORCED stop is addressed by location, not by identity: it destroys whatever occupies this
   // runtime directory and tmux session. Asking "is this the exact runtime I was told about?" has no

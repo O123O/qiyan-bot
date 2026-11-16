@@ -153,6 +153,42 @@ test("every shared runtime operation re-attests its XDG root", async (t) => {
   );
 });
 
+test("forced stop tolerates vanished runtime directories without recreating them", async (t) => {
+  const xdg = await mkdtemp(join(tmpdir(), "qiyan-remote-missing-"));
+  t.after(() => rm(xdg, { recursive: true, force: true }));
+  await chmod(xdg, 0o700);
+  const base = join(xdg, "qiyan-bot");
+  const runtimeDir = join(base, randomBytes(12).toString("hex"));
+  const request = { runtimeDir, session: `qiyan-${runtimeDir.slice(-24)}`, tmuxMode: "explicit" };
+  for (const missing of ["base", "leaf"]) {
+    if (missing === "leaf") await mkdir(base, { mode: 0o700 });
+    const result = await runBoundedProcess("env", [
+      `XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "stop",
+      encodeRemoteArgument(JSON.stringify({ ...request, force: true })),
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+    assert.deepEqual(parseRemoteHelperResponse(result.stdout, "stop"), {
+      stopped: true, destroyedIdentity: null, survivors: "unknown: no identity to signal from",
+    });
+    await assert.rejects(stat(runtimeDir), { code: "ENOENT" });
+    if (missing === "base") await assert.rejects(stat(base), { code: "ENOENT" });
+    await assert.rejects(runBoundedProcess("env", [
+      `XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "stop",
+      encodeRemoteArgument(JSON.stringify(request)),
+    ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }));
+  }
+  const forceStop = () => runBoundedProcess("env", [
+    `XDG_RUNTIME_DIR=${xdg}`, process.execPath, helperPath.pathname, "stop",
+    encodeRemoteArgument(JSON.stringify({ ...request, force: true })),
+  ], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+  await chmod(base, 0o755);
+  await assert.rejects(forceStop(), /invalid runtime directory|unsafe runtime directory/u);
+  await chmod(base, 0o700);
+  const outside = await mkdtemp(join(tmpdir(), "qiyan-remote-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await symlink(outside, runtimeDir);
+  await assert.rejects(forceStop(), /unsafe runtime directory/u);
+});
+
 test("an unsafe XDG replacement cannot execute cached helper bytes", async (t) => {
   const xdg = await mkdtemp(join(tmpdir(), "qiyan-trusted-helper-"));
   t.after(() => rm(xdg, { recursive: true, force: true }));
