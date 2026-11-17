@@ -658,7 +658,8 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // Bounded. Failure is silent to the reader, which behaves exactly as it did before -- but a
   // background report's republish now depends on this too, and silence there is a lost answer,
   // so a read that THREW leaves the latch open for the next caller to retry. Only a conclusive
-  // answer -- the probe worked and the thread has no findable turn -- closes it for good; one
+  // answer -- the probe worked and the thread has no findable turn, or the page budget ran out
+  // with the walk unfinished -- closes it for good; one
   // NFS stall would otherwise mute every background report on the thread for the life of the
   // process. A second caller arriving mid-read still gets `undefined` and drops its report;
   // bounded, because the one that follows finds `lastTurnId` already set.
@@ -1315,7 +1316,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // settles into `terminalTurns`, leaving `lastTurnId` on something older that never
     // produced a word of this text. Dropping it there is what this code did before adoption
     // existed; publishing it under an unrelated turn would be worse than dropping it.
-    if (!folded || absorbing === undefined || state.lastSettledTurnId !== absorbing) return;
+    //
+    // No settle recorded at all is a different thing from a mismatched one, and must not be
+    // read as one: it means nothing has settled in this process and `lastTurnId` came from the
+    // transcript seed, which is precisely the turn reconstruction folds this output into.
+    // Refusing there deleted the bucket and republished a FULL view of the older text -- a
+    // committed answer with nothing sent looking for the rest of it.
+    if (!folded || absorbing === undefined) return;
+    if (state.lastSettledTurnId !== undefined && state.lastSettledTurnId !== absorbing) return;
     const live = state.liveItems.get(absorbing) ?? { items: [], bytes: 0, overflowed: false };
     state.liveItems.set(absorbing, live);
     if (live.overflowed) return;

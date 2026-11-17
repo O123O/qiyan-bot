@@ -2836,3 +2836,50 @@ test("text absorbed after a reconciled turn is still delivered under that turn",
   assert.deepEqual(terminals.at(-1)?.items?.map((item) => item.text), ["watching", "two files failed"],
     "the answer written after the sweep is delivered, not dropped behind a full view of the old text");
 });
+
+// The seeded anchor is the third way into the same grave. Nothing has settled in this process,
+// so the fold guard has no settle to match -- and reading "no settle" as "a mismatched settle"
+// refuses adoption, deletes the folded bucket, and republishes a FULL view of the background
+// text alone. Full means the relay commits it with nothing sent looking for the rest, so the
+// user's answer is gone for good rather than merely late.
+test("a fold under a seeded anchor is adopted, not dropped as a mismatch", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-seeded", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "watch the run" } },
+    { type: "assistant", uuid: "a1", timestamp: "2026-08-01T04:02:58.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "watching" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-seeded", cwd: "/w", excludeTurns: true });
+
+  // The first report seeds the anchor from disk; the second starts speaking under it.
+  claude.emit({ type: "turn/completed", sessionId: "thread-seeded", origin: "task-notification", status: "completed", at: 3 });
+  await delay(20);
+  claude.emit({
+    type: "content/assistant", sessionId: "thread-seeded", at: 4,
+    message: { uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "first background line" }] } },
+  });
+
+  await rt.request("turn/start", {
+    threadId: "thread-seeded", clientUserMessageId: "to:web:mid", input: [{ type: "text", text: "any news?" }],
+  });
+  claude.emit({
+    type: "content/assistant", sessionId: "thread-seeded", at: 5,
+    message: { uuid: "a3", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "two files failed" }] } },
+  });
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.emit({
+    type: "turn/completed", sessionId: "thread-seeded", origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 6,
+  });
+  claude.emit({ type: "turn/completed", sessionId: "thread-seeded", origin: "task-notification", status: "completed", at: 7 });
+
+  const republished = notifications.filter((entry) => entry.method === "turn/completed")
+    .map((entry) => entry.params.turn).find((turn) => turn.id === "u1");
+  assert.deepEqual(republished?.items?.map((item: any) => item.text),
+    ["first background line", "two files failed"],
+    "the answer the user was waiting for rides out with the report, under the turn on disk");
+});
