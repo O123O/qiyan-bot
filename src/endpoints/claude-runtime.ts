@@ -301,13 +301,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // findable turn is still on disk. Dropping the report instead is the same silence a
       // stranded turn used to cause, and it lands the morning after every restart.
       //
-      // Deliberately after the fact: the seed is a bounded transcript read and this handler
-      // is synchronous, so the republish follows when the id is known. One report is still
-      // dropped by design: right after an adoption the newest transcript turn IS the epoch's
-      // baseline, which the relay ignores on purpose -- not this bug returning, and it clears
-      // as soon as one managed turn completes. A turn that starts
-      // while it reads takes the work back — it will carry this output through its own
-      // completion, which is the rule above, applied at the moment the answer is known.
+      // Deliberately after the fact: the seed is a bounded transcript read and this handler is
+      // synchronous, so the republish follows once the id is known. A turn that starts while it
+      // reads takes the work back -- it will carry this output through its own completion,
+      // which is the rule above, applied at the moment the answer is known.
+      //
+      // One report is still dropped by design: right after an adoption the newest transcript
+      // turn IS the epoch's baseline, which the relay ignores on purpose. Not this bug
+      // returning, and it clears as soon as one managed turn completes.
       void this.seedLastTurnId(threadId, state).then((seeded) => {
         if (seeded === undefined || state.running.length > 0) return;
         // The thread may have been archived or unsubscribed, or the endpoint stopped, while the
@@ -656,13 +657,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // page into a single window read.
   //
   // Bounded. Failure is silent to the reader, which behaves exactly as it did before -- but a
-  // background report's republish now depends on this too, and silence there is a lost answer,
-  // so a read that THREW leaves the latch open for the next caller to retry. Only a conclusive
-  // answer -- the probe worked and the thread has no findable turn, or the page budget ran out
-  // with the walk unfinished -- closes it for good; one
-  // NFS stall would otherwise mute every background report on the thread for the life of the
-  // process. A second caller arriving mid-read still gets `undefined` and drops its report;
-  // bounded, because the one that follows finds `lastTurnId` already set.
+  // background report's republish now depends on this too, and silence there is a lost answer.
+  // So a read that THREW leaves the latch open for the next caller to retry: one NFS stall
+  // would otherwise mute every background report on the thread for the life of the process.
+  // What closes the latch for good is an answer, conclusive or spent -- the probe worked and
+  // the thread holds no findable turn, or the page budget ran out with the walk unfinished.
+  //
+  // A second caller arriving mid-read still gets `undefined` and drops its report. Bounded,
+  // because the one after it finds `lastTurnId` already set.
   private async seedLastTurnId(threadId: string, state: ThreadState): Promise<string | undefined> {
     if (state.lastTurnIdSeeded) return undefined;
     state.lastTurnIdSeeded = true;
