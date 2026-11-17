@@ -1926,3 +1926,95 @@ test("a forced restart destroys a runtime whose identity cannot be proven", asyn
   assert.equal(runtime.runtimeStops, stops + 1, "the unprovable runtime was destroyed, not abandoned");
   assert.notEqual(manager.endpointGeneration("devbox").endpoint, runtime);
 });
+
+// Observing a failed lifecycle action, which is what turns "it may have taken effect" into an
+// answer. Every case asserts the verdict AND that looking never started anything: an observation
+// that connected in order to look would be reporting on its own side effect.
+test("a lifecycle outcome is observed from the endpoint, never inferred or started", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+  const stopping = await remote.runtimeIdentity();
+  assert.ok(stopping);
+  const startsBefore = remote.starts;
+
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "intact", identity: stopping });
+
+  // The runtime the action set out to stop is gone and a different one answers: a restart that
+  // threw after this point still did the thing it exists to do.
+  remote.identityToken = "c".repeat(32);
+  const replacement = await remote.runtimeIdentity();
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "replaced", identity: replacement });
+
+  // The host was reached and said there is no runtime: an ANSWER, not a failure to get one. An
+  // unreachable host throws instead, and lands in the catch below. Reporting this as merely
+  // unobservable would settle a restart that is one start short of done, and recovery -- the only
+  // thing that finishes it -- never looks at settled rows again.
+  remote.identityAvailable = false;
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "stopped" });
+
+  remote.identityAvailable = true;
+  remote.onRuntimeIdentity = () => { throw new Error("ssh channel is gone"); };
+  const unreachable = await manager.observeLifecycleOutcome("devbox", stopping);
+  assert.equal(unreachable.outcome, "unobservable");
+  assert.match(unreachable.outcome === "unobservable" ? unreachable.reason : "", /ssh channel is gone/u);
+
+  assert.equal(remote.starts, startsBefore, "observing must not start or restart anything");
+});
+
+test("an endpoint with no live runtime is unobservable rather than intact", async () => {
+  const { manager, remotes } = fixture();
+  const stopping: RuntimeIdentity = { kind: "ssh", token: "a".repeat(32), pid: 10, linuxStartTime: "20", processGroupId: 10 };
+  const observed = await manager.observeLifecycleOutcome("never-activated", stopping);
+  assert.equal(observed.outcome, "unobservable");
+  assert.match(observed.outcome === "unobservable" ? observed.reason : "", /holds no runtime to ask/u);
+  assert.equal(remotes.size, 0, "an absent endpoint is not connected to in order to be looked at");
+});
+
+// A daemonless endpoint has no runtime identity, but it is not therefore unobservable: its
+// runtime IS its connection, so its own state answers the same question. Reporting it unknown
+// would settle the row, and settling takes away the recovery that re-readies the adapter.
+test("a daemonless endpoint is observed by the connection that is its runtime", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+  const stopping = await remote.runtimeIdentity();
+  assert.ok(stopping);
+  remote.daemonless = true;
+
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "intact" },
+    "a connection still up is a stop that did not land, identity or no identity");
+
+  remote.state = "stopped";
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox", stopping), { outcome: "stopped" },
+    "an abandoned connection leaves a restart one start short, which recovery completes");
+});
+
+// A forced action destroys by location and does not insist on reading an identity first, so on an
+// unreachable host -- the case the whole observation path exists for -- it has no stop target to
+// offer. The two answers that matter there must still be told apart.
+test("an action with no stop target still separates an absent runtime from an unreachable host", async () => {
+  const { manager, remotes } = fixture();
+  await manager.ensureReady("devbox");
+  const remote = remotes.get("devbox");
+  assert.ok(remote);
+
+  remote.identityAvailable = false;
+  assert.deepEqual(await manager.observeLifecycleOutcome("devbox"), { outcome: "stopped" },
+    "a host that answers 'absent' is a verdict even with nothing to compare");
+
+  remote.identityAvailable = true;
+  remote.onRuntimeIdentity = () => { throw new Error("ssh channel is gone"); };
+  const unreachable = await manager.observeLifecycleOutcome("devbox");
+  assert.equal(unreachable.outcome, "unobservable");
+  assert.match(unreachable.outcome === "unobservable" ? unreachable.reason : "", /ssh channel is gone/u);
+
+  // A live runtime with no target cannot be attributed: it may be the one the action failed to
+  // stop, or the replacement it did start. Never a verdict.
+  remote.onRuntimeIdentity = undefined;
+  const live = await manager.observeLifecycleOutcome("devbox");
+  assert.equal(live.outcome, "unobservable");
+  assert.match(live.outcome === "unobservable" ? live.reason : "", /no identity to compare it with/u);
+});

@@ -12,6 +12,17 @@ import type {
 
 // What a forced lifecycle action spent. Force's justification is that the operator spends an
 // in-flight turn deliberately, so he is owed the account rather than a bare success.
+// The three answers a post-mortem look at an endpoint can give about the runtime a failed
+// lifecycle action was stopping. `replaced` and `intact` are verdicts; `unobservable` carries the
+// reason it is not one, so a caller reporting it can say why rather than say "maybe".
+export type EndpointLifecycleObservation =
+  | { outcome: "replaced"; identity: RuntimeIdentity }
+  // `identity` is absent for a daemonless endpoint, whose runtime IS its connection and so has
+  // none to name. The verdict is the same one: the thing the action set out to stop is still up.
+  | { outcome: "intact"; identity?: RuntimeIdentity }
+  | { outcome: "stopped" }
+  | { outcome: "unobservable"; reason: string };
+
 export interface EndpointLifecycleOutcome {
   readonly destroyed?: RuntimeDestroyReport;
   // Managed threads that were not provably idle when force destroyed the runtime. Read from the
@@ -648,6 +659,56 @@ export class EndpointManager {
   // manufactures more unresolved operations, while refusing a restart for a merely absent
   // runtime deadlocks the only repair available.
   awaitingAuthentication(id: string): boolean { return this.record(id).recoveryPause !== undefined; }
+
+  // What a failed lifecycle action actually did to the runtime it set out to stop -- read off the
+  // host, not inferred from the ledger.
+  //
+  // A restart's effect is observable in one comparison: the endpoint either still carries the
+  // identity the action was stopping, or it carries a different one, or it cannot be asked. The
+  // lifecycle verbs already checkpoint that identity as the first thing they do, so the expensive
+  // half of the comparison is on the row before anything is touched; this supplies the other half.
+  //
+  // It never starts, publishes or reconnects an endpoint: it asks the one the manager already
+  // holds, and an endpoint the manager holds none for is `unobservable` rather than assumed
+  // stopped. An observation that connected in order to look would be reporting on its own side
+  // effect, and would turn every failed restart of a dead host into a connection attempt. It is
+  // not, however, free of remote work: reading a legacy tmux runtime's identity re-runs
+  // `prepareRemoteHost`, because `SshRuntime.stop` drops its prepared state. That work is
+  // read-only on the host, and it is bounded only by the remote helper's own per-invoke timeout --
+  // acceptable because this runs after the lifecycle queue is released, so a hanging host delays
+  // this one tool call instead of wedging the endpoint.
+  // `stopping` is optional on purpose. A FORCED action destroys by location and deliberately does
+  // not insist on reading an identity first (see shutdownTarget), so on the very host this exists
+  // for -- an unreachable one -- it has no stop target to offer. It can still be told the two
+  // apart that matter there: a host that answers "absent" from one that cannot be reached at all.
+  async observeLifecycleOutcome(id: string, stopping?: RuntimeIdentity): Promise<EndpointLifecycleObservation> {
+    const endpoint = this.records.get(this.normalize(id))?.endpoint;
+    if (!endpoint) return { outcome: "unobservable", reason: "the endpoint holds no runtime to ask" };
+    // A daemonless endpoint (local Claude) has no runtime identity at all, so the comparison below
+    // cannot apply to it -- but it is not therefore unobservable. Its runtime IS its connection,
+    // and `stopEndpointRuntime` abandoning that connection is what sets `state` away from "ready".
+    // So the endpoint's own state answers the same question the identity answers for a daemon,
+    // and answering it keeps a failed Claude restart recoverable: `recoverRestart`'s daemonless
+    // branch re-readies the adapter and republishes, which settling the row would take away.
+    if (endpoint.daemonless) return endpoint.state === "ready" ? { outcome: "intact" } : { outcome: "stopped" };
+    let identity: RuntimeIdentity | undefined;
+    try { identity = await endpoint.runtimeIdentity(); }
+    catch (error) {
+      return { outcome: "unobservable", reason: `the runtime identity could not be read: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    // `undefined` here is an ANSWER, not a failure to get one. A runtime that cannot be reached
+    // throws, and an unhealthy one without an identity throws; only a host that was reached and
+    // reported `absent` returns nothing. So this is positive evidence that the stop landed and
+    // nothing replaced it -- a half-done restart, one start short of finished, which is precisely
+    // what the reconciliation pass exists to complete. Reporting it as merely unobservable would
+    // settle the row and take that pass away.
+    if (!identity) return { outcome: "stopped" };
+    // A live runtime with nothing to compare it against. It cannot be attributed -- it may be the
+    // one this action failed to stop, or the replacement it did start -- so it is honestly
+    // unobservable, and only the "absent" answer above gets to be a verdict without a target.
+    if (!stopping) return { outcome: "unobservable", reason: "a live runtime answered, but the action recorded no identity to compare it with" };
+    return sameRuntimeIdentity(identity, stopping) ? { outcome: "intact", identity } : { outcome: "replaced", identity };
+  }
 
   onEndpoint(listener: (endpoint: ManagedAppServerEndpoint, generation: number) => void): () => void {
     this.endpointListeners.add(listener);

@@ -42,7 +42,7 @@ import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-cont
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { ensureWebUiToken } from "./webui/web-token.ts";
-import { AppError } from "./core/errors.ts";
+import { AppError, tagObservedOutcome } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
   createBackgroundFailureReporter,
@@ -120,7 +120,7 @@ import { authorizationIncident, WeixinChatAdapter } from "./chat-apps/weixin/cha
 import { WeixinIncidentRouter } from "./chat-apps/weixin/incident-router.ts";
 import { EndpointCatalog } from "./endpoints/catalog.ts";
 import { EndpointBindingStore } from "./endpoints/binding-store.ts";
-import { EndpointManager, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
+import { EndpointManager, type EndpointLifecycleObservation, type EndpointLifecycleOutcome, type EndpointRecoveryPause } from "./endpoints/manager.ts";
 import { SshGenerationPlanner, buildSshStreamArgs, type SshConnectionPlan } from "./endpoints/ssh-config.ts";
 import { runBoundedProcess } from "./endpoints/ssh-process.ts";
 import { WorkerMemoryWatch, selectWatchTargets, type MemoryScope, type WorkerMemorySample } from "./sessions/worker-memory.ts";
@@ -2564,6 +2564,145 @@ export function recoverablePhase(phase: EndpointLifecyclePhase): "draining" | "i
   return phase === "destroyed" ? "runtime_stopped" : phase;
 }
 
+// The phases whose checkpointed identity names the runtime being STOPPED. `runtime_started` is
+// deliberately absent: it carries the REPLACEMENT's identity, and a restart that reaches the
+// `desiredState === "disconnected"` branch writes that one and nothing else -- so a watch that
+// took any identity it was handed would compare the live replacement against itself and report
+// "the runtime was not stopped" about a runtime it had just started. Selecting by phase rather
+// than by arrival order is what keeps that true no matter which branch ran.
+const LIFECYCLE_STOP_TARGET_PHASES = new Set(["draining", "idle_proven", "runtime_stopped", "destroyed"]);
+
+// Holds on to the runtime identity a lifecycle action set out to stop, and whether the stop
+// actually landed, so that a failure has something to compare the endpoint against and some
+// basis for attributing what it finds.
+export function lifecycleIdentityWatch(): {
+  observe(checkpoint: unknown): void;
+  identity(): RuntimeIdentity | undefined;
+  stopped(): boolean;
+  checkpointed(): boolean;
+} {
+  let identity: RuntimeIdentity | undefined;
+  let stopped = false;
+  let checkpointed = false;
+  return {
+    observe(checkpoint) {
+      checkpointed = true;
+      const phase = String((checkpoint as { phase?: unknown } | undefined)?.phase);
+      if (!LIFECYCLE_STOP_TARGET_PHASES.has(phase)) return;
+      // `destroyed` is a forced teardown by location, which recoverablePhase already treats as
+      // runtime_stopped; both mean the old runtime is gone.
+      if (phase === "runtime_stopped" || phase === "destroyed") stopped = true;
+      if (identity) return;
+      const value = (checkpoint as { identity?: unknown } | undefined)?.identity;
+      if (value === undefined) return;
+      // A daemonless endpoint checkpoints without one and an unparseable value is not a
+      // comparison anyone can make; both leave this empty, and an empty watch is never observed
+      // against at all -- the caller rethrows instead, leaving the older proofs to decide.
+      try { identity = parseRuntimeIdentity(value); } catch { /* not a comparison we can make */ }
+    },
+    identity: () => identity,
+    stopped: () => stopped,
+    checkpointed: () => checkpointed,
+  };
+}
+
+// Applies `lifecycleFailureDisposition` against the live endpoint. Returns the error to raise
+// when the outcome was observed, "completed" when the verb's effect is on the host, and
+// `undefined` to rethrow the original -- which leaves the row to the ledger's own proofs and to
+// the reconciliation pass.
+export async function decideLifecycleFailure(
+  endpointManager: Pick<EndpointManager, "observeLifecycleOutcome">,
+  kind: "restart" | "disconnect",
+  endpointId: string,
+  stopping: ReturnType<typeof lifecycleIdentityWatch>,
+  error: unknown,
+): Promise<AppError | "completed" | undefined> {
+  // The one thing observation must never overrule: an action that wrote NO checkpoint proves, by
+  // that absence alone, that it stopped nothing (see isProvenNoEffect). That proof is stronger
+  // than anything a look at the host could add, so leave it to it.
+  //
+  // Deliberately not keyed on a missing identity. A forced action destroys by location and may
+  // hold no identity at all, which is the normal state on an unreachable host -- the exact case
+  // this change exists for. Gating there sent it back to the fence.
+  if (!stopping.checkpointed()) return undefined;
+  const decided = lifecycleFailureDisposition(
+    kind, await endpointManager.observeLifecycleOutcome(endpointId, stopping.identity()), stopping.stopped());
+  if (decided.disposition === "completed") return "completed";
+  if (decided.disposition === "recoverable") return undefined;
+  return settledLifecycleFailure(kind, endpointId, decided.observation, error);
+}
+
+export type LifecycleFailureDisposition =
+  // The effect the verb exists to produce is on the host; report success.
+  | { disposition: "completed" }
+  // Leave it to the ledger and the reconciliation pass: the action is half-done and there is a
+  // path that finishes it, or what happened cannot be attributed to this call.
+  | { disposition: "recoverable" }
+  // Nothing is owed and nothing will come: settle it with what was seen.
+  | { disposition: "settled"; observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" | "stopped" }> };
+
+// What to do with a lifecycle action that threw, given what the endpoint turned out to be
+// carrying. The whole point of the change this belongs to is that "uncertain" must not be the
+// answer where something could be observed -- but it remains the right answer where observing
+// shows work still owed, because an unsettled row is exactly what keeps the reconciliation pass
+// coming back to finish it.
+export function lifecycleFailureDisposition(
+  kind: "restart" | "disconnect",
+  observation: EndpointLifecycleObservation,
+  stoppedRuntime: boolean,
+): LifecycleFailureDisposition {
+  // The host was reached and reported no runtime. For a restart that is a stop that landed with
+  // its start still owed; for a disconnect it is a stop that landed with the gate still open.
+  // Both are completed by recovery, and both would lose that if settled here.
+  if (observation.outcome === "stopped") return { disposition: "recoverable" };
+  if (observation.outcome === "replaced") {
+    // A different live runtime is only THIS call's doing if this call got as far as stopping the
+    // old one. Several bot instances share these endpoints and this ledger, so without that
+    // check a restart refused at its own idle proof -- provably zero effect -- would report
+    // success on the strength of a peer's restart finishing alongside it.
+    if (kind === "restart" && stoppedRuntime) return { disposition: "completed" };
+    // For a disconnect a live runtime is the opposite of the postcondition, whoever started it.
+    return { disposition: "recoverable" };
+  }
+  return { disposition: "settled", observation };
+}
+
+// The answer a failed lifecycle action owes its caller, once the endpoint has been looked at.
+//
+// Never OPERATION_UNCERTAIN. "It may have taken effect" is what the ledger says when nothing went
+// and asked, and for these two verbs something can: `observeLifecycleOutcome` compares the runtime
+// the action checkpointed against the one the endpoint reports now. Both answers below are
+// terminal, and both name what is known -- the first that the runtime is provably still up, the
+// second that it could not be reached and why.
+//
+// `replaced` and `stopped` are not handled here because neither is a settled failure: see
+// `lifecycleFailureDisposition`, which routes the first to success or to recovery by attribution,
+// and the second to recovery because the host still owes the rest of the action.
+export function settledLifecycleFailure(
+  kind: "restart" | "disconnect",
+  endpointId: string,
+  observation: Exclude<EndpointLifecycleObservation, { outcome: "replaced" | "stopped" }>,
+  error: unknown,
+): AppError {
+  const reason = error instanceof Error ? error.message : String(error);
+  const settled = observation.outcome === "intact"
+    ? tagObservedOutcome(new AppError("ENDPOINT_UNAVAILABLE",
+      `${kind} of endpoint ${endpointId} failed and its runtime was not stopped `
+      // A daemonless endpoint has no pid to name; it is still up, which is the part that matters.
+      + `(${observation.identity ? `pid ${observation.identity.pid} is` : "it is"} still serving): ${reason}`,
+      { endpoint: endpointId }), "no_effect")
+    // Terminal despite naming what it does not know. An unresolved row fences every later
+    // lifecycle action on its endpoint, and on an endpoint nobody can reach a later lifecycle
+    // action is the only move left -- so holding the row back protects nothing and removes the
+    // only repair. What stops a second runtime is the host, not this row: the runtime attests its
+    // identity there and a start refuses over a live supervised one whatever the ledger believes.
+    : tagObservedOutcome(new AppError("ENDPOINT_UNAVAILABLE",
+      `${kind} of endpoint ${endpointId} failed: ${reason}; its effect on the runtime could not be `
+      + `observed (${observation.reason}), so retry it or check the host`, { endpoint: endpointId }), "unknown_on_host");
+  // The original throw site is otherwise lost: this error's stack points here.
+  return Object.assign(settled, { cause: error });
+}
+
 export function parseEndpointLifecycleCheckpoint(value: unknown): { endpoint: string; phase: EndpointLifecyclePhase; identity?: RuntimeIdentity } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
@@ -4605,11 +4744,21 @@ export async function buildProductionApp(
         if (await settleEndpointLifecycleOrder(
           context.operationSequence, endpointId, "disconnect_endpoint", context.signal, args.force,
         ) === "satisfied") return { endpoint: endpointId, state: "disconnected" };
-        const outcome = await endpointManager.disconnect(
-          endpointId,
-          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
-          args.force,
-        );
+        const stopping = lifecycleIdentityWatch();
+        let outcome: EndpointLifecycleOutcome;
+        try {
+          outcome = await endpointManager.disconnect(
+            endpointId,
+            (checkpoint) => { stopping.observe(checkpoint); context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }); },
+            args.force,
+          );
+        } catch (error) {
+          // A disconnect has no "completed" answer to find -- there is no replacement that would
+          // mean the work is done -- so either the endpoint was looked at and settles the row, or
+          // the row stays recoverable and the original error travels as it always did.
+          const decided = await decideLifecycleFailure(endpointManager, "disconnect", endpointId, stopping, error);
+          throw decided === undefined ? error : decided;
+        }
         return { endpoint: endpointId, state: "disconnected", ...forcedLifecycleReport(outcome) };
       },
       // Re-enters recovery for an endpoint's managed sessions without stopping its runtime. This
@@ -4671,11 +4820,26 @@ export async function buildProductionApp(
         ) === "satisfied") return { endpoint: endpointId, state: "ready" };
         // Daemonless (Claude) endpoints go through the same restart flow; the manager skips the
         // runtime-identity drain/shutdown for them (see EndpointManager.shutdownTarget).
-        const outcome = await endpointManager.restart(
-          endpointId,
-          (checkpoint) => context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }),
-          args.force,
-        );
+        const stopping = lifecycleIdentityWatch();
+        let outcome: EndpointLifecycleOutcome;
+        let completedAfterError: string | undefined;
+        try {
+          outcome = await endpointManager.restart(
+            endpointId,
+            (checkpoint) => { stopping.observe(checkpoint); context.checkpoint({ endpoint: endpointId, ...(checkpoint as object) }); },
+            args.force,
+          );
+        } catch (error) {
+          const decided = await decideLifecycleFailure(endpointManager, "restart", endpointId, stopping, error);
+          if (decided !== "completed") throw decided === undefined ? error : decided;
+          // The stop and the start both landed, so the restart did the thing it exists to do and
+          // the throw came after them -- typically from the ledger write that follows. The forced
+          // account (what was destroyed, which turns were interrupted) cannot be recovered here
+          // because it travelled with the error rather than with a result; it survives as the
+          // prose `withDestroySpend` appended to the message, not as structured fields.
+          outcome = {};
+          completedAfterError = error instanceof Error ? error.message : String(error);
+        }
         // The restart is done and the endpoint is running a new runtime. Session recovery is a
         // separate thing that can fail on its own, and letting its failure poison this result
         // reported a completed restart as uncertain -- which leaves the row fencing the next
@@ -4689,6 +4853,7 @@ export async function buildProductionApp(
           state: "ready",
           sessions_restored: restored.ok,
           ...(restored.ok ? {} : { sessions_restored_error: restored.reason }),
+          ...(completedAfterError === undefined ? {} : { completed_after_error: completedAfterError }),
           ...forcedLifecycleReport(outcome),
         };
       },
