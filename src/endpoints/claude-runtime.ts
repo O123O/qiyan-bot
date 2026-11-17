@@ -305,6 +305,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // unanswered. `lastTurnId` deliberately stays on the absorbing turn, which is the findable
     // one and the one a background task's report must republish.
     if (event.folded) {
+      // Text produced while the absorbing turn ran is keyed on `running[0]`, which is that
+      // turn whenever a human send absorbed it -- the fold sits BEHIND the head. A turn
+      // answering a `<task-notification>` row has no entry of its own, so the folded send IS
+      // the head and the answer accumulated against it instead. Hand it to the turn that
+      // really produced it, which is the one the notification's terminal republishes and the
+      // one reconstruction folds these rows into: the alternative drops a delivered answer on
+      // the floor here, the exact silence this fold handling exists to end.
+      this.adoptFoldedItems(state, turnId);
       this.emitter.emit("notification", "turn/completed", {
         threadId,
         turn: { id: turnId, status: "completed", itemsView: "full", items: [], folded: true },
@@ -1235,6 +1243,32 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       return;
     }
     live.items.push(item);
+  }
+
+  // A no-op in every fold but that one: a send folded into a HUMAN turn sits behind it in
+  // `running`, so the head collected the text and the folded bucket is empty.
+  //
+  // Move what a folded send collected onto the turn that absorbed it, and drop the folded
+  // bucket either way -- nothing may be published under an id no transcript holds. An
+  // overflow on either side stays an overflow: it means the live view is already incomplete,
+  // and the terminal must fall back to the transcript rather than deliver a partial answer as
+  // a full one. Without a turn to adopt them, the items go: the send's own terminal is
+  // explicitly empty, and the transcript still holds the rows for a history read.
+  private adoptFoldedItems(state: ThreadState, foldedTurnId: string): void {
+    const folded = state.liveItems.get(foldedTurnId);
+    state.liveItems.delete(foldedTurnId);
+    const absorbing = state.lastTurnId;
+    if (!folded || absorbing === undefined || absorbing === foldedTurnId) return;
+    const live = state.liveItems.get(absorbing) ?? { items: [], bytes: 0, overflowed: false };
+    state.liveItems.set(absorbing, live);
+    if (live.overflowed) return;
+    if (folded.overflowed || live.bytes + folded.bytes > LIVE_TURN_ITEM_BYTES) {
+      live.overflowed = true;
+      live.items = [];
+      return;
+    }
+    live.bytes += folded.bytes;
+    live.items.push(...folded.items);
   }
 
   // Announce the turn now executing. Called when a send is accepted into an empty queue,

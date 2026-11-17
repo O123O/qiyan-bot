@@ -2674,3 +2674,50 @@ test("a turn larger than the exact window pages past itself instead of failing t
   }
   assert.ok(seen.includes("older"), `expected the older turn to remain readable, saw ${JSON.stringify(seen)}`);
 });
+
+// The other half of that silence. A send folded into a HUMAN turn sits behind it, so the
+// absorbing turn is `running[0]` and collects the answer text itself. A turn answering a
+// `<task-notification>` row has no entry at all, so the folded send is the head and the text
+// accumulated against a turn id no transcript will ever hold. Settling it as terminal-and-empty
+// without moving that text drops the answer the user was waiting for.
+test("text absorbed by a background turn is delivered under the turn that produced it", async () => {
+  const claude = new FakeClaude();
+  const runtime = makeRuntime(claude);
+  await runtime.start();
+  const { thread } = await runtime.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:first",
+    input: [{ type: "text", text: "babysit the test run" }],
+  });
+  claude.reply(thread.id, "watching now");
+  claude.settleTurn(thread.id, "to:web:first", "completed");
+
+  // The user speaks while a background report is being answered: accepted, then folded.
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:mid",
+    input: [{ type: "text", text: "did you receive my message?" }],
+  });
+  const notifications: Array<{ method: string; params: any }> = [];
+  runtime.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.reply(thread.id, "yes -- three files failed, none from the merge");
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 9,
+  });
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification",
+    status: "completed", at: 10,
+  });
+
+  const terminals = notifications.filter((entry) => entry.method === "turn/completed").map((entry) => entry.params.turn);
+  assert.deepEqual(terminals[0], { id: "to:web:mid", status: "completed", itemsView: "full", items: [], folded: true });
+  assert.equal(terminals[1]?.id, "to:web:first", "the report republishes the findable turn");
+  assert.deepEqual(
+    terminals[1]?.items?.map((item: any) => item.text),
+    ["watching now", "yes -- three files failed, none from the merge"],
+    "carrying the answer the folded send collected, instead of leaving it on a phantom turn",
+  );
+});

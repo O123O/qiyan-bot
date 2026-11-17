@@ -502,3 +502,38 @@ for (const kind of nonHumanOrigins) {
     session.close();
   });
 }
+
+// Measured in production, on a worker babysitting a test run through Monitor notifications:
+// the user's message landed while a `<task-notification>` turn was running, Claude absorbed it
+// into that turn ("remove ... reason=absorbed_mid_turn"), and the task-notification result
+// returned here without sweeping it. The send sat in flight forever; the runtime suppresses a
+// background report while a turn is running, so the session went silent for two hours and five
+// end-of-turns while the user kept asking whether it had received anything.
+test("a send absorbed into a task-notification turn is settled by that turn's result", async () => {
+  const { session, query, events } = makeSession();
+  query.push({ type: "system", subtype: "task_started", task_id: "task-1" });
+  await delay(5);
+  // Sent while the background turn is running, so Claude folds it into that turn.
+  session.send("uuid-mid", "did you receive my message?");
+  await delay(5);
+  assert.equal(session.status().activity, "working");
+
+  query.push({
+    type: "result", subtype: "success", is_error: false, result: "answered both",
+    origin: { kind: "task-notification" },
+  });
+  await delay(5);
+
+  const completed = events.filter((event) => event.type === "turn/completed") as any[];
+  assert.deepEqual(
+    completed.map((event) => [event.origin, event.uuid, event.folded ?? false]),
+    [["human", "uuid-mid", true], ["task-notification", undefined, false]],
+    "the folded send is settled FIRST, so the report that carries its answer is not suppressed behind it",
+  );
+  assert.deepEqual(session.status().inFlightTurns, [], "and nothing is left in flight to strand the session");
+
+  query.push({ type: "system", subtype: "task_notification", task_id: "task-1", status: "completed" });
+  await delay(5);
+  assert.equal(session.status().activity, "idle");
+  session.close();
+});

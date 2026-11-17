@@ -27,7 +27,7 @@ import {
 
 export const REMOTE_HELPER_SHA256 = "75b0566fe9ea30f76b048be88e558911383cbeb5aec1c03a640a4ea8648951f1";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
-export const REMOTE_CLAUDE_HOST_SHA256 = "a5bdc2580d647d2b3d82ae74aa1f9444a8b98e77c4a06785a6f2ec964daa13b9";
+export const REMOTE_CLAUDE_HOST_SHA256 = "05bbf1ff5c90c331e4835124b4984d36c79f1fa6fcfce812bb37f84bd590eb2b";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
 // Shared by both proxies, which are the same kind of channel and have no reason to diverge.
 // maxPreludeBytes is spent twice over: as a one-shot budget for startup output, and after
