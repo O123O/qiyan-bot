@@ -302,14 +302,22 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // stranded turn used to cause, and it lands the morning after every restart.
       //
       // Deliberately after the fact: the seed is a bounded transcript read and this handler
-      // is synchronous, so the republish follows when the id is known. A turn that starts
+      // is synchronous, so the republish follows when the id is known. One report is still
+      // dropped by design: right after an adoption the newest transcript turn IS the epoch's
+      // baseline, which the relay ignores on purpose -- not this bug returning, and it clears
+      // as soon as one managed turn completes. A turn that starts
       // while it reads takes the work back — it will carry this output through its own
       // completion, which is the rule above, applied at the moment the answer is known.
       void this.seedLastTurnId(threadId, state).then((seeded) => {
         if (seeded === undefined || state.running.length > 0) return;
+        // The thread may have been archived or unsubscribed, or the endpoint stopped, while the
+        // read ran: publishing into that is noise the relay would have to drop.
+        if (this.threads.get(threadId) !== state) return;
+        // A turn that completed inside the read window is newer than the row the seed found,
+        // and reconstruction folds this output into THAT turn.
         this.emitter.emit("notification", "turn/completed", {
           threadId,
-          turn: this.terminalTurnPayload(state, seeded, "completed"),
+          turn: this.terminalTurnPayload(state, state.lastTurnId ?? seeded, "completed"),
         });
       }, () => undefined);
       return;
@@ -647,7 +655,13 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // the reader would have done on every page anyway. Paying it once per thread turns every later
   // page into a single window read.
   //
-  // Bounded, and failure is silent: without an id the reader behaves exactly as it did before.
+  // Bounded. Failure is silent to the reader, which behaves exactly as it did before -- but a
+  // background report's republish now depends on this too, and silence there is a lost answer,
+  // so a read that THREW leaves the latch open for the next caller to retry. Only a conclusive
+  // answer -- the probe worked and the thread has no findable turn -- closes it for good; one
+  // NFS stall would otherwise mute every background report on the thread for the life of the
+  // process. A second caller arriving mid-read still gets `undefined` and drops its report;
+  // bounded, because the one that follows finds `lastTurnId` already set.
   private async seedLastTurnId(threadId: string, state: ThreadState): Promise<string | undefined> {
     if (state.lastTurnIdSeeded) return undefined;
     state.lastTurnIdSeeded = true;
@@ -659,12 +673,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         sortDirection: "desc",
         itemsView: "notLoaded",
       }).catch(() => undefined);
-      const found = probe?.data[0]?.id;
+      if (probe === undefined) {
+        delete state.lastTurnIdSeeded;
+        return undefined;
+      }
+      const found = probe.data[0]?.id;
       if (found !== undefined) {
-        state.lastTurnId = found;
+        // A turn that settled WHILE this read ran is newer than anything the read saw, and it
+        // is the one live and history now agree on. Never walk the anchor backwards onto an
+        // older row: the tail attribution and the relay's durable cursor both follow it.
+        if (state.lastTurnId === undefined) state.lastTurnId = found;
         return found;
       }
-      if (!probe?.nextCursor) return undefined;
+      if (!probe.nextCursor) return undefined;
       cursor = probe.nextCursor;
     }
     return undefined;
@@ -793,6 +814,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     for (const turnId of settled) {
       state.materialized = true;
       state.lastTurnId = turnId;
+      state.lastSettledTurnId = turnId;
       // Republish the terminal rather than dropping it silently: the answer this turn produced
       // is still on disk, and this is the only thing that will ever deliver it.
       this.emitter.emit("notification", "turn/completed", {
@@ -989,6 +1011,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     state.running = state.running.filter((id) => id !== clientId);
     state.materialized = true;
     state.lastTurnId = clientId;
+    state.lastSettledTurnId = clientId;
     this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
     return { turn: { id: clientId, status: "completed" } };
   }

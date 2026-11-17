@@ -2795,3 +2795,44 @@ test("a fold settled after an interrupted turn does not hand its text to an olde
   assert.deepEqual(republished?.items?.map((item: any) => item.text), ["first answer"],
     "the older turn carries only what it produced");
 });
+
+// The reconcile sweep settles a turn whose completion was lost, and that turn is then the one
+// a background report folds into. Guarding adoption on "the turn that just ran" has to count
+// that settle too: refusing it deletes the folded bucket while the swept turn still has a live
+// one, so the republished terminal is a FULL view carrying only the old text -- the relay
+// commits it without a transcript scan and the background answer is destroyed outright.
+test("text absorbed after a reconciled turn is still delivered under that turn", async (t) => {
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, staleTurnSweepMs: 10 });
+  await rt.start();
+  t.after(() => rt.closeConnection());
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const terminals: Array<{ id: string; items?: Array<{ text: string }> }> = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/completed") terminals.push((params as any).turn);
+  });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:lost", input: [{ type: "text", text: "watch it" }],
+  });
+  claude.reply(thread.id, "watching");
+  claude.loseCompletion(thread.id, "to:web:lost");
+  for (let waited = 0; waited < 100 && !terminals.some((turn) => turn.id === "to:web:lost"); waited += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:mid", input: [{ type: "text", text: "any news?" }],
+  });
+  claude.reply(thread.id, "two files failed");
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 9,
+  });
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification", status: "completed", at: 10,
+  });
+  assert.deepEqual(terminals.filter((turn) => turn.id === "to:web:lost").length, 2,
+    "the sweep's terminal, then the background report republished under the same turn");
+  assert.deepEqual(terminals.at(-1)?.items?.map((item) => item.text), ["watching", "two files failed"],
+    "the answer written after the sweep is delivered, not dropped behind a full view of the old text");
+});

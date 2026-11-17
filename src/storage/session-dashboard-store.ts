@@ -217,6 +217,9 @@ export class SessionDashboardStore {
         ? undefined
         : LastWorkerEventSchema.parse(JSON.parse(String(row.last_worker_event_json)));
       if (parsed.message_id === null || parsed.message_id === recorded?.message_id) return false;
+      // A backlog re-commit can hand back an EARLIER final message of the same turn with a
+      // fresh observation time. Different is not newer, so require both.
+      if (recorded && Date.parse(parsed.at) < Date.parse(recorded.at)) return false;
     }
     const observedAt = Date.parse(parsed.at);
     this.db.prepare(`UPDATE session_dashboard_facts SET last_worker_event_json = ?, last_worker_turn_ordinal = ?,

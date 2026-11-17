@@ -537,3 +537,30 @@ test("a send absorbed into a task-notification turn is settled by that turn's re
   assert.equal(session.status().activity, "idle");
   session.close();
 });
+
+// The sweep reports a folded send `completed` even when the result that ended its turn
+// FAILED, exactly as the human path does: the send was answered inside that turn, and what
+// failed is the turn, which is reported on its own terminal. One `subtype` away from silently
+// flipping, so it is pinned here.
+test("a failed task-notification result still sweeps, and reports the fold completed", async () => {
+  const { session, query, events } = makeSession();
+  query.push({ type: "system", subtype: "task_started", task_id: "task-1" });
+  await delay(5);
+  session.send("uuid-mid", "status?");
+  await delay(5);
+
+  query.push({
+    type: "result", subtype: "error_during_execution", is_error: true,
+    origin: { kind: "task-notification" },
+  });
+  await delay(5);
+
+  const completed = events.filter((event) => event.type === "turn/completed") as any[];
+  assert.deepEqual(
+    completed.map((event) => [event.origin, event.status]),
+    [["human", "completed"], ["task-notification", "failed"]],
+    "the turn's failure is its own; the send it absorbed was still answered",
+  );
+  assert.deepEqual(session.status().inFlightTurns, [], "and a failed result strands nothing either");
+  session.close();
+});
