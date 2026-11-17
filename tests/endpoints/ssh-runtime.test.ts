@@ -499,6 +499,57 @@ test("reuses a healthy detached runtime and changes identity only after replacem
   assert.notDeepEqual(await runtime.runtimeIdentity(), first);
 });
 
+test("rebootstraps cached explicit state before starting after runtime files disappear", async () => {
+  const remote = new NamespaceRemote();
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  await runtime.ensureStarted();
+  remote.sharedStatus = "absent";
+  const before = remote.calls.length;
+
+  await runtime.ensureStarted();
+
+  const calls = remote.calls.slice(before).map((call) => call.operation);
+  assert.equal(calls.filter((operation) => operation === "bootstrap").length, 1);
+  assert.ok(calls.indexOf("bootstrap") < calls.indexOf("start"));
+});
+
+test("forced stop invalidates cached preparation before replacement startup", async () => {
+  const remote = new NamespaceRemote();
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  const identity = await runtime.ensureStarted();
+  await runtime.stop(identity, true);
+  const before = remote.calls.length;
+
+  await runtime.ensureStarted();
+
+  const calls = remote.calls.slice(before).map((call) => call.operation);
+  assert.equal(calls.filter((operation) => operation === "bootstrap").length, 1);
+  assert.ok(calls.indexOf("bootstrap") < calls.indexOf("start"));
+});
+
+test("rebootstrap leaves the legacy migration retry available", async () => {
+  class ReclaimableRemote extends NamespaceRemote {
+    override async invoke<T>(operation: string, args: readonly string[], helperPath?: string): Promise<T> {
+      const result = await super.invoke<T>(operation, args, helperPath);
+      if (operation === "inspect" && JSON.parse(args[0] ?? "{}").tmuxMode === "legacy") {
+        return { ...result, supervised: false };
+      }
+      return result;
+    }
+  }
+  const remote = new ReclaimableRemote();
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  await runtime.ensureStarted();
+  remote.sharedStatus = "absent";
+  remote.legacyStatus = "unhealthy";
+
+  await runtime.ensureStarted();
+
+  assert.equal(remote.legacyStatus, "absent");
+  assert.equal(remote.sharedStatus, "healthy");
+  assert.equal(remote.calls.filter((call) => call.operation === "start").length, 2);
+});
+
 test("reuses a healthy legacy runtime without duplication and moves to shared XDG state after exact stop", async () => {
   const remote = new NamespaceRemote();
   remote.legacyStatus = "healthy";

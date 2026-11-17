@@ -25,7 +25,7 @@ import {
   type RuntimeIdentity,
 } from "./types.ts";
 
-export const REMOTE_HELPER_SHA256 = "c4a484ea1c4b818336a85939f15ea785ba8bb9841e7f6d6ec5a08d86c267578d";
+export const REMOTE_HELPER_SHA256 = "75b0566fe9ea30f76b048be88e558911383cbeb5aec1c03a640a4ea8648951f1";
 export const REMOTE_LAUNCHER_SHA256 = "315bf0e4f68ba7b1ba77f78c31590beff2e14b2ab75e9aef00ad0174232849d9";
 export const REMOTE_CLAUDE_HOST_SHA256 = "a5bdc2580d647d2b3d82ae74aa1f9444a8b98e77c4a06785a6f2ec964daa13b9";
 export const REMOTE_CLAUDE_HOST_LAUNCHER_SHA256 = "a90315d1675a9b796a64bb3a4d64b2619b5e414b6a80155f426d51123c92d1a2";
@@ -266,10 +266,17 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
   }
   get remote(): RemoteRuntimeClient { return this.options.remote; }
 
-  async ensureStarted(retried = false): Promise<RuntimeIdentity> {
+  async ensureStarted(retried = false, rebootstrapped = false): Promise<RuntimeIdentity> {
     let redirected = false;
+    const cached = this.prepared !== undefined;
     const prepared = await this.prepare();
     const current = await this.inspectPrepared(prepared);
+    // Cached host facts outlive /run/user (and can outlive the login node).
+    // Re-run the normal attested bootstrap before replacing a vanished runtime.
+    if (cached && current.status === "absent" && prepared.tmuxMode === "explicit" && !rebootstrapped) {
+      delete this.prepared;
+      return this.ensureStarted(retried, true);
+    }
     // Captured on BOTH paths. `start` is skipped entirely for a runtime that is already healthy,
     // so `inspect` has to carry the token too or a reconnect to a live WebSocket generation would
     // have no credential to present.
@@ -329,7 +336,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // case nobody has thought of cannot turn into a stack overflow.
       if (retried) throw new AppError("ENDPOINT_UNAVAILABLE", `SSH runtime could not be prepared: ${this.options.endpointId}`);
       delete this.prepared;
-      return this.ensureStarted(true);
+      return this.ensureStarted(true, rebootstrapped);
     }
     const result = await this.options.remote.invoke<{ identity: unknown; token?: unknown }>("start", [JSON.stringify({
       runtimeDir: prepared.runtimeDir,
@@ -388,7 +395,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       expected: expectedIdentity,
       ...(force ? { force: true } : {}),
     })], prepared.host.remoteHelperPath);
-    if (prepared.tmuxMode === "legacy") delete this.prepared;
+    if (force || prepared.tmuxMode === "legacy") delete this.prepared;
     return parseRuntimeDestroyReport(reported);
   }
 
