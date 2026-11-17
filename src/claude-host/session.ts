@@ -452,8 +452,40 @@ export class ClaudeHostSession {
 
     // A task-notification result belongs to a background task, not to any accepted
     // send. It is still a top-level end-of-turn and is delivered, but it must never
-    // settle a human turn.
+    // settle a human turn ON ITS OWN UUID -- it carries none.
+    //
+    // It does end the turn it reports in, and a turn answering a `<task-notification>` row
+    // ABSORBS sends exactly as a human turn does: Claude pulls a send that arrives while it
+    // runs out of the queue and answers it inside the running turn, whatever started that
+    // turn. Measured on a session babysitting a test run through Monitor notifications:
+    //   18:58:57 enqueue "did you receive my message, what is nvfp4_quant_algo?"
+    //   18:58:58 remove   reason=absorbed_mid_turn  commandUuid=to:web:21ff8abc-…
+    // Returning here without sweeping left that send in flight forever. Worse than the
+    // strand itself is what a non-empty in-flight set does to the report: the runtime
+    // suppresses a task-notification terminal while a turn is running, because a running
+    // turn carries the folded output through its own completion -- and that turn never
+    // completes. The session went MUTE, two hours and five end-of-turns, while the user
+    // watched messages land and nothing come back.
+    //
+    // Everything in flight when this result lands was queued while the turn it ends was
+    // running, so it was folded into it. Settle the lot, and settle it BEFORE the
+    // notification's own terminal: emptying the in-flight set is what lets that terminal
+    // through. Same trade as the human path for a send accepted in the window between the
+    // SDK emitting this result and the host consuming it -- it reads folded for one turn,
+    // and its own result then arrives naming a turn no longer in flight and is delivered as
+    // uncorrelated, republishing the terminal that carries its text.
     if (isTaskNotification) {
+      for (const turn of this.inFlight.splice(0)) {
+        this.emit({
+          type: "turn/completed",
+          sessionId: this.sessionId,
+          origin: "human",
+          status: "completed",
+          folded: true,
+          uuid: turn.uuid,
+          at: this.now(),
+        });
+      }
       this.emit({
         type: "turn/completed",
         sessionId: this.sessionId,

@@ -405,6 +405,17 @@ var ClaudeHostSession = class {
     const isTaskNotification = origin.kind === "task-notification";
     const failed = message.subtype !== "success";
     if (isTaskNotification) {
+      for (const turn of this.inFlight.splice(0)) {
+        this.emit({
+          type: "turn/completed",
+          sessionId: this.sessionId,
+          origin: "human",
+          status: "completed",
+          folded: true,
+          uuid: turn.uuid,
+          at: this.now()
+        });
+      }
       this.emit({
         type: "turn/completed",
         sessionId: this.sessionId,

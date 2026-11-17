@@ -416,11 +416,15 @@ export class EventRelay {
     const messages = this.finals.persistTerminalTurn(target.endpointId, target.threadId, turn, this.options.clock.now());
     const eventId = `terminal:${target.endpointId}:${target.threadId}:${turn.id}`;
     // A folded send is settled, not reported. It was answered inside the turn that absorbed
-    // it, so it is not a worker event: observing it mints a turn ordinal ABOVE the absorbing
-    // turn's -- it is first seen here, never at turn/started -- and the dashboard then takes
-    // it as the worker's last event and REJECTS the real terminal that follows on the lower
-    // ordinal. The manager would read a phantom turn id with no final message precisely when
-    // the user steered mid-turn.
+    // it, so it is not a worker event, and the manager must never read a phantom turn id with
+    // no final message precisely when the user steered mid-turn.
+    //
+    // The ordinal reasoning this once carried is no longer the reason. A folded send is NOT
+    // always first seen here: one folded into a turn answering a `<task-notification>` row is
+    // accepted into an empty `running` and does get a turn/started, so its ordinal exists
+    // already. And the dashboard no longer rejects the absorbing turn's own terminal on the
+    // lower ordinal -- it compares the final message on an equal one. The rule stands on the
+    // simpler fact: a send with no turn of its own cannot be the worker's latest word.
     if (!turn.folded) await this.options.onTerminal?.({
       endpointId: target.endpointId,
       threadId: target.threadId,

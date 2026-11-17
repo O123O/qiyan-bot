@@ -2674,3 +2674,212 @@ test("a turn larger than the exact window pages past itself instead of failing t
   }
   assert.ok(seen.includes("older"), `expected the older turn to remain readable, saw ${JSON.stringify(seen)}`);
 });
+
+// The other half of that silence. A send folded into a HUMAN turn sits behind it, so the
+// absorbing turn is `running[0]` and collects the answer text itself. A turn answering a
+// `<task-notification>` row has no entry at all, so the folded send is the head and the text
+// accumulated against a turn id no transcript will ever hold. Settling it as terminal-and-empty
+// without moving that text drops the answer the user was waiting for.
+test("text absorbed by a background turn is delivered under the turn that produced it", async () => {
+  const claude = new FakeClaude();
+  const runtime = makeRuntime(claude);
+  await runtime.start();
+  const { thread } = await runtime.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:first",
+    input: [{ type: "text", text: "babysit the test run" }],
+  });
+  claude.reply(thread.id, "watching now");
+  claude.settleTurn(thread.id, "to:web:first", "completed");
+
+  // The user speaks while a background report is being answered: accepted, then folded.
+  await runtime.request("turn/start", {
+    threadId: thread.id,
+    clientUserMessageId: "to:web:mid",
+    input: [{ type: "text", text: "did you receive my message?" }],
+  });
+  const notifications: Array<{ method: string; params: any }> = [];
+  runtime.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.reply(thread.id, "yes -- three files failed, none from the merge");
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 9,
+  });
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification",
+    status: "completed", at: 10,
+  });
+
+  const terminals = notifications.filter((entry) => entry.method === "turn/completed").map((entry) => entry.params.turn);
+  assert.deepEqual(terminals[0], { id: "to:web:mid", status: "completed", itemsView: "full", items: [], folded: true });
+  assert.equal(terminals[1]?.id, "to:web:first", "the report republishes the findable turn");
+  assert.deepEqual(
+    terminals[1]?.items?.map((item: any) => item.text),
+    ["watching now", "yes -- three files failed, none from the merge"],
+    "carrying the answer the folded send collected, instead of leaving it on a phantom turn",
+  );
+});
+
+// `lastTurnId` is only ever set by watching a turn settle in THIS process. After a restart
+// that reattached a session -- or on any thread whose turns all predate the process -- a
+// background report had no id to republish and was dropped, which is the same silence a
+// stranded turn causes, arriving the morning after every restart. The findable turn is on disk.
+test("a background report with no remembered turn seeds the findable one from the transcript", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-restarted", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "watch the run" } },
+    { type: "assistant", uuid: "a1", timestamp: "2026-08-01T04:02:58.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "watching" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-restarted", cwd: "/w", excludeTurns: true });
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+
+  claude.emit({
+    type: "turn/completed", sessionId: "thread-restarted", origin: "task-notification",
+    status: "completed", at: 3,
+  });
+  await delay(20);
+
+  assert.deepEqual(notifications.filter((entry) => entry.method === "turn/completed").map((entry) => entry.params.turn.id),
+    ["u1"], "the report is published under the transcript's newest turn, not dropped");
+});
+
+// `lastTurnId` holds the last turn to complete NORMALLY, which after an interrupt is not the
+// turn that just ran. Adopting a fold's text onto it would publish real text under an older
+// turn that never produced a word of it -- a worse answer than the drop it replaced.
+test("a fold settled after an interrupted turn does not hand its text to an older turn", async () => {
+  const claude = new FakeClaude();
+  const runtime = makeRuntime(claude);
+  await runtime.start();
+  const { thread } = await runtime.request<{ thread: any }>("thread/start", { cwd: "/w" });
+
+  await runtime.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:old",
+    input: [{ type: "text", text: "first question" }],
+  });
+  claude.reply(thread.id, "first answer");
+  claude.settleTurn(thread.id, "to:web:old", "completed");
+
+  await runtime.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:aborted",
+    input: [{ type: "text", text: "second question" }],
+  });
+  claude.settleTurn(thread.id, "to:web:aborted", "interrupted");
+
+  // Whatever lands against the head after that abort belongs to the aborted turn, not to the
+  // completed one two turns back.
+  await runtime.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:folded",
+    input: [{ type: "text", text: "third question" }],
+  });
+  claude.reply(thread.id, "stray text from the abort window");
+  const notifications: Array<{ method: string; params: any }> = [];
+  runtime.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:folded", status: "completed", folded: true, at: 9,
+  });
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification",
+    status: "completed", at: 10,
+  });
+
+  const republished = notifications.filter((entry) => entry.method === "turn/completed")
+    .map((entry) => entry.params.turn).find((turn) => turn.id === "to:web:old");
+  assert.deepEqual(republished?.items?.map((item: any) => item.text), ["first answer"],
+    "the older turn carries only what it produced");
+});
+
+// The reconcile sweep settles a turn whose completion was lost, and that turn is then the one
+// a background report folds into. Guarding adoption on "the turn that just ran" has to count
+// that settle too: refusing it deletes the folded bucket while the swept turn still has a live
+// one, so the republished terminal is a FULL view carrying only the old text -- the relay
+// commits it without a transcript scan and the background answer is destroyed outright.
+test("text absorbed after a reconciled turn is still delivered under that turn", async (t) => {
+  const claude = new FakeClaude();
+  const rt = new ClaudeCodeRuntime({ id: "claude-local", host: claude, runner: claude, launchFlags: {}, staleTurnSweepMs: 10 });
+  await rt.start();
+  t.after(() => rt.closeConnection());
+  const { thread } = await rt.request<{ thread: { id: string } }>("thread/start", { cwd: "/w" });
+  const terminals: Array<{ id: string; items?: Array<{ text: string }> }> = [];
+  rt.onNotification((method, params) => {
+    if (method === "turn/completed") terminals.push((params as any).turn);
+  });
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:lost", input: [{ type: "text", text: "watch it" }],
+  });
+  claude.reply(thread.id, "watching");
+  claude.loseCompletion(thread.id, "to:web:lost");
+  for (let waited = 0; waited < 100 && !terminals.some((turn) => turn.id === "to:web:lost"); waited += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  await rt.request("turn/start", {
+    threadId: thread.id, clientUserMessageId: "to:web:mid", input: [{ type: "text", text: "any news?" }],
+  });
+  claude.reply(thread.id, "two files failed");
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 9,
+  });
+  claude.emit({
+    type: "turn/completed", sessionId: thread.id, origin: "task-notification", status: "completed", at: 10,
+  });
+  assert.deepEqual(terminals.filter((turn) => turn.id === "to:web:lost").length, 2,
+    "the sweep's terminal, then the background report republished under the same turn");
+  assert.deepEqual(terminals.at(-1)?.items?.map((item) => item.text), ["watching", "two files failed"],
+    "the answer written after the sweep is delivered, not dropped behind a full view of the old text");
+});
+
+// The seeded anchor is the third way into the same grave. Nothing has settled in this process,
+// so the fold guard has no settle to match -- and reading "no settle" as "a mismatched settle"
+// refuses adoption, deletes the folded bucket, and republishes a FULL view of the background
+// text alone. Full means the relay commits it with nothing sent looking for the rest, so the
+// user's answer is gone for good rather than merely late.
+test("a fold under a seeded anchor is adopted, not dropped as a mismatch", async () => {
+  const claude = new FakeClaude();
+  claude.seed("thread-seeded", [
+    { type: "user", cwd: "/w", promptSource: "sdk", uuid: "u1", timestamp: "2026-08-01T04:02:00.000Z",
+      message: { role: "user", content: "watch the run" } },
+    { type: "assistant", uuid: "a1", timestamp: "2026-08-01T04:02:58.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "watching" }] } },
+  ]);
+  const rt = makeRuntime(claude);
+  await rt.start();
+  await rt.request("thread/resume", { threadId: "thread-seeded", cwd: "/w", excludeTurns: true });
+
+  // The first report seeds the anchor from disk; the second starts speaking under it.
+  claude.emit({ type: "turn/completed", sessionId: "thread-seeded", origin: "task-notification", status: "completed", at: 3 });
+  await delay(20);
+  claude.emit({
+    type: "content/assistant", sessionId: "thread-seeded", at: 4,
+    message: { uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "first background line" }] } },
+  });
+
+  await rt.request("turn/start", {
+    threadId: "thread-seeded", clientUserMessageId: "to:web:mid", input: [{ type: "text", text: "any news?" }],
+  });
+  claude.emit({
+    type: "content/assistant", sessionId: "thread-seeded", at: 5,
+    message: { uuid: "a3", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "two files failed" }] } },
+  });
+  const notifications: Array<{ method: string; params: any }> = [];
+  rt.onNotification((method, params) => notifications.push({ method, params: params as any }));
+  claude.emit({
+    type: "turn/completed", sessionId: "thread-seeded", origin: "human",
+    uuid: "to:web:mid", status: "completed", folded: true, at: 6,
+  });
+  claude.emit({ type: "turn/completed", sessionId: "thread-seeded", origin: "task-notification", status: "completed", at: 7 });
+
+  const republished = notifications.filter((entry) => entry.method === "turn/completed")
+    .map((entry) => entry.params.turn).find((turn) => turn.id === "u1");
+  assert.deepEqual(republished?.items?.map((item: any) => item.text),
+    ["first background line", "two files failed"],
+    "the answer the user was waiting for rides out with the report, under the turn on disk");
+});

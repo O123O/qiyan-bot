@@ -203,7 +203,24 @@ export class SessionDashboardStore {
     const parsed = LastWorkerEventSchema.parse(value);
     this.ensureFacts(identity);
     const row = this.rawFacts(identity)!;
-    if (row.last_worker_turn_ordinal !== null && Number(row.last_worker_turn_ordinal) >= turnOrdinal) return false;
+    const recordedOrdinal = row.last_worker_turn_ordinal === null ? null : Number(row.last_worker_turn_ordinal);
+    if (recordedOrdinal !== null && recordedOrdinal > turnOrdinal) return false;
+    // The SAME turn, speaking again. A worker's background task reports by republishing the
+    // terminal of the turn its output folds into, so the newest answer a session produced
+    // arrives on an ordinal already on record -- and rejecting it as a duplicate left
+    // `last_worker_event` pinned to an older answer while `last_sent` moved on, which is
+    // indistinguishable from a worker that never replied. Keyed on the final message rather
+    // than the timestamp: a plain redelivery of the same answer carries the same id and must
+    // still be rejected, or every relay retry would churn the dashboard.
+    if (recordedOrdinal === turnOrdinal) {
+      const recorded = row.last_worker_event_json === null
+        ? undefined
+        : LastWorkerEventSchema.parse(JSON.parse(String(row.last_worker_event_json)));
+      if (parsed.message_id === null || parsed.message_id === recorded?.message_id) return false;
+      // A backlog re-commit can hand back an EARLIER final message of the same turn with a
+      // fresh observation time. Different is not newer, so require both.
+      if (recorded && Date.parse(parsed.at) < Date.parse(recorded.at)) return false;
+    }
     const observedAt = Date.parse(parsed.at);
     this.db.prepare(`UPDATE session_dashboard_facts SET last_worker_event_json = ?, last_worker_turn_ordinal = ?,
       newest_observation_at = MAX(COALESCE(newest_observation_at, ?), ?) WHERE endpoint_id = ? AND thread_id = ?`)

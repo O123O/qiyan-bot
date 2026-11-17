@@ -53,6 +53,11 @@ interface ThreadState {
   // folded into that turn by reconstruction, so it is the only identity live and history
   // agree on for it.
   lastTurnId?: string;
+  // The last turn to reach a terminal here at all, interrupted ones included. `lastTurnId`
+  // alone cannot say whether the turn that just ran is the one it names, and a fold settling
+  // after an INTERRUPTED turn must not hand that turn's text to the older one `lastTurnId`
+  // still points at.
+  lastSettledTurnId?: string;
   // Whether the one-time seed from disk has been attempted, so a thread with no findable turn
   // does not repeat the walk on every page.
   lastTurnIdSeeded?: boolean;
@@ -283,11 +288,39 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // hold: bounded retries, then a degraded endpoint and a spurious recovery warning.
     if (event.origin === "task-notification") {
       // A running turn will carry the folded output through its own completion.
-      if (state.running.length > 0 || state.lastTurnId === undefined) return;
-      this.emitter.emit("notification", "turn/completed", {
-        threadId,
-        turn: this.terminalTurnPayload(state, state.lastTurnId, "completed"),
-      });
+      if (state.running.length > 0) return;
+      if (state.lastTurnId !== undefined) {
+        this.emitter.emit("notification", "turn/completed", {
+          threadId,
+          turn: this.terminalTurnPayload(state, state.lastTurnId, "completed"),
+        });
+        return;
+      }
+      // No turn has settled in THIS process, so there is no remembered id to republish: a
+      // session reattached after a restart, or one whose turns all predate the process. The
+      // findable turn is still on disk. Dropping the report instead is the same silence a
+      // stranded turn used to cause, and it lands the morning after every restart.
+      //
+      // Deliberately after the fact: the seed is a bounded transcript read and this handler is
+      // synchronous, so the republish follows once the id is known. A turn that starts while it
+      // reads takes the work back -- it will carry this output through its own completion,
+      // which is the rule above, applied at the moment the answer is known.
+      //
+      // One report is still dropped by design: right after an adoption the newest transcript
+      // turn IS the epoch's baseline, which the relay ignores on purpose. Not this bug
+      // returning, and it clears as soon as one managed turn completes.
+      void this.seedLastTurnId(threadId, state).then((seeded) => {
+        if (seeded === undefined || state.running.length > 0) return;
+        // The thread may have been archived or unsubscribed, or the endpoint stopped, while the
+        // read ran: publishing into that is noise the relay would have to drop.
+        if (this.threads.get(threadId) !== state) return;
+        // A turn that completed inside the read window is newer than the row the seed found,
+        // and reconstruction folds this output into THAT turn.
+        this.emitter.emit("notification", "turn/completed", {
+          threadId,
+          turn: this.terminalTurnPayload(state, state.lastTurnId ?? seeded, "completed"),
+        });
+      }, () => undefined);
       return;
     }
     const turnId = event.uuid ?? state.running[0];
@@ -305,6 +338,14 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // unanswered. `lastTurnId` deliberately stays on the absorbing turn, which is the findable
     // one and the one a background task's report must republish.
     if (event.folded) {
+      // Text produced while the absorbing turn ran is keyed on `running[0]`, which is that
+      // turn whenever a human send absorbed it -- the fold sits BEHIND the head. A turn
+      // answering a `<task-notification>` row has no entry of its own, so the folded send IS
+      // the head and the answer accumulated against it instead. Hand it to the turn that
+      // really produced it, which is the one the notification's terminal republishes and the
+      // one reconstruction folds these rows into: the alternative drops a delivered answer on
+      // the floor here, the exact silence this fold handling exists to end.
+      this.adoptFoldedItems(state, turnId);
       this.emitter.emit("notification", "turn/completed", {
         threadId,
         turn: { id: turnId, status: "completed", itemsView: "full", items: [], folded: true },
@@ -316,6 +357,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // about to carry, degrading a delivered answer into a transcript lookup.
       return;
     }
+    state.lastSettledTurnId = turnId;
     if (event.status !== "completed") state.terminalTurns.add(turnId);
     // Only a normally completed turn is certain to be a findable transcript turn: a turn
     // that failed before `claude` wrote its user row exists only as a synthesized terminal.
@@ -614,7 +656,15 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // the reader would have done on every page anyway. Paying it once per thread turns every later
   // page into a single window read.
   //
-  // Bounded, and failure is silent: without an id the reader behaves exactly as it did before.
+  // Bounded. Failure is silent to the reader, which behaves exactly as it did before -- but a
+  // background report's republish now depends on this too, and silence there is a lost answer.
+  // So a read that THREW leaves the latch open for the next caller to retry: one NFS stall
+  // would otherwise mute every background report on the thread for the life of the process.
+  // What closes the latch for good is an answer, conclusive or spent -- the probe worked and
+  // the thread holds no findable turn, or the page budget ran out with the walk unfinished.
+  //
+  // A second caller arriving mid-read still gets `undefined` and drops its report. Bounded,
+  // because the one after it finds `lastTurnId` already set.
   private async seedLastTurnId(threadId: string, state: ThreadState): Promise<string | undefined> {
     if (state.lastTurnIdSeeded) return undefined;
     state.lastTurnIdSeeded = true;
@@ -626,12 +676,19 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
         sortDirection: "desc",
         itemsView: "notLoaded",
       }).catch(() => undefined);
-      const found = probe?.data[0]?.id;
+      if (probe === undefined) {
+        delete state.lastTurnIdSeeded;
+        return undefined;
+      }
+      const found = probe.data[0]?.id;
       if (found !== undefined) {
-        state.lastTurnId = found;
+        // A turn that settled WHILE this read ran is newer than anything the read saw, and it
+        // is the one live and history now agree on. Never walk the anchor backwards onto an
+        // older row: the tail attribution and the relay's durable cursor both follow it.
+        if (state.lastTurnId === undefined) state.lastTurnId = found;
         return found;
       }
-      if (!probe?.nextCursor) return undefined;
+      if (!probe.nextCursor) return undefined;
       cursor = probe.nextCursor;
     }
     return undefined;
@@ -760,6 +817,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     for (const turnId of settled) {
       state.materialized = true;
       state.lastTurnId = turnId;
+      state.lastSettledTurnId = turnId;
       // Republish the terminal rather than dropping it silently: the answer this turn produced
       // is still on disk, and this is the only thing that will ever deliver it.
       this.emitter.emit("notification", "turn/completed", {
@@ -956,6 +1014,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     state.running = state.running.filter((id) => id !== clientId);
     state.materialized = true;
     state.lastTurnId = clientId;
+    state.lastSettledTurnId = clientId;
     this.emitter.emit("notification", "turn/completed", { threadId, turn: { id: clientId } });
     return { turn: { id: clientId, status: "completed" } };
   }
@@ -1235,6 +1294,48 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       return;
     }
     live.items.push(item);
+  }
+
+  // A no-op for a send folded into a HUMAN turn: that send sits behind the absorbing turn in
+  // `running`, so the head collected the text and the folded bucket is empty. A fold settled
+  // across an INTERRUPT can hold text and still find no honest home for it; see below.
+  //
+  // Move what a folded send collected onto the turn that absorbed it, and drop the folded
+  // bucket either way -- nothing may be published under an id no transcript holds. An
+  // overflow on either side stays an overflow: it means the live view is already incomplete,
+  // and the terminal must fall back to the transcript rather than deliver a partial answer as
+  // a full one. Without a turn to adopt them, the items go: the send's own terminal is
+  // explicitly empty, and the transcript still holds the rows for a history read.
+  private adoptFoldedItems(state: ThreadState, foldedTurnId: string): void {
+    const absorbing = state.lastTurnId;
+    // That id is what the republish reads: emptying its bucket here would destroy the very
+    // text the terminal is about to carry. Guard BEFORE the delete, not after it.
+    if (absorbing === foldedTurnId) return;
+    const folded = state.liveItems.get(foldedTurnId);
+    state.liveItems.delete(foldedTurnId);
+    // Adopt only onto the turn that actually just ran. `lastTurnId` names the last turn to
+    // complete NORMALLY, which on the interrupt-fold path is not that turn: an aborted head
+    // settles into `terminalTurns`, leaving `lastTurnId` on something older that never
+    // produced a word of this text. Dropping it there is what this code did before adoption
+    // existed; publishing it under an unrelated turn would be worse than dropping it.
+    //
+    // No settle recorded at all is a different thing from a mismatched one, and must not be
+    // read as one: it means nothing has settled in this process and `lastTurnId` came from the
+    // transcript seed, which is precisely the turn reconstruction folds this output into.
+    // Refusing there deleted the bucket and republished a FULL view of the older text -- a
+    // committed answer with nothing sent looking for the rest of it.
+    if (!folded || absorbing === undefined) return;
+    if (state.lastSettledTurnId !== undefined && state.lastSettledTurnId !== absorbing) return;
+    const live = state.liveItems.get(absorbing) ?? { items: [], bytes: 0, overflowed: false };
+    state.liveItems.set(absorbing, live);
+    if (live.overflowed) return;
+    if (folded.overflowed || live.bytes + folded.bytes > LIVE_TURN_ITEM_BYTES) {
+      live.overflowed = true;
+      live.items = [];
+      return;
+    }
+    live.bytes += folded.bytes;
+    live.items.push(...folded.items);
   }
 
   // Announce the turn now executing. Called when a send is accepted into an empty queue,
