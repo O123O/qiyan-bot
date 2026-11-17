@@ -273,3 +273,30 @@ test("rejects invalid persisted fact JSON instead of discarding it", () => {
   db.prepare("INSERT INTO session_dashboard_facts(endpoint_id, thread_id, last_sent_json, last_sent_operation_sequence) VALUES (?, ?, ?, ?)").run("local", "thread-1", "{}", 1);
   assert.throws(() => store.facts(identity));
 });
+
+// A worker babysitting a long job reports through background tasks, and each report
+// republishes the terminal of the turn its output folds into. That lands on an ordinal already
+// on record, so the strict watermark rejected every one of them: `last_worker_event` stayed
+// pinned to the last answer the user had actually prompted for, while `last_sent` advanced
+// with each new message. The manager reads that pair as a worker that never replied.
+test("a background report on the same turn advances the worker event, but a redelivery does not", () => {
+  const store = new SessionDashboardStore(createTestDatabase());
+  store.hydrateTurnOrder(identity, [{ id: "t1", startedAt: 1 }]);
+  assert.equal(store.observeLastWorkerEvent(identity,
+    { message_id: "m1", turn_id: "t1", status: "completed", at: "1970-01-01T00:00:01.000Z" }, 1), true);
+
+  assert.equal(store.observeLastWorkerEvent(identity,
+    { message_id: "m1", turn_id: "t1", status: "completed", at: "1970-01-01T00:00:09.000Z" }, 1), false,
+    "the same answer redelivered is still a duplicate");
+
+  assert.equal(store.observeLastWorkerEvent(identity,
+    { message_id: "m2", turn_id: "t1", status: "completed", at: "1970-01-01T00:00:10.000Z" }, 1), true,
+    "a background report's new answer is the worker's latest word");
+  assert.equal(store.facts(identity).lastWorkerEvent?.message_id, "m2");
+
+  // The watermark still holds against a genuinely older turn.
+  store.hydrateTurnOrder(identity, [{ id: "t1", startedAt: 1 }, { id: "t0", startedAt: 0 }]);
+  assert.equal(store.observeLastWorkerEvent(identity,
+    { message_id: "m0", turn_id: "t0", status: "completed", at: "1970-01-01T00:00:11.000Z" }, 0), false);
+  assert.equal(store.facts(identity).lastWorkerEvent?.message_id, "m2");
+});
