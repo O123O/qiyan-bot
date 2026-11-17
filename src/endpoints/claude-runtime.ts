@@ -53,6 +53,11 @@ interface ThreadState {
   // folded into that turn by reconstruction, so it is the only identity live and history
   // agree on for it.
   lastTurnId?: string;
+  // The last turn to reach a terminal here at all, interrupted ones included. `lastTurnId`
+  // alone cannot say whether the turn that just ran is the one it names, and a fold settling
+  // after an INTERRUPTED turn must not hand that turn's text to the older one `lastTurnId`
+  // still points at.
+  lastSettledTurnId?: string;
   // Whether the one-time seed from disk has been attempted, so a thread with no findable turn
   // does not repeat the walk on every page.
   lastTurnIdSeeded?: boolean;
@@ -283,11 +288,30 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     // hold: bounded retries, then a degraded endpoint and a spurious recovery warning.
     if (event.origin === "task-notification") {
       // A running turn will carry the folded output through its own completion.
-      if (state.running.length > 0 || state.lastTurnId === undefined) return;
-      this.emitter.emit("notification", "turn/completed", {
-        threadId,
-        turn: this.terminalTurnPayload(state, state.lastTurnId, "completed"),
-      });
+      if (state.running.length > 0) return;
+      if (state.lastTurnId !== undefined) {
+        this.emitter.emit("notification", "turn/completed", {
+          threadId,
+          turn: this.terminalTurnPayload(state, state.lastTurnId, "completed"),
+        });
+        return;
+      }
+      // No turn has settled in THIS process, so there is no remembered id to republish: a
+      // session reattached after a restart, or one whose turns all predate the process. The
+      // findable turn is still on disk. Dropping the report instead is the same silence a
+      // stranded turn used to cause, and it lands the morning after every restart.
+      //
+      // Deliberately after the fact: the seed is a bounded transcript read and this handler
+      // is synchronous, so the republish follows when the id is known. A turn that starts
+      // while it reads takes the work back — it will carry this output through its own
+      // completion, which is the rule above, applied at the moment the answer is known.
+      void this.seedLastTurnId(threadId, state).then((seeded) => {
+        if (seeded === undefined || state.running.length > 0) return;
+        this.emitter.emit("notification", "turn/completed", {
+          threadId,
+          turn: this.terminalTurnPayload(state, seeded, "completed"),
+        });
+      }, () => undefined);
       return;
     }
     const turnId = event.uuid ?? state.running[0];
@@ -324,6 +348,7 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
       // about to carry, degrading a delivered answer into a transcript lookup.
       return;
     }
+    state.lastSettledTurnId = turnId;
     if (event.status !== "completed") state.terminalTurns.add(turnId);
     // Only a normally completed turn is certain to be a findable transcript turn: a turn
     // that failed before `claude` wrote its user row exists only as a synthesized terminal.
@@ -1245,8 +1270,9 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
     live.items.push(item);
   }
 
-  // A no-op in every fold but that one: a send folded into a HUMAN turn sits behind it in
-  // `running`, so the head collected the text and the folded bucket is empty.
+  // A no-op for a send folded into a HUMAN turn: that send sits behind the absorbing turn in
+  // `running`, so the head collected the text and the folded bucket is empty. A fold settled
+  // across an INTERRUPT can hold text and still find no honest home for it; see below.
   //
   // Move what a folded send collected onto the turn that absorbed it, and drop the folded
   // bucket either way -- nothing may be published under an id no transcript holds. An
@@ -1255,10 +1281,18 @@ export class ClaudeCodeRuntime implements ManagedAppServerEndpoint {
   // a full one. Without a turn to adopt them, the items go: the send's own terminal is
   // explicitly empty, and the transcript still holds the rows for a history read.
   private adoptFoldedItems(state: ThreadState, foldedTurnId: string): void {
+    const absorbing = state.lastTurnId;
+    // That id is what the republish reads: emptying its bucket here would destroy the very
+    // text the terminal is about to carry. Guard BEFORE the delete, not after it.
+    if (absorbing === foldedTurnId) return;
     const folded = state.liveItems.get(foldedTurnId);
     state.liveItems.delete(foldedTurnId);
-    const absorbing = state.lastTurnId;
-    if (!folded || absorbing === undefined || absorbing === foldedTurnId) return;
+    // Adopt only onto the turn that actually just ran. `lastTurnId` names the last turn to
+    // complete NORMALLY, which on the interrupt-fold path is not that turn: an aborted head
+    // settles into `terminalTurns`, leaving `lastTurnId` on something older that never
+    // produced a word of this text. Dropping it there is what this code did before adoption
+    // existed; publishing it under an unrelated turn would be worse than dropping it.
+    if (!folded || absorbing === undefined || state.lastSettledTurnId !== absorbing) return;
     const live = state.liveItems.get(absorbing) ?? { items: [], bytes: 0, overflowed: false };
     state.liveItems.set(absorbing, live);
     if (live.overflowed) return;
