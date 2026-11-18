@@ -4381,6 +4381,12 @@ export async function buildProductionApp(
           if (isLocalEndpointId(id, localClaudeEndpointId)) return localHostName;
           return endpointCatalog.definitions().find((definition) => definition.id === id)?.host ?? id;
         },
+        // An endpoint that cannot be asked is not on some generation we failed to read: it is not
+        // there. -1 matches no recorded view, which is the honest answer for the list.
+        endpointGeneration: (id) => {
+          try { return pool.endpointGeneration(id).generation; }
+          catch { return -1; }
+        },
       },
       // Local file browsing is confined to each session's managed project directory. Only LOCAL
       // sessions expose files here; a remote (ssh) session's project dir is on another host, so it

@@ -22,6 +22,9 @@ export interface WebReadsDeps {
   historyReadable?(endpointId: string, threadId: string): boolean;
   // Lease-free display label: local process hostname or configured SSH alias.
   host(endpointId: string): string;
+  // The endpoint's current runtime generation, for comparison against the one a cached native view
+  // was recorded under. -1 when the endpoint cannot be asked at all, which is itself a mismatch.
+  endpointGeneration?(endpointId: string): number;
   // Runs a read path as one database transaction. The browser polls the session snapshot, and each
   // implicit transaction on the NFS-hosted database costs a lock cycle over the wire, so a snapshot
   // built from a statement per session per fact was seconds of round trips.
@@ -88,6 +91,14 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
     const native = deps.nativeSession(session.endpoint, session.thread_id, session.mapping_id);
     const goal = info?.goal ?? null;
     const historyReadable = deps.historyReadable?.(session.endpoint, session.thread_id) !== false;
+    // A native view records the generation it was observed under. When the endpoint has moved on —
+    // its runtime was reclaimed and replaced — the view describes a runtime that no longer exists,
+    // and `availability: "ready"` is a fact about the past. Observed on polyphe: the app-server was
+    // restarted into an unreachable listener, and three workers went on reading `idle` from the
+    // generation before it. `status()` has always made this comparison; this list never did.
+    const current = deps.endpointGeneration?.(session.endpoint);
+    const sameGeneration = current === undefined || native?.endpointGeneration === current;
+    const live = native?.availability === "ready" && sameGeneration;
     return {
       nickname,
       mappingId: session.mapping_id,
@@ -97,15 +108,15 @@ export function listSessions(deps: WebReadsDeps): WebSessionSummary[] {
       lifecycleState: session.lifecycle_state,
       // `idle` on a session whose history cannot be located is a comfortable lie: it is not
       // resting, it is unusable. Report what it is rather than what its status field says.
-      nativeStatus: native?.availability !== "ready"
+      nativeStatus: !live
         ? null
         : historyReadable
-          ? native.status
+          ? native!.status
           : "unavailable",
       // Withheld with the status it belongs to. A reader that trusts an active turn id over the
       // status — the panel does, so that a turn in flight always reads as working — would
       // otherwise render a session we just called unusable as working on a turn we cannot locate.
-      activeTurnId: native?.availability === "ready" && historyReadable ? native.activeTurnId : null,
+      activeTurnId: live && historyReadable ? native!.activeTurnId : null,
       model: info?.model.current ?? null,
       effort: info?.reasoning_effort.current ?? null,
       host: deps.host(session.endpoint),
