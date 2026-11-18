@@ -759,20 +759,45 @@ test("a host that once redirected its socket keeps starting on ws after a later 
   remote.status = "unhealthy";
   remote.serverAlive = true;
   remote.socketRedirected = true;
-  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  // The endpoint manager builds a new SshRuntime for every activation, so the memory has to be the
+  // caller's. A latch on the instance would be reset by the reconnect it exists to survive.
+  const socketRedirects = new Set<string>();
+  const activate = () => new SshRuntime({ endpointId: "devbox", remote, socketRedirects });
 
-  await runtime.ensureStarted();
+  await activate().ensureStarted();
   const listeners = () => remote.calls.filter((call) => call.operation === "start")
     .map((call) => JSON.parse(call.args[0]!).listener);
   assert.deepEqual(listeners(), ["ws"], "the observed redirect repairs this generation");
 
-  // The ws generation dies for a reason that has nothing to do with the redirect, and the next
-  // inspect cannot see one — there is no unix socket left to dangle.
+  // The ws generation dies for a reason that has nothing to do with the redirect, the endpoint is
+  // reactivated, and the next inspect cannot see one — there is no unix socket left to dangle.
   remote.status = "unhealthy";
   remote.supervised = false;
-  await runtime.ensureStarted();
+  await activate().ensureStarted();
 
   assert.deepEqual(listeners(), ["ws", "ws"], "and the host is still known to need ws");
+  assert.deepEqual([...socketRedirects], ["devbox"], "remembered against the endpoint, not the object");
+});
+
+// One host's isolated /tmp says nothing about another's, and a loopback port is reachable by every
+// local user on a shared login node where a unix socket is 0600. Paying that on a host which never
+// needed it would be a silent downgrade.
+test("the redirect memory is per endpoint, not a blanket switch to ws", async () => {
+  const socketRedirects = new Set<string>();
+  const redirecting = new FakeRemote();
+  redirecting.status = "unhealthy";
+  redirecting.serverAlive = true;
+  redirecting.socketRedirected = true;
+  await new SshRuntime({ endpointId: "devbox", remote: redirecting, socketRedirects }).ensureStarted();
+
+  const ordinary = new FakeRemote();
+  await new SshRuntime({ endpointId: "otherbox", remote: ordinary, socketRedirects }).ensureStarted();
+
+  assert.deepEqual(
+    ordinary.calls.filter((call) => call.operation === "start").map((call) => JSON.parse(call.args[0]!).listener),
+    [undefined],
+    "a host that has shown no redirect still gets the private socket",
+  );
 });
 
 // The latch says something about the HOST, not about this runtime being disposable. Keeping the
@@ -783,13 +808,13 @@ test("the redirect latch does not license reclaiming a runtime that is unhealthy
   remote.status = "unhealthy";
   remote.serverAlive = true;
   remote.socketRedirected = true;
-  const runtime = new SshRuntime({ endpointId: "devbox", remote });
-  await runtime.ensureStarted();
+  const socketRedirects = new Set<string>();
+  await new SshRuntime({ endpointId: "devbox", remote, socketRedirects }).ensureStarted();
 
   remote.status = "unhealthy";
   remote.supervised = true;
   remote.socketRedirected = undefined;
 
-  await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
+  await assert.rejects(new SshRuntime({ endpointId: "devbox", remote, socketRedirects }).ensureStarted(), /unhealthy/u);
   assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1, "only the first, proven reclaim");
 });

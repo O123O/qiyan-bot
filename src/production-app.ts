@@ -3735,6 +3735,10 @@ export async function buildProductionApp(
           checkExisting: (id, destination, references) => endpointBindings.checkExisting(id, destination, references),
           attestControlMaster: attestUserControlMaster,
         });
+        // Outside `createRemote` on purpose: a new SshRuntime is built for every activation, so a
+        // host's socket-redirect lesson has to be remembered somewhere that survives the reconnect
+        // which would otherwise unlearn it. See SshRuntime's `socketRedirects`.
+        const sshSocketRedirects = new Set<string>();
         endpointManager = new EndpointManager({
           localEndpoint: endpoint,
           ...(claudeEndpoint ? { builtinEndpoints: [claudeEndpoint] } : {}),
@@ -3784,6 +3788,7 @@ export async function buildProductionApp(
               endpointId: definition.id,
               remote,
               assetRoot: remoteAssetRoot,
+              socketRedirects: sshSocketRedirects,
               // Reclaiming a dead runtime kills processes the worker's user started. Say so:
               // otherwise whoever owned the long-running command that got killed has no way
               // to learn it happened.
@@ -4389,8 +4394,13 @@ export async function buildProductionApp(
         },
         // An endpoint that cannot be asked is not on some generation we failed to read: it is not
         // there. -1 matches no recorded view, which is the honest answer for the list.
+        // The ENDPOINT MANAGER's counter, which is the one `bindProjectEndpoint` stamps onto every
+        // native view it registers. The pool keeps a second, independent counter that is bumped by
+        // its own constructor for the endpoints it is seeded with, so for a builtin it runs
+        // permanently one ahead — comparing against it would make every local worker read as
+        // having no status at all, which `safe-restart.sh` would take as "not working".
         endpointGeneration: (id) => {
-          try { return pool.endpointGeneration(id).generation; }
+          try { return endpointManager.endpointGeneration(id).generation; }
           catch { return -1; }
         },
       },
