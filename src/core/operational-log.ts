@@ -77,7 +77,7 @@ export function createOperationalLogSink(
   return (event) => {
     const fields = [`event=${safeToken(event.code)}`];
     if (event.adapter !== undefined) fields.push(`adapter=${safeToken(event.adapter)}`);
-    if (event.endpoint !== undefined) fields.push(`endpoint=${safeToken(event.endpoint)}`);
+    if (event.endpoint !== undefined) fields.push(`endpoint=${safeEndpoint(event.endpoint)}`);
     if (event.reason !== undefined) fields.push(`reason=${safeToken(event.reason)}`);
     if (event.loss !== undefined) fields.push(`loss=${safeToken(event.loss)}`);
     if (event.component !== undefined) fields.push(`component=${safeToken(event.component)}`);
@@ -93,6 +93,15 @@ export function createOperationalLogSink(
 
 function safeToken(value: string): string {
   return /^[a-z][a-z0-9_-]{0,63}$/u.test(value) ? value : "unknown";
+}
+
+// Endpoint ids are allowed to begin with a digit (src/endpoints/catalog.ts), which the token rule
+// is not: `3090-box` printed as `endpoint=unknown`, on exactly the lines written to say which
+// endpoint something happened to. The id's own validated charset is the right test here — it is
+// already bounded and already slug-shaped, so nothing is being let through that a token would not
+// have been trusted with.
+function safeEndpoint(value: string): string {
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/u.test(value) ? value : "unknown";
 }
 
 function safeCount(value: number): string {

@@ -31,6 +31,18 @@ test("operational logs contain only bounded structured metadata", () => {
   assert.equal(lines.join("").includes("secret-token"), false);
 });
 
+// Endpoint ids may begin with a digit; the token rule may not. These lines exist to say which
+// endpoint something happened to, and `endpoint=unknown` is the one thing they must never say
+// about an id that is perfectly valid.
+test("an endpoint id that starts with a digit is still named", () => {
+  const lines: string[] = [];
+  const report = createOperationalLogSink((line) => { lines.push(line); });
+  report({ level: "warn", code: "endpoint_reconnect_gave_up", endpoint: "3090-box", reason: "reconnect_budget_exhausted" });
+  report({ level: "warn", code: "endpoint_reconnect_gave_up", endpoint: "not a valid id", reason: "reconnect_budget_exhausted" });
+
+  assert.deepEqual(lines.map((line) => line.split(" ")[3]), ["endpoint=3090-box", "endpoint=unknown"]);
+});
+
 // The sink renders anything that is not a lowercase slug as "unknown", which is a silent way of
 // discarding the only thing a failure line carries. Every caller with a real cause in hand has to
 // convert it first, and `describeAttemptFailure` is that conversion — so what it produces must
