@@ -228,6 +228,22 @@ export async function prepareRemoteHost(options: {
 
 export class SshRuntime implements SshRuntimeController, RemoteHost {
   private capabilityToken?: string;
+  // This host redirected a unix listener into a per-connection /tmp at least once, so every later
+  // generation starts on ws without waiting to be taught again.
+  //
+  // `inspect` can only report the redirect against a LIVE UNIX generation — it reads the dangling
+  // link, and a ws generation has no link to read. So the evidence is destroyed by the very repair
+  // it triggers, and without this latch the knowledge lives exactly as long as the generation that
+  // carried it: reclaim a ws generation for any unrelated reason and the next start goes back to
+  // unix, fails from a fresh channel, and has to relearn. Measured on polyphe: a correct ws start
+  // at 20:52:27 was followed by a unix start at 20:54:03 and an endpoint that stayed unreachable.
+  //
+  // Deliberately NOT persisted across process restarts. The design (docs/development/
+  // app-server-listener-design.md) accepts one failed connection per affected host per restart so
+  // that a host which stops isolating /tmp is not punished forever — a loopback port is reachable
+  // by every local user on a shared login node and is protected only by the capability token,
+  // where a unix socket is 0600. In-memory keeps that re-learning without paying it per reclaim.
+  private socketRedirectSeen = false;
   private prepared?: {
     host: RemoteHost;
     runtimeDir: string;
@@ -314,7 +330,10 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // it is alive and serving: it serves only the channel that started it, so from everywhere
       // else it is permanently unreachable. unservingSupervisor cannot cover this — it requires a
       // dead server, and this one is healthy from its own side forever.
+      // The reclaim gate stays keyed on what this inspect SAW. The latch is a statement about the
+      // host, not grounds to tear down a runtime that is unhealthy for some other reason.
       redirected = current.socketRedirected === true;
+      if (redirected) this.socketRedirectSeen = true;
       if (!current.identity || (!redirected && current.supervised !== false && !unservingSupervisor(current))) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
@@ -347,7 +366,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // `start` cannot work this out for itself: it runs in the channel that creates the
       // app-server, and codex's daemon socket lives in that channel's own /tmp, so from in there
       // the redirect is invisible. Only `inspect`, which runs in later channels, can see it.
-      ...(redirected ? { listener: "ws" } : {}),
+      ...(this.socketRedirectSeen ? { listener: "ws" } : {}),
     })], prepared.host.remoteHelperPath);
     if (typeof result.token === "string") this.capabilityToken = result.token; else delete this.capabilityToken;
     return parseRuntimeIdentity(result.identity);

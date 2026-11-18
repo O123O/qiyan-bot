@@ -94,8 +94,21 @@ healthy from its own side indefinitely. So `socketRedirected` is its own reclaim
 
 The cost is one failed connection per affected host per restart: the first `start` succeeds on
 unix, the first proxy in a new channel fails, and the reconnect that follows carries the redirect
-report and repairs it. Self-healing without memory, which is what keeps a host that stops isolating
-`/tmp` from being punished forever.
+report and repairs it.
+
+Per *restart*, not per reclaim. `inspect` can only report the redirect against a live **unix**
+generation — the evidence is a dangling link, and a ws generation has none — so the repair destroys
+the evidence that caused it. Derived fresh on every `ensureStarted`, the knowledge therefore lived
+exactly as long as the generation carrying it: reclaim a ws generation for any unrelated reason and
+the next start went back to unix. Measured on polyphe, codex 0.169.1: a correct ws start at
+20:52:27, a unix start at 20:54:03, and an endpoint that stayed unreachable afterwards.
+
+`SshRuntime` therefore latches the observation in memory for the endpoint's lifetime, and starts on
+ws whenever it is set. The latch is deliberately **not** persisted: a host that stops isolating
+`/tmp` should go back to a `0600` socket rather than a loopback port that every local user on a
+shared login node can reach, and a process restart is what re-asks the question. The reclaim gate
+stays keyed on what `inspect` actually saw, never on the latch — the latch is a statement about the
+host, not grounds to tear down a runtime that is unhealthy for some other reason.
 
 For a `ws` start the helper, not QiYan:For a `ws` start the helper, not QiYan:
 

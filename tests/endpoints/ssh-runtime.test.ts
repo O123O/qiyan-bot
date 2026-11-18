@@ -62,6 +62,9 @@ class FakeRemote implements RemoteRuntimeClient {
   serverAlive: boolean | undefined;
   socketListening: boolean | undefined;
   sessionAgeMs: number | undefined;
+  // Only ever reported against a live UNIX generation: the evidence is a dangling link, and a ws
+  // generation has none. The fake follows the helper in clearing it once a ws start has happened.
+  socketRedirected: boolean | undefined;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
@@ -76,10 +79,15 @@ class FakeRemote implements RemoteRuntimeClient {
         ...(this.serverAlive === undefined ? {} : { serverAlive: this.serverAlive }),
         ...(this.socketListening === undefined ? {} : { socketListening: this.socketListening }),
         ...(this.sessionAgeMs === undefined ? {} : { sessionAgeMs: this.sessionAgeMs }),
+        ...(this.socketRedirected === undefined ? {} : { socketRedirected: this.socketRedirected }),
         ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}),
       } as T;
     }
-    if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
+    if (operation === "start") {
+      this.status = "healthy";
+      if (JSON.parse(args[0] ?? "{}").listener === "ws") this.socketRedirected = undefined;
+      return { identity: this.identity } as T;
+    }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
     throw new Error(`unexpected operation ${operation}`);
   }
@@ -739,4 +747,49 @@ test("does not report an unhealthy runtime with missing identity metadata as abs
   const runtime = new SshRuntime({ endpointId: "devbox", remote });
 
   await assert.rejects(runtime.runtimeIdentity(), /unhealthy|identity/iu);
+});
+
+// A host that redirects its unix listener into a per-connection /tmp teaches QiYan exactly once,
+// and the lesson is destroyed by the repair: `inspect` reads the redirect off a dangling link, and
+// a ws generation has no link. Before the latch the next reclaim — for any reason at all — started
+// unix again. Measured on polyphe: a correct ws start at 20:52:27, a unix start at 20:54:03, and an
+// endpoint that stayed unreachable with nobody left to notice.
+test("a host that once redirected its socket keeps starting on ws after a later reclaim", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.serverAlive = true;
+  remote.socketRedirected = true;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+
+  await runtime.ensureStarted();
+  const listeners = () => remote.calls.filter((call) => call.operation === "start")
+    .map((call) => JSON.parse(call.args[0]!).listener);
+  assert.deepEqual(listeners(), ["ws"], "the observed redirect repairs this generation");
+
+  // The ws generation dies for a reason that has nothing to do with the redirect, and the next
+  // inspect cannot see one — there is no unix socket left to dangle.
+  remote.status = "unhealthy";
+  remote.supervised = false;
+  await runtime.ensureStarted();
+
+  assert.deepEqual(listeners(), ["ws", "ws"], "and the host is still known to need ws");
+});
+
+// The latch says something about the HOST, not about this runtime being disposable. Keeping the
+// reclaim gate on what inspect actually saw is what stops a latched endpoint from tearing down a
+// live runtime that is merely slow to boot.
+test("the redirect latch does not license reclaiming a runtime that is unhealthy for another reason", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.serverAlive = true;
+  remote.socketRedirected = true;
+  const runtime = new SshRuntime({ endpointId: "devbox", remote });
+  await runtime.ensureStarted();
+
+  remote.status = "unhealthy";
+  remote.supervised = true;
+  remote.socketRedirected = undefined;
+
+  await assert.rejects(runtime.ensureStarted(), /unhealthy/u);
+  assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1, "only the first, proven reclaim");
 });
