@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createOperationalLogSink } from "../../src/core/operational-log.ts";
-import { describeAttemptFailure } from "../../src/assistant/runtime.ts";
-import { AppError } from "../../src/core/errors.ts";
+import { AppError, describeAttemptFailure } from "../../src/core/errors.ts";
 
 test("operational logs contain only bounded structured metadata", () => {
   const lines: string[] = [];
@@ -29,6 +28,26 @@ test("operational logs contain only bounded structured metadata", () => {
     "qiyan-bot: WARN event=endpoint_runtime_reclaimed endpoint=polyphe reason=dead_supervisor component=ssh_runtime survivors=3\n",
   ]);
   assert.equal(lines.join("").includes("secret-token"), false);
+});
+
+// The LAN-exposure warning is the one line telling you an unauthenticated full-access UI is
+// reachable over plain HTTP, and it printed `reason=unknown` — the sentence it carried was a
+// sentence. Every journal reason has to be a token, including the ones written as prose by hand.
+test("every reason this build emits survives the sink as itself", () => {
+  const lines: string[] = [];
+  const report = createOperationalLogSink((line) => { lines.push(line); });
+  for (const reason of [
+    "lan_reachable_plain_http", "reconnect_budget_exhausted",
+    "sample_timed_out", "sample_failed", "no_reading",
+  ]) {
+    report({ level: "warn", code: "web_ui_lan_exposure", reason });
+  }
+
+  assert.equal(lines.some((line) => line.includes("reason=unknown")), false);
+  assert.deepEqual(lines.map((line) => line.trim().split("reason=")[1]), [
+    "lan_reachable_plain_http", "reconnect_budget_exhausted",
+    "sample_timed_out", "sample_failed", "no_reading",
+  ]);
 });
 
 // Endpoint ids may begin with a digit; the token rule may not. These lines exist to say which

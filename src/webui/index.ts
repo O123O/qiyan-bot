@@ -13,6 +13,7 @@ import { WEB_BINDING } from "./web-adapter.ts";
 import { createWebServer } from "./web-server.ts";
 import { readWebUiState } from "./webui-state.ts";
 import { setWebUiSignalHandler } from "./webui-signal.ts";
+import { describeAttemptFailure } from "../core/errors.ts";
 
 export { WebBus } from "./web-bus.ts";
 export { createWebAdapter, WEB_ADAPTER_ID } from "./web-adapter.ts";
@@ -86,7 +87,7 @@ export function createWebUiToggle(deps: {
     let target: WebUiTarget;
     try { target = deps.resolveTarget(); }
     catch (error) {
-      deps.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: `web-ui state unreadable; keeping current state (${error instanceof Error ? error.message : String(error)})` });
+      deps.report({ level: "warn", code: "background_task_failed", component: "web_ui_state", reason: describeAttemptFailure(error).token });
       return;
     }
     if (!target.enabled) { if (current) { await current.handle.stop(); current = undefined; } return; }
