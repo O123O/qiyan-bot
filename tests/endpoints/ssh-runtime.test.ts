@@ -62,6 +62,9 @@ class FakeRemote implements RemoteRuntimeClient {
   serverAlive: boolean | undefined;
   socketListening: boolean | undefined;
   sessionAgeMs: number | undefined;
+  // Only ever reported against a live UNIX generation: the evidence is a dangling link, and a ws
+  // generation has none. The fake follows the helper in clearing it once a ws start has happened.
+  socketRedirected: boolean | undefined;
   identity = { kind: "ssh" as const, token: "a".repeat(32), pid: 101, linuxStartTime: "202", processGroupId: 101 };
 
   async bootstrap(): Promise<void> { this.calls.push({ operation: "bootstrap", args: [] }); }
@@ -76,10 +79,15 @@ class FakeRemote implements RemoteRuntimeClient {
         ...(this.serverAlive === undefined ? {} : { serverAlive: this.serverAlive }),
         ...(this.socketListening === undefined ? {} : { socketListening: this.socketListening }),
         ...(this.sessionAgeMs === undefined ? {} : { sessionAgeMs: this.sessionAgeMs }),
+        ...(this.socketRedirected === undefined ? {} : { socketRedirected: this.socketRedirected }),
         ...((this.status === "healthy" || this.status === "unhealthy") && this.exposeIdentity ? { identity: this.identity } : {}),
       } as T;
     }
-    if (operation === "start") { this.status = "healthy"; return { identity: this.identity } as T; }
+    if (operation === "start") {
+      this.status = "healthy";
+      if (JSON.parse(args[0] ?? "{}").listener === "ws") this.socketRedirected = undefined;
+      return { identity: this.identity } as T;
+    }
     if (operation === "stop") { this.status = "absent"; return { stopped: true } as T; }
     throw new Error(`unexpected operation ${operation}`);
   }
@@ -739,4 +747,74 @@ test("does not report an unhealthy runtime with missing identity metadata as abs
   const runtime = new SshRuntime({ endpointId: "devbox", remote });
 
   await assert.rejects(runtime.runtimeIdentity(), /unhealthy|identity/iu);
+});
+
+// A host that redirects its unix listener into a per-connection /tmp teaches QiYan exactly once,
+// and the lesson is destroyed by the repair: `inspect` reads the redirect off a dangling link, and
+// a ws generation has no link. Before the latch the next reclaim — for any reason at all — started
+// unix again. Measured on polyphe: a correct ws start at 20:52:27, a unix start at 20:54:03, and an
+// endpoint that stayed unreachable with nobody left to notice.
+test("a host that once redirected its socket keeps starting on ws after a later reclaim", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.serverAlive = true;
+  remote.socketRedirected = true;
+  // The endpoint manager builds a new SshRuntime for every activation, so the memory has to be the
+  // caller's. A latch on the instance would be reset by the reconnect it exists to survive.
+  const socketRedirects = new Set<string>();
+  const activate = () => new SshRuntime({ endpointId: "devbox", remote, socketRedirects });
+
+  await activate().ensureStarted();
+  const listeners = () => remote.calls.filter((call) => call.operation === "start")
+    .map((call) => JSON.parse(call.args[0]!).listener);
+  assert.deepEqual(listeners(), ["ws"], "the observed redirect repairs this generation");
+
+  // The ws generation dies for a reason that has nothing to do with the redirect, the endpoint is
+  // reactivated, and the next inspect cannot see one — there is no unix socket left to dangle.
+  remote.status = "unhealthy";
+  remote.supervised = false;
+  await activate().ensureStarted();
+
+  assert.deepEqual(listeners(), ["ws", "ws"], "and the host is still known to need ws");
+  assert.deepEqual([...socketRedirects], ["devbox"], "remembered against the endpoint, not the object");
+});
+
+// One host's isolated /tmp says nothing about another's, and a loopback port is reachable by every
+// local user on a shared login node where a unix socket is 0600. Paying that on a host which never
+// needed it would be a silent downgrade.
+test("the redirect memory is per endpoint, not a blanket switch to ws", async () => {
+  const socketRedirects = new Set<string>();
+  const redirecting = new FakeRemote();
+  redirecting.status = "unhealthy";
+  redirecting.serverAlive = true;
+  redirecting.socketRedirected = true;
+  await new SshRuntime({ endpointId: "devbox", remote: redirecting, socketRedirects }).ensureStarted();
+
+  const ordinary = new FakeRemote();
+  await new SshRuntime({ endpointId: "otherbox", remote: ordinary, socketRedirects }).ensureStarted();
+
+  assert.deepEqual(
+    ordinary.calls.filter((call) => call.operation === "start").map((call) => JSON.parse(call.args[0]!).listener),
+    [undefined],
+    "a host that has shown no redirect still gets the private socket",
+  );
+});
+
+// The latch says something about the HOST, not about this runtime being disposable. Keeping the
+// reclaim gate on what inspect actually saw is what stops a latched endpoint from tearing down a
+// live runtime that is merely slow to boot.
+test("the redirect latch does not license reclaiming a runtime that is unhealthy for another reason", async () => {
+  const remote = new FakeRemote();
+  remote.status = "unhealthy";
+  remote.serverAlive = true;
+  remote.socketRedirected = true;
+  const socketRedirects = new Set<string>();
+  await new SshRuntime({ endpointId: "devbox", remote, socketRedirects }).ensureStarted();
+
+  remote.status = "unhealthy";
+  remote.supervised = true;
+  remote.socketRedirected = undefined;
+
+  await assert.rejects(new SshRuntime({ endpointId: "devbox", remote, socketRedirects }).ensureStarted(), /unhealthy/u);
+  assert.equal(remote.calls.filter((call) => call.operation === "stop").length, 1, "only the first, proven reclaim");
 });

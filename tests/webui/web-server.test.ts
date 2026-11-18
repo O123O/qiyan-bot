@@ -72,6 +72,30 @@ test("a session with no readability opinion reports its plain status", () => {
   assert.equal(session?.nativeStatus, "idle");
 });
 
+// The endpoint's runtime was reclaimed and replaced, so the cached native view describes a
+// generation that no longer exists. Observed on polyphe: codex was restarted into a listener
+// unreachable from every channel but its own, and three workers went on reporting `idle` from
+// the generation before it — the manager read a dead endpoint as three resting workers.
+test("a session whose endpoint has moved to a new generation is not reported idle", () => {
+  const moved: WebReadsDeps = { ...reads, endpointGeneration: () => 2 };
+  const matched: WebReadsDeps = { ...reads, endpointGeneration: () => 1 };
+
+  const stale = listSessions(moved).find((session) => session.nickname === "payments");
+  const current = listSessions(matched).find((session) => session.nickname === "payments");
+
+  assert.equal(stale?.nativeStatus, null, "a status from a runtime that is gone is not a status");
+  assert.equal(stale?.activeTurnId, null, "and its turn is withheld with it");
+  assert.equal(current?.nativeStatus, "idle", "the live generation still reports its real status");
+});
+
+// An endpoint that cannot be asked at all reports -1, which matches no recorded view. That has to
+// read as "unknown" and not as the last thing we happened to see.
+test("a session whose endpoint cannot be asked for its generation is not reported idle", () => {
+  const unreachable: WebReadsDeps = { ...reads, endpointGeneration: () => -1 };
+
+  assert.equal(listSessions(unreachable).find((session) => session.nickname === "payments")?.nativeStatus, null);
+});
+
 interface ServerCalls {
   inputs: Array<{ text: string; target?: string; clientInputId?: string; echoInAssistant?: boolean }>;
   goals: WebGoalControlInput[];

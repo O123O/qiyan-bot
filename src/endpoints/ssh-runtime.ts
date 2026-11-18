@@ -240,6 +240,23 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
     endpointId: string;
     remote: RemoteRuntimeClient;
     assetRoot?: string;
+    // Endpoint ids whose host has been seen redirecting a unix listener into a per-connection
+    // /tmp. Shared by the caller and written through, because it has to outlive this object: the
+    // endpoint manager builds a NEW SshRuntime for every activation — reconnect, restart, reclaim
+    // — so a latch living on the instance would be reset by the very event it exists to survive.
+    //
+    // `inspect` can only report the redirect against a live UNIX generation: the evidence is a
+    // dangling link, and the ws generation that repairs it has none. The repair therefore destroys
+    // its own cause, and without memory the knowledge lives exactly as long as the generation
+    // carrying it. Measured on polyphe: a correct ws start at 20:52:27, a unix start at 20:54:03,
+    // and an endpoint that stayed unreachable with nothing left to teach it again.
+    //
+    // Deliberately in memory and not on disk. The design (docs/development/
+    // app-server-listener-design.md) accepts one failed connection per affected host per PROCESS
+    // so that a host which stops isolating /tmp is not punished forever: a loopback port is
+    // reachable by every local user on a shared login node and is protected only by the capability
+    // token, where a unix socket is 0600. A process restart is what re-asks the question.
+    socketRedirects?: Set<string>;
     // Called when a dead runtime's leftovers are cleared. Reclaiming kills processes the
     // worker's user started, so it must not be silent: without this, whoever owned the
     // four-hour `git` that got killed has no way to find out that it was.
@@ -314,7 +331,10 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // it is alive and serving: it serves only the channel that started it, so from everywhere
       // else it is permanently unreachable. unservingSupervisor cannot cover this — it requires a
       // dead server, and this one is healthy from its own side forever.
+      // The reclaim gate stays keyed on what this inspect SAW. The latch is a statement about the
+      // host, not grounds to tear down a runtime that is unhealthy for some other reason.
       redirected = current.socketRedirected === true;
+      if (redirected) this.options.socketRedirects?.add(this.options.endpointId);
       if (!current.identity || (!redirected && current.supervised !== false && !unservingSupervisor(current))) {
         throw new AppError("ENDPOINT_UNAVAILABLE", `existing SSH runtime is unhealthy: ${this.options.endpointId}`);
       }
@@ -347,7 +367,7 @@ export class SshRuntime implements SshRuntimeController, RemoteHost {
       // `start` cannot work this out for itself: it runs in the channel that creates the
       // app-server, and codex's daemon socket lives in that channel's own /tmp, so from in there
       // the redirect is invisible. Only `inspect`, which runs in later channels, can see it.
-      ...(redirected ? { listener: "ws" } : {}),
+      ...(redirected || this.options.socketRedirects?.has(this.options.endpointId) ? { listener: "ws" } : {}),
     })], prepared.host.remoteHelperPath);
     if (typeof result.token === "string") this.capabilityToken = result.token; else delete this.capabilityToken;
     return parseRuntimeIdentity(result.identity);

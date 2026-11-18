@@ -256,10 +256,10 @@ export class WorkerMemoryWatch {
       // A sample that hung or threw IS an unmeasured sample. Letting it reach onError instead
       // meant the escalation ladder never fired for the one failure it exists for — a wedged
       // host — while that host emitted an unthrottled operational warning every single tick.
-      this.recordUnmeasured(target, key, error instanceof Error ? error.message : "sample failed");
+      this.recordUnmeasured(target, key, error instanceof WorkerMemoryTimeout ? "sample_timed_out" : "sample_failed");
       return;
     }
-    if (!sample) { this.recordUnmeasured(target, key, "no reading"); return; }
+    if (!sample) { this.recordUnmeasured(target, key, "no_reading"); return; }
     this.unmeasured.delete(key);
     const reading = sample;
     const free = hostFreePercent(reading);
@@ -300,6 +300,8 @@ export class WorkerMemoryWatch {
     return scope === "endpoint" ? target.endpointId : stateKey(target);
   }
 
+  // `reason` is a journal token, never prose: the operational sink renders anything that is not a
+  // lowercase slug as "unknown", so a message here is the same as saying nothing.
   private recordUnmeasured(target: WorkerMemoryTarget, key: string, reason: string): void {
     const consecutive = (this.unmeasured.get(key) ?? 0) + 1;
     this.unmeasured.set(key, consecutive);
@@ -359,9 +361,14 @@ function stateKey(target: WorkerMemoryTarget): string {
 
 // Rejects rather than resolving, so a timeout reaches onError and is visible, and so a hung
 // send is never mistaken for a delivered warning.
+// A wedged host and a probe that threw are different incidents, and the journal takes a token for
+// each. Distinguishing them by message text would make the token depend on prose nobody treats as
+// an interface; the class is the interface.
+export class WorkerMemoryTimeout extends Error {}
+
 function bounded<T>(work: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    const timer = setTimeout(() => reject(new WorkerMemoryTimeout(message)), timeoutMs);
     timer.unref?.();
     work.then(
       (value) => { clearTimeout(timer); resolve(value); },

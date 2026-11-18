@@ -2018,3 +2018,30 @@ test("an action with no stop target still separates an absent runtime from an un
   assert.equal(live.outcome, "unobservable");
   assert.match(live.outcome === "unobservable" ? live.reason : "", /no identity to compare it with/u);
 });
+
+// Two counters, same name, different numbers. The pool bumps its own for every endpoint it is
+// CONSTRUCTED with, and the manager's starts at zero and only moves when it publishes. For a
+// builtin — `local`, and a local Claude endpoint — that leaves the pool permanently one ahead.
+//
+// Every native session view is stamped with the MANAGER's number (bindProjectEndpoint), so any
+// reader comparing a view against the pool's number sees a mismatch that never resolves. It would
+// report every local worker as having no status at all, and `scripts/safe-restart.sh` reads a
+// missing status as "not working" — a force-free restart straight through live work.
+test("the generation a native view is stamped with is the manager's, not the pool's", async () => {
+  const value = fixture();
+  const pool = new AppServerPool([value.local], {});
+  // What `bindProjectEndpoint` receives and stamps onto every view it registers.
+  const stamped: number[] = [];
+  value.manager.onEndpoint((endpoint, generation) => {
+    stamped.push(generation);
+    pool.replaceEndpoint(endpoint);
+  });
+
+  await value.manager.ensureReady("local");
+
+  assert.deepEqual(stamped, [value.manager.endpointGeneration("local").generation],
+    "a lease-free reader comparing against a view must ask the manager for this number");
+  // And the pool is a different number, which is why asking the wrong one is not a harmless
+  // substitution: its constructor already counted the endpoints it was seeded with.
+  assert.notEqual(pool.endpointGeneration("local").generation, stamped[0]);
+});
