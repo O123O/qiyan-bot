@@ -54,7 +54,7 @@ import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { assistantAuthenticationStartupError, recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
 import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedAssistantProfile } from "./assistant/profile.ts";
-import { AssistantRuntime } from "./assistant/runtime.ts";
+import { AssistantRuntime, describeAttemptFailure } from "./assistant/runtime.ts";
 import { AssistantPostTurnActions, type AssistantPostTurnAction } from "./assistant/post-turn-actions.ts";
 import { runAssistantCompaction, runAssistantRestart, startAssistantTurnWithPendingSettings } from "./assistant/self-controls.ts";
 import { recordCompletedSystemAction } from "./assistant/system-awareness.ts";
@@ -798,14 +798,16 @@ export type SessionRecoveryOutcome = { ok: true } | { ok: false; reason: string 
 // human intervened.
 export async function settleSessionRecovery(
   resume: () => Promise<unknown>,
-  onFailed: (reason: string) => void,
+  // Both forms of the cause. The outcome carries the readable message for the tool result; the
+  // journal takes a token, and handing it the message means it prints `reason=unknown`.
+  onFailed: (reason: string, error: unknown) => void,
 ): Promise<SessionRecoveryOutcome> {
   try {
     await resume();
     return { ok: true };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    onFailed(reason);
+    onFailed(reason, error);
     return { ok: false, reason };
   }
 }
@@ -3677,7 +3679,9 @@ export async function buildProductionApp(
           now: () => Date.now(),
           onError: (error, target) => reportOperationalSafely(report, {
             level: "warn", code: "background_task_failed", component: "worker_memory_watch",
-            endpoint: target.endpointId, reason: error instanceof Error ? error.message : "unknown",
+            // A message is not a token: `safeToken` renders a sentence as "unknown", which is how
+            // every one of these lines lost the only thing it was written to carry.
+            endpoint: target.endpointId, reason: describeAttemptFailure(error).token,
           }),
           // Being unable to measure is this feature's whole failure mode, and it is silent by
           // construction. Say it out loud once it has persisted, so a watch that has quietly
@@ -3686,7 +3690,7 @@ export async function buildProductionApp(
             if (consecutive !== 10 && consecutive % 60 !== 0) return;
             reportOperationalSafely(report, {
               level: "warn", code: "worker_memory_unmeasured", component: "worker_memory_watch",
-              endpoint: target.endpointId, reason: `${why} for ${consecutive} consecutive checks`,
+              endpoint: target.endpointId, reason: why, consecutiveFailures: consecutive,
             });
           },
         });
@@ -3825,7 +3829,9 @@ export async function buildProductionApp(
           },
           onReconnectGaveUp: (id, attempts) => reportOperationalSafely(report, {
             level: "warn", code: "endpoint_reconnect_gave_up", component: "endpoint_manager", consecutiveFailures: attempts,
-            reason: `endpoint ${id} unreachable after sustained reconnect attempts (~48h); pausing automatic recovery until restart or next use`,
+            // The sentence this used to pass named the endpoint and said what had happened, and
+            // the journal printed `reason=unknown` with no endpoint at all. Both facts, as fields.
+            endpoint: id, reason: "reconnect_budget_exhausted",
           }),
           onRecoveryPaused: (id, recovery) => {
             reportOperationalSafely(report, {
@@ -5037,8 +5043,9 @@ export async function buildProductionApp(
   }
 
   function resumeManagedEndpointSafely(endpointId: string): Promise<SessionRecoveryOutcome> {
-    return settleSessionRecovery(() => resumeManagedEndpoint(endpointId, true), (reason) => reportOperationalSafely(report, {
-      level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId, reason,
+    return settleSessionRecovery(() => resumeManagedEndpoint(endpointId, true), (_reason, error) => reportOperationalSafely(report, {
+      level: "warn", code: "background_task_failed", component: "restart_session_recovery", endpoint: endpointId,
+      reason: describeAttemptFailure(error).token,
     }));
   }
 
@@ -6361,7 +6368,7 @@ export async function buildProductionApp(
     return settleStartupCapacityBootstrap(endpointIds, resumeManagedEndpoint, (endpointId, error) => {
       reportOperationalSafely(report, {
         level: "warn", code: "background_task_failed", component: "managed_recovery",
-        reason: `startup managed recovery of ${endpointId} failed: ${error instanceof Error ? error.message : String(error)}`,
+        endpoint: endpointId, reason: describeAttemptFailure(error).token,
       });
       // This startup attempt owns the endpoint recovery slot. Remove it from the ready buffer so
       // acceptAndDrain() cannot immediately duplicate it. The recovery owner and a later ready event

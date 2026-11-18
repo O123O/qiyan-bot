@@ -145,7 +145,9 @@ test("a hung sample is bounded rather than left to stall the pass", async () => 
   // It is a failure to MEASURE, so it takes the unmeasured ladder rather than reporting an
   // unthrottled error on every tick for as long as the host stays wedged.
   assert.equal(unmeasured.length, 1);
-  assert.match(unmeasured[0]!, /sample timed out/u);
+  // A journal token, not a sentence: the operational sink prints anything else as "unknown", and a
+  // wedged host is precisely the case these lines exist to make visible.
+  assert.deepEqual(unmeasured, ["sample_timed_out"]);
   assert.deepEqual(errors, []);
 });
 
@@ -164,7 +166,7 @@ test("a sample or a send that throws is isolated, and the other workers still ge
     onUnmeasured: (_t, _consecutive, reason) => unmeasured.push(reason),
   });
   await watch.tick();
-  assert.deepEqual(unmeasured, ["probe exploded"]);
+  assert.deepEqual(unmeasured, ["sample_failed"], "a probe that threw is told apart from one that hung");
   assert.deepEqual(sent, ["qarl"]);
 });
 
@@ -401,7 +403,7 @@ test("a hung sample counts as unmeasured, not as a bare error", async () => {
   await watch.tick();
   await watch.tick();
   assert.deepEqual(unmeasured.map((entry) => entry.consecutive), [1, 2, 3], "the ladder sees the wedged host");
-  assert.match(unmeasured[0]!.reason, /timed out/u);
+  assert.equal(unmeasured[0]!.reason, "sample_timed_out");
   assert.deepEqual(errors, [], "and it is not also reported as an unthrottled error every tick");
 });
 
