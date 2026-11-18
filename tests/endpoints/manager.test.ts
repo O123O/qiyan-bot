@@ -2027,16 +2027,21 @@ test("an action with no stop target still separates an absent runtime from an un
 // reader comparing a view against the pool's number sees a mismatch that never resolves. It would
 // report every local worker as having no status at all, and `scripts/safe-restart.sh` reads a
 // missing status as "not working" — a force-free restart straight through live work.
-test("the pool's endpoint generation is not the one native views are stamped with", async () => {
+test("the generation a native view is stamped with is the manager's, not the pool's", async () => {
   const value = fixture();
   const pool = new AppServerPool([value.local], {});
+  // What `bindProjectEndpoint` receives and stamps onto every view it registers.
+  const stamped: number[] = [];
+  value.manager.onEndpoint((endpoint, generation) => {
+    stamped.push(generation);
+    pool.replaceEndpoint(endpoint);
+  });
 
   await value.manager.ensureReady("local");
-  pool.replaceEndpoint(value.manager.endpointGeneration("local").endpoint);
 
-  assert.notEqual(
-    pool.endpointGeneration("local").generation,
-    value.manager.endpointGeneration("local").generation,
-    "a reader that compares against the pool must not be wired to a manager-stamped view",
-  );
+  assert.deepEqual(stamped, [value.manager.endpointGeneration("local").generation],
+    "a lease-free reader comparing against a view must ask the manager for this number");
+  // And the pool is a different number, which is why asking the wrong one is not a harmless
+  // substitution: its constructor already counted the endpoints it was seeded with.
+  assert.notEqual(pool.endpointGeneration("local").generation, stamped[0]);
 });
