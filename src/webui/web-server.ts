@@ -16,6 +16,7 @@ import { runCommand } from "./web-exec.ts";
 import { discoverRepos, gitCommit, gitDiff, gitStage, gitStatus, gitUnstage } from "./web-git.ts";
 import { remoteBrowse, remoteCreateEntry, remoteDiscover, remoteGitCommit, remoteGitDiff, remoteGitStage, remoteGitStatus, remoteGitUnstage, remoteReadStream, remoteRunCommand, remoteUploadFile, type RemoteDeps } from "./web-remote.ts";
 import type { WebGoalControlInput, WebGoalControlResult } from "./web-goal-control.ts";
+import { describeAttemptFailure } from "../core/errors.ts";
 
 const AUTH_COOKIE = "qiyan_web_token";
 // A previewed HTML/SVG document opened in its own tab. A bare `sandbox` is the FULLY restrictive
@@ -270,7 +271,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
         lastSessions = serialized;
         options.bus.broadcast({ type: "sessions", ...snapshot, at: Date.now() });
       }
-    } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: error instanceof Error ? error.message : String(error) }); }
+    } catch (error) { options.report({ level: "warn", code: "background_task_failed", component: "web_ui", reason: describeAttemptFailure(error).token }); }
   };
 
   const json = (response: ServerResponse, status: number, body: unknown): void => {
@@ -641,7 +642,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
       // Loud warning: a non-loopback bind exposes a danger-full-access surface on the LAN over
       // plain HTTP — the access token travels in cleartext (URL + cookie) and grants a full shell.
       if (host !== "127.0.0.1") {
-        options.report({ level: "warn", code: "web_ui_lan_exposure", component: "web_ui", reason: `bound ${host}:${boundPort} — full-access UI reachable on the LAN over plain HTTP` });
+        // The sentence here printed as `reason=unknown`, so the one warning about an unauthenticated
+        // full-access UI on the LAN said nothing about why. The bound address is already in
+        // webui.json; what this line owes the reader is the name of the hazard.
+        options.report({ level: "warn", code: "web_ui_lan_exposure", component: "web_ui", reason: "lan_reachable_plain_http" });
         process.stderr.write(`\n*** SECURITY WARNING: QiYan web UI is bound to ${host}:${boundPort} (NOT loopback). This is a danger-full-access surface over plain HTTP; the access token is sniffable on the network. Prefer WEB_HOST=127.0.0.1 + an SSH tunnel. ***\n\n`);
       }
       return { url: `http://${host}:${boundPort}/?token=${options.token}` };

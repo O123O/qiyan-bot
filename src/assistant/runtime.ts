@@ -6,7 +6,7 @@ import { inTransaction } from "../storage/database.ts";
 import type { DeliveryStore } from "../storage/delivery-store.ts";
 import type { OperationRecord, OperationStore } from "../storage/operation-store.ts";
 import type { OperationalEventSink } from "../core/operational-log.ts";
-import { AppError } from "../core/errors.ts";
+import { AppError, describeAttemptFailure } from "../core/errors.ts";
 
 export interface ActiveAssistantContext {
   attemptId: string;
@@ -379,20 +379,4 @@ export class AssistantRuntime {
       this.db.prepare("UPDATE attachments SET ref_count = MAX(ref_count - 1, 0) WHERE id = ?").run(id);
     }
   }
-}
-
-// The journal takes a token (safeToken only accepts a lowercase slug); the owner-facing notice
-// takes the readable detail. Splitting them means the chat message can name the actual cause
-// without the journal degrading it to "unknown".
-export function describeAttemptFailure(error: unknown): { token: string; detail: string } {
-  const detail = (value: string): string => {
-    const line = value.replace(/\s+/gu, " ").trim();
-    return line.length > 300 ? `${line.slice(0, 299)}\u2026` : line;
-  };
-  if (error instanceof AppError) return { token: error.code.toLowerCase(), detail: detail(`${error.code}: ${error.message}`) };
-  if (error instanceof Error) return { token: "exception", detail: detail(error.message || error.name) };
-  if (typeof error === "string" && error.length > 0) {
-    return { token: /^[a-z][a-z0-9_-]{0,63}$/u.test(error) ? error : "unknown", detail: detail(error) };
-  }
-  return { token: "unknown", detail: "no cause was recorded" };
 }

@@ -42,7 +42,7 @@ import { createWebGoalControl, type WebGoalControl } from "./webui/web-goal-cont
 import { workerDeliveryNickname } from "./webui/web-reads.ts";
 import { webUiStatePath } from "./webui/webui-state.ts";
 import { ensureWebUiToken } from "./webui/web-token.ts";
-import { AppError, tagObservedOutcome } from "./core/errors.ts";
+import { AppError, tagObservedOutcome, describeAttemptFailure } from "./core/errors.ts";
 import { runBackground } from "./core/background.ts";
 import {
   createBackgroundFailureReporter,
@@ -54,7 +54,7 @@ import { SessionDashboard } from "./assistant/session-dashboard.ts";
 import { activateAssistantProfileIdentity, resumeAssistantIdentity } from "./assistant/identity.ts";
 import { assistantAuthenticationStartupError, recordAssistantAuthenticationFailure } from "./assistant/auth-recovery.ts";
 import { buildAssistantChildEnvironment, prepareAssistantProfile, type PreparedAssistantProfile } from "./assistant/profile.ts";
-import { AssistantRuntime, describeAttemptFailure } from "./assistant/runtime.ts";
+import { AssistantRuntime } from "./assistant/runtime.ts";
 import { AssistantPostTurnActions, type AssistantPostTurnAction } from "./assistant/post-turn-actions.ts";
 import { runAssistantCompaction, runAssistantRestart, startAssistantTurnWithPendingSettings } from "./assistant/self-controls.ts";
 import { recordCompletedSystemAction } from "./assistant/system-awareness.ts";
@@ -6320,7 +6320,7 @@ export async function buildProductionApp(
           level: "warn",
           code: "operation_recovery_write_failed",
           component: operationId,
-          reason: error instanceof Error ? error.message : String(error),
+          reason: describeAttemptFailure(error).token,
         }),
       });
     });
