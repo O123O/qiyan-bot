@@ -244,10 +244,26 @@ export class ConversationStore {
       WHERE state = 'active' ORDER BY created_at, id`).all() as Array<Record<string, unknown>>).map((row) => this.parseAttempt(row));
   }
 
-  nextPendingCandidate(): { kind: "chat" | "internal"; contextId: string } | undefined {
-    const row = this.db.prepare(`SELECT id, source_class FROM source_contexts
-      WHERE state = 'pending' ORDER BY arrival_sequence, id LIMIT 1`).get() as { id: string; source_class: string } | undefined;
-    return row ? { kind: row.source_class === "chat" ? "chat" : "internal", contextId: row.id } : undefined;
+  nextPendingCandidate(): {
+    kind: "chat" | "internal";
+    contextId: string;
+    // Which conversation this start would serve, absent for an internal source that belongs to
+    // none. A caller deciding whether a newly arrived message releases a wait needs this, not
+    // the context id: a source restored to pending keeps its original arrival sequence, so the
+    // new message is never itself the candidate while an older retry is waiting.
+    binding?: Pick<ConversationBinding, "adapterId" | "conversationKey">;
+  } | undefined {
+    const row = this.db.prepare(`SELECT id, source_class, adapter_id, conversation_key FROM source_contexts
+      WHERE state = 'pending' ORDER BY arrival_sequence, id LIMIT 1`)
+      .get() as { id: string; source_class: string; adapter_id: string | null; conversation_key: string | null } | undefined;
+    if (!row) return undefined;
+    return {
+      kind: row.source_class === "chat" ? "chat" : "internal",
+      contextId: row.id,
+      ...(row.adapter_id === null || row.conversation_key === null
+        ? {}
+        : { binding: { adapterId: row.adapter_id, conversationKey: row.conversation_key } }),
+    };
   }
 
   createAttempt(candidate: { kind: "chat" | "internal"; contextId: string }): AssistantAttempt {

@@ -1,8 +1,15 @@
+import { codexErrorCode } from "../core/errors.ts";
 import type { RegistrySession } from "../registry/session-registry.ts";
 
 export const TRANSIENT_TURN_RETRY_MESSAGE =
   "[system] Your previous turn failed with a transient provider error before producing anything."
   + " Continue the work it was meant to do; if it already finished, no response is needed.";
+
+// How long to leave a provider alone after it refuses a turn. Long enough that three attempts
+// span a real outage rather than a single bad minute, short enough that a blip costs no more
+// than one wait. The assistant waits the same, so a provider failure parks one side of the
+// system for the same length of time it parks the other.
+export const TRANSIENT_TURN_RETRY_MS = 120_000;
 
 // Codex classifies every turn failure, so the retryable set is a decision about codes rather than
 // a guess about messages. These are the failures where the request produced nothing and the same
@@ -24,13 +31,10 @@ const RETRYABLE_CODES: ReadonlySet<string> = new Set([
 // stream errors on its own `error` notification and leaves the turn's last_error alone, because
 // it retries those itself -- so listing it would be dead code implying coverage we do not have.
 
-// CodexErrorInfo is either a bare string or a single-key object carrying an http status.
+// The shape is read in core/errors.ts, which also needs it to name a failed turn in the journal.
+// One reader, so a classification here and the reason printed there cannot drift apart.
 export function transientTurnErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object") return undefined;
-  const info = (error as { codexErrorInfo?: unknown }).codexErrorInfo;
-  const code = typeof info === "string"
-    ? info
-    : info && typeof info === "object" && !Array.isArray(info) ? Object.keys(info)[0] : undefined;
+  const code = codexErrorCode(error);
   return code !== undefined && RETRYABLE_CODES.has(code) ? code : undefined;
 }
 
@@ -83,7 +87,7 @@ export class TransientTurnRetry {
     maxAttempts?: number;
   }) {}
 
-  private get retryMs(): number { return this.deps.retryMs ?? 120_000; }
+  private get retryMs(): number { return this.deps.retryMs ?? TRANSIENT_TURN_RETRY_MS; }
   private get maxAttempts(): number { return this.deps.maxAttempts ?? 3; }
   private get timers(): RetryTimers { return this.deps.timers ?? nodeRetryTimers; }
 

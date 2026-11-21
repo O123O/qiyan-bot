@@ -44,7 +44,13 @@ test("Slack and Telegram share one durable conversation owner and arrival queue"
   conversations.markSubmitted(lease.attemptId, steer.contextId, "turn-1");
 
   conversations.failUnstartedAttempt(lease.attemptId);
-  assert.deepEqual(conversations.nextPendingCandidate(), { kind: "chat", contextId: "telegram-queued" });
+  // The candidate names its conversation as well as its id: a dispatcher deciding whether a
+  // newly arrived message releases a provider-outage wait has to know which conversation the
+  // start it would release belongs to, and the id alone cannot answer that.
+  assert.deepEqual(conversations.nextPendingCandidate(), {
+    kind: "chat", contextId: "telegram-queued",
+    binding: { adapterId: "telegram", conversationKey: "telegram:42" },
+  });
   assert.deepEqual(routes.current(), otherThread, "unsolicited output follows the most recently accepted owner route");
   assert.deepEqual(new OwnerRouteStore(db, telegram).current(), otherThread, "latest owner route survives restart");
 });
