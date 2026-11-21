@@ -85,3 +85,47 @@ test("a classified failure cause reaches the journal instead of degrading to unk
   ]);
   assert.equal(lines.join("").includes("unknown"), false);
 });
+
+// Codex reports a failed turn as DATA on the turn -- `{ message, codexErrorInfo,
+// additionalDetails }` -- so it is neither an Error nor a string and used to fall through every
+// branch to "no cause was recorded". Measured 2026-11-20 20:10-20:14 UTC: three assistant turns
+// lost to a model-API outage, each journalled as `reason=unknown`, and the owner told that the
+// last failure had no cause while codex had named it twice over.
+test("a codex turn error names the failure it already classified", () => {
+  assert.deepEqual(describeAttemptFailure({
+    message: "stream error: failed to connect to Responses WebSocket",
+    codexErrorInfo: { responseStreamConnectionFailed: { httpStatusCode: null } },
+    additionalDetails: null,
+  }), {
+    token: "responsestreamconnectionfailed",
+    detail: "stream error: failed to connect to Responses WebSocket",
+  });
+
+  // The bare-string form of CodexErrorInfo, and a detail assembled from both halves.
+  assert.deepEqual(describeAttemptFailure({
+    message: "server overloaded", codexErrorInfo: "serverOverloaded", additionalDetails: "retry later",
+  }), { token: "serveroverloaded", detail: "server overloaded -- retry later" });
+
+  // Classified as a turn failure even when codex declines to say which kind, because that is
+  // still more than "unknown", which here only ever meant the cause was lost on the way in.
+  assert.deepEqual(describeAttemptFailure({ message: "turn failed", codexErrorInfo: null, additionalDetails: null }),
+    { token: "turn_failed", detail: "turn failed" });
+
+  // A foreign rejected value -- some library's `{ message, code }` -- is NOT a turn failure.
+  // Its message is worth carrying; naming it one would assert something nothing here showed.
+  assert.deepEqual(describeAttemptFailure({ message: "socket hang up", code: "ECONNRESET" }),
+    { token: "unknown", detail: "socket hang up" });
+
+  // And the real fallback is untouched: nothing in hand is still nothing in hand.
+  assert.deepEqual(describeAttemptFailure(undefined), { token: "unknown", detail: "no cause was recorded" });
+
+  const lines: string[] = [];
+  const report = createOperationalLogSink((line) => { lines.push(line); });
+  report({
+    level: "warn", code: "assistant_attempt_failed", component: "assistant_runtime",
+    reason: describeAttemptFailure({ message: "x", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 502 } }, additionalDetails: null }).token,
+  });
+  // The same spelling the worker line already uses for this code, so one outage reads the same
+  // on both sides of the system.
+  assert.equal(lines[0], "qiyan-bot: WARN event=assistant_attempt_failed reason=httpconnectionfailed component=assistant_runtime\n");
+});

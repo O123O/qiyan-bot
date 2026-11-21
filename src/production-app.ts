@@ -91,7 +91,7 @@ import { backgroundStopReport, SessionService } from "./sessions/service.ts";
 import { NativeSessionState } from "./sessions/native-session-state.ts";
 import { repairActiveTurnIdentity } from "./sessions/native-session-probe.ts";
 import { RuntimeRestartRecovery, RUNTIME_RESTART_RESUME_MESSAGE } from "./sessions/runtime-restart-recovery.ts";
-import { TransientTurnRetry, TRANSIENT_TURN_RETRY_MESSAGE, turnRetryDecision } from "./sessions/transient-turn-retry.ts";
+import { TransientTurnRetry, TRANSIENT_TURN_RETRY_MESSAGE, TRANSIENT_TURN_RETRY_MS, transientTurnErrorCode, turnRetryDecision } from "./sessions/transient-turn-retry.ts";
 import { parseRolloutSlice, readCodexRolloutHistoryPage, readLocalRolloutSlice } from "./sessions/codex-rollout-history.ts";
 import { ThreadGate } from "./sessions/thread-gate.ts";
 import { inReadTransaction, markDatabaseClosedCleanly, openDatabase, type Database } from "./storage/database.ts";
@@ -5508,6 +5508,13 @@ export async function buildProductionApp(
 
   async function processAssistantTerminalOnce(params: any): Promise<void> {
     const identity = registry.snapshot().assistant;
+    // Before `terminal`, which on one branch starts the next attempt itself. The notification
+    // carries the same classification the authoritative read confirms below, and the gate takes
+    // the later of the two deadlines, so setting it twice costs nothing and setting it late
+    // would let exactly one start through the wait.
+    if (transientTurnErrorCode(params.turn?.error) !== undefined) {
+      await dispatcher.deferStartsForProviderOutage(Date.now() + TRANSIENT_TURN_RETRY_MS);
+    }
     await dispatcher.terminal(params.turn);
     const attemptBefore = assistant.contextForTurn(params.turn.id);
     if (!attemptBefore) return;
@@ -5535,6 +5542,11 @@ export async function buildProductionApp(
         messages.map((message) => message.body).join("\n") || undefined,
         resolved.error,
       );
+      // The same classification the workers retry on. Asking again at once spends the attempt
+      // budget on an outage that has not had time to end; the wait matches theirs.
+      if (transientTurnErrorCode(resolved.error) !== undefined) {
+        void dispatcher.deferStartsForProviderOutage(Date.now() + TRANSIENT_TURN_RETRY_MS);
+      }
     });
     for (const contextId of memberIds) attemptScope.notifyMembership(contextId);
     if (operations.listRecoverable().some((operation) => operation.attemptId === attemptBefore.attemptId)) {

@@ -2,6 +2,7 @@ import type { AttachmentStore, FileHandleId } from "../attachments/store.ts";
 import { TurnIdentityConflictError, turnNoLongerSteerable } from "../app-server/pool.ts";
 import type { AppServerPool, TurnCapacityClaim } from "../app-server/pool.ts";
 import { JsonRpcResponseError } from "../app-server/json-rpc-client.ts";
+import { sameConversation } from "../chat-apps/shared/binding.ts";
 import { AppError } from "../core/errors.ts";
 import type { CanonicalChatSource } from "../core/types.ts";
 import type { AssistantAttempt, ChatAcceptanceEffects, ConversationStore, ReservedSubmission } from "../storage/conversation-store.ts";
@@ -104,6 +105,11 @@ export class ConversationDispatcher {
   private nativeRecoveryFailureCause: unknown;
   private nativeAuthorityGeneration = 0;
   private stopped = false;
+  // Not before this time may another attempt be STARTED, because the provider itself is down.
+  // Deliberately not `pumpPaused`: every terminal clears that one, which is exactly the event
+  // that sets this one, so sharing the flag would make the wait last no time at all.
+  private providerOutageUntil = 0;
+  private providerOutageTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly store: ConversationStore,
@@ -116,7 +122,47 @@ export class ConversationDispatcher {
     return this.post(() => {
       this.pumpPaused = false;
       this.store.acceptChatSource(source, effects, this.currentAttempt);
+      // Someone is here now, asking, and waiting out a backoff while the owner watches is worse
+      // than one failed turn. But the release has to be aimed, because candidates are taken
+      // oldest-first: clearing on ANY message let one in an unrelated conversation hand the
+      // start to the context that had just failed, spending its retry on the outage the wait
+      // exists to sit out -- the incident reproduced through its own fix.
+      //
+      // The discriminator is the CONVERSATION, not the context id. A failed source is restored
+      // to pending keeping its original arrival sequence, and an accepted message always takes
+      // a fresh one, so the new message is never itself the next candidate while a retry is
+      // waiting -- an id comparison releases only when there is nothing to release. Matching
+      // the conversation frees the start that serves the person who just typed, and still
+      // refuses to let a third conversation's message pay for a second one's retry.
+      const candidate = this.providerOutageUntil > 0 ? this.store.nextPendingCandidate() : undefined;
+      // Through `sameConversation`, which is where this system decides that question once --
+      // `createAttemptInTransaction` asks it of the same two conversations. An inline comparison
+      // would answer identically today and silently over-release the day that helper gains a
+      // third discriminator.
+      if (candidate?.binding && sameConversation(candidate.binding, source.binding)) {
+        this.clearProviderOutage();
+      }
       this.pump();
+    });
+  }
+
+  // The attempt budget is spent on attempts, and an outage answers three of them in ten seconds
+  // unless something spaces them out. Measured 2026-11-20: the model API refused connections
+  // from 20:10:44, the assistant exhausted its three attempts by 20:13:20, and the provider was
+  // answering again by 20:15 -- while the codex WORKERS, which space their retries two minutes
+  // apart, rode the same outage out without anyone noticing. This is that spacing, for the
+  // assistant, and it gates only the START of a new attempt: a turn already running keeps its
+  // steers, and a new owner message cancels the wait outright.
+  deferStartsForProviderOutage(retryAt: number): Promise<void> {
+    return this.post(() => {
+      if (retryAt <= Date.now() || retryAt <= this.providerOutageUntil) return;
+      this.providerOutageUntil = retryAt;
+      // Re-arm rather than leave the timer alone: an armed wake fires at the OLD deadline and
+      // clears the gate there, so a second failure extending the wait would otherwise shorten
+      // it to whatever remained of the first.
+      if (this.providerOutageTimer) clearTimeout(this.providerOutageTimer);
+      this.providerOutageTimer = undefined;
+      this.scheduleProviderOutageWake();
     });
   }
 
@@ -303,6 +349,7 @@ export class ConversationDispatcher {
   async stop(): Promise<void> {
     this.stopped = true;
     this.cancelRecovery();
+    this.clearProviderOutage();
     if (this.admissionRetryTimer) clearTimeout(this.admissionRetryTimer);
     this.admissionRetryTimer = undefined;
     if (this.eventWakeTimer) clearTimeout(this.eventWakeTimer);
@@ -325,6 +372,11 @@ export class ConversationDispatcher {
     if (this.stopped || this.networkCount > 0 || this.pumpPaused || this.nativeBusy && !this.currentAttempt) return;
     const attempt = this.currentAttempt;
     if (!attempt) {
+      // Only new starts wait. An attempt already in flight is unaffected below.
+      if (this.providerOutageUntil > Date.now()) {
+        this.scheduleProviderOutageWake();
+        return;
+      }
       const sourceCandidate = this.store.nextPendingCandidate();
       const eventCandidate = this.options.scheduler?.peekEligibleEventBatch();
       const chooseEvent = !!eventCandidate && (!sourceCandidate || eventCandidate.forced);
@@ -847,6 +899,22 @@ export class ConversationDispatcher {
       if (!this.stopped) void this.recover();
     }, Math.max(0, wakeAt - Date.now()));
     this.recoveryTimer.unref?.();
+  }
+
+  private scheduleProviderOutageWake(): void {
+    if (this.providerOutageTimer || this.stopped) return;
+    this.providerOutageTimer = setTimeout(() => {
+      this.providerOutageTimer = undefined;
+      this.providerOutageUntil = 0;
+      if (!this.stopped) void this.post(() => this.pump());
+    }, Math.max(0, this.providerOutageUntil - Date.now()));
+    this.providerOutageTimer.unref?.();
+  }
+
+  private clearProviderOutage(): void {
+    this.providerOutageUntil = 0;
+    if (this.providerOutageTimer) clearTimeout(this.providerOutageTimer);
+    this.providerOutageTimer = undefined;
   }
 
   private cancelRecovery(): void {

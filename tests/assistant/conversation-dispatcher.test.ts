@@ -1617,3 +1617,82 @@ test("a due event never interrupts an active conversation period", async () => {
   await dispatcher.stop();
   await value.dispatcher.stop();
 });
+
+// A provider outage used to be answered by three attempts inside ten seconds, which is the
+// attempt budget spent before the outage has had any time to end. Measured 2026-11-20: the model
+// API refused connections at 20:10:44, the assistant was out of attempts by 20:13:20, and the
+// provider was answering again by 20:15.
+//
+// Production shape, which these tests have to build by hand: an effect-free failure sends the
+// source back to `pending` for another attempt (AssistantRuntime.failAttemptGroup), keeping the
+// arrival sequence it already had -- so the retry is always OLDER than anything typed next.
+async function awaitingRetryAfterProviderFailure(retryAt: number) {
+  const context = fixture();
+  await context.dispatcher.accept(chat("first"));
+  context.runner.starts[0]!.result.resolve({ turn: { id: "turn-1", status: "inProgress", itemsView: "full", items: [] } });
+  await context.dispatcher.idle();
+  await context.dispatcher.deferStartsForProviderOutage(retryAt);
+  await context.dispatcher.terminal({ id: "turn-1", status: "failed", itemsView: "full", items: [] });
+  context.db.prepare("UPDATE assistant_attempts SET state = 'failed', accepting_tools = 0 WHERE context_id = 'first'").run();
+  context.db.prepare("UPDATE assistant_attempt_sources SET state = 'failed' WHERE context_id = 'first'").run();
+  context.db.prepare("UPDATE source_contexts SET state = 'pending' WHERE id = 'first'").run();
+  return context;
+}
+
+test("a provider outage defers the retry, and lets it through when the wait ends", async () => {
+  const { runner, dispatcher } = await awaitingRetryAfterProviderFailure(Date.now() + 300);
+  // The pump production runs after every terminal. Without the wait it starts the retry here,
+  // which is the attempt the outage would have spent.
+  await dispatcher.enqueueInternal("terminal");
+  assert.equal(runner.starts.length, 1, "the restored source must not retry while the provider is down");
+  await waitFor(() => runner.starts.length === 2);
+  runner.starts[1]!.result.resolve({ turn: { id: "turn-2", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+// The wait is an estimate about a provider, not a rule about the owner: making them watch a
+// backoff is worse than one failed turn. The start it frees is the retry of their own
+// conversation, which is what carries their new message.
+test("a message in the waiting conversation cancels the wait", async () => {
+  const { runner, dispatcher } = await awaitingRetryAfterProviderFailure(Date.now() + 60_000);
+  await dispatcher.accept(chat("second"));
+  await waitFor(() => runner.starts.length === 2);
+  runner.starts[1]!.result.resolve({ turn: { id: "turn-2", status: "inProgress", itemsView: "full", items: [] } });
+  // The released start is the retry itself, and the message that released it joins that same
+  // turn -- which is how releasing for this conversation answers the person who just typed.
+  await waitFor(() => runner.steers.length === 1);
+  runner.steers[0]!.result.resolve({ turnId: "turn-2" });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+// Candidates are taken oldest-first, so a message in ANOTHER conversation releasing the wait
+// does not hand the start to itself: it hands it to the retry waiting ahead of it, which then
+// spends its attempt on the outage. That message is still served, after the wait, in its turn.
+test("a message in another conversation does not release the wait for an older retry", async () => {
+  const { runner, dispatcher } = await awaitingRetryAfterProviderFailure(Date.now() + 300);
+  await dispatcher.accept(chat("newest", "chat-3"));
+  await dispatcher.enqueueInternal("terminal");
+  assert.equal(runner.starts.length, 1, "a younger conversation must not release a wait it would not win");
+  await waitFor(() => runner.starts.length === 2);
+  runner.starts[1]!.result.resolve({ turn: { id: "turn-2", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});
+
+// A second failure inside the first wait must extend it, not inherit what is left of it. The
+// armed wake fires at the deadline it was armed for and clears the gate there, so without a
+// re-arm the longer wait silently collapses into the shorter one.
+test("a second provider failure extends the wait instead of inheriting its remainder", async () => {
+  const { runner, dispatcher } = await awaitingRetryAfterProviderFailure(Date.now() + 60);
+  await dispatcher.deferStartsForProviderOutage(Date.now() + 400);
+  // Past the first deadline, well short of the second.
+  await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  await dispatcher.enqueueInternal("terminal");
+  assert.equal(runner.starts.length, 1, "the wait must run to the later deadline");
+  await waitFor(() => runner.starts.length === 2);
+  runner.starts[1]!.result.resolve({ turn: { id: "turn-2", status: "inProgress", itemsView: "full", items: [] } });
+  await dispatcher.idle();
+  await dispatcher.stop();
+});

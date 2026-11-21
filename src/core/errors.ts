@@ -74,6 +74,17 @@ export function observedOutcome(error: unknown): ObservedOutcome | undefined {
     : undefined;
 }
 
+// A codex turn failure is DATA, not a thrown error: the app-server reports it as
+// `{ message, codexErrorInfo, additionalDetails }` on the turn itself, and `codexErrorInfo` is
+// either a bare string ("serverOverloaded") or a single-key object carrying an http status
+// (`{ httpConnectionFailed: { httpStatusCode } }`). This reads the code out of either shape.
+export function codexErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const info = (error as { codexErrorInfo?: unknown }).codexErrorInfo;
+  if (typeof info === "string") return info;
+  return info && typeof info === "object" && !Array.isArray(info) ? Object.keys(info)[0] : undefined;
+}
+
 // The journal takes a token (safeToken only accepts a lowercase slug); the owner-facing notice
 // takes the readable detail. Splitting them means the chat message can name the actual cause
 // without the journal degrading it to "unknown".
@@ -86,6 +97,26 @@ export function describeAttemptFailure(error: unknown): { token: string; detail:
   if (error instanceof Error) return { token: "exception", detail: detail(error.message || error.name) };
   if (typeof error === "string" && error.length > 0) {
     return { token: /^[a-z][a-z0-9_-]{0,63}$/u.test(error) ? error : "unknown", detail: detail(error) };
+  }
+  // A failed codex turn arrives here as that plain object, which is neither an Error nor a
+  // string, so it used to fall all the way through to "no cause was recorded" -- about an
+  // outage codex had already classified for us. Measured 2026-11-20 20:10-20:14 UTC: three
+  // assistant turns lost to `failed to connect to Responses WebSocket`, each reported as
+  // `assistant_attempt_failed reason=unknown` and announced to the owner as having no cause.
+  // The code is lower-cased rather than re-spelled, so it reads the same here as it does on
+  // the worker line (`turn_retry_scheduled reason=httpconnectionfailed`) that names it today.
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    const additional = (error as { additionalDetails?: unknown }).additionalDetails;
+    const text = [message, additional].filter((part): part is string => typeof part === "string" && part.length > 0).join(" -- ");
+    const code = codexErrorCode(error);
+    if (code !== undefined) return { token: code.toLowerCase(), detail: detail(text || code) };
+    // `codexErrorInfo` present but null is codex saying it has no classification for this
+    // failure -- which still tells us a TURN failed, and is the discriminator for the shape.
+    // Without that key this is some other library's rejected value: its message is worth
+    // carrying, but naming it a turn failure would assert something nothing here has shown.
+    if ("codexErrorInfo" in error) return { token: "turn_failed", detail: detail(text || "turn failed") };
+    if (text) return { token: "unknown", detail: detail(text) };
   }
   return { token: "unknown", detail: "no cause was recorded" };
 }
